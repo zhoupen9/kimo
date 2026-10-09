@@ -19,6 +19,7 @@ fn main() -> eframe::Result {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("Jimao")
+            .with_decorations(false) // custom titlebar drawn in app.rs
             .with_inner_size([1280.0, 800.0]),
         ..Default::default()
     };

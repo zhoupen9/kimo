@@ -109,6 +109,10 @@ Event (mpsc) ──► drain_events() at frame start ──► merge into Accoun
   tests go in this codebase; no `tests/` directory yet.
 - egui is pinned to 0.31.x along with eframe. Keep both in lockstep when
   bumping, and expect API churn on upgrade (check the egui CHANGELOG).
+- The window is undecorated on purpose (`with_decorations(false)` in
+  `main.rs`): `titlebar()` in `app.rs` draws the custom title bar — drag
+  area, double-click maximize, and the minimize/maximize/close buttons sent
+  as `ViewportCommand`s. Don't re-enable system decorations.
 - When touching the UI, actually run `cargo run` and click through it; the
   layout has no golden tests.
 

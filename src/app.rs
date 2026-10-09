@@ -366,6 +366,103 @@ impl JimaoApp {
 
     // ----- UI ----------------------------------------------------------------
 
+    /// Custom window title bar (the window is created undecorated in
+    /// `main.rs`): title on the left, minimize/maximize/close on the right
+    /// edge, and the remaining area drags the window (double-click toggles
+    /// maximize).
+    fn titlebar(&mut self, ui: &mut egui::Ui) {
+        let bar = ui.available_rect_before_wrap();
+        let visuals = ui.visuals().clone();
+        let maximized = ui.input(|i| i.viewport().maximized.unwrap_or(false));
+
+        #[derive(Clone, Copy)]
+        enum Ctrl {
+            Minimize,
+            Maximize,
+            Close,
+        }
+        // Drawn right to left so Close ends up at the very right edge.
+        let buttons = [
+            (Ctrl::Close, false),
+            (Ctrl::Maximize, maximized),
+            (Ctrl::Minimize, false),
+        ];
+        for (idx, (ctrl, is_max)) in buttons.iter().enumerate() {
+            let right = bar.right() - TITLEBAR_BUTTON_WIDTH * idx as f32;
+            let rect = egui::Rect::from_min_max(
+                egui::pos2(right - TITLEBAR_BUTTON_WIDTH, bar.top()),
+                egui::pos2(right, bar.bottom()),
+            );
+            let resp = ui.interact(
+                rect,
+                egui::Id::new(("titlebar-button", idx)),
+                egui::Sense::click(),
+            );
+            let fg = if resp.hovered() {
+                let bg = match ctrl {
+                    Ctrl::Close => egui::Color32::from_rgb(232, 17, 35),
+                    _ => visuals.widgets.hovered.bg_fill,
+                };
+                ui.painter().rect_filled(rect, 0.0, bg);
+                egui::Color32::WHITE
+            } else {
+                visuals.text_color()
+            };
+            match (ctrl, is_max) {
+                (Ctrl::Minimize, _) => paint_minimize_icon(ui.painter(), rect, fg),
+                (Ctrl::Maximize, false) => paint_maximize_icon(ui.painter(), rect, fg),
+                (Ctrl::Maximize, true) => {
+                    paint_restore_icon(ui.painter(), rect, fg, visuals.panel_fill)
+                }
+                (Ctrl::Close, _) => paint_close_icon(ui.painter(), rect, fg),
+            }
+            if resp.clicked() {
+                match ctrl {
+                    Ctrl::Minimize => ui
+                        .ctx()
+                        .send_viewport_cmd(egui::ViewportCommand::Minimized(true)),
+                    Ctrl::Maximize => ui
+                        .ctx()
+                        .send_viewport_cmd(egui::ViewportCommand::Maximized(!maximized)),
+                    Ctrl::Close => ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close),
+                }
+            }
+        }
+
+        // Everything left of the buttons is the drag surface.
+        let drag_rect = egui::Rect::from_min_max(
+            bar.left_top(),
+            egui::pos2(
+                bar.right() - TITLEBAR_BUTTON_WIDTH * buttons.len() as f32,
+                bar.bottom(),
+            ),
+        );
+        let drag = ui.interact(
+            drag_rect,
+            egui::Id::new("titlebar-drag"),
+            egui::Sense::click_and_drag(),
+        );
+        if drag.drag_started() {
+            ui.ctx().send_viewport_cmd(egui::ViewportCommand::StartDrag);
+        }
+        if drag.double_clicked() {
+            ui.ctx()
+                .send_viewport_cmd(egui::ViewportCommand::Maximized(!maximized));
+        }
+
+        ui.painter().text(
+            egui::pos2(bar.left() + 12.0, bar.center().y),
+            egui::Align2::LEFT_CENTER,
+            "Jimao",
+            egui::FontId::proportional(13.0),
+            visuals.text_color(),
+        );
+        ui.painter().line_segment(
+            [bar.left_bottom(), bar.right_bottom()],
+            egui::Stroke::new(1.0_f32, visuals.widgets.noninteractive.bg_stroke.color),
+        );
+    }
+
     fn toolbar(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
             if ui.button("⟳ Sync").clicked() {
@@ -719,6 +816,9 @@ impl eframe::App for JimaoApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.drain_events();
 
+        egui::TopBottomPanel::top("titlebar")
+            .exact_height(TITLEBAR_HEIGHT)
+            .show(ctx, |ui| self.titlebar(ui));
         egui::TopBottomPanel::top("toolbar").show(ctx, |ui| self.toolbar(ui));
         egui::SidePanel::left("sidebar")
             .resizable(true)
@@ -739,6 +839,68 @@ impl eframe::App for JimaoApp {
 }
 
 // ----- helpers --------------------------------------------------------------
+
+const TITLEBAR_HEIGHT: f32 = 30.0;
+const TITLEBAR_BUTTON_WIDTH: f32 = 42.0;
+
+// Title bar window-control glyphs, painted as vector shapes so they render
+// identically regardless of which fonts are installed.
+
+fn paint_minimize_icon(p: &egui::Painter, rect: egui::Rect, color: egui::Color32) {
+    let y = rect.center().y + 4.0;
+    let x = rect.center().x;
+    p.line_segment(
+        [egui::pos2(x - 5.0, y), egui::pos2(x + 5.0, y)],
+        egui::Stroke::new(1.5_f32, color),
+    );
+}
+
+fn paint_maximize_icon(p: &egui::Painter, rect: egui::Rect, color: egui::Color32) {
+    p.rect_stroke(
+        egui::Rect::from_center_size(rect.center(), egui::vec2(10.0, 10.0)),
+        0.0,
+        egui::Stroke::new(1.2_f32, color),
+        egui::StrokeKind::Middle,
+    );
+}
+
+fn paint_restore_icon(
+    p: &egui::Painter,
+    rect: egui::Rect,
+    color: egui::Color32,
+    bg: egui::Color32,
+) {
+    let c = rect.center();
+    let back = egui::Rect::from_min_size(egui::pos2(c.x - 2.0, c.y - 6.0), egui::vec2(10.0, 10.0));
+    let front = egui::Rect::from_min_size(egui::pos2(c.x - 6.0, c.y - 4.0), egui::vec2(10.0, 10.0));
+    p.rect_stroke(
+        back,
+        0.0,
+        egui::Stroke::new(1.2_f32, color),
+        egui::StrokeKind::Middle,
+    );
+    // Occlude the back window where they overlap so the two read as stacked.
+    p.rect_filled(front, 0.0, bg);
+    p.rect_stroke(
+        front,
+        0.0,
+        egui::Stroke::new(1.2_f32, color),
+        egui::StrokeKind::Middle,
+    );
+}
+
+fn paint_close_icon(p: &egui::Painter, rect: egui::Rect, color: egui::Color32) {
+    let c = rect.center();
+    let r = 4.5;
+    p.line_segment(
+        [egui::pos2(c.x - r, c.y - r), egui::pos2(c.x + r, c.y + r)],
+        egui::Stroke::new(1.5_f32, color),
+    );
+    p.line_segment(
+        [egui::pos2(c.x - r, c.y + r), egui::pos2(c.x + r, c.y - r)],
+        egui::Stroke::new(1.5_f32, color),
+    );
+}
 
 fn sort_messages(messages: &mut [MailMessage]) {
     messages.sort_by_key(|m| std::cmp::Reverse(m.timestamp.unwrap_or(0)));
