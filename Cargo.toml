@@ -1,0 +1,24 @@
+[package]
+name = "jimao"
+version = "0.1.0"
+edition = "2021"
+description = "Jimao — a pure-Rust email client (IMAP & POP3) with an egui interface"
+license = "MIT"
+
+[dependencies]
+eframe = "0.31"
+egui = "0.31"
+
+# TLS: rustls with the pure-Rust `ring` crypto provider (no OpenSSL / aws-lc-rs).
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+webpki-roots = "0.26"
+
+# RFC 5322 message parsing (pure Rust).
+mail-parser = "0.11"
+
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[profile.release]
+lto = true
+strip = true
