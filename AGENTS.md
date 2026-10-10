@@ -21,6 +21,12 @@ Jimao is a desktop **email client** GUI written in pure Rust:
   (pulling in `encoding_rs`, pure Rust) so GB2312/GBK/GB18030/Big5/
   Shift-JIS/… mail decodes to proper UTF-8 instead of Latin-1 mojibake.
 - **Receive-only by design.** There is no SMTP and no mail composing/sending.
+- **Tray icon:** `src/tray.rs` implements StatusNotifierItem by speaking the
+  D-Bus wire protocol directly on a `std::thread` — deliberately not zbus
+  (async executor, rule 2) or the GTK tray crates (C, rule 1). The icon is
+  `assets/app.svg`, embedded with `include_str!` and rasterized by resvg
+  (pure Rust, no default features). Missing StatusNotifierWatcher disables
+  the tray silently.
 - **Persistence:** JSON files under XDG dirs (`~/.config/jimao/accounts.json`,
   `~/.local/share/jimao/cache/<account>.json`). No external database.
 
@@ -71,6 +77,7 @@ src/storage.rs          XDG paths, accounts.json, per-account FolderCache/Accoun
 src/mail.rs             raw RFC 5322 bytes → MailMessage (mail-parser; HTML kept for rendering)
 src/html.rs             HTML mail → egui widgets (subset: blocks, lists, tables, links, inline styles)
 src/css.rs              tiny CSS subset (decls, tag/class/id selectors) for HTML mail
+src/tray.rs             StatusNotifierItem over raw D-Bus (session bus, std::thread) + svg→ARGB icon
 src/sync.rs             Job/Event enums, worker threads, per-protocol sync logic
 src/protocol/mod.rs     protocol modules
 src/protocol/stream.rs  TcpStream/TLS transport (MailStream, STARTTLS upgrade, buffered Conn)

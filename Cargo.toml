@@ -28,6 +28,9 @@ ureq = { version = "2.10", features = ["tls", "gzip"] }
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp", "bmp"] }
 sha1_smol = "1.0"
 
+# Tray icon rasterization (pure Rust; no default features → no text shaping).
+resvg = { version = "0.46", default-features = false }
+
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
