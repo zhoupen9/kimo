@@ -5,7 +5,8 @@
 //! module speaks just enough of the D-Bus wire protocol, over the session
 //! bus, on one dedicated `std::thread`: it registers a
 //! `org.kde.StatusNotifierItem` and serves the properties/activations that
-//! KDE Plasma and compatible trays query. The icon is `assets/app.png`
+//! KDE Plasma and compatible trays query, plus a `com.canonical.dbusmenu`
+//! context menu (Show / Quit) at `MENU_PATH`. The icon is `assets/app.png`
 //! (rasterized from `assets/app.svg`), embedded at compile time, decoded
 //! with the pure-Rust image crate with its colors kept as-is. A missing
 //! StatusNotifierWatcher (e.g. GNOME without an extension) simply disables
@@ -34,8 +35,15 @@ const FIELD_SENDER: u8 = 7;
 const FIELD_SIGNATURE: u8 = 8;
 
 const SNI_INTERFACE: &str = "org.kde.StatusNotifierItem";
+const DBUSMENU_INTERFACE: &str = "com.canonical.dbusmenu";
 const INTROSPECTABLE: &str = "org.freedesktop.DBus.Introspectable";
 const PROPERTIES: &str = "org.freedesktop.DBus.Properties";
+
+/// Where the SNI `Menu` property points: our `com.canonical.dbusmenu` object.
+const MENU_PATH: &str = "/Menu";
+/// Menu node ids (0 is the invisible root that the layout hangs off).
+const MENU_SHOW_ID: i32 = 1;
+const MENU_QUIT_ID: i32 = 2;
 
 const INTROSPECT_XML: &str = concat!(
     "<!DOCTYPE node PUBLIC \"-//freedesktop//DTD D-BUS Object Introspection 1.0//EN\" ",
@@ -60,6 +68,63 @@ const INTROSPECT_XML: &str = concat!(
     "    <method name=\"Activate\"><arg type=\"i\" name=\"x\"/><arg type=\"i\" name=\"y\"/></method>\n",
     "    <method name=\"SecondaryActivate\"><arg type=\"i\" name=\"x\"/><arg type=\"i\" name=\"y\"/></method>\n",
     "    <method name=\"Scroll\"><arg type=\"i\" name=\"delta\"/><arg type=\"s\" name=\"orientation\"/></method>\n",
+    "  </interface>\n",
+    "  <interface name=\"org.freedesktop.DBus.Properties\">\n",
+    "    <method name=\"Get\"><arg type=\"s\"/><arg type=\"s\"/><arg type=\"v\" direction=\"out\"/></method>\n",
+    "    <method name=\"GetAll\"><arg type=\"s\"/><arg type=\"a{sv}\" direction=\"out\"/></method>\n",
+    "  </interface>\n",
+    "  <interface name=\"org.freedesktop.DBus.Introspectable\">\n",
+    "    <method name=\"Introspect\"><arg type=\"s\" direction=\"out\"/></method>\n",
+    "  </interface>\n",
+    "</node>\n",
+);
+
+/// Introspection for the menu object at `MENU_PATH`.
+const MENU_INTROSPECT_XML: &str = concat!(
+    "<!DOCTYPE node PUBLIC \"-//freedesktop//DTD D-BUS Object Introspection 1.0//EN\" ",
+    "\"http://www.freedesktop.org/standards/dbus/1.0/introspect.dtd\">\n",
+    "<node>\n",
+    "  <interface name=\"com.canonical.dbusmenu\">\n",
+    "    <property name=\"Version\" type=\"u\" access=\"read\"/>\n",
+    "    <property name=\"TextDirection\" type=\"s\" access=\"read\"/>\n",
+    "    <property name=\"Status\" type=\"s\" access=\"read\"/>\n",
+    "    <property name=\"IconThemePath\" type=\"as\" access=\"read\"/>\n",
+    "    <method name=\"GetLayout\">\n",
+    "      <arg type=\"i\" name=\"parentId\" direction=\"in\"/>\n",
+    "      <arg type=\"i\" name=\"recursionDepth\" direction=\"in\"/>\n",
+    "      <arg type=\"as\" name=\"propertyNames\" direction=\"in\"/>\n",
+    "      <arg type=\"u\" name=\"revision\" direction=\"out\"/>\n",
+    "      <arg type=\"(ia{sv}av)\" name=\"layout\" direction=\"out\"/>\n",
+    "    </method>\n",
+    "    <method name=\"GetGroupProperties\">\n",
+    "      <arg type=\"ai\" name=\"ids\" direction=\"in\"/>\n",
+    "      <arg type=\"as\" name=\"propertyNames\" direction=\"in\"/>\n",
+    "      <arg type=\"a(ia{sv})\" name=\"properties\" direction=\"out\"/>\n",
+    "    </method>\n",
+    "    <method name=\"GetProperty\">\n",
+    "      <arg type=\"i\" name=\"id\" direction=\"in\"/>\n",
+    "      <arg type=\"s\" name=\"name\" direction=\"in\"/>\n",
+    "      <arg type=\"v\" name=\"value\" direction=\"out\"/>\n",
+    "    </method>\n",
+    "    <method name=\"Event\">\n",
+    "      <arg type=\"i\" name=\"id\" direction=\"in\"/>\n",
+    "      <arg type=\"s\" name=\"eventId\" direction=\"in\"/>\n",
+    "      <arg type=\"v\" name=\"data\" direction=\"in\"/>\n",
+    "      <arg type=\"u\" name=\"timestamp\" direction=\"in\"/>\n",
+    "    </method>\n",
+    "    <method name=\"EventGroup\">\n",
+    "      <arg type=\"a(isvu)\" name=\"events\" direction=\"in\"/>\n",
+    "      <arg type=\"ai\" name=\"idErrors\" direction=\"out\"/>\n",
+    "    </method>\n",
+    "    <method name=\"AboutToShow\">\n",
+    "      <arg type=\"i\" name=\"id\" direction=\"in\"/>\n",
+    "      <arg type=\"b\" name=\"needUpdate\" direction=\"out\"/>\n",
+    "    </method>\n",
+    "    <method name=\"AboutToShowGroup\">\n",
+    "      <arg type=\"ai\" name=\"ids\" direction=\"in\"/>\n",
+    "      <arg type=\"ai\" name=\"updatesNeeded\" direction=\"out\"/>\n",
+    "      <arg type=\"ai\" name=\"idErrors\" direction=\"out\"/>\n",
+    "    </method>\n",
     "  </interface>\n",
     "  <interface name=\"org.freedesktop.DBus.Properties\">\n",
     "    <method name=\"Get\"><arg type=\"s\"/><arg type=\"s\"/><arg type=\"v\" direction=\"out\"/></method>\n",
@@ -129,8 +194,10 @@ fn signature_alignment(sig: &str) -> usize {
     }
 }
 
-/// Little-endian marshaller; alignment is relative to the buffer start,
-/// which for us is always the message start.
+/// Little-endian marshaller; alignment is relative to the buffer start. D-Bus
+/// aligns values relative to the start of the *message*, so every buffer must
+/// begin at an 8-aligned message offset — which is why arrays are marshalled
+/// in place instead of into a scratch buffer.
 struct Marshal {
     buf: Vec<u8>,
 }
@@ -181,14 +248,16 @@ impl Marshal {
             Value::Str(s) | Value::ObjectPath(s) => self.string(s),
             Value::Signature(s) => self.signature(s),
             Value::Array { signature, values } => {
-                let mut elements = Marshal::new();
-                for item in values {
-                    elements.value(item);
-                }
                 self.align(4);
-                self.uint32(elements.buf.len() as u32);
+                let len_at = self.buf.len();
+                self.buf.extend_from_slice(&[0; 4]);
                 self.align(signature_alignment(signature));
-                self.buf.extend_from_slice(&elements.buf);
+                let data_at = self.buf.len();
+                for item in values {
+                    self.value(item);
+                }
+                let len = (self.buf.len() - data_at) as u32;
+                self.buf[len_at..len_at + 4].copy_from_slice(&len.to_le_bytes());
             }
             Value::Struct(items) => {
                 self.align(8);
@@ -247,7 +316,6 @@ fn build_message(kind: u8, serial: u32, fields: &[(u8, Value)], body: &[u8]) -> 
 pub(crate) struct Message {
     kind: u8,
     serial: u32,
-    #[allow(dead_code)]
     path: Option<String>,
     interface: Option<String>,
     member: Option<String>,
@@ -256,6 +324,33 @@ pub(crate) struct Message {
     sender: Option<String>,
     signature: Option<String>,
     body: Vec<u8>,
+}
+
+/// The first complete type in `sig`, with the number of bytes it spans.
+fn first_type(sig: &str) -> Option<(String, usize)> {
+    let first = *sig.as_bytes().first()?;
+    match first {
+        b'a' => {
+            let (element, used) = first_type(&sig[1..])?;
+            Some((format!("a{element}"), used + 1))
+        }
+        b'(' | b'{' => {
+            let close = if first == b'(' { b')' } else { b'}' };
+            let mut depth = 0usize;
+            for (i, byte) in sig.bytes().enumerate() {
+                if byte == first {
+                    depth += 1;
+                } else if byte == close {
+                    depth -= 1;
+                    if depth == 0 {
+                        return Some((sig[..=i].to_string(), i + 1));
+                    }
+                }
+            }
+            None
+        }
+        _ => Some((sig[..1].to_string(), 1)),
+    }
 }
 
 struct Unmarshal<'a> {
@@ -289,6 +384,21 @@ impl<'a> Unmarshal<'a> {
         Some(u32::from_le_bytes(self.take(4)?.try_into().ok()?))
     }
 
+    fn int32(&mut self) -> Option<i32> {
+        self.align(4);
+        Some(i32::from_le_bytes(self.take(4)?.try_into().ok()?))
+    }
+
+    /// An `ai` array of int32s, excluding the array header.
+    fn int32_array(&mut self) -> Option<Vec<i32>> {
+        self.align(4);
+        let len = self.uint32()? as usize;
+        self.align(4);
+        (0..len / 4)
+            .map(|_| Some(i32::from_le_bytes(self.take(4)?.try_into().ok()?)))
+            .collect()
+    }
+
     fn string(&mut self) -> Option<String> {
         let len = self.uint32()? as usize;
         let bytes = self.take(len)?;
@@ -303,6 +413,57 @@ impl<'a> Unmarshal<'a> {
         let s = String::from_utf8_lossy(bytes).into_owned();
         self.take(1)?; // nul
         Some(s)
+    }
+
+    /// Step over one complete value of type `sig`. Used to skip variant
+    /// payloads we do not care about (the `v` of an `EventGroup` event).
+    fn skip_value(&mut self, sig: &str) -> Option<()> {
+        let (first, _) = first_type(sig)?;
+        match first.as_bytes().first()? {
+            b'y' => {
+                self.take(1)?;
+            }
+            b'n' | b'q' => {
+                self.align(2);
+                self.take(2)?;
+            }
+            b'b' | b'i' | b'u' => {
+                self.align(4);
+                self.take(4)?;
+            }
+            b'x' | b't' | b'd' => {
+                self.align(8);
+                self.take(8)?;
+            }
+            b's' | b'o' => {
+                self.string()?;
+            }
+            b'g' => {
+                self.signature()?;
+            }
+            b'v' => {
+                let inner = self.signature()?;
+                self.skip_value(&inner)?;
+            }
+            b'a' => {
+                self.align(4);
+                let len = self.uint32()? as usize;
+                let (element, _) = first_type(&first[1..])?;
+                self.align(signature_alignment(&element));
+                self.take(len)?;
+            }
+            b'(' | b'{' => {
+                self.align(8);
+                let mut rest = &first[1..first.len() - 1];
+                while !rest.is_empty() {
+                    let (member, used) = first_type(rest)?;
+                    self.skip_value(&member)?;
+                    rest = &rest[used..];
+                }
+            }
+            _ => return None,
+        }
+        Some(())
     }
 
     /// One header field: (code byte, variant).
@@ -548,6 +709,181 @@ fn empty_pixmaps() -> Value {
     }
 }
 
+/// An `a{sv}` dictionary built from (name, value) pairs.
+fn properties_dict(props: &[(&str, Value)]) -> Value {
+    Value::Array {
+        signature: "{sv}".to_string(),
+        values: props
+            .iter()
+            .map(|(name, value)| {
+                Value::Struct(vec![
+                    Value::Str((*name).to_string()),
+                    Value::Variant(Box::new(value.clone())),
+                ])
+            })
+            .collect(),
+    }
+}
+
+/// One `com.canonical.dbusmenu` layout node: `(ia{sv}av)`.
+fn menu_node(id: i32, props: &[(&str, Value)], children: Vec<Value>) -> Value {
+    Value::Struct(vec![
+        Value::Int32(id),
+        properties_dict(props),
+        Value::Array {
+            signature: "v".to_string(),
+            values: children
+                .into_iter()
+                .map(|child| Value::Variant(Box::new(child)))
+                .collect(),
+        },
+    ])
+}
+
+/// The label of a menu entry; `None` for the root and unknown ids.
+fn menu_label(id: i32) -> Option<&'static str> {
+    match id {
+        MENU_SHOW_ID => Some("Show"),
+        MENU_QUIT_ID => Some("Quit"),
+        _ => None,
+    }
+}
+
+/// A clickable menu entry (no submenu of its own).
+fn menu_entry(id: i32, label: &str) -> Value {
+    menu_node(
+        id,
+        &[
+            ("label", Value::Str(label.to_string())),
+            ("enabled", Value::Bool(true)),
+            ("visible", Value::Bool(true)),
+        ],
+        Vec::new(),
+    )
+}
+
+/// The layout value of a `GetLayout` reply, for the requested parent node.
+fn menu_layout_for(parent: i32) -> Value {
+    match menu_label(parent) {
+        Some(label) => menu_entry(parent, label),
+        None if parent == 0 => menu_node(
+            0,
+            &[("children-display", Value::Str("submenu".to_string()))],
+            vec![
+                menu_entry(MENU_SHOW_ID, "Show"),
+                menu_entry(MENU_QUIT_ID, "Quit"),
+            ],
+        ),
+        None => menu_node(parent, &[], Vec::new()),
+    }
+}
+
+/// Properties of the menu object itself (not of its entries).
+fn menu_property(name: &str) -> Option<Value> {
+    match name {
+        "Version" => Some(Value::UInt32(3)),
+        "TextDirection" => Some(Value::Str("ltr".to_string())),
+        "Status" => Some(Value::Str("normal".to_string())),
+        "IconThemePath" => Some(Value::Array {
+            signature: "s".to_string(),
+            values: Vec::new(),
+        }),
+        _ => None,
+    }
+}
+
+fn all_menu_properties() -> Value {
+    properties_dict(&[
+        ("Version", Value::UInt32(3)),
+        ("TextDirection", Value::Str("ltr".to_string())),
+        ("Status", Value::Str("normal".to_string())),
+        (
+            "IconThemePath",
+            Value::Array {
+                signature: "s".to_string(),
+                values: Vec::new(),
+            },
+        ),
+    ])
+}
+
+/// A menu entry's properties, for `GetProperty`/`GetGroupProperties`.
+fn menu_item_properties(id: i32) -> Value {
+    match menu_label(id) {
+        // No `type`: libdbusmenu-gtk only builds a widget for its default
+        // item type, and anything else (e.g. "normal") is dropped as unknown.
+        Some(label) => properties_dict(&[
+            ("label", Value::Str(label.to_string())),
+            ("enabled", Value::Bool(true)),
+            ("visible", Value::Bool(true)),
+        ]),
+        None => properties_dict(&[("children-display", Value::Str("submenu".to_string()))]),
+    }
+}
+
+/// One named property of a menu entry.
+fn menu_item_property(id: i32, name: &str) -> Option<Value> {
+    let Value::Array { values, .. } = menu_item_properties(id) else {
+        return None;
+    };
+    values.into_iter().find_map(|entry| {
+        let Value::Struct(fields) = entry else {
+            return None;
+        };
+        if !matches!(fields.first(), Some(Value::Str(key)) if key == name) {
+            return None;
+        }
+        match fields.get(1) {
+            Some(Value::Variant(inner)) => Some((**inner).clone()),
+            _ => None,
+        }
+    })
+}
+
+/// The (id, event) pairs of an `Event` or `EventGroup` call. Malformed input
+/// yields no events rather than killing the tray thread.
+fn menu_events(member: &str, body: &[u8]) -> Vec<(i32, String)> {
+    let mut u = Unmarshal::new(body);
+    let mut out = Vec::new();
+    if member == "Event" {
+        if let (Some(id), Some(event)) = (u.int32(), u.string()) {
+            out.push((id, event));
+        }
+        return out;
+    }
+    // EventGroup: a(isvu)
+    u.align(4);
+    let Some(len) = u.uint32() else {
+        return out;
+    };
+    let end = u.pos + len as usize;
+    while u.pos < end {
+        u.align(8);
+        let (Some(id), Some(event)) = (u.int32(), u.string()) else {
+            break;
+        };
+        out.push((id, event));
+        let Some(sig) = u.signature() else { break };
+        if u.skip_value(&sig).is_none() || u.uint32().is_none() {
+            break;
+        }
+    }
+    out
+}
+
+/// Bring the main window back and focus it.
+fn show_window(ctx: &egui::Context) {
+    ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+    ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+    ctx.request_repaint();
+}
+
+/// Ask eframe to close the main viewport, which ends the process.
+fn quit(ctx: &egui::Context) {
+    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+    ctx.request_repaint();
+}
+
 fn sni_property(name: &str, icon: &Icon) -> Option<Value> {
     match name {
         "Category" => Some(Value::Str("ApplicationStatus".into())),
@@ -571,7 +907,7 @@ fn sni_property(name: &str, icon: &Icon) -> Option<Value> {
             Value::Str(String::new()),
         ])),
         "ItemIsMenu" => Some(Value::Bool(false)),
-        "Menu" => Some(Value::ObjectPath("/NO_DBUSMENU".into())),
+        "Menu" => Some(Value::ObjectPath(MENU_PATH.to_string())),
         _ => None,
     }
 }
@@ -594,19 +930,14 @@ fn all_properties(icon: &Icon) -> Value {
         "ItemIsMenu",
         "Menu",
     ];
-    Value::Array {
-        signature: "{sv}".to_string(),
-        values: names
-            .iter()
-            .filter_map(|n| sni_property(n, icon).map(|v| (n, v)))
-            .map(|(n, v)| {
-                Value::Struct(vec![Value::Str(n.to_string()), Value::Variant(Box::new(v))])
-            })
-            .collect(),
-    }
+    let props: Vec<(&str, Value)> = names
+        .iter()
+        .filter_map(|n| sni_property(n, icon).map(|v| (*n, v)))
+        .collect();
+    properties_dict(&props)
 }
 
-/// Serve StatusNotifierItem method calls until the bus goes away.
+/// Serve StatusNotifierItem and DBusMenu method calls until the bus goes away.
 fn serve(bus: &mut Bus, ctx: &egui::Context, icon: &Icon) -> Result<(), String> {
     loop {
         let msg = bus.read_message()?;
@@ -615,31 +946,111 @@ fn serve(bus: &mut Bus, ctx: &egui::Context, icon: &Icon) -> Result<(), String> 
         }
         let interface = msg.interface.as_deref().unwrap_or("");
         let member = msg.member.as_deref().unwrap_or("");
+        let on_menu = msg.path.as_deref() == Some(MENU_PATH);
         // Method calls carry their own serial; replies echo it.
         let call_serial = msg.serial;
         let sender = msg.sender.clone();
         let Some(sender) = sender else { continue };
+        let invalid_args = Some("org.freedesktop.DBus.Error.InvalidArgs");
 
         let (reply_values, error): (Vec<Value>, Option<&str>) = match (interface, member) {
             (INTROSPECTABLE, "Introspect") | ("", "Introspect") => {
-                (vec![Value::Str(INTROSPECT_XML.to_string())], None)
+                let xml = if on_menu {
+                    MENU_INTROSPECT_XML
+                } else {
+                    INTROSPECT_XML
+                };
+                (vec![Value::Str(xml.to_string())], None)
             }
             (PROPERTIES, "Get") | (PROPERTIES, "Set") => {
                 let mut body = Unmarshal::new(&msg.body);
-                let _iface = body.string().unwrap_or_default();
+                let iface = body.string().unwrap_or_default();
                 let prop = body.string().unwrap_or_default();
-                match sni_property(&prop, icon) {
+                let value = if iface == DBUSMENU_INTERFACE {
+                    menu_property(&prop)
+                } else {
+                    sni_property(&prop, icon)
+                };
+                match value {
                     Some(v) => (vec![Value::Variant(Box::new(v))], None),
-                    None => (Vec::new(), Some("org.freedesktop.DBus.Error.InvalidArgs")),
+                    None => (Vec::new(), invalid_args),
                 }
             }
-            (PROPERTIES, "GetAll") => (vec![all_properties(icon)], None),
+            (PROPERTIES, "GetAll") => {
+                let mut body = Unmarshal::new(&msg.body);
+                let iface = body.string().unwrap_or_default();
+                if iface == DBUSMENU_INTERFACE {
+                    (vec![all_menu_properties()], None)
+                } else {
+                    (vec![all_properties(icon)], None)
+                }
+            }
             (SNI_INTERFACE, "Activate") | (SNI_INTERFACE, "SecondaryActivate") => {
-                ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
-                ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+                show_window(ctx);
                 (Vec::new(), None)
             }
             (SNI_INTERFACE, "Scroll") => (Vec::new(), None),
+            (DBUSMENU_INTERFACE, "GetLayout") => {
+                let mut body = Unmarshal::new(&msg.body);
+                let parent = body.int32().unwrap_or(0);
+                (vec![Value::UInt32(1), menu_layout_for(parent)], None)
+            }
+            (DBUSMENU_INTERFACE, "GetGroupProperties") => {
+                let mut body = Unmarshal::new(&msg.body);
+                let mut ids = body.int32_array().unwrap_or_default();
+                if ids.is_empty() {
+                    ids = vec![0, MENU_SHOW_ID, MENU_QUIT_ID];
+                }
+                let values = ids
+                    .into_iter()
+                    .map(|id| Value::Struct(vec![Value::Int32(id), menu_item_properties(id)]))
+                    .collect();
+                (
+                    vec![Value::Array {
+                        signature: "(ia{sv})".to_string(),
+                        values,
+                    }],
+                    None,
+                )
+            }
+            (DBUSMENU_INTERFACE, "GetProperty") => {
+                let mut body = Unmarshal::new(&msg.body);
+                let id = body.int32().unwrap_or(-1);
+                let name = body.string().unwrap_or_default();
+                match menu_item_property(id, &name) {
+                    Some(v) => (vec![Value::Variant(Box::new(v))], None),
+                    None => (Vec::new(), invalid_args),
+                }
+            }
+            (DBUSMENU_INTERFACE, "Event") | (DBUSMENU_INTERFACE, "EventGroup") => {
+                for (id, event) in menu_events(member, &msg.body) {
+                    if event != "clicked" {
+                        continue;
+                    }
+                    match id {
+                        MENU_SHOW_ID => show_window(ctx),
+                        MENU_QUIT_ID => quit(ctx),
+                        _ => {}
+                    }
+                }
+                if member == "EventGroup" {
+                    let id_errors = Value::Array {
+                        signature: "i".to_string(),
+                        values: Vec::new(),
+                    };
+                    (vec![id_errors], None)
+                } else {
+                    (Vec::new(), None)
+                }
+            }
+            (DBUSMENU_INTERFACE, "AboutToShow") => (vec![Value::Bool(false)], None),
+            (DBUSMENU_INTERFACE, "AboutToShowGroup") => {
+                let empty = || Value::Array {
+                    signature: "i".to_string(),
+                    values: Vec::new(),
+                };
+                (vec![empty(), empty()], None)
+            }
             _ => (Vec::new(), Some("org.freedesktop.DBus.Error.UnknownMethod")),
         };
 
@@ -827,6 +1238,178 @@ mod tests {
         );
         // Straight alpha, network byte order: alpha first, then R, G, B.
         assert_eq!(&icon.argb[..4], &[0x11, 0x22, 0x33, 0x44]);
+    }
+
+    /// D-Bus aligns values relative to the start of the message, so an
+    /// 8-aligned element is padded relative to the message even when its
+    /// array's own data starts at a 4-mod-8 offset.
+    #[test]
+    fn array_elements_align_to_the_message() {
+        let value = Value::Struct(vec![
+            Value::Str("ab".into()),
+            Value::Array {
+                signature: "v".into(),
+                values: vec![Value::Variant(Box::new(Value::Struct(vec![Value::Int32(
+                    7,
+                )])))],
+            },
+        ]);
+        let (signature, body) = build_body(&[value]);
+        assert_eq!(signature, "(sav)");
+        // "ab": 4-byte length + 2 bytes + nul = 7, padded to the array length.
+        assert_eq!(&body[..8], &[2, 0, 0, 0, b'a', b'b', 0, 0]);
+        let len = u32::from_le_bytes(body[8..12].try_into().unwrap());
+        assert_eq!(len, 16);
+        // The array data starts at 12 (4 mod 8); the variant signature is at
+        // 12..17, so the struct inside it is padded to 24, not to 20.
+        assert_eq!(&body[12..17], &[3, b'(', b'i', b')', 0]);
+        assert_eq!(&body[17..24], &[0; 7]);
+        assert_eq!(&body[24..28], &7i32.to_le_bytes());
+        assert_eq!(body.len(), 28);
+    }
+
+    #[test]
+    fn skip_value_steps_over_unwanted_payloads() {
+        let (_, body) = build_body(&[
+            Value::Int32(9),
+            Value::Str("clicked".into()),
+            Value::Variant(Box::new(Value::Array {
+                signature: "s".into(),
+                values: vec![Value::Str("x".into())],
+            })),
+            Value::UInt32(1234),
+        ]);
+        let mut u = Unmarshal::new(&body);
+        assert_eq!(u.int32(), Some(9));
+        assert_eq!(u.string().as_deref(), Some("clicked"));
+        let sig = u.signature().unwrap();
+        assert_eq!(sig, "as");
+        u.skip_value(&sig).unwrap();
+        assert_eq!(u.uint32(), Some(1234));
+    }
+
+    #[test]
+    fn item_points_at_the_menu_object() {
+        let icon = Icon {
+            width: 1,
+            height: 1,
+            argb: vec![0; 4],
+        };
+        assert_eq!(
+            sni_property("Menu", &icon),
+            Some(Value::ObjectPath(MENU_PATH.to_string()))
+        );
+        assert_eq!(sni_property("ItemIsMenu", &icon), Some(Value::Bool(false)));
+        assert_eq!(menu_property("Version"), Some(Value::UInt32(3)));
+        assert_eq!(menu_property("Status"), Some(Value::Str("normal".into())));
+    }
+
+    /// Walk a `GetLayout` reply far enough to prove its shape: revision 1,
+    /// root id 0, then the Show and Quit entries.
+    #[test]
+    fn menu_layout_exposes_show_and_quit() {
+        let (signature, body) = build_body(&[Value::UInt32(1), menu_layout_for(0)]);
+        assert_eq!(signature, "u(ia{sv}av)");
+
+        let mut u = Unmarshal::new(&body);
+        assert_eq!(u.uint32(), Some(1));
+        u.align(8);
+        assert_eq!(u.int32(), Some(0));
+        let props_len = u.uint32().unwrap() as usize;
+        u.align(8);
+        let props_end = u.pos + props_len;
+        assert_eq!(u.string().as_deref(), Some("children-display"));
+        assert_eq!(u.signature().as_deref(), Some("s"));
+        assert_eq!(u.string().as_deref(), Some("submenu"));
+        assert_eq!(u.pos, props_end);
+
+        let children_len = u.uint32().unwrap() as usize;
+        let children_end = u.pos + children_len;
+        let mut entries = Vec::new();
+        while u.pos < children_end {
+            assert_eq!(u.signature().as_deref(), Some("(ia{sv}av)"));
+            u.align(8);
+            let id = u.int32().unwrap();
+            let props_len = u.uint32().unwrap() as usize;
+            u.align(8);
+            let props_end = u.pos + props_len;
+            u.align(8);
+            assert_eq!(u.string().as_deref(), Some("label"));
+            assert_eq!(u.signature().as_deref(), Some("s"));
+            entries.push((id, u.string().unwrap()));
+            u.pos = props_end;
+            assert_eq!(u.uint32(), Some(0)); // no submenu
+        }
+        assert_eq!(
+            entries,
+            vec![(1, "Show".to_string()), (2, "Quit".to_string())]
+        );
+    }
+
+    /// libdbusmenu-gtk only builds a widget for items whose `type` it knows
+    /// (or that leave it unset); `type: "normal"` silently produced an empty
+    /// menu in waybar, so standard entries must not declare one.
+    #[test]
+    fn standard_items_do_not_declare_a_type() {
+        for id in [MENU_SHOW_ID, MENU_QUIT_ID] {
+            let Value::Array { values, .. } = menu_item_properties(id) else {
+                panic!("properties must be a dict");
+            };
+            let keys: Vec<&str> = values
+                .iter()
+                .filter_map(|entry| match entry {
+                    Value::Struct(fields) => match fields.first() {
+                        Some(Value::Str(key)) => Some(key.as_str()),
+                        _ => None,
+                    },
+                    _ => None,
+                })
+                .collect();
+            assert!(keys.contains(&"label"), "entry {id} has no label: {keys:?}");
+            assert!(
+                !keys.contains(&"type"),
+                "entry {id} declares a type: {keys:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn menu_events_parse_both_call_shapes() {
+        let (_, event) = build_body(&[
+            Value::Int32(MENU_QUIT_ID),
+            Value::Str("clicked".into()),
+            Value::Variant(Box::new(Value::Str(String::new()))),
+            Value::UInt32(0),
+        ]);
+        assert_eq!(
+            menu_events("Event", &event),
+            vec![(MENU_QUIT_ID, "clicked".to_string())]
+        );
+
+        let (_, group) = build_body(&[Value::Array {
+            signature: "(isvu)".into(),
+            values: vec![
+                Value::Struct(vec![
+                    Value::Int32(MENU_SHOW_ID),
+                    Value::Str("clicked".into()),
+                    Value::Variant(Box::new(Value::Bool(true))),
+                    Value::UInt32(1),
+                ]),
+                Value::Struct(vec![
+                    Value::Int32(MENU_QUIT_ID),
+                    Value::Str("hovered".into()),
+                    Value::Variant(Box::new(Value::Str("x".into()))),
+                    Value::UInt32(2),
+                ]),
+            ],
+        }]);
+        assert_eq!(
+            menu_events("EventGroup", &group),
+            vec![
+                (MENU_SHOW_ID, "clicked".to_string()),
+                (MENU_QUIT_ID, "hovered".to_string())
+            ]
+        );
     }
 
     #[test]

@@ -27,8 +27,11 @@ Jimao is a desktop **email client** GUI written in pure Rust:
   `assets/app.png` (48px, rasterized from the multi-color `assets/app.svg`
   — regenerate with any svg→png tool, e.g. `rsvg-convert -w 48 -h 48`),
   embedded with `include_bytes!` and decoded with the image crate, keeping
-  its own colors (the purple circle works on any panel). Missing
-  StatusNotifierWatcher disables the tray silently.
+  its own colors (the purple circle works on any panel). Left click raises
+  the window; the right-click menu is a minimal `com.canonical.dbusmenu`
+  object at `/Menu` (Show / Quit) served by the same thread. Missing
+  StatusNotifierWatcher disables the tray silently, and `IconPixmap` must
+  stay `a(iiay)` — hosts cannot read a bare byte array.
 - **Persistence:** JSON files under XDG dirs (`~/.config/jimao/accounts.json`,
   `~/.local/share/jimao/cache/<account>.json`). No external database.
 
