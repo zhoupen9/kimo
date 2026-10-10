@@ -16,6 +16,9 @@ Jimao is a desktop **email client** GUI written in pure Rust:
   widgets in `src/html.rs` — no CSS engine, no JavaScript, no remote
   content, and deliberately no webview (a webview would link webkit and
   violate rule 1).
+- **Charsets:** mail-parser is built with the `full_encoding` feature
+  (pulling in `encoding_rs`, pure Rust) so GB2312/GBK/GB18030/Big5/
+  Shift-JIS/… mail decodes to proper UTF-8 instead of Latin-1 mojibake.
 - **Receive-only by design.** There is no SMTP and no mail composing/sending.
 - **Persistence:** JSON files under XDG dirs (`~/.config/jimao/accounts.json`,
   `~/.local/share/jimao/cache/<account>.json`). No external database.

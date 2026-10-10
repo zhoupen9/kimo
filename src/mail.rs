@@ -134,4 +134,36 @@ mod tests {
         assert!(msg.body_html.is_none());
         assert_eq!(msg.body_text.trim(), "Just text.");
     }
+
+    #[test]
+    fn gb2312_subject_and_body_decode_to_chinese() {
+        // Subject encoded-word: "8月项目周报" (GBK, base64).
+        // Body: "本月项目进展：一切正常。" as raw GBK bytes.
+        let raw = b"From: liuyq@nroad.com.cn\r\n\
+                    Subject: =?gb2312?B?ONTCz+7Ev9bcsag=?=\r\n\
+                    Content-Type: text/plain; charset=gb2312\r\n\
+                    \r\n\
+                    \xb1\xbe\xd4\xc2\xcf\xee\xc4\xbf\xbd\xf8\xd5\xb9\xa3\xba\xd2\xbb\xc7\xd0\xd5\xfd\xb3\xa3\xa1\xa3\r\n";
+        let msg = parse(raw, "9", false);
+        assert_eq!(msg.subject, "8\u{6708}\u{9879}\u{76ee}\u{5468}\u{62a5}"); // 8月项目周报
+        assert!(
+            msg.body_text.contains("\u{9879}\u{76ee}"),
+            "body should contain 项目"
+        );
+    }
+
+    #[test]
+    fn gbk_body_without_encoded_subject_still_decodes() {
+        let raw = b"From: a@b.c\r\n\
+                    Subject: plain ascii subject\r\n\
+                    Content-Type: text/plain; charset=gbk\r\n\
+                    Mime-Version: 1.0\r\n\
+                    \r\n\
+                    \xc4\xe3\xba\xc3\xa3\xac\xca\xc0\xbd\xe7\r\n";
+        let msg = parse(raw, "10", false);
+        assert!(
+            msg.body_text.contains("\u{4f60}\u{597d}"),
+            "body should contain 你好"
+        );
+    }
 }

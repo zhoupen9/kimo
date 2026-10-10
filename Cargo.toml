@@ -13,8 +13,9 @@ egui = "0.31"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
 webpki-roots = "0.26"
 
-# RFC 5322 message parsing (pure Rust).
-mail-parser = "0.11"
+# RFC 5322 message parsing (pure Rust). `full_encoding` pulls in encoding_rs
+# (also pure Rust) so GBK/GB2312/Big5/Shift-JIS/… bodies decode correctly.
+mail-parser = { version = "0.11", features = ["full_encoding"] }
 
 # HTML mail rendering: html5ever DOM (pure Rust, from Servo) + egui widgets.
 scraper = "0.27"
