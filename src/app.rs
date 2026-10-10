@@ -869,48 +869,114 @@ impl JimaoApp {
         egui::ScrollArea::vertical()
             .auto_shrink([false, false])
             .show(ui, |ui| {
-                egui::Grid::new("message_list")
-                    .num_columns(3)
-                    .striped(true)
-                    .min_col_width(80.0)
-                    .show(ui, |ui| {
-                        ui.label(egui::RichText::new("From").small().weak());
-                        ui.label(egui::RichText::new("Subject").small().weak());
-                        ui.label(egui::RichText::new("Date").small().weak());
-                        ui.end_row();
-                        for msg in &messages {
-                            let is_selected =
-                                self.selected_message.as_deref() == Some(msg.uid.as_str());
-                            let (style_from, style_subject) = if msg.seen {
-                                (
-                                    egui::RichText::new(truncate(&msg.from, 24)),
-                                    egui::RichText::new(truncate(&msg.subject, 50)),
-                                )
-                            } else {
-                                (
-                                    egui::RichText::new(truncate(&msg.from, 24)).strong(),
-                                    egui::RichText::new(truncate(&msg.subject, 50)).strong(),
-                                )
-                            };
-                            if ui.selectable_label(is_selected, style_from).clicked() {
-                                self.open_message(msg);
-                            }
-                            if ui.selectable_label(is_selected, style_subject).clicked() {
-                                self.open_message(msg);
-                            }
-                            if ui
-                                .selectable_label(
-                                    is_selected,
-                                    egui::RichText::new(display_date(msg)).small().weak(),
-                                )
-                                .clicked()
-                            {
-                                self.open_message(msg);
-                            }
-                            ui.end_row();
-                        }
-                    });
+                for msg in &messages {
+                    self.message_row(ui, msg);
+                }
             });
+    }
+
+    /// One message card in the list: avatar on the left; sender + timestamp,
+    /// subject and a content preview stacked on the right.
+    fn message_row(&mut self, ui: &mut egui::Ui, msg: &MailMessage) {
+        let is_selected = self.selected_message.as_deref() == Some(msg.uid.as_str());
+        let visuals = ui.visuals().clone();
+        let (rect, resp) = ui.allocate_exact_size(
+            egui::vec2(ui.available_width(), MESSAGE_ROW_HEIGHT),
+            egui::Sense::click(),
+        );
+
+        let painter = ui.painter();
+        if is_selected {
+            painter.rect_filled(rect.shrink(1.0), 4.0, visuals.selection.bg_fill);
+        } else if resp.hovered() {
+            painter.rect_filled(rect.shrink(1.0), 4.0, visuals.faint_bg_color);
+        }
+        painter.line_segment(
+            [rect.left_bottom(), rect.right_bottom()],
+            egui::Stroke::new(1.0_f32, visuals.widgets.noninteractive.bg_stroke.color),
+        );
+
+        // Avatar: deterministic color per sender, initial centered in it.
+        let avatar_center = egui::pos2(rect.left() + 8.0 + AVATAR_DIAMETER / 2.0, rect.center().y);
+        painter.circle_filled(
+            avatar_center,
+            AVATAR_DIAMETER / 2.0,
+            sender_color(&msg.from),
+        );
+        painter.text(
+            avatar_center,
+            egui::Align2::CENTER_CENTER,
+            sender_initial(&msg.from),
+            egui::FontId::proportional(18.0),
+            egui::Color32::WHITE,
+        );
+
+        let text_left = avatar_center.x + AVATAR_DIAMETER / 2.0 + 10.0;
+        let text_right = rect.right() - 10.0;
+        // Unread mail keeps the full-contrast text color; read mail is muted.
+        let main_color = if msg.seen {
+            visuals.weak_text_color()
+        } else {
+            visuals.text_color()
+        };
+
+        // First row: timestamp right-aligned, sender truncated before it.
+        let date_galley = ui.ctx().fonts(|f| {
+            f.layout_no_wrap(
+                display_date(msg),
+                egui::FontId::proportional(12.0),
+                visuals.weak_text_color(),
+            )
+        });
+        let date_pos = egui::pos2(
+            text_right - date_galley.size().x,
+            rect.top() + 20.0 - date_galley.size().y * 0.5,
+        );
+        painter.galley(date_pos, date_galley, visuals.weak_text_color());
+        let sender_max_width = (date_pos.x - text_left - 12.0).max(40.0);
+        let sender = truncate_galley(ui.ctx(), &msg.from, 14.0, main_color, sender_max_width);
+        painter.galley(
+            egui::pos2(text_left, rect.top() + 20.0 - sender.size().y * 0.5),
+            sender,
+            main_color,
+        );
+
+        // Second row: subject.
+        let subject = truncate_galley(
+            ui.ctx(),
+            &msg.subject,
+            14.0,
+            main_color,
+            text_right - text_left,
+        );
+        painter.galley(
+            egui::pos2(text_left, rect.top() + 40.0 - subject.size().y * 0.5),
+            subject,
+            main_color,
+        );
+
+        // Third row: content preview, always muted.
+        let preview = if msg.preview.is_empty() {
+            " ".to_string()
+        } else {
+            msg.preview.clone()
+        };
+        let preview = truncate_galley(
+            ui.ctx(),
+            &preview,
+            12.0,
+            visuals.weak_text_color(),
+            text_right - text_left,
+        );
+        painter.galley(
+            egui::pos2(text_left, rect.top() + 57.0 - preview.size().y * 0.5),
+            preview,
+            visuals.weak_text_color(),
+        );
+
+        if resp.clicked() {
+            self.open_message(msg);
+        }
     }
 
     /// Right column: the selected message, or a placeholder.
@@ -1153,6 +1219,79 @@ impl eframe::App for JimaoApp {
 const TITLEBAR_HEIGHT: f32 = 30.0;
 const TITLEBAR_BUTTON_WIDTH: f32 = 42.0;
 
+/// Message-card geometry in the mail list.
+const MESSAGE_ROW_HEIGHT: f32 = 68.0;
+const AVATAR_DIAMETER: f32 = 38.0;
+
+/// Deterministic, readable-on-white-text avatar colors (Material palette).
+const AVATAR_COLORS: &[egui::Color32] = &[
+    egui::Color32::from_rgb(229, 57, 53),
+    egui::Color32::from_rgb(66, 133, 244),
+    egui::Color32::from_rgb(52, 168, 83),
+    egui::Color32::from_rgb(251, 140, 0),
+    egui::Color32::from_rgb(142, 36, 170),
+    egui::Color32::from_rgb(0, 150, 136),
+    egui::Color32::from_rgb(121, 85, 72),
+    egui::Color32::from_rgb(236, 64, 122),
+];
+
+fn sender_color(from: &str) -> egui::Color32 {
+    let hash = from
+        .bytes()
+        .fold(0u32, |h, b| h.wrapping_mul(31).wrapping_add(b as u32));
+    AVATAR_COLORS[(hash as usize) % AVATAR_COLORS.len()]
+}
+
+/// First character of the display name (or e-mail local part), for avatars.
+fn sender_initial(from: &str) -> String {
+    let name = from.split('<').next().unwrap_or("").trim();
+    let source = if name.is_empty() {
+        from.split('@').next().unwrap_or("")
+    } else {
+        name
+    };
+    source
+        .chars()
+        .next()
+        .map(|c| c.to_uppercase().to_string())
+        .unwrap_or_else(|| "?".to_string())
+}
+
+/// Lay out a single line of text, cut with an ellipsis (by binary search on
+/// characters) to fit `max_width` pixels.
+fn truncate_galley(
+    ctx: &egui::Context,
+    text: &str,
+    size: f32,
+    color: egui::Color32,
+    max_width: f32,
+) -> std::sync::Arc<egui::Galley> {
+    let font = egui::FontId::proportional(size);
+    let full = ctx.fonts(|f| f.layout_no_wrap(text.to_owned(), font.clone(), color));
+    if full.size().x <= max_width {
+        return full;
+    }
+    let chars: Vec<char> = text.chars().collect();
+    // Find the longest prefix + "…" that fits (lo fits, hi never does).
+    let (mut lo, mut hi) = (0usize, chars.len());
+    while lo + 1 < hi {
+        let mid = (lo + hi) / 2;
+        let cut: String = chars[..mid].iter().collect::<String>() + "…";
+        let fits = ctx
+            .fonts(|f| f.layout_no_wrap(cut, font.clone(), color))
+            .size()
+            .x
+            <= max_width;
+        if fits {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
+    }
+    let cut: String = chars[..lo].iter().collect::<String>() + "…";
+    ctx.fonts(|f| f.layout_no_wrap(cut, font, color))
+}
+
 // Title bar window-control glyphs, painted as vector shapes so they render
 // identically regardless of which fonts are installed.
 
@@ -1292,16 +1431,6 @@ fn slug(name: &str) -> String {
     }
 }
 
-fn truncate(s: &str, max: usize) -> String {
-    if s.chars().count() <= max {
-        s.to_owned()
-    } else {
-        let mut t: String = s.chars().take(max).collect();
-        t.push('…');
-        t
-    }
-}
-
 fn display_date(m: &MailMessage) -> String {
     m.timestamp
         .map(format_timestamp)
@@ -1417,10 +1546,31 @@ mod tests {
     }
 
     #[test]
-    fn truncation_respects_char_boundaries() {
-        assert_eq!(truncate("abc", 5), "abc");
-        let t = truncate("汉字汉字汉字", 2);
-        assert_eq!(t, "汉字…");
+    fn sender_initial_prefers_name_over_email() {
+        assert_eq!(sender_initial("Alice <alice@example.com>"), "A");
+        assert_eq!(sender_initial("张三 <zhang@nroad.com.cn>"), "张");
+        assert_eq!(sender_initial("bob@example.com"), "B");
+        assert_eq!(sender_initial(""), "?");
+    }
+
+    #[test]
+    fn sender_color_is_deterministic() {
+        assert_eq!(sender_color("a@b.c"), sender_color("a@b.c"));
+        assert_ne!(sender_color("a@b.c"), sender_color("other@b.c"));
+    }
+
+    #[test]
+    fn truncate_galley_cuts_to_fit_and_appends_ellipsis() {
+        let ctx = egui::Context::default();
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            let color = egui::Color32::WHITE;
+            let short = truncate_galley(ctx, "hi", 14.0, color, 500.0);
+            assert_eq!(short.text(), "hi");
+
+            let long = truncate_galley(ctx, &"很长的一段中文内容。".repeat(10), 14.0, color, 100.0);
+            assert!(long.size().x <= 100.0);
+            assert!(long.text().ends_with('…'));
+        });
     }
 
     #[test]
@@ -1442,6 +1592,7 @@ mod tests {
                 seen: false,
                 body_text: String::new(),
                 body_html: None,
+                preview: String::new(),
                 attachment_names: vec![],
             },
             MailMessage {
@@ -1454,6 +1605,7 @@ mod tests {
                 seen: false,
                 body_text: String::new(),
                 body_html: None,
+                preview: String::new(),
                 attachment_names: vec![],
             },
         ];

@@ -70,6 +70,7 @@ src/error.rs            MailError + MailResult
 src/storage.rs          XDG paths, accounts.json, per-account FolderCache/AccountCache
 src/mail.rs             raw RFC 5322 bytes → MailMessage (mail-parser; HTML kept for rendering)
 src/html.rs             HTML mail → egui widgets (subset: blocks, lists, tables, links, inline styles)
+src/css.rs              tiny CSS subset (decls, tag/class/id selectors) for HTML mail
 src/sync.rs             Job/Event enums, worker threads, per-protocol sync logic
 src/protocol/mod.rs     protocol modules
 src/protocol/stream.rs  TcpStream/TLS transport (MailStream, STARTTLS upgrade, buffered Conn)
@@ -135,8 +136,10 @@ Event (mpsc) ──► drain_events() at frame start ──► merge into Accoun
   bumping, and expect API churn on upgrade (check the egui CHANGELOG).
 - Layout is a three-column mail client: left navigation (collapsible via
   the title-bar toggle; auto-collapses when the window is narrower than
-  640px — see `NAV_AUTO_COLLAPSE_WIDTH`), central message list with the
-  filter box, right reading pane with a "No mail selected" placeholder.
+  640px — see `NAV_AUTO_COLLAPSE_WIDTH`), central message list (avatar
+  cards: sender + timestamp, subject, content preview — see
+  `message_row`), right reading pane with a "No mail selected"
+  placeholder.
 - The window is undecorated on purpose (`with_decorations(false)` in
   `main.rs`): `titlebar()` in `app.rs` draws the custom title bar — nav
   toggle, account menu (switch/add/remove), sync button, theme switcher
@@ -158,8 +161,7 @@ Do not "fix" these casually — they are known:
   compound selectors and layout CSS are ignored. Simple tables render as
   aligned grids; layout tables (block elements inside cells — most HTML
   mail) render as flowing full-width rows, because egui Grid sizes columns
-  to the minimum wrapped width. `cid:` inline images are not supported yet
-  (attachments are not stored). A real webview would violate rule 1.
+  to the minimum wrapped width. A real webview would violate rule 1.
 - POP3 sync re-downloads bodies every time (UIDL lets us skip but is not
   wired through the Job yet).
 - No IDLE/push for IMAP; sync is manual or on-startup.

@@ -71,6 +71,9 @@ pub struct MailMessage {
     /// `crate::html` instead of the plain text.
     #[serde(default)]
     pub body_html: Option<String>,
+    /// One-line plain-text snippet for the message list.
+    #[serde(default)]
+    pub preview: String,
     pub attachment_names: Vec<String>,
 }
 
