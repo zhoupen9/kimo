@@ -783,7 +783,13 @@ impl JimaoApp {
                 .auto_shrink([false, false])
                 .show(ui, |ui| {
                     ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Wrap);
-                    ui.label(msg.body_text.as_str());
+                    if let Some(html) = &msg.body_html {
+                        crate::html::render(ui, html);
+                    } else if !msg.body_text.is_empty() {
+                        ui.label(msg.body_text.as_str());
+                    } else {
+                        ui.label(egui::RichText::new("(no text body)").weak());
+                    }
                 });
         });
     }
@@ -1134,6 +1140,7 @@ mod tests {
                 timestamp: Some(100),
                 seen: false,
                 body_text: String::new(),
+                body_html: None,
                 attachment_names: vec![],
             },
             MailMessage {
@@ -1145,6 +1152,7 @@ mod tests {
                 timestamp: Some(200),
                 seen: false,
                 body_text: String::new(),
+                body_html: None,
                 attachment_names: vec![],
             },
         ];

@@ -12,6 +12,10 @@ Jimao is a desktop **email client** GUI written in pure Rust:
   `src/protocol/` — no `imap`/`async-imap`/`pop` crates.
 - **TLS:** rustls with the pure-Rust `ring` crypto provider + webpki-roots.
   The `ring` provider is installed process-wide in `src/main.rs`.
+- **HTML mail:** parsed with html5ever (via `scraper`) and rendered as egui
+  widgets in `src/html.rs` — no CSS engine, no JavaScript, no remote
+  content, and deliberately no webview (a webview would link webkit and
+  violate rule 1).
 - **Receive-only by design.** There is no SMTP and no mail composing/sending.
 - **Persistence:** JSON files under XDG dirs (`~/.config/jimao/accounts.json`,
   `~/.local/share/jimao/cache/<account>.json`). No external database.
@@ -60,7 +64,8 @@ src/app.rs              all UI: JimaoApp state, panels, add-account window, even
 src/models.rs           Account / Protocol / TlsMode / MailMessage (serde types)
 src/error.rs            MailError + MailResult
 src/storage.rs          XDG paths, accounts.json, per-account FolderCache/AccountCache
-src/mail.rs             raw RFC 5322 bytes → MailMessage (mail-parser, HTML→text fallback)
+src/mail.rs             raw RFC 5322 bytes → MailMessage (mail-parser; HTML kept for rendering)
+src/html.rs             HTML mail → egui widgets (subset: blocks, lists, tables, links, inline styles)
 src/sync.rs             Job/Event enums, worker threads, per-protocol sync logic
 src/protocol/mod.rs     protocol modules
 src/protocol/stream.rs  TcpStream/TLS transport (MailStream, STARTTLS upgrade, buffered Conn)
@@ -128,9 +133,9 @@ Do not "fix" these casually — they are known:
 - Attachments are listed by name but cannot be saved or opened yet.
 - No message deletion/expunge (IMAP `\Deleted` + EXPUNGE, POP3 `DELE`).
 - Credentials in plain text (see above); no OAuth2/XOAUTH2.
-- HTML bodies are rendered as tag-stripped text, not a web view (a webview
-  would violate rule 1 — the realistic option is an in-egui HTML renderer,
-  not webkit).
+- HTML mail renders through the in-egui subset renderer (`src/html.rs`):
+  no CSS support, remote images stay placeholders, complex table layouts
+  degrade. A real webview would violate rule 1.
 - POP3 sync re-downloads bodies every time (UIDL lets us skip but is not
   wired through the Job yet).
 - No IDLE/push for IMAP; sync is manual or on-startup.

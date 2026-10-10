@@ -4,6 +4,7 @@
 
 mod app;
 mod error;
+mod html;
 mod mail;
 mod models;
 mod protocol;

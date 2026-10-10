@@ -1,5 +1,5 @@
-//! Raw RFC 5322 bytes → `MailMessage` via `mail-parser`, with a crude
-//! HTML-to-text fallback for messages that only have an HTML body.
+//! Raw RFC 5322 bytes → `MailMessage` via `mail-parser`. HTML bodies are
+//! kept as-is (`body_html`) and rendered by `crate::html` in the UI.
 
 use mail_parser::{MessageParser, MimeHeaders};
 
@@ -7,19 +7,29 @@ use crate::models::MailMessage;
 
 pub fn parse(raw: &[u8], uid: &str, seen: bool) -> MailMessage {
     let parsed = MessageParser::default().parse(raw);
-    let (subject, from, to, date, timestamp, body_text, attachments) = match parsed {
+    let (subject, from, to, date, timestamp, body_text, body_html, attachments) = match parsed {
         Some(m) => {
             let dt = m.date().copied();
+            // The body accessors convert between flavors, so look at the
+            // real part type to know whether this message is HTML-based.
+            let body_is_html = m
+                .html_body
+                .first()
+                .or_else(|| m.text_body.first())
+                .and_then(|&i| m.parts.get(i as usize))
+                .is_some_and(|p| matches!(p.body, mail_parser::PartType::Html(_)));
             (
                 m.subject().unwrap_or_default().to_owned(),
                 address_to_string(m.from()),
                 address_to_string(m.to()),
                 dt.map(|d| d.to_string()).unwrap_or_default(),
                 dt.map(|d| d.to_timestamp()),
-                m.body_text(0)
-                    .map(|c| c.into_owned())
-                    .or_else(|| m.body_html(0).map(|c| html_to_text(&c)))
-                    .unwrap_or_else(|| "(message has no text body)".to_string()),
+                m.body_text(0).map(|c| c.into_owned()).unwrap_or_default(),
+                if body_is_html {
+                    m.body_html(0).map(|c| c.into_owned())
+                } else {
+                    None
+                },
                 m.attachments()
                     .filter_map(|part| part.attachment_name().map(|n| n.to_string()))
                     .collect(),
@@ -32,6 +42,7 @@ pub fn parse(raw: &[u8], uid: &str, seen: bool) -> MailMessage {
             String::new(),
             None,
             String::from_utf8_lossy(raw).into_owned(),
+            None,
             Vec::new(),
         ),
     };
@@ -53,6 +64,7 @@ pub fn parse(raw: &[u8], uid: &str, seen: bool) -> MailMessage {
         timestamp,
         seen,
         body_text,
+        body_html,
         attachment_names: attachments,
     }
 }
@@ -80,80 +92,6 @@ fn address_to_string(addr: Option<&mail_parser::Address<'_>>) -> String {
     }
 }
 
-/// Very small HTML → text conversion for previewing HTML-only mail: drop
-/// style/script blocks, convert obvious block tags to newlines, strip the
-/// remaining tags and decode the handful of entities that matter.
-pub fn html_to_text(html: &str) -> String {
-    let mut out = String::with_capacity(html.len());
-    let mut chars = html.chars().peekable();
-    let mut skip_until: Option<&'static str> = None;
-    while let Some(c) = chars.next() {
-        if let Some(end) = skip_until {
-            let peek: String = chars
-                .clone()
-                .take(end.len())
-                .collect::<String>()
-                .to_lowercase();
-            if peek.starts_with(end) {
-                skip_until = None;
-                for _ in 0..end.len() {
-                    chars.next();
-                }
-                for t in chars.by_ref() {
-                    if t == '>' {
-                        break;
-                    }
-                }
-            }
-            continue;
-        }
-        if c != '<' {
-            out.push(c);
-            continue;
-        }
-        let tag: String = chars
-            .clone()
-            .take_while(|t| !matches!(t, '>' | ' ' | '\t' | '\n'))
-            .collect();
-        let tag = tag.to_lowercase();
-        match tag.as_str() {
-            "script" | "style" => {
-                skip_until = Some(if tag == "script" {
-                    "</script"
-                } else {
-                    "</style"
-                })
-            }
-            "br" | "p" | "div" | "li" | "tr" | "h1" | "h2" | "h3" | "h4" | "h5" | "h6" => {
-                out.push('\n')
-            }
-            _ => {}
-        }
-        // Consume the rest of the tag.
-        for t in chars.by_ref() {
-            if t == '>' {
-                break;
-            }
-        }
-    }
-    let mut decoded = decode_entities(&out);
-    // Collapse runs of blank lines but keep paragraph breaks readable.
-    while decoded.contains("\n\n\n") {
-        decoded = decoded.replace("\n\n\n", "\n\n");
-    }
-    decoded.trim().to_string()
-}
-
-fn decode_entities(s: &str) -> String {
-    s.replace("&nbsp;", " ")
-        .replace("&lt;", "<")
-        .replace("&gt;", ">")
-        .replace("&quot;", "\"")
-        .replace("&#39;", "'")
-        .replace("&apos;", "'")
-        .replace("&amp;", "&")
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -169,16 +107,31 @@ mod tests {
         assert_eq!(msg.subject, "Hello");
         assert!(msg.from.contains("alice@example.com"));
         assert!(msg.body_text.contains("Hi there!"));
+        assert!(msg.body_html.is_none());
         assert!(!msg.seen);
     }
 
     #[test]
-    fn html_fallback_strips_tags() {
-        let text =
-            html_to_text("<html><body><p>Hello<br>World</p><script>evil()</script></body></html>");
-        assert!(text.contains("Hello"));
-        assert!(text.contains("World"));
-        assert!(!text.contains("evil"));
-        assert!(!text.contains('<'));
+    fn html_body_is_captured_for_rendering() {
+        let raw = b"From: Alice <alice@example.com>\r\n\
+                    Subject: Rendered\r\n\
+                    Content-Type: text/html; charset=utf-8\r\n\
+                    \r\n\
+                    <p>Hello <b>world</b>!</p>\r\n";
+        let msg = parse(raw, "7", true);
+        let html = msg.body_html.expect("html body");
+        assert!(html.contains("<b>world</b>"));
+        assert!(msg.seen);
+    }
+
+    #[test]
+    fn plain_message_is_not_marked_html_based() {
+        let raw = b"From: Alice <alice@example.com>\r\n\
+                    Subject: Plain\r\n\
+                    \r\n\
+                    Just text.\r\n";
+        let msg = parse(raw, "8", false);
+        assert!(msg.body_html.is_none());
+        assert_eq!(msg.body_text.trim(), "Just text.");
     }
 }

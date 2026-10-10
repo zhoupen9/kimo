@@ -67,6 +67,10 @@ pub struct MailMessage {
     pub timestamp: Option<i64>,
     pub seen: bool,
     pub body_text: String,
+    /// Raw HTML body part, when the message is HTML-based; rendered by
+    /// `crate::html` instead of the plain text.
+    #[serde(default)]
+    pub body_html: Option<String>,
     pub attachment_names: Vec<String>,
 }
 
