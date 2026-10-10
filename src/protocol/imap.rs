@@ -286,6 +286,81 @@ fn parse_mailbox_name(rest: &str) -> Option<String> {
     }
 }
 
+/// Decode a modified UTF-7 (RFC 3501 §5.1.3) mailbox name for display,
+/// e.g. `&XfJT0ZAB-` → `已发送`. Non-ASCII runs are wrapped in `&`…`-`
+/// around a base64-style alphabet (`,` = 63) encoding UTF-16BE; `&-` is a
+/// literal `&`. This is display-only: every command sent to the server
+/// (SELECT, UID STORE, …) keeps the encoded wire form.
+///
+/// Lenient by design — segments that fail to decode pass through unchanged.
+pub fn decode_mailbox_name(name: &str) -> String {
+    if !name.contains('&') {
+        return name.to_string();
+    }
+    let mut out = String::with_capacity(name.len());
+    let mut rest = name;
+    while let Some(amp) = rest.find('&') {
+        out.push_str(&rest[..amp]);
+        rest = &rest[amp + 1..];
+        match rest.find('-') {
+            Some(dash) => {
+                let segment = &rest[..dash];
+                rest = &rest[dash + 1..];
+                if segment.is_empty() {
+                    out.push('&'); // `&-` escapes a literal ampersand
+                } else if let Some(decoded) = decode_mutf7_segment(segment) {
+                    out.push_str(&decoded);
+                } else {
+                    out.push('&');
+                    out.push_str(segment);
+                    out.push('-');
+                }
+            }
+            None => {
+                // Unterminated shift — show the rest untouched.
+                out.push('&');
+                out.push_str(rest);
+                rest = "";
+            }
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+/// Decode one `&`…`-` segment (base64 alphabet with `,` = 63, UTF-16BE).
+fn decode_mutf7_segment(segment: &str) -> Option<String> {
+    let mut acc: u32 = 0;
+    let mut bit_count = 0;
+    let mut bytes: Vec<u8> = Vec::with_capacity(segment.len() * 3 / 4 + 1);
+    for c in segment.chars() {
+        let v = match c {
+            'A'..='Z' => c as u32 - 'A' as u32,
+            'a'..='z' => c as u32 - 'a' as u32 + 26,
+            '0'..='9' => c as u32 - '0' as u32 + 52,
+            '+' => 62,
+            ',' => 63,
+            _ => return None,
+        };
+        acc = (acc << 6) | v;
+        bit_count += 6;
+        if bit_count >= 8 {
+            bit_count -= 8;
+            bytes.push(((acc >> bit_count) & 0xFF) as u8);
+        }
+    }
+    if bytes.is_empty() || !bytes.len().is_multiple_of(2) {
+        return None; // no character, or half a UTF-16 unit
+    }
+    let units: Vec<u16> = bytes
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|pair| u16::from_be_bytes(*pair))
+        .collect();
+    String::from_utf16(&units).ok()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -294,6 +369,32 @@ mod tests {
     fn quotes_are_escaped() {
         assert_eq!(quote_string("plain"), "\"plain\"");
         assert_eq!(quote_string("a\"b\\c"), "\"a\\\"b\\\\c\"");
+    }
+
+    #[test]
+    fn mailbox_names_decode_from_modified_utf7() {
+        // Real-world names from a Chinese IMAP server.
+        assert_eq!(decode_mailbox_name("INBOX"), "INBOX");
+        assert_eq!(decode_mailbox_name("&V4NXPpCuTvY-"), "垃圾邮件");
+        assert_eq!(decode_mailbox_name("&XfJSIJZkkK5O9g-"), "已删除邮件");
+        assert_eq!(decode_mailbox_name("&XfJT0ZAB-"), "已发送");
+        assert_eq!(decode_mailbox_name("&g0l6Pw-"), "草稿");
+        // Mixed ASCII/non-ASCII.
+        assert_eq!(decode_mailbox_name("&XfJT0ZAB-/2024"), "已发送/2024");
+        // `&-` escapes a literal ampersand.
+        assert_eq!(decode_mailbox_name("A&-B"), "A&B");
+        // `,` is base64 value 63: "&D,8-" encodes UTF-16BE 0x0FFF.
+        assert_eq!(decode_mailbox_name("&D,8-"), "\u{0FFF}");
+    }
+
+    #[test]
+    fn malformed_mutf7_passes_through_unchanged() {
+        assert_eq!(decode_mailbox_name("&!!-"), "&!!-"); // not base64
+        assert_eq!(decode_mailbox_name("&abc"), "&abc"); // unterminated
+        assert_eq!(decode_mailbox_name("&A-"), "&A-"); // zero characters
+        assert_eq!(decode_mailbox_name("&zz-"), "&zz-"); // half a UTF-16 unit
+                                                         // Unpaired surrogate is not valid UTF-16 → pass through.
+        assert_eq!(decode_mailbox_name("&2AA-"), "&2AA-");
     }
 
     #[test]

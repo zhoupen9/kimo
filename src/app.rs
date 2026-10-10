@@ -734,10 +734,13 @@ impl JimaoApp {
                         .and_then(|s| s.cache.folders.iter().find(|f| f.name == folder))
                         .map(|f| f.messages.iter().filter(|m| !m.seen).count())
                         .unwrap_or(0);
+                    // `folder` is the IMAP wire form (possibly modified
+                    // UTF-7); decode it just for the label.
+                    let display = crate::protocol::imap::decode_mailbox_name(folder.as_str());
                     let text = if unread > 0 {
-                        egui::RichText::new(format!("📁 {folder} ({unread})")).strong()
+                        egui::RichText::new(format!("📁 {display} ({unread})")).strong()
                     } else {
-                        egui::RichText::new(format!("📁 {folder}")).weak()
+                        egui::RichText::new(format!("📁 {display}")).weak()
                     };
                     if ui.selectable_label(selected, text).clicked() {
                         self.select_folder(account.id.clone(), folder, account.protocol);

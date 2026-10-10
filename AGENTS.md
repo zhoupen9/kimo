@@ -112,6 +112,10 @@ Event (mpsc) ──► drain_events() at frame start ──► merge into Accoun
   UI shows them distinctly from protocol bugs.
 - Protocol clients are synchronous and single-purpose; add a method only
   when a sync job actually needs it.
+- IMAP mailbox names stay in their wire form (possibly modified UTF-7) in
+  `Event`s, state and caches; `imap::decode_mailbox_name` decodes them for
+  display only. SELECT/UID STORE must always use the wire form — do not
+  re-encode decoded names by hand.
 - Pure parsing helpers (e.g. `extract_uid`, `literal_size`, `html_to_text`)
   live next to their users and get `#[cfg(test)]` unit tests — that is where
   tests go in this codebase; no `tests/` directory yet.
