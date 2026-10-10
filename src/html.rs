@@ -248,8 +248,16 @@ impl Renderer {
                                                 s.bold = true;
                                             }
                                         });
-                                        self.children(ui, cell, &cell_style);
-                                        self.flush(ui);
+                                        // Grid cells may only contain widgets;
+                                        // cells with block elements (p, div,
+                                        // lists…) need a flowing layout, so
+                                        // render them inside `ui::vertical`
+                                        // (calling e.g. `add_space` on the
+                                        // grid-cell Ui itself panics).
+                                        ui.vertical(|ui| {
+                                            self.children(ui, cell, &cell_style);
+                                            self.flush(ui);
+                                        });
                                     }
                                     ui.end_row();
                                 }
@@ -476,5 +484,27 @@ mod tests {
         let frag = Html::parse_fragment(html);
         let pre = find_element(&frag, "pre");
         assert_eq!(collect_pre_text(pre), "line one\nbold\nline three");
+    }
+
+    #[test]
+    fn block_elements_inside_table_cells_do_not_panic() {
+        // Regression: block elements (p/div/lists/blockquote/hr/pre, nested
+        // tables) inside table cells used to panic with "You cannot advance
+        // the cursor when in a grid layout". Run the real egui layout to
+        // exercise it.
+        let ctx = egui::Context::default();
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                render(
+                    ui,
+                    "<table>\
+                     <tr><th>head</th><td><p>para</p><ul><li>item</li></ul></td></tr>\
+                     <tr><td><div>block<div>nested</div></div></td>\
+                     <td><table><tr><td><p>inner</p></td></tr></table></td></tr>\
+                     <tr><td><blockquote>quote</blockquote><hr></td><td><pre>x\ny</pre></td></tr>\
+                     </table>",
+                );
+            });
+        });
     }
 }
