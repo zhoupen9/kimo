@@ -14,8 +14,8 @@
 use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
 
-/// The application icon (a monochrome silhouette rasterized from
-/// `assets/app.svg`), embedded at compile time.
+/// The application icon (rasterized from `assets/app.svg`), embedded at
+/// compile time.
 pub(crate) const APP_PNG: &[u8] = include_bytes!("../assets/app.png");
 
 /// D-Bus message types. (Signals, type 4, are received and skipped.)
@@ -48,11 +48,11 @@ const INTROSPECT_XML: &str = concat!(
     "    <property name=\"Status\" type=\"s\" access=\"read\"/>\n",
     "    <property name=\"WindowId\" type=\"i\" access=\"read\"/>\n",
     "    <property name=\"IconName\" type=\"s\" access=\"read\"/>\n",
-    "    <property name=\"IconPixmap\" type=\"aay\" access=\"read\"/>\n",
+    "    <property name=\"IconPixmap\" type=\"a(iiay)\" access=\"read\"/>\n",
     "    <property name=\"OverlayIconName\" type=\"s\" access=\"read\"/>\n",
-    "    <property name=\"OverlayIconPixmap\" type=\"aay\" access=\"read\"/>\n",
+    "    <property name=\"OverlayIconPixmap\" type=\"a(iiay)\" access=\"read\"/>\n",
     "    <property name=\"AttentionIconName\" type=\"s\" access=\"read\"/>\n",
-    "    <property name=\"AttentionIconPixmap\" type=\"aay\" access=\"read\"/>\n",
+    "    <property name=\"AttentionIconPixmap\" type=\"a(iiay)\" access=\"read\"/>\n",
     "    <property name=\"AttentionMovieName\" type=\"s\" access=\"read\"/>\n",
     "    <property name=\"ToolTip\" type=\"(sa(ii)ss)\" access=\"read\"/>\n",
     "    <property name=\"ItemIsMenu\" type=\"b\" access=\"read\"/>\n",
@@ -500,22 +500,55 @@ fn current_uid() -> Option<String> {
 
 // ----- SNI service -----------------------------------------------------------
 
-/// Decode the embedded PNG icon into the SNI IconPixmap format: straight
-/// alpha, ARGB32 in network byte order. The icon's own colors are kept.
-fn icon_argb(png: &[u8]) -> Option<Vec<u8>> {
-    let decoded = image::load_from_memory(png).ok()?;
-    let rgba = decoded.to_rgba8();
-    let mut out = Vec::with_capacity(rgba.len());
-    for px in rgba.as_raw().as_chunks::<4>().0 {
-        out.push(px[3]); // a
-        out.push(px[0]); // r
-        out.push(px[1]); // g
-        out.push(px[2]); // b
-    }
-    Some(out)
+/// A decoded tray icon: its pixel size plus straight-alpha ARGB32 pixels in
+/// network byte order — the payload of one SNI \`IconPixmap\` entry.
+struct Icon {
+    width: i32,
+    height: i32,
+    argb: Vec<u8>,
 }
 
-fn sni_property(name: &str, pixmap: &[u8]) -> Option<Value> {
+/// Decode the embedded PNG icon. The icon's own colors are kept.
+fn icon_argb(png: &[u8]) -> Option<Icon> {
+    let decoded = image::load_from_memory(png).ok()?;
+    let rgba = decoded.to_rgba8();
+    let (width, height) = (rgba.width() as i32, rgba.height() as i32);
+    let mut argb = Vec::with_capacity(rgba.len());
+    for px in rgba.as_raw().as_chunks::<4>().0 {
+        argb.push(px[3]); // a
+        argb.push(px[0]); // r
+        argb.push(px[1]); // g
+        argb.push(px[2]); // b
+    }
+    Some(Icon {
+        width,
+        height,
+        argb,
+    })
+}
+
+/// The SNI `IconPixmap` value: `a(iiay)`, one (width, height, ARGB32 data)
+/// struct per icon size. Hosts cannot read a bare byte array.
+fn pixmap_value(icon: &Icon) -> Value {
+    Value::Array {
+        signature: "(iiay)".to_string(),
+        values: vec![Value::Struct(vec![
+            Value::Int32(icon.width),
+            Value::Int32(icon.height),
+            Value::bytes(&icon.argb),
+        ])],
+    }
+}
+
+/// An empty `IconPixmap` value: `a(iiay)` with no entries.
+fn empty_pixmaps() -> Value {
+    Value::Array {
+        signature: "(iiay)".to_string(),
+        values: Vec::new(),
+    }
+}
+
+fn sni_property(name: &str, icon: &Icon) -> Option<Value> {
     match name {
         "Category" => Some(Value::Str("ApplicationStatus".into())),
         "Id" => Some(Value::Str("jimao".into())),
@@ -523,17 +556,11 @@ fn sni_property(name: &str, pixmap: &[u8]) -> Option<Value> {
         "Status" => Some(Value::Str("Active".into())),
         "WindowId" => Some(Value::Int32(0)),
         "IconName" => Some(Value::Str(String::new())),
-        "IconPixmap" => Some(Value::Array {
-            signature: "ay".to_string(),
-            values: vec![Value::bytes(pixmap)],
-        }),
+        "IconPixmap" => Some(pixmap_value(icon)),
         "OverlayIconName" | "AttentionIconName" | "AttentionMovieName" => {
             Some(Value::Str(String::new()))
         }
-        "OverlayIconPixmap" | "AttentionIconPixmap" => Some(Value::Array {
-            signature: "aay".to_string(),
-            values: Vec::new(),
-        }),
+        "OverlayIconPixmap" | "AttentionIconPixmap" => Some(empty_pixmaps()),
         "ToolTip" => Some(Value::Struct(vec![
             Value::Str(String::new()),
             Value::Array {
@@ -549,7 +576,7 @@ fn sni_property(name: &str, pixmap: &[u8]) -> Option<Value> {
     }
 }
 
-fn all_properties(pixmap: &[u8]) -> Value {
+fn all_properties(icon: &Icon) -> Value {
     let names = [
         "Category",
         "Id",
@@ -571,7 +598,7 @@ fn all_properties(pixmap: &[u8]) -> Value {
         signature: "{sv}".to_string(),
         values: names
             .iter()
-            .filter_map(|n| sni_property(n, pixmap).map(|v| (n, v)))
+            .filter_map(|n| sni_property(n, icon).map(|v| (n, v)))
             .map(|(n, v)| {
                 Value::Struct(vec![Value::Str(n.to_string()), Value::Variant(Box::new(v))])
             })
@@ -580,7 +607,7 @@ fn all_properties(pixmap: &[u8]) -> Value {
 }
 
 /// Serve StatusNotifierItem method calls until the bus goes away.
-fn serve(bus: &mut Bus, ctx: &egui::Context, pixmap: &[u8]) -> Result<(), String> {
+fn serve(bus: &mut Bus, ctx: &egui::Context, icon: &Icon) -> Result<(), String> {
     loop {
         let msg = bus.read_message()?;
         if msg.kind != MSG_METHOD_CALL {
@@ -601,12 +628,12 @@ fn serve(bus: &mut Bus, ctx: &egui::Context, pixmap: &[u8]) -> Result<(), String
                 let mut body = Unmarshal::new(&msg.body);
                 let _iface = body.string().unwrap_or_default();
                 let prop = body.string().unwrap_or_default();
-                match sni_property(&prop, pixmap) {
+                match sni_property(&prop, icon) {
                     Some(v) => (vec![Value::Variant(Box::new(v))], None),
                     None => (Vec::new(), Some("org.freedesktop.DBus.Error.InvalidArgs")),
                 }
             }
-            (PROPERTIES, "GetAll") => (vec![all_properties(pixmap)], None),
+            (PROPERTIES, "GetAll") => (vec![all_properties(icon)], None),
             (SNI_INTERFACE, "Activate") | (SNI_INTERFACE, "SecondaryActivate") => {
                 ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
                 ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
@@ -641,7 +668,7 @@ fn serve(bus: &mut Bus, ctx: &egui::Context, pixmap: &[u8]) -> Result<(), String
 /// Spawn the tray thread. Failure is non-fatal: it is logged and the app
 /// runs without a tray icon.
 pub fn spawn(ctx: egui::Context) {
-    let Some(pixmap) = icon_argb(APP_PNG) else {
+    let Some(icon) = icon_argb(APP_PNG) else {
         eprintln!("jimao tray: could not decode the tray icon");
         return;
     };
@@ -699,7 +726,7 @@ pub fn spawn(ctx: egui::Context) {
                     }
                     Ok(_) => {}
                 }
-                serve(&mut bus, &ctx, &pixmap)
+                serve(&mut bus, &ctx, &icon)
             };
             if let Err(e) = run() {
                 eprintln!("jimao tray: {e}");
@@ -766,7 +793,12 @@ mod tests {
 
     #[test]
     fn empty_array_properties_marshal() {
-        let v = all_properties(&[]);
+        let icon = Icon {
+            width: 1,
+            height: 1,
+            argb: vec![0, 0, 0, 0],
+        };
+        let v = all_properties(&icon);
         assert_eq!(type_signature(&v), "a{sv}");
         let (sig, body) = build_body(&[v]);
         assert_eq!(sig, "a{sv}");
@@ -775,8 +807,26 @@ mod tests {
 
     #[test]
     fn icon_pixmap_is_argb_network_order() {
-        let v = sni_property("IconPixmap", &[0x11, 0x22, 0x33, 0x44]).unwrap();
-        assert_eq!(type_signature(&v), "aay");
+        // The spec types IconPixmap as a(iiay): (width, height, ARGB32 data).
+        let icon = Icon {
+            width: 2,
+            height: 1,
+            argb: vec![0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88],
+        };
+        let v = sni_property("IconPixmap", &icon).unwrap();
+        assert_eq!(type_signature(&v), "a(iiay)");
+        let Value::Array { values, .. } = &v else {
+            panic!("IconPixmap must be an array");
+        };
+        let Value::Struct(entry) = &values[0] else {
+            panic!("each IconPixmap entry must be a (iiay) struct");
+        };
+        assert_eq!(
+            entry,
+            &vec![Value::Int32(2), Value::Int32(1), Value::bytes(&icon.argb),]
+        );
+        // Straight alpha, network byte order: alpha first, then R, G, B.
+        assert_eq!(&icon.argb[..4], &[0x11, 0x22, 0x33, 0x44]);
     }
 
     #[test]
@@ -789,16 +839,17 @@ mod tests {
 
     #[test]
     fn embedded_png_decodes_with_its_colors() {
-        let argb = icon_argb(APP_PNG).expect("decodes");
-        assert_eq!(argb.len(), 48 * 48 * 4);
+        let icon = icon_argb(APP_PNG).expect("decodes");
+        assert_eq!((icon.width, icon.height), (48, 48));
+        assert_eq!(icon.argb.len(), 48 * 48 * 4);
         // The icon's background circle is #835be1 (131, 91, 225): the
         // pixmap must contain it as straight ARGB — a regression guard
         // against recoloring that once flattened the icon into a blob.
         assert!(
-            argb.as_chunks::<4>().0.contains(&[255, 131, 91, 225]),
+            icon.argb.as_chunks::<4>().0.contains(&[255, 131, 91, 225]),
             "purple background pixels must survive"
         );
         // Corners are outside the circle: fully transparent.
-        assert_eq!(&argb[..4], &[0, 0, 0, 0]);
+        assert_eq!(&icon.argb[..4], &[0, 0, 0, 0]);
     }
 }
