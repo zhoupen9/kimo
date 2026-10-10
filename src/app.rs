@@ -2,9 +2,13 @@
 //! `sync::Event`s drained at the top of every frame; opening a socket happens
 //! only in worker threads.
 //!
-//! Layout: custom title bar on top (nav toggle, account menu, sync, window
-//! controls), then three columns — collapsible navigation, message list,
-//! reading pane.
+//! Layout: custom title bar on top (nav toggle, account menu, sync, HTML
+//! renderer switch, theme, window controls), then three columns —
+//! collapsible navigation, message list, reading pane.
+//!
+//! The reading pane has two HTML renderers, switched from the title bar: the
+//! built-in one lays the mail out as egui widgets (`crate::html`), the other
+//! rasterizes it with Blitz (`crate::blitz_render`) on a worker thread.
 
 use std::collections::HashMap;
 use std::sync::mpsc;
@@ -60,6 +64,62 @@ impl Theme {
     }
 }
 
+/// Which renderer draws the HTML body in the reading pane.
+///
+/// `Simple` is the built-in renderer: the mail becomes native egui widgets,
+/// follows the app theme and stays interactive. `Blitz` runs the real browser
+/// engine over the same HTML and shows the rasterized page, which is much
+/// closer to what the sender designed. The choice is toggled from the title
+/// bar and remembered in `settings.json`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum HtmlRenderer {
+    Simple,
+    Blitz,
+}
+
+impl HtmlRenderer {
+    /// Title-bar label: short enough for a 42px button.
+    fn label(self) -> &'static str {
+        match self {
+            HtmlRenderer::Simple => "Simple",
+            HtmlRenderer::Blitz => "Blitz",
+        }
+    }
+
+    /// Value stored in `settings.json`.
+    fn as_str(self) -> &'static str {
+        match self {
+            HtmlRenderer::Simple => "egui",
+            HtmlRenderer::Blitz => "blitz",
+        }
+    }
+
+    fn parse(value: &str) -> Self {
+        match value {
+            "blitz" => HtmlRenderer::Blitz,
+            _ => HtmlRenderer::Simple,
+        }
+    }
+
+    fn toggled(self) -> Self {
+        match self {
+            HtmlRenderer::Simple => HtmlRenderer::Blitz,
+            HtmlRenderer::Blitz => HtmlRenderer::Simple,
+        }
+    }
+
+    fn tooltip(self) -> &'static str {
+        match self {
+            HtmlRenderer::Simple => {
+                "HTML renderer: Simple — mail HTML drawn as native egui widgets. Click to render with Blitz."
+            }
+            HtmlRenderer::Blitz => {
+                "HTML renderer: Blitz — full CSS layout, rasterized. Click for the built-in renderer."
+            }
+        }
+    }
+}
+
 pub struct JimaoApp {
     ctx: egui::Context,
     tx: mpsc::Sender<Event>,
@@ -92,6 +152,47 @@ pub struct JimaoApp {
     /// `None` marks a decode failure (not retried). Decoding happens once
     /// when a message is first rendered.
     inline_textures: HashMap<String, Option<egui::TextureHandle>>,
+    /// Which renderer the reading pane uses for HTML bodies.
+    html_renderer: HtmlRenderer,
+    /// Blitz-rendered pages, keyed by message and geometry; `blitz_order`
+    /// holds the insertion order so old pages can be evicted (textures are
+    /// megabytes each).
+    blitz_pages: HashMap<String, BlitzPage>,
+    blitz_order: Vec<String>,
+    /// Geometry requested in the previous frame. A render only starts once
+    /// the pane has kept the same size for two frames, so dragging the
+    /// splitter queues one render instead of one per frame.
+    pending_blitz_key: Option<String>,
+    /// Message the reading pane's scroll offset belongs to, so opening another
+    /// mail starts at the top instead of mid-page.
+    scrolled_message: Option<String>,
+}
+
+/// A Blitz page: rendering, rendered, or failed.
+enum BlitzPage {
+    /// A worker thread is rasterizing it.
+    Loading,
+    Ready(RasterizedPage),
+    Failed(String),
+}
+
+/// A finished Blitz page, uploaded as egui textures. Tiles are stacked at
+/// their `offset` from the page origin; both are in points.
+struct RasterizedPage {
+    tiles: Vec<RasterTile>,
+    /// Page size in points.
+    size: egui::Vec2,
+    /// Clickable link boxes relative to the page origin, in points.
+    links: Vec<(egui::Rect, String)>,
+    /// The message was too tall to rasterize in full; its tail is missing.
+    truncated: bool,
+}
+
+struct RasterTile {
+    texture: egui::TextureHandle,
+    /// Offset from the page origin, in points.
+    offset: egui::Vec2,
+    size: egui::Vec2,
 }
 
 enum ImageStatus {
@@ -168,6 +269,13 @@ impl JimaoApp {
             images: HashMap::new(),
             stylesheets: HashMap::new(),
             inline_textures: HashMap::new(),
+            html_renderer: HtmlRenderer::parse(
+                &storage::load_settings().html_renderer.unwrap_or_default(),
+            ),
+            blitz_pages: HashMap::new(),
+            blitz_order: Vec::new(),
+            pending_blitz_key: None,
+            scrolled_message: None,
         };
 
         app.selected_account = app.accounts.first().map(|a| a.id.clone());
@@ -290,6 +398,12 @@ impl JimaoApp {
             }
             Event::StylesheetFailed { url } => {
                 self.stylesheets.insert(url, None);
+            }
+            Event::HtmlRendered { key, page } => self.store_blitz_page(key, page),
+            Event::HtmlRenderFailed { key, error } => {
+                if let Some(slot) = self.blitz_pages.get_mut(&key) {
+                    *slot = BlitzPage::Failed(error);
+                }
             }
         }
     }
@@ -457,6 +571,207 @@ impl JimaoApp {
         );
     }
 
+    // ----- Blitz pages ------------------------------------------------------
+
+    /// Identity of a rendered page: the message, the account it came from and
+    /// the geometry it was laid out for. Anything else invalidates the cache
+    /// entry and starts a fresh render.
+    fn blitz_key(&self, msg: &MailMessage, width: u32, viewport_height: u32, scale: f32) -> String {
+        format!(
+            "{}/{}/{}/{}x{}@{:.2}",
+            self.selected_account.as_deref().unwrap_or("-"),
+            self.selected_folder.as_deref().unwrap_or("-"),
+            msg.uid,
+            width,
+            viewport_height,
+            scale
+        )
+    }
+
+    /// Ask a worker thread to rasterize this message's HTML with Blitz.
+    ///
+    /// Rendering a newsletter takes hundreds of milliseconds, so it never
+    /// happens on the UI thread (hard rule 3); the finished page arrives as
+    /// `Event::HtmlRendered`.
+    fn start_blitz_render(
+        &mut self,
+        key: String,
+        msg: &MailMessage,
+        html: &str,
+        width: u32,
+        viewport_height: u32,
+        scale: f32,
+    ) {
+        // Only one render at a time: resizing the pane invalidates the width
+        // repeatedly, and every superseded render would be wasted work. Their
+        // results are dropped when they arrive, since the keys are gone.
+        let stale: Vec<String> = self
+            .blitz_pages
+            .iter()
+            .filter(|(_, page)| matches!(page, BlitzPage::Loading))
+            .map(|(key, _)| key.clone())
+            .collect();
+        for key in stale {
+            self.blitz_pages.remove(&key);
+        }
+        self.blitz_order
+            .retain(|entry| self.blitz_pages.contains_key(entry));
+
+        let request = crate::blitz_render::PageRequest {
+            html: html.to_string(),
+            width,
+            viewport_height,
+            scale,
+            inline_images: msg
+                .inline_images
+                .iter()
+                .map(|image| (image.cid.clone(), image.data_base64.clone()))
+                .collect(),
+        };
+        self.blitz_pages.insert(key.clone(), BlitzPage::Loading);
+        self.touch_blitz_page(&key);
+        self.evict_blitz_pages();
+        sync::spawn(
+            Job::RenderHtml {
+                key,
+                request: Box::new(request),
+            },
+            self.ctx.clone(),
+            self.tx.clone(),
+        );
+    }
+
+    /// Turn a finished render into egui textures.
+    ///
+    /// Runs on the UI thread, but only uploads what the worker already
+    /// rasterized. A result whose key is no longer pending (the user selected
+    /// another message or resized the pane) is dropped.
+    fn store_blitz_page(&mut self, key: String, page: crate::blitz_render::Page) {
+        if !matches!(self.blitz_pages.get(&key), Some(BlitzPage::Loading)) {
+            return;
+        }
+        // The renderer may have rasterized at a lower scale than the one we
+        // asked for (a page too large for its pixel budget), so sizes come
+        // from the page itself, never from the requested scale.
+        let to_points = |pixels: u32| pixels as f32 / page.scale;
+
+        let mut tiles = Vec::with_capacity(page.tiles.len());
+        for (index, tile) in page.tiles.iter().enumerate() {
+            // vello renders premultiplied alpha, which is also how egui
+            // stores and blends its textures.
+            let image = egui::ColorImage::from_rgba_premultiplied(
+                [tile.width as usize, tile.height as usize],
+                &tile.rgba,
+            );
+            tiles.push(RasterTile {
+                texture: self.ctx.load_texture(
+                    format!("blitz:{key}:{index}"),
+                    image,
+                    egui::TextureOptions::LINEAR,
+                ),
+                offset: egui::vec2(0.0, to_points(tile.y)),
+                size: egui::vec2(to_points(tile.width), to_points(tile.height)),
+            });
+        }
+        let links = page
+            .links
+            .iter()
+            .map(|link| {
+                (
+                    egui::Rect::from_min_size(
+                        egui::pos2(link.x, link.y),
+                        egui::vec2(link.width, link.height),
+                    ),
+                    link.href.clone(),
+                )
+            })
+            .collect();
+        self.blitz_pages.insert(
+            key.clone(),
+            BlitzPage::Ready(RasterizedPage {
+                tiles,
+                size: egui::vec2(page.css_width, page.css_height),
+                links,
+                truncated: page.truncated,
+            }),
+        );
+        self.touch_blitz_page(&key);
+        self.evict_blitz_pages();
+    }
+
+    /// Move `key` to the back of the cache order, so eviction always drops
+    /// the least recently used page.
+    fn touch_blitz_page(&mut self, key: &str) {
+        self.blitz_order.retain(|entry| entry != key);
+        self.blitz_order.push(key.to_string());
+    }
+
+    /// Drop the oldest rendered pages; each one is a few megabytes of texture.
+    fn evict_blitz_pages(&mut self) {
+        while self.blitz_order.len() > BLITZ_PAGES_CACHED {
+            let oldest = self.blitz_order.remove(0);
+            self.blitz_pages.remove(&oldest);
+        }
+    }
+
+    /// Reading pane in Blitz mode: request a render if this message and
+    /// geometry have none yet, then blit the finished page.
+    fn blitz_view(&mut self, ui: &mut egui::Ui, msg: &MailMessage, html: &str) {
+        let scale = ui.ctx().pixels_per_point();
+        let available = ui.available_width().max(160.0);
+        let css_width = (available - BLITZ_PAGE_MARGIN * 2.0).max(160.0);
+        let width = quantize(css_width * scale, BLITZ_WIDTH_STEP);
+        let viewport_height = quantize(ui.available_height().max(160.0) * scale, BLITZ_HEIGHT_STEP);
+        let key = self.blitz_key(msg, width, viewport_height, scale);
+
+        if !self.blitz_pages.contains_key(&key) {
+            // Wait for the geometry to settle: dragging the pane splitter
+            // would otherwise queue a render on every frame.
+            if self.pending_blitz_key.as_deref() == Some(key.as_str()) {
+                self.start_blitz_render(key.clone(), msg, html, width, viewport_height, scale);
+            } else {
+                self.pending_blitz_key = Some(key.clone());
+            }
+        }
+
+        let mut retry = false;
+        match self.blitz_pages.get(&key) {
+            Some(BlitzPage::Ready(page)) => draw_blitz_page(ui, page),
+            Some(BlitzPage::Failed(error)) => {
+                ui.vertical_centered(|ui| {
+                    ui.add_space(24.0);
+                    ui.label(egui::RichText::new("Blitz could not render this mail").weak());
+                    ui.label(egui::RichText::new(error.as_str()).small().weak());
+                    retry = ui.button("Try again").clicked();
+                });
+            }
+            _ => {
+                ui.vertical_centered(|ui| {
+                    ui.add_space(24.0);
+                    ui.spinner();
+                    ui.label(
+                        egui::RichText::new("Rendering HTML with Blitz…")
+                            .small()
+                            .weak(),
+                    );
+                });
+            }
+        }
+        if retry {
+            self.blitz_pages.remove(&key);
+            self.blitz_order.retain(|entry| entry != &key);
+            self.pending_blitz_key = None;
+        }
+    }
+
+    /// Write the current UI settings back to `settings.json`.
+    fn persist_settings(&self) {
+        let _ = storage::save_settings(&Settings {
+            theme: self.theme.as_str().to_string(),
+            html_renderer: Some(self.html_renderer.as_str().to_string()),
+        });
+    }
+
     /// Apply the selected theme to the context, resolving "system" against
     /// the cached OS preference.
     fn apply_theme(&self, ctx: &egui::Context) {
@@ -613,17 +928,53 @@ impl JimaoApp {
             if self.theme == Theme::System {
                 self.system_dark = system_prefers_dark();
             }
-            let _ = storage::save_settings(&Settings {
-                theme: self.theme.as_str().to_string(),
-            });
+            self.persist_settings();
         }
         theme_resp.on_hover_text(format!(
             "Theme: {} — click to switch (system → light → dark)",
             self.theme.label()
         ));
 
+        // HTML renderer switch (Simple ↔ Blitz), left of the theme button.
+        // Filled while Blitz is active, so the current renderer is visible at
+        // a glance.
+        let renderer_right = theme_rect.left();
+        let renderer_rect = egui::Rect::from_min_max(
+            egui::pos2(renderer_right - TITLEBAR_BUTTON_WIDTH, bar.top()),
+            egui::pos2(renderer_right, bar.bottom()),
+        );
+        let renderer_resp = ui.interact(
+            renderer_rect,
+            egui::Id::new("titlebar-html-renderer"),
+            egui::Sense::click(),
+        );
+        if renderer_resp.hovered() {
+            ui.painter()
+                .rect_filled(renderer_rect, 0.0, visuals.widgets.hovered.bg_fill);
+        }
+        if self.html_renderer == HtmlRenderer::Blitz {
+            ui.painter().rect_filled(
+                renderer_rect.shrink2(egui::vec2(6.0, 6.0)),
+                5.0,
+                visuals.selection.bg_fill,
+            );
+        }
+        ui.painter().text(
+            renderer_rect.center(),
+            egui::Align2::CENTER_CENTER,
+            self.html_renderer.label(),
+            egui::FontId::proportional(11.0),
+            visuals.text_color(),
+        );
+        if renderer_resp.clicked() {
+            self.html_renderer = self.html_renderer.toggled();
+            self.persist_settings();
+            self.pending_blitz_key = None;
+        }
+        renderer_resp.on_hover_text(self.html_renderer.tooltip());
+
         // --- left content row, kept clear of the window buttons ---
-        let content_right = theme_rect.left();
+        let content_right = renderer_rect.left();
         let row_size = egui::vec2((content_right - bar.left()).max(0.0), bar.height());
         let content_end = ui
             .allocate_ui_with_layout(
@@ -1023,65 +1374,88 @@ impl JimaoApp {
                 );
             }
             ui.separator();
-            egui::ScrollArea::vertical()
+            // A newly opened message starts at the top. The scroll offset is
+            // per pane, not per message, so without this the next mail opens
+            // wherever the previous one was left — for a Blitz page that means
+            // the top of the page is simply not on screen.
+            let message_key = format!(
+                "{}/{}",
+                self.selected_folder.as_deref().unwrap_or("-"),
+                msg.uid
+            );
+            let new_message = self.scrolled_message.as_deref() != Some(message_key.as_str());
+            if new_message {
+                self.scrolled_message = Some(message_key);
+            }
+            let mut scroll = egui::ScrollArea::vertical()
                 .auto_shrink([false, false])
-                .show(ui, |ui| {
-                    ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Wrap);
-                    let html = msg.body_html.as_deref();
-                    if let Some(html) = html {
-                        // Give the renderer what is already loaded and collect
-                        // the URLs it still wants.
-                        let textures: HashMap<String, egui::TextureHandle> = self
-                            .images
-                            .iter()
-                            .filter_map(|(url, status)| match status {
-                                ImageStatus::Ready(texture) => Some((url.clone(), texture.clone())),
-                                _ => None,
-                            })
-                            .collect();
-                        let sheets: HashMap<String, String> = self
-                            .stylesheets
-                            .iter()
-                            .filter_map(|(url, text)| {
-                                text.as_ref().map(|t| (url.clone(), t.clone()))
-                            })
-                            .collect();
-                        // Inline `cid:` attachments of this message, decoded
-                        // once and cached per (uid, cid).
-                        let egui_ctx = self.ctx.clone();
-                        let mut inline_map: HashMap<String, egui::TextureHandle> = HashMap::new();
-                        for image in &msg.inline_images {
-                            let key = format!("{}/{}", msg.uid, image.cid);
-                            let texture = self
-                                .inline_textures
-                                .entry(key)
-                                .or_insert_with(|| decode_inline_image(&egui_ctx, image));
-                            if let Some(texture) = texture {
-                                inline_map.insert(image.cid.clone(), texture.clone());
-                            }
+                // Switching renderers swaps the whole pane; a scroll offset
+                // from the other renderer would land in empty space.
+                .id_salt(("mail-content", self.html_renderer.as_str()));
+            if new_message {
+                scroll = scroll.vertical_scroll_offset(0.0);
+            }
+            scroll.show(ui, |ui| {
+                ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Wrap);
+                let html = msg.body_html.as_deref();
+                // Blitz takes the whole body; the built-in renderer below
+                // needs the app's resource pipeline, so it stays as is.
+                if let (HtmlRenderer::Blitz, Some(html)) = (self.html_renderer, html) {
+                    self.blitz_view(ui, &msg, html);
+                    return;
+                }
+                if let Some(html) = html {
+                    // Give the renderer what is already loaded and collect
+                    // the URLs it still wants.
+                    let textures: HashMap<String, egui::TextureHandle> = self
+                        .images
+                        .iter()
+                        .filter_map(|(url, status)| match status {
+                            ImageStatus::Ready(texture) => Some((url.clone(), texture.clone())),
+                            _ => None,
+                        })
+                        .collect();
+                    let sheets: HashMap<String, String> = self
+                        .stylesheets
+                        .iter()
+                        .filter_map(|(url, text)| text.as_ref().map(|t| (url.clone(), t.clone())))
+                        .collect();
+                    // Inline `cid:` attachments of this message, decoded
+                    // once and cached per (uid, cid).
+                    let egui_ctx = self.ctx.clone();
+                    let mut inline_map: HashMap<String, egui::TextureHandle> = HashMap::new();
+                    for image in &msg.inline_images {
+                        let key = format!("{}/{}", msg.uid, image.cid);
+                        let texture = self
+                            .inline_textures
+                            .entry(key)
+                            .or_insert_with(|| decode_inline_image(&egui_ctx, image));
+                        if let Some(texture) = texture {
+                            inline_map.insert(image.cid.clone(), texture.clone());
                         }
-                        let mut html_ctx = crate::html::HtmlContext {
-                            images: &textures,
-                            inline_images: &inline_map,
-                            stylesheets: &sheets,
-                            missing_images: Vec::new(),
-                            missing_stylesheets: Vec::new(),
-                        };
-                        crate::html::render(ui, html, &mut html_ctx);
-                        let missing_images = std::mem::take(&mut html_ctx.missing_images);
-                        let missing_sheets = std::mem::take(&mut html_ctx.missing_stylesheets);
-                        for url in missing_images {
-                            self.request_image(url);
-                        }
-                        for url in missing_sheets {
-                            self.request_stylesheet(url);
-                        }
-                    } else if !msg.body_text.is_empty() {
-                        ui.label(msg.body_text.as_str());
-                    } else {
-                        ui.label(egui::RichText::new("(no text body)").weak());
                     }
-                });
+                    let mut html_ctx = crate::html::HtmlContext {
+                        images: &textures,
+                        inline_images: &inline_map,
+                        stylesheets: &sheets,
+                        missing_images: Vec::new(),
+                        missing_stylesheets: Vec::new(),
+                    };
+                    crate::html::render(ui, html, &mut html_ctx);
+                    let missing_images = std::mem::take(&mut html_ctx.missing_images);
+                    let missing_sheets = std::mem::take(&mut html_ctx.missing_stylesheets);
+                    for url in missing_images {
+                        self.request_image(url);
+                    }
+                    for url in missing_sheets {
+                        self.request_stylesheet(url);
+                    }
+                } else if !msg.body_text.is_empty() {
+                    ui.label(msg.body_text.as_str());
+                } else {
+                    ui.label(egui::RichText::new("(no text body)").weak());
+                }
+            });
         });
     }
 
@@ -1242,6 +1616,77 @@ impl eframe::App for JimaoApp {
 
 const TITLEBAR_HEIGHT: f32 = 30.0;
 const TITLEBAR_BUTTON_WIDTH: f32 = 42.0;
+
+/// Blitz reading pane: page margin, geometry quantization for renders, and
+/// how many rendered pages stay in memory (each is megabytes of texture).
+const BLITZ_PAGE_MARGIN: f32 = 8.0;
+const BLITZ_WIDTH_STEP: u32 = 32;
+const BLITZ_HEIGHT_STEP: u32 = 128;
+const BLITZ_PAGES_CACHED: usize = 2;
+
+/// Round `value` up to the next multiple of `step`, so a pane resize only
+/// re-renders in coarse steps.
+fn quantize(value: f32, step: u32) -> u32 {
+    let value = if value.is_finite() {
+        value.max(1.0)
+    } else {
+        1.0
+    };
+    let step = step.max(1) as f32;
+    ((value / step).ceil() * step) as u32
+}
+
+/// Blit a finished Blitz page and re-attach its links as clickable boxes.
+fn draw_blitz_page(ui: &mut egui::Ui, page: &RasterizedPage) {
+    if page.truncated {
+        ui.label(
+            egui::RichText::new("This message is too tall to render in full — the end is missing.")
+                .small()
+                .weak(),
+        );
+    }
+    let row_width = ui.available_width();
+    // The page can be wider than the pane: fixed-width mail is laid out at its
+    // own width and scaled down here, so nothing is cut off.
+    let fit = ((row_width - BLITZ_PAGE_MARGIN * 2.0) / page.size.x).min(1.0);
+    let (_, space) = ui.allocate_space(egui::vec2(
+        row_width,
+        page.size.y * fit + BLITZ_PAGE_MARGIN * 2.0,
+    ));
+    let origin = egui::pos2(
+        space.left() + BLITZ_PAGE_MARGIN,
+        space.top() + BLITZ_PAGE_MARGIN,
+    );
+    let uv = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
+    for tile in &page.tiles {
+        let rect = egui::Rect::from_min_size(origin + tile.offset * fit, tile.size * fit);
+        ui.painter()
+            .image(tile.texture.id(), rect, uv, egui::Color32::WHITE);
+    }
+
+    for (rect, href) in &page.links {
+        let rect = egui::Rect::from_min_size(origin + rect.min.to_vec2() * fit, rect.size() * fit);
+        let id = egui::Id::new((
+            "blitz-link",
+            href,
+            (rect.min.x * 10.0) as i32,
+            (rect.min.y * 10.0) as i32,
+        ));
+        let response = ui.interact(rect, id, egui::Sense::click());
+        if response.hovered() {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+            ui.painter().rect_filled(
+                rect,
+                2.0,
+                ui.visuals().selection.bg_fill.gamma_multiply(0.35),
+            );
+        }
+        if response.clicked() {
+            crate::html::open_url(ui, href);
+        }
+        response.on_hover_text(href.as_str());
+    }
+}
 
 /// Message-card geometry in the mail list.
 const MESSAGE_ROW_HEIGHT: f32 = 68.0;
@@ -1538,6 +1983,29 @@ fn install_cjk_font(ctx: &egui::Context) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn html_renderer_round_trips_through_settings() {
+        assert_eq!(HtmlRenderer::parse("blitz"), HtmlRenderer::Blitz);
+        assert_eq!(HtmlRenderer::parse("egui"), HtmlRenderer::Simple);
+        // Anything unknown — including the legacy render_mode field's "web" —
+        // falls back to the built-in renderer.
+        assert_eq!(HtmlRenderer::parse("web"), HtmlRenderer::Simple);
+        assert_eq!(HtmlRenderer::parse(""), HtmlRenderer::Simple);
+        assert_eq!(HtmlRenderer::Simple.toggled(), HtmlRenderer::Blitz);
+        assert_eq!(HtmlRenderer::Blitz.toggled(), HtmlRenderer::Simple);
+        assert_eq!(HtmlRenderer::Blitz.as_str(), "blitz");
+        assert_eq!(HtmlRenderer::Simple.as_str(), "egui");
+    }
+
+    #[test]
+    fn quantize_rounds_up_to_geometry_steps() {
+        assert_eq!(quantize(0.0, 32), 32);
+        assert_eq!(quantize(32.0, 32), 32);
+        assert_eq!(quantize(32.1, 32), 64);
+        assert_eq!(quantize(1000.0, 128), 1024);
+        assert_eq!(quantize(f32::NAN, 32), 32);
+    }
 
     #[test]
     fn theme_cycles_system_light_dark() {

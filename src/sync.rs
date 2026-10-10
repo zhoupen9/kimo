@@ -39,6 +39,14 @@ pub enum Job {
     FetchImage { url: String },
     /// Download a remote stylesheet referenced by HTML mail.
     FetchStylesheet { url: String },
+    /// Rasterize an HTML body with Blitz (see `crate::blitz_render`).
+    /// Results come back as `Event::HtmlRendered`.
+    RenderHtml {
+        /// Identifies the page (message + geometry), so a result that arrives
+        /// after the user moved on can be dropped.
+        key: String,
+        request: Box<crate::blitz_render::PageRequest>,
+    },
 }
 
 pub enum Event {
@@ -79,6 +87,15 @@ pub enum Event {
     StylesheetFailed {
         url: String,
     },
+    /// A Blitz-rendered HTML body, ready to be uploaded as textures.
+    HtmlRendered {
+        key: String,
+        page: crate::blitz_render::Page,
+    },
+    HtmlRenderFailed {
+        key: String,
+        error: String,
+    },
 }
 
 pub fn spawn(job: Job, ctx: egui::Context, tx: Sender<Event>) {
@@ -104,12 +121,22 @@ pub fn spawn(job: Job, ctx: egui::Context, tx: Sender<Event>) {
             let _ = tx.send(event);
             ctx.request_repaint();
         }
+        Job::RenderHtml { key, request } => {
+            let event = match crate::blitz_render::render(&request) {
+                Ok(page) => Event::HtmlRendered { key, page },
+                Err(error) => Event::HtmlRenderFailed { key, error },
+            };
+            let _ = tx.send(event);
+            ctx.request_repaint();
+        }
         account_job => {
             let account_id = match &account_job {
                 Job::Sync { account }
                 | Job::SyncFolder { account, .. }
                 | Job::MarkSeen { account, .. } => account.id.clone(),
-                Job::FetchImage { .. } | Job::FetchStylesheet { .. } => unreachable!(),
+                Job::FetchImage { .. } | Job::FetchStylesheet { .. } | Job::RenderHtml { .. } => {
+                    unreachable!()
+                }
             };
             let _ = tx.send(Event::SyncStarted {
                 account_id: account_id.clone(),
@@ -125,7 +152,9 @@ pub fn spawn(job: Job, ctx: egui::Context, tx: Sender<Event>) {
                     folder,
                     uid,
                 } => imap_mark_seen(&account, &folder, uid),
-                Job::FetchImage { .. } | Job::FetchStylesheet { .. } => unreachable!(),
+                Job::FetchImage { .. } | Job::FetchStylesheet { .. } | Job::RenderHtml { .. } => {
+                    unreachable!()
+                }
             };
             let _ = match result {
                 Ok(()) => tx.send(Event::SyncDone { account_id }),
@@ -147,7 +176,9 @@ fn remote_url(url: &str) -> MailResult<()> {
     }
 }
 
-fn http_get(url: &str, max_bytes: u64) -> MailResult<Vec<u8>> {
+/// GET a URL with the standard timeouts and a byte cap. Shared with
+/// `blitz_render`, which fetches mail resources while rasterizing.
+pub(crate) fn http_get(url: &str, max_bytes: u64) -> MailResult<Vec<u8>> {
     remote_url(url)?;
     let agent = ureq::AgentBuilder::new()
         .timeout_connect(FETCH_CONNECT_TIMEOUT)

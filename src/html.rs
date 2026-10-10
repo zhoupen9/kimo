@@ -569,7 +569,9 @@ fn style_rich(seg: &Seg) -> RichText {
     rich
 }
 
-fn open_url(ui: &Ui, url: &str) {
+/// Open a link in the user's browser, but only for schemes we trust. Shared
+/// with the Blitz reading-pane renderer, whose links are clickable boxes.
+pub(crate) fn open_url(ui: &Ui, url: &str) {
     let url = url.trim();
     let lower = url.to_ascii_lowercase();
     if lower.starts_with("http://") || lower.starts_with("https://") || lower.starts_with("mailto:")

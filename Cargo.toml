@@ -31,6 +31,40 @@ sha1_smol = "1.0"
 # Inline cid: images are cached as base64 in the JSON message cache.
 base64 = "0.22"
 
+# Full-fidelity HTML mail renderer (optional second content renderer, see
+# src/blitz_render.rs): Blitz is a pure-Rust DOM/CSS/layout engine — stylo for
+# CSS, taffy for layout, vello_cpu for CPU rasterization. No GPU, no async
+# runtime. The blitz-*-0.3.0-beta.2 crates are pinned in lockstep (they require
+# each other exactly), anyrender_vello_cpu 0.17 is the CPU ImageRenderer
+# matching anyrender 0.13. The stylo crates are MPL-2.0 (file-level copyleft,
+# fine for linking).
+#
+# blitz-dom is built with default-features = false on purpose: its
+# "system-fonts" feature enables fontique's fontconfig backend, i.e. a C
+# library (hard rule 1). Instead src/blitz_render.rs registers the fonts found
+# on disk with parley/fontique, exactly like app.rs::install_cjk_font does for
+# egui. "svg"/"woff" keep SVG images and embedded fonts working (pure Rust);
+# "floats" turns on float layout, which HTML mail relies on heavily;
+# "complex-scripts" hands parley the ICU4X CJK/Thai/Khmer/Lao dictionaries
+# (already-compiled data). Without it every Chinese or Japanese run is logged
+# as "No segmentation model for complex script" and is only broken by the
+# coarse UAX-14 rules.
+blitz-dom = { version = "=0.3.0-beta.2", default-features = false, features = [
+    "svg",
+    "woff",
+    "floats",
+    "complex-scripts",
+] }
+blitz-html = { version = "=0.3.0-beta.2", default-features = false }
+blitz-traits = { version = "=0.3.0-beta.2", default-features = false }
+blitz-paint = { version = "=0.3.0-beta.2", default-features = false, features = ["svg"] }
+anyrender = "0.13"
+anyrender_vello_cpu = "0.17"
+# `Affine` for replaying a recorded page into per-slice surfaces (already in
+# the tree via blitz; declared here because we name the type).
+kurbo = "0.13"
+parley = { version = "0.11", default-features = false, features = ["std"] }
+
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
