@@ -12,7 +12,7 @@
 //! StatusNotifierWatcher (e.g. GNOME without an extension) simply disables
 //! the tray — the app keeps running.
 
-use std::io::{Read, Write};
+use std::io::{ErrorKind, Read, Write};
 use std::os::unix::net::UnixStream;
 
 /// The application icon (rasterized from `assets/app.svg`), embedded at
@@ -527,6 +527,30 @@ fn parse_message(buf: &[u8]) -> Option<Message> {
 
 // ----- session bus client ----------------------------------------------------
 
+/// Fill `buf` completely, riding out idle-timeout expiries.
+///
+/// The session bus sends nothing at all for hours at a time, so the socket's
+/// read timeout only bounds one `read` syscall: its expiry is the normal
+/// state, not a broken connection. `read_exact` reports it as a fatal
+/// `WouldBlock`, which killed the tray thread after 30 quiet seconds and
+/// dropped the icon from the panel. Only EOF or a real error may end a read.
+fn read_full(mut stream: &UnixStream, buf: &mut [u8]) -> Result<(), String> {
+    let mut filled = 0;
+    while filled < buf.len() {
+        match stream.read(&mut buf[filled..]) {
+            Ok(0) => return Err("bus closed the connection".to_string()),
+            Ok(n) => filled += n,
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    ErrorKind::WouldBlock | ErrorKind::TimedOut | ErrorKind::Interrupted
+                ) => {}
+            Err(e) => return Err(format!("bus read: {e}")),
+        }
+    }
+    Ok(())
+}
+
 struct Bus {
     reader: UnixStream,
     writer: UnixStream,
@@ -545,6 +569,9 @@ impl Bus {
             })?
             .to_string();
         let stream = UnixStream::connect(&path).map_err(|e| format!("connect {path}: {e}"))?;
+        // Bounds a single read syscall only: the bus is silent most of the
+        // time, and `read_full` treats an expiry as "wait longer" rather than
+        // as a disconnection.
         stream
             .set_read_timeout(Some(std::time::Duration::from_secs(30)))
             .ok();
@@ -612,28 +639,20 @@ impl Bus {
 
     fn read_message(&mut self) -> Result<Message, String> {
         let mut head = [0u8; 16];
-        self.reader
-            .read_exact(&mut head)
-            .map_err(|e| format!("bus read: {e}"))?;
+        read_full(&self.reader, &mut head)?;
         let body_len = u32::from_le_bytes(head[4..8].try_into().unwrap()) as usize;
         let fields_len = u32::from_le_bytes(head[12..16].try_into().unwrap()) as usize;
         let mut buf = head.to_vec();
         let mut fields = vec![0u8; fields_len];
-        self.reader
-            .read_exact(&mut fields)
-            .map_err(|e| format!("bus read: {e}"))?;
+        read_full(&self.reader, &mut fields)?;
         buf.extend_from_slice(&fields);
         let header_end = buf.len().div_ceil(8) * 8;
         let padding = header_end - buf.len();
         let mut pad = vec![0u8; padding];
-        self.reader
-            .read_exact(&mut pad)
-            .map_err(|e| format!("bus read: {e}"))?;
+        read_full(&self.reader, &mut pad)?;
         buf.extend_from_slice(&pad);
         let mut body = vec![0u8; body_len];
-        self.reader
-            .read_exact(&mut body)
-            .map_err(|e| format!("bus read: {e}"))?;
+        read_full(&self.reader, &mut body)?;
         buf.extend_from_slice(&body);
         parse_message(&buf).ok_or_else(|| "malformed message from bus".to_string())
     }
@@ -1434,5 +1453,66 @@ mod tests {
         );
         // Corners are outside the circle: fully transparent.
         assert_eq!(&icon.argb[..4], &[0, 0, 0, 0]);
+    }
+
+    /// A quiet bus must not end the tray: `read_message` has to ride out
+    /// read-timeout expiries. The peer stays silent for several timeouts and
+    /// splits its message mid-header, so this also pins down that a resumed
+    /// read keeps its place in the frame.
+    #[test]
+    fn idle_bus_does_not_end_a_read() {
+        let (reader, mut writer) = UnixStream::pair().unwrap();
+        reader
+            .set_read_timeout(Some(std::time::Duration::from_millis(50)))
+            .unwrap();
+        let body = build_body(&[Value::Str("kimo".into())]).1;
+        let wire = build_message(
+            MSG_METHOD_RETURN,
+            3,
+            &[
+                (FIELD_REPLY_SERIAL, Value::UInt32(1)),
+                (FIELD_SIGNATURE, Value::Signature("s".into())),
+            ],
+            &body,
+        );
+        let sender = std::thread::spawn(move || {
+            writer.write_all(&wire[..8]).unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            writer.write_all(&wire[8..]).unwrap();
+        });
+        let mut bus = Bus {
+            reader: reader.try_clone().unwrap(),
+            writer: reader,
+            serial: 0,
+        };
+        let msg = bus.read_message().expect("an idle bus is not an error");
+        assert_eq!(msg.serial, 3);
+        assert_eq!(msg.reply_serial, Some(1));
+        sender.join().unwrap();
+    }
+
+    /// A bus that really closed still ends the read loop — and ends it
+    /// promptly, rather than spinning on EOF until the harness gives up.
+    #[test]
+    fn closed_bus_ends_a_read() {
+        let (reader, writer) = UnixStream::pair().unwrap();
+        reader
+            .set_read_timeout(Some(std::time::Duration::from_millis(50)))
+            .unwrap();
+        drop(writer);
+        let mut bus = Bus {
+            reader: reader.try_clone().unwrap(),
+            writer: reader,
+            serial: 0,
+        };
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            tx.send(bus.read_message().is_err()).ok();
+        });
+        assert_eq!(
+            rx.recv_timeout(std::time::Duration::from_secs(5)),
+            Ok(true),
+            "a closed bus must end the read loop"
+        );
     }
 }

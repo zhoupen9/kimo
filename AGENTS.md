@@ -36,7 +36,10 @@ Kimo is a desktop **email client** GUI written in pure Rust:
   the window; the right-click menu is a minimal `com.canonical.dbusmenu`
   object at `/Menu` (Show / Quit) served by the same thread. Missing
   StatusNotifierWatcher disables the tray silently, and `IconPixmap` must
-  stay `a(iiay)` — hosts cannot read a bare byte array.
+  stay `a(iiay)` — hosts cannot read a bare byte array. The bus is silent
+  for hours at a time, so reads go through `read_full`: an idle read-timeout
+  expiry must never end the thread (`read_exact` turned it into a fatal
+  `WouldBlock`, and the icon vanished 30s after startup).
 - **Persistence:** JSON files under XDG dirs (`~/.config/kimo/accounts.json`,
   `~/.local/share/kimo/cache/<account>.json`). No external database.
 
