@@ -110,6 +110,31 @@ pub fn delete_cache(account_id: &str) {
     let _ = fs::remove_file(data_dir().join("cache").join(format!("{account_id}.json")));
 }
 
+// ----- remote resource cache -------------------------------------------------
+
+/// Disk cache for fetched remote mail resources (images, stylesheets),
+/// keyed by the SHA-1 of the URL:
+/// `~/.local/share/jimao/cache/resources/<sha1hex>.bin`.
+fn resource_path(url: &str) -> PathBuf {
+    let digest = sha1_smol::Sha1::from(url).digest().to_string();
+    data_dir()
+        .join("cache")
+        .join("resources")
+        .join(format!("{digest}.bin"))
+}
+
+pub fn load_resource(url: &str) -> Option<Vec<u8>> {
+    fs::read(resource_path(url)).ok()
+}
+
+pub fn save_resource(url: &str, bytes: &[u8]) {
+    let path = resource_path(url);
+    if let Some(dir) = path.parent() {
+        let _ = fs::create_dir_all(dir);
+    }
+    let _ = fs::write(path, bytes);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

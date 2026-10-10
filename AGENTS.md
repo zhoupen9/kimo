@@ -13,9 +13,10 @@ Jimao is a desktop **email client** GUI written in pure Rust:
 - **TLS:** rustls with the pure-Rust `ring` crypto provider + webpki-roots.
   The `ring` provider is installed process-wide in `src/main.rs`.
 - **HTML mail:** parsed with html5ever (via `scraper`) and rendered as egui
-  widgets in `src/html.rs` — no CSS engine, no JavaScript, no remote
-  content, and deliberately no webview (a webview would link webkit and
-  violate rule 1).
+  widgets in `src/html.rs`, with a small CSS subset (`src/css.rs`). Remote
+  images and stylesheets load **by default** on worker threads (see the
+  conventions below). There is no JavaScript and deliberately no webview
+  (a webview would link webkit and violate rule 1).
 - **Charsets:** mail-parser is built with the `full_encoding` feature
   (pulling in `encoding_rs`, pure Rust) so GB2312/GBK/GB18030/Big5/
   Shift-JIS/… mail decodes to proper UTF-8 instead of Latin-1 mojibake.
@@ -92,6 +93,14 @@ Event (mpsc) ──► drain_events() at frame start ──► merge into Accoun
 - Merge identity: IMAP messages are keyed by `(UIDVALIDITY, UID)` per folder
   (a UIDVALIDITY change clears the folder cache); POP3 messages are keyed by
   their UIDL string, and `\Seen` is local-only.
+- Remote HTML-mail resources (images, stylesheets) load by default — an
+  explicit decision by the project owner, accepting that this leaks the
+  reader's IP and open timing to senders (tracking pixels). Fetches run as
+  `Job::FetchImage`/`FetchStylesheet` on worker threads via ureq (pure
+  Rust, rustls + ring), are capped in size, cached on disk at
+  `~/.local/share/jimao/cache/resources/` (SHA-1 of the URL) and held in
+  `JimaoApp::images`/`stylesheets`. The renderer reports missing URLs via
+  `html::HtmlContext`; never fetch on the UI thread.
 - `FETCH_LIMIT` (in `sync.rs`) caps how many of the newest messages are
   fetched per folder per sync.
 - Remote mutations are limited to `UID STORE +FLAGS.SILENT (\Seen)` (IMAP).
@@ -144,9 +153,13 @@ Do not "fix" these casually — they are known:
 - Attachments are listed by name but cannot be saved or opened yet.
 - No message deletion/expunge (IMAP `\Deleted` + EXPUNGE, POP3 `DELE`).
 - Credentials in plain text (see above); no OAuth2/XOAUTH2.
-- HTML mail renders through the in-egui subset renderer (`src/html.rs`):
-  no CSS support, remote images stay placeholders, complex table layouts
-  degrade. A real webview would violate rule 1.
+- HTML mail renders through the in-egui subset renderer (`src/html.rs`).
+  CSS is the `src/css.rs` subset (colors, fonts, sizes, display/visibility);
+  compound selectors and layout CSS are ignored. Simple tables render as
+  aligned grids; layout tables (block elements inside cells — most HTML
+  mail) render as flowing full-width rows, because egui Grid sizes columns
+  to the minimum wrapped width. `cid:` inline images are not supported yet
+  (attachments are not stored). A real webview would violate rule 1.
 - POP3 sync re-downloads bodies every time (UIDL lets us skip but is not
   wired through the Job yet).
 - No IDLE/push for IMAP; sync is manual or on-startup.

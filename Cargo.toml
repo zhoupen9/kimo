@@ -21,6 +21,13 @@ mail-parser = { version = "0.11", features = ["full_encoding"] }
 scraper = "0.27"
 ego-tree = "0.11"
 
+# Remote mail content (images/stylesheets), fetched on worker threads.
+# ureq is synchronous + rustls-based (pure Rust; `tls` feature pulls rustls
+# with the ring provider, gzip via miniz_oxide). Image decoding is pure Rust.
+ureq = { version = "2.10", features = ["tls", "gzip"] }
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp", "bmp"] }
+sha1_smol = "1.0"
+
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 

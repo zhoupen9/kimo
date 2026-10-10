@@ -82,6 +82,18 @@ pub struct JimaoApp {
     /// the filesystem every frame. Refreshed on startup and whenever the
     /// theme cycles back to System.
     system_dark: bool,
+    /// Remote images for HTML mail, keyed by URL; fetched on worker threads
+    /// and cached in memory as egui textures (disk cache in storage).
+    images: HashMap<String, ImageStatus>,
+    /// Remote stylesheets for HTML mail: `Some(text)` once loaded, `None`
+    /// while loading or after a failure (no retry).
+    stylesheets: HashMap<String, Option<String>>,
+}
+
+enum ImageStatus {
+    Loading,
+    Failed,
+    Ready(egui::TextureHandle),
 }
 
 #[derive(Default)]
@@ -149,6 +161,8 @@ impl JimaoApp {
             was_narrow: false,
             theme: Theme::parse(&storage::load_settings().theme),
             system_dark: system_prefers_dark(),
+            images: HashMap::new(),
+            stylesheets: HashMap::new(),
         };
 
         app.selected_account = app.accounts.first().map(|a| a.id.clone());
@@ -246,6 +260,28 @@ impl JimaoApp {
                     state.syncing = false;
                     state.error = Some(error);
                 }
+            }
+            Event::ImageLoaded {
+                url,
+                width,
+                height,
+                rgba,
+            } => {
+                let image = egui::ColorImage::from_rgba_unmultiplied(
+                    [width as usize, height as usize],
+                    &rgba,
+                );
+                let texture = self.ctx.load_texture(&url, image, Default::default());
+                self.images.insert(url, ImageStatus::Ready(texture));
+            }
+            Event::ImageFailed { url } => {
+                self.images.insert(url, ImageStatus::Failed);
+            }
+            Event::StylesheetLoaded { url, text } => {
+                self.stylesheets.insert(url, Some(text));
+            }
+            Event::StylesheetFailed { url } => {
+                self.stylesheets.insert(url, None);
             }
         }
     }
@@ -382,6 +418,36 @@ impl JimaoApp {
     }
 
     // ----- queries ----------------------------------------------------------
+
+    /// Ask a worker thread to fetch a remote mail image (once per URL).
+    fn request_image(&mut self, url: String) {
+        if self.images.contains_key(&url) {
+            return; // already loading, loaded or failed
+        }
+        if !(url.starts_with("https://") || url.starts_with("http://")) {
+            self.images.insert(url, ImageStatus::Failed);
+            return;
+        }
+        self.images.insert(url.clone(), ImageStatus::Loading);
+        sync::spawn(Job::FetchImage { url }, self.ctx.clone(), self.tx.clone());
+    }
+
+    /// Ask a worker thread to fetch a remote stylesheet (once per URL).
+    fn request_stylesheet(&mut self, url: String) {
+        if self.stylesheets.contains_key(&url) {
+            return;
+        }
+        if !(url.starts_with("https://") || url.starts_with("http://")) {
+            self.stylesheets.insert(url.clone(), None);
+            return;
+        }
+        self.stylesheets.insert(url.clone(), None);
+        sync::spawn(
+            Job::FetchStylesheet { url },
+            self.ctx.clone(),
+            self.tx.clone(),
+        );
+    }
 
     /// Apply the selected theme to the context, resolving "system" against
     /// the cached OS preference.
@@ -888,7 +954,38 @@ impl JimaoApp {
                 .show(ui, |ui| {
                     ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Wrap);
                     if let Some(html) = &msg.body_html {
-                        crate::html::render(ui, html);
+                        // Give the renderer what is already loaded and collect
+                        // the URLs it still wants.
+                        let textures: HashMap<String, egui::TextureHandle> = self
+                            .images
+                            .iter()
+                            .filter_map(|(url, status)| match status {
+                                ImageStatus::Ready(texture) => Some((url.clone(), texture.clone())),
+                                _ => None,
+                            })
+                            .collect();
+                        let sheets: HashMap<String, String> = self
+                            .stylesheets
+                            .iter()
+                            .filter_map(|(url, text)| {
+                                text.as_ref().map(|t| (url.clone(), t.clone()))
+                            })
+                            .collect();
+                        let mut html_ctx = crate::html::HtmlContext {
+                            images: &textures,
+                            stylesheets: &sheets,
+                            missing_images: Vec::new(),
+                            missing_stylesheets: Vec::new(),
+                        };
+                        crate::html::render(ui, html, &mut html_ctx);
+                        let missing_images = std::mem::take(&mut html_ctx.missing_images);
+                        let missing_sheets = std::mem::take(&mut html_ctx.missing_stylesheets);
+                        for url in missing_images {
+                            self.request_image(url);
+                        }
+                        for url in missing_sheets {
+                            self.request_stylesheet(url);
+                        }
                     } else if !msg.body_text.is_empty() {
                         ui.label(msg.body_text.as_str());
                     } else {
