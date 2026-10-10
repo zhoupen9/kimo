@@ -1,6 +1,10 @@
 //! The egui application: all UI state and drawing. Network results arrive as
 //! `sync::Event`s drained at the top of every frame; opening a socket happens
 //! only in worker threads.
+//!
+//! Layout: custom title bar on top (nav toggle, account menu, sync, window
+//! controls), then three columns — collapsible navigation, message list,
+//! reading pane.
 
 use std::collections::HashMap;
 use std::sync::mpsc;
@@ -8,6 +12,9 @@ use std::sync::mpsc;
 use crate::models::{Account, MailMessage, Protocol, TlsMode};
 use crate::storage::{self, FolderCache};
 use crate::sync::{self, Event, Job};
+
+/// Below this window width the navigation bar collapses automatically.
+const NAV_AUTO_COLLAPSE_WIDTH: f32 = 640.0;
 
 pub struct JimaoApp {
     ctx: egui::Context,
@@ -22,6 +29,10 @@ pub struct JimaoApp {
     show_add_account: bool,
     add_form: AddAccountForm,
     confirm_delete: Option<String>,
+    nav_collapsed: bool,
+    /// Whether the window was narrow last frame, so auto-collapse only
+    /// triggers when crossing the threshold (not every frame).
+    was_narrow: bool,
 }
 
 #[derive(Default)]
@@ -29,7 +40,6 @@ pub struct AccountUiState {
     pub folders: Vec<String>,
     pub cache: storage::AccountCache,
     pub syncing: bool,
-    pub first_sync_done: bool,
     pub error: Option<String>,
 }
 
@@ -86,6 +96,8 @@ impl JimaoApp {
             show_add_account: false,
             add_form: AddAccountForm::default(),
             confirm_delete: None,
+            nav_collapsed: false,
+            was_narrow: false,
         };
 
         app.selected_account = app.accounts.first().map(|a| a.id.clone());
@@ -172,7 +184,6 @@ impl JimaoApp {
                 let mut snapshot = None;
                 if let Some(state) = self.states.get_mut(&account_id) {
                     state.syncing = false;
-                    state.first_sync_done = true;
                     snapshot = Some(state.cache.clone());
                 }
                 if let Some(cache) = snapshot {
@@ -182,7 +193,6 @@ impl JimaoApp {
             Event::SyncFailed { account_id, error } => {
                 if let Some(state) = self.states.get_mut(&account_id) {
                     state.syncing = false;
-                    state.first_sync_done = true;
                     state.error = Some(error);
                 }
             }
@@ -195,6 +205,13 @@ impl JimaoApp {
         for account in self.accounts.clone() {
             sync::spawn(Job::Sync { account }, self.ctx.clone(), self.tx.clone());
         }
+    }
+
+    fn current_account(&self) -> Option<Account> {
+        self.accounts
+            .iter()
+            .find(|a| self.selected_account.as_deref() == Some(a.id.as_str()))
+            .cloned()
     }
 
     fn select_folder(&mut self, account_id: String, folder: String, protocol: Protocol) {
@@ -367,9 +384,10 @@ impl JimaoApp {
     // ----- UI ----------------------------------------------------------------
 
     /// Custom window title bar (the window is created undecorated in
-    /// `main.rs`): title on the left, minimize/maximize/close on the right
-    /// edge, and the remaining area drags the window (double-click toggles
-    /// maximize).
+    /// `main.rs`). Left to right: nav collapse toggle, app title, account
+    /// menu, sync button, per-account status. Right edge: minimize /
+    /// maximize / close. The leftover space drags the window (double-click
+    /// toggles maximize).
     fn titlebar(&mut self, ui: &mut egui::Ui) {
         let bar = ui.available_rect_before_wrap();
         let visuals = ui.visuals().clone();
@@ -429,171 +447,241 @@ impl JimaoApp {
             }
         }
 
-        // Everything left of the buttons is the drag surface.
+        // --- left content row, kept clear of the window buttons ---
+        let content_right = bar.right() - TITLEBAR_BUTTON_WIDTH * buttons.len() as f32;
+        let row_size = egui::vec2((content_right - bar.left()).max(0.0), bar.height());
+        let content_end = ui
+            .allocate_ui_with_layout(
+                row_size,
+                egui::Layout::left_to_right(egui::Align::Center),
+                |row| {
+                    // Nav collapse toggle (hamburger, painted as lines).
+                    let toggle = row.add_sized([26.0, 22.0], egui::Button::new(""));
+                    if toggle.clicked() {
+                        self.nav_collapsed = !self.nav_collapsed;
+                    }
+                    let tr = toggle.rect;
+                    for i in -1i32..=1 {
+                        let y = tr.center().y + i as f32 * 4.0;
+                        row.painter().line_segment(
+                            [
+                                egui::pos2(tr.left() + 6.0, y),
+                                egui::pos2(tr.right() - 6.0, y),
+                            ],
+                            egui::Stroke::new(1.5_f32, visuals.text_color()),
+                        );
+                    }
+                    toggle.on_hover_text(if self.nav_collapsed {
+                        "Show folders"
+                    } else {
+                        "Hide folders"
+                    });
+
+                    row.label(egui::RichText::new("Jimao").small().strong());
+                    row.separator();
+
+                    // Account menu: switch accounts, add, remove (two-step confirm).
+                    let selected_name = self
+                        .current_account()
+                        .map(|a| a.name)
+                        .unwrap_or_else(|| "No account".to_string());
+                    let mut switch_to: Option<Account> = None;
+                    let mut add_clicked = false;
+                    egui::ComboBox::from_id_salt("account-selector")
+                        .selected_text(selected_name)
+                        .width(170.0)
+                        .show_ui(row, |ui| {
+                            ui.set_min_width(240.0);
+                            for account in &self.accounts {
+                                let is_sel =
+                                    self.selected_account.as_deref() == Some(account.id.as_str());
+                                let text = egui::RichText::new(format!(
+                                    "{} · {}",
+                                    account.name,
+                                    account.protocol.label()
+                                ));
+                                if ui.selectable_label(is_sel, text).clicked() {
+                                    switch_to = Some(account.clone());
+                                }
+                            }
+                            if !self.accounts.is_empty() {
+                                ui.separator();
+                            }
+                            if ui.button("+ Add account…").clicked() {
+                                add_clicked = true;
+                            }
+                            if let Some(current) = self
+                                .accounts
+                                .iter()
+                                .find(|a| self.selected_account.as_deref() == Some(a.id.as_str()))
+                            {
+                                let confirming =
+                                    self.confirm_delete.as_deref() == Some(current.id.as_str());
+                                let label = if confirming {
+                                    egui::RichText::new(format!("Remove \"{}\"?", current.name))
+                                        .color(egui::Color32::RED)
+                                } else {
+                                    egui::RichText::new(format!("Remove \"{}\"", current.name))
+                                };
+                                if ui.button(label).clicked() {
+                                    if confirming {
+                                        let id = current.id.clone();
+                                        self.delete_account(&id);
+                                        self.confirm_delete = None;
+                                    } else {
+                                        self.confirm_delete = Some(current.id.clone());
+                                    }
+                                }
+                            }
+                        });
+                    if let Some(account) = switch_to {
+                        self.select_folder(
+                            account.id.clone(),
+                            "INBOX".to_string(),
+                            account.protocol,
+                        );
+                    }
+                    if add_clicked {
+                        self.add_form = AddAccountForm::default();
+                        self.show_add_account = true;
+                    }
+
+                    if row.button("Sync").clicked() {
+                        self.sync_all();
+                    }
+
+                    // Per-account status: spinner while syncing, warning on error.
+                    for account in self.accounts.clone() {
+                        let Some(state) = self.states.get(&account.id) else {
+                            continue;
+                        };
+                        if state.syncing {
+                            row.spinner()
+                                .on_hover_text(format!("{}: syncing…", account.name));
+                        } else if let Some(err) = &state.error {
+                            row.label(egui::RichText::new("⚠").color(egui::Color32::RED))
+                                .on_hover_text(format!("{}: {err}", account.name));
+                        }
+                    }
+
+                    row.min_rect().right()
+                },
+            )
+            .inner;
+
+        // --- drag surface: whatever is left between content and buttons ---
+        let drag_left = content_end + 4.0;
         let drag_rect = egui::Rect::from_min_max(
-            bar.left_top(),
-            egui::pos2(
-                bar.right() - TITLEBAR_BUTTON_WIDTH * buttons.len() as f32,
-                bar.bottom(),
-            ),
+            egui::pos2(drag_left.max(bar.left()), bar.top()),
+            egui::pos2(content_right, bar.bottom()),
         );
-        let drag = ui.interact(
-            drag_rect,
-            egui::Id::new("titlebar-drag"),
-            egui::Sense::click_and_drag(),
-        );
-        if drag.drag_started() {
-            ui.ctx().send_viewport_cmd(egui::ViewportCommand::StartDrag);
-        }
-        if drag.double_clicked() {
-            ui.ctx()
-                .send_viewport_cmd(egui::ViewportCommand::Maximized(!maximized));
+        if drag_rect.is_positive() {
+            let drag = ui.interact(
+                drag_rect,
+                egui::Id::new("titlebar-drag"),
+                egui::Sense::click_and_drag(),
+            );
+            if drag.drag_started() {
+                ui.ctx().send_viewport_cmd(egui::ViewportCommand::StartDrag);
+            }
+            if drag.double_clicked() {
+                ui.ctx()
+                    .send_viewport_cmd(egui::ViewportCommand::Maximized(!maximized));
+            }
         }
 
-        ui.painter().text(
-            egui::pos2(bar.left() + 12.0, bar.center().y),
-            egui::Align2::LEFT_CENTER,
-            "Jimao",
-            egui::FontId::proportional(13.0),
-            visuals.text_color(),
-        );
         ui.painter().line_segment(
             [bar.left_bottom(), bar.right_bottom()],
             egui::Stroke::new(1.0_f32, visuals.widgets.noninteractive.bg_stroke.color),
         );
     }
 
-    fn toolbar(&mut self, ui: &mut egui::Ui) {
-        ui.horizontal(|ui| {
-            if ui.button("⟳ Sync").clicked() {
-                self.sync_all();
-            }
-            if ui.button("＋ Add account").clicked() {
-                self.add_form = AddAccountForm::default();
-                self.show_add_account = true;
-            }
-            ui.separator();
-            ui.add(
-                egui::TextEdit::singleline(&mut self.filter)
-                    .hint_text("Filter by subject or sender…")
-                    .desired_width(220.0),
-            );
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                for account in self.accounts.clone() {
-                    let Some(state) = self.states.get(&account.id) else {
-                        continue;
-                    };
-                    if state.syncing {
-                        ui.spinner()
-                            .on_hover_text(format!("{}: syncing…", account.name));
-                    } else if let Some(err) = &state.error {
-                        ui.label(egui::RichText::new("⚠").color(egui::Color32::RED))
-                            .on_hover_text(format!("{}: {err}", account.name));
-                    }
-                }
-            });
-        });
-    }
-
-    fn sidebar(&mut self, ui: &mut egui::Ui) {
+    /// Left column: folders of the selected account.
+    fn nav(&mut self, ui: &mut egui::Ui) {
         egui::ScrollArea::vertical()
             .auto_shrink([false, false])
             .show(ui, |ui| {
-                if self.accounts.is_empty() {
-                    ui.label("No accounts configured.");
+                let Some(account) = self.current_account() else {
+                    ui.label("No account selected.");
                     ui.label(
-                        "Use \"＋ Add account\" in the toolbar to add an IMAP or POP3 mailbox.",
+                        egui::RichText::new("Add one from the account menu in the title bar.")
+                            .small()
+                            .weak(),
                     );
                     return;
-                }
-                for account in self.accounts.clone() {
-                    let (folders, syncing, error) = {
-                        let state = self.states.entry(account.id.clone()).or_default();
-                        (state.folders.clone(), state.syncing, state.error.clone())
-                    };
+                };
+                let (folders, syncing, error) = {
+                    let state = self.states.entry(account.id.clone()).or_default();
+                    (state.folders.clone(), state.syncing, state.error.clone())
+                };
 
-                    ui.horizontal(|ui| {
-                        ui.strong(account.name.as_str());
-                        ui.label(egui::RichText::new(account.protocol.label()).small().weak());
-                        if syncing {
-                            ui.spinner();
-                        }
-                        if ui.button("⟳").on_hover_text("Sync this account").clicked() {
-                            sync::spawn(
-                                Job::Sync {
-                                    account: account.clone(),
-                                },
-                                self.ctx.clone(),
-                                self.tx.clone(),
-                            );
-                        }
-                        let confirming =
-                            self.confirm_delete.as_deref() == Some(account.id.as_str());
-                        let label = if confirming { "Remove?" } else { "✕" };
-                        let button = if confirming {
-                            egui::Button::new(egui::RichText::new(label).color(egui::Color32::RED))
-                                .small()
-                        } else {
-                            egui::Button::new(label).small()
-                        };
-                        if ui
-                            .add(button)
-                            .on_hover_text("Remove account (and its local cache)")
-                            .clicked()
-                        {
-                            if confirming {
-                                self.delete_account(&account.id);
-                                self.confirm_delete = None;
-                            } else {
-                                self.confirm_delete = Some(account.id.clone());
-                            }
-                        }
-                    });
-                    if let Some(err) = error {
-                        ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Wrap);
-                        ui.label(
-                            egui::RichText::new(format!("⚠ {err}"))
-                                .small()
-                                .color(egui::Color32::RED),
-                        );
-                    }
+                ui.label(egui::RichText::new("MAILBOXES").small().weak());
+                ui.add_space(4.0);
 
-                    let folder_list = if folders.is_empty() {
-                        vec!["INBOX".to_string()]
+                let folders_were_empty = folders.is_empty();
+                let folder_list = if folders.is_empty() {
+                    vec!["INBOX".to_string()]
+                } else {
+                    folders
+                };
+                for folder in folder_list {
+                    let selected = self.selected_account.as_deref() == Some(account.id.as_str())
+                        && self.selected_folder.as_deref() == Some(folder.as_str());
+                    let unread = self
+                        .states
+                        .get(&account.id)
+                        .and_then(|s| s.cache.folders.iter().find(|f| f.name == folder))
+                        .map(|f| f.messages.iter().filter(|m| !m.seen).count())
+                        .unwrap_or(0);
+                    let text = if unread > 0 {
+                        egui::RichText::new(format!("📁 {folder} ({unread})")).strong()
                     } else {
-                        folders
+                        egui::RichText::new(format!("📁 {folder}")).weak()
                     };
-                    for folder in folder_list {
-                        let selected = self.selected_account.as_deref()
-                            == Some(account.id.as_str())
-                            && self.selected_folder.as_deref() == Some(folder.as_str());
-                        let unread = self
-                            .states
-                            .get(&account.id)
-                            .and_then(|s| s.cache.folders.iter().find(|f| f.name == folder))
-                            .map(|f| f.messages.iter().filter(|m| !m.seen).count())
-                            .unwrap_or(0);
-                        let text = if unread > 0 {
-                            egui::RichText::new(format!("📁 {folder} ({unread})")).strong()
-                        } else {
-                            egui::RichText::new(format!("📁 {folder}")).weak()
-                        };
-                        if ui.selectable_label(selected, text).clicked() {
-                            self.select_folder(account.id.clone(), folder, account.protocol);
-                        }
+                    if ui.selectable_label(selected, text).clicked() {
+                        self.select_folder(account.id.clone(), folder, account.protocol);
                     }
-                    ui.add_space(6.0);
+                }
+                if syncing && folders_were_empty {
+                    ui.add_space(4.0);
+                    ui.spinner();
+                }
+                if let Some(err) = error {
+                    ui.add_space(4.0);
+                    ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Wrap);
+                    ui.label(
+                        egui::RichText::new(format!("⚠ {err}"))
+                            .small()
+                            .color(egui::Color32::RED),
+                    );
                 }
             });
     }
 
-    fn message_list(&mut self, ui: &mut egui::Ui) {
+    /// Middle column: filter bar plus the message list.
+    fn mail_list(&mut self, ui: &mut egui::Ui) {
         if self.accounts.is_empty() || self.selected_account.is_none() {
             ui.centered_and_justified(|ui| {
                 ui.heading("Jimao");
             });
             return;
         }
+
+        ui.horizontal(|ui| {
+            ui.add(
+                egui::TextEdit::singleline(&mut self.filter)
+                    .hint_text("Filter by subject or sender…")
+                    .desired_width(200.0),
+            );
+            let count = self.current_messages().len();
+            ui.label(
+                egui::RichText::new(format!("{count} messages"))
+                    .small()
+                    .weak(),
+            );
+        });
+        ui.separator();
+
         let messages = self.current_messages();
         if messages.is_empty() {
             ui.centered_and_justified(|ui| {
@@ -602,7 +690,7 @@ impl JimaoApp {
                 } else if self.selected_folder_synced() {
                     "This folder is empty."
                 } else {
-                    "Not fetched yet — click ⟳ Sync."
+                    "Not fetched yet — click Sync in the title bar."
                 };
                 ui.label(egui::RichText::new(text).weak().heading());
             });
@@ -625,13 +713,13 @@ impl JimaoApp {
                                 self.selected_message.as_deref() == Some(msg.uid.as_str());
                             let (style_from, style_subject) = if msg.seen {
                                 (
-                                    egui::RichText::new(truncate(&msg.from, 30)),
-                                    egui::RichText::new(truncate(&msg.subject, 70)),
+                                    egui::RichText::new(truncate(&msg.from, 24)),
+                                    egui::RichText::new(truncate(&msg.subject, 50)),
                                 )
                             } else {
                                 (
-                                    egui::RichText::new(truncate(&msg.from, 30)).strong(),
-                                    egui::RichText::new(truncate(&msg.subject, 70)).strong(),
+                                    egui::RichText::new(truncate(&msg.from, 24)).strong(),
+                                    egui::RichText::new(truncate(&msg.subject, 50)).strong(),
                                 )
                             };
                             if ui.selectable_label(is_selected, style_from).clicked() {
@@ -655,11 +743,16 @@ impl JimaoApp {
             });
     }
 
-    fn preview(&mut self, ui: &mut egui::Ui) {
+    /// Right column: the selected message, or a placeholder.
+    fn mail_content(&mut self, ui: &mut egui::Ui) {
         let Some(msg) = self.selected_message_view() else {
+            ui.centered_and_justified(|ui| {
+                ui.label(egui::RichText::new("No mail selected").weak().heading());
+            });
             return;
         };
         ui.vertical(|ui| {
+            ui.set_min_width(ui.available_width());
             ui.heading(msg.subject.as_str());
             ui.label(
                 egui::RichText::new(format!("From: {}", msg.from))
@@ -816,21 +909,30 @@ impl eframe::App for JimaoApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.drain_events();
 
+        // Collapse the nav bar automatically when the window becomes narrow;
+        // re-expanding is a manual choice and stays until the next crossing.
+        let narrow = ctx.screen_rect().width() < NAV_AUTO_COLLAPSE_WIDTH;
+        if narrow && !self.was_narrow {
+            self.nav_collapsed = true;
+        }
+        self.was_narrow = narrow;
+
         egui::TopBottomPanel::top("titlebar")
             .exact_height(TITLEBAR_HEIGHT)
             .show(ctx, |ui| self.titlebar(ui));
-        egui::TopBottomPanel::top("toolbar").show(ctx, |ui| self.toolbar(ui));
-        egui::SidePanel::left("sidebar")
+        egui::SidePanel::right("mail_content")
             .resizable(true)
-            .default_width(230.0)
-            .show(ctx, |ui| self.sidebar(ui));
-        if self.selected_message.is_some() {
-            egui::TopBottomPanel::bottom("preview")
+            .min_width(280.0)
+            .default_width(460.0)
+            .show(ctx, |ui| self.mail_content(ui));
+        if !self.nav_collapsed {
+            egui::SidePanel::left("nav")
                 .resizable(true)
-                .default_height(300.0)
-                .show(ctx, |ui| self.preview(ui));
+                .min_width(150.0)
+                .default_width(200.0)
+                .show(ctx, |ui| self.nav(ui));
         }
-        egui::CentralPanel::default().show(ctx, |ui| self.message_list(ui));
+        egui::CentralPanel::default().show(ctx, |ui| self.mail_list(ui));
 
         if self.show_add_account {
             self.add_account_window(ctx);
