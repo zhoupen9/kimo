@@ -60,6 +60,49 @@ impl Theme {
     }
 }
 
+/// How HTML mail bodies are rendered; persisted in `settings.json`.
+///
+/// `Web` needs the optional `webview` feature (WebKitGTK window). In builds
+/// without it the stored value is ignored and HTML mail always uses `Simple`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum RenderMode {
+    /// In-app egui renderer (`html.rs`): instant, pure Rust.
+    Simple,
+    /// WebKitGTK window (`webview.rs`): browser-grade, separate window.
+    Web,
+}
+
+#[cfg_attr(not(feature = "webview"), allow(dead_code))]
+impl RenderMode {
+    fn other(self) -> Self {
+        match self {
+            RenderMode::Simple => RenderMode::Web,
+            RenderMode::Web => RenderMode::Simple,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            RenderMode::Simple => "Simple",
+            RenderMode::Web => "Web view",
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            RenderMode::Simple => "simple",
+            RenderMode::Web => "web",
+        }
+    }
+
+    fn parse(s: &str) -> Self {
+        match s {
+            "web" => RenderMode::Web,
+            _ => RenderMode::Simple,
+        }
+    }
+}
+
 pub struct JimaoApp {
     ctx: egui::Context,
     tx: mpsc::Sender<Event>,
@@ -78,6 +121,8 @@ pub struct JimaoApp {
     /// triggers when crossing the threshold (not every frame).
     was_narrow: bool,
     theme: Theme,
+    /// HTML mail renderer: the in-app one, or the feature-gated web view.
+    render_mode: RenderMode,
     /// Cached OS dark-mode preference, so "system" resolution does not hit
     /// the filesystem every frame. Refreshed on startup and whenever the
     /// theme cycles back to System.
@@ -92,6 +137,18 @@ pub struct JimaoApp {
     /// `None` marks a decode failure (not retried). Decoding happens once
     /// when a message is first rendered.
     inline_textures: HashMap<String, Option<egui::TextureHandle>>,
+    /// WebKitGTK window, created on first use (only with the `webview`
+    /// feature). Dropping it stops the GTK thread.
+    #[cfg(feature = "webview")]
+    webview: Option<crate::webview::WebView>,
+    /// UID of the message loaded into the web view, so the document is not
+    /// reloaded on every frame.
+    #[cfg(feature = "webview")]
+    webview_uid: Option<String>,
+    /// Set when GTK/WebKitGTK could not start: the pane falls back to the
+    /// simple renderer instead of retrying every frame.
+    #[cfg(feature = "webview")]
+    webview_failed: bool,
 }
 
 enum ImageStatus {
@@ -164,10 +221,17 @@ impl JimaoApp {
             nav_collapsed: false,
             was_narrow: false,
             theme: Theme::parse(&storage::load_settings().theme),
+            render_mode: RenderMode::parse(&storage::load_settings().render_mode),
             system_dark: system_prefers_dark(),
             images: HashMap::new(),
             stylesheets: HashMap::new(),
             inline_textures: HashMap::new(),
+            #[cfg(feature = "webview")]
+            webview: None,
+            #[cfg(feature = "webview")]
+            webview_uid: None,
+            #[cfg(feature = "webview")]
+            webview_failed: false,
         };
 
         app.selected_account = app.accounts.first().map(|a| a.id.clone());
@@ -457,6 +521,97 @@ impl JimaoApp {
         );
     }
 
+    /// Hand the selected message's HTML to the web view window. Returns false
+    /// when the web view is not in use — Simple mode, a build without the
+    /// `webview` feature, or WebKitGTK that failed to start — so the caller
+    /// renders the mail in-app instead.
+    fn show_in_web_view(&mut self, msg: &MailMessage, html: &str, force: bool) -> bool {
+        let wanted = self.render_mode == RenderMode::Web;
+        #[cfg(feature = "webview")]
+        {
+            if !wanted || self.webview_failed {
+                return false;
+            }
+            self.load_into_web_view(msg, html, force);
+            true
+        }
+        #[cfg(not(feature = "webview"))]
+        {
+            let _ = (wanted, msg, html, force);
+            false
+        }
+    }
+
+    /// True when the web view was requested but could not start, so the pane
+    /// can say why it fell back to the simple renderer.
+    fn web_view_unavailable(&self) -> bool {
+        #[cfg(feature = "webview")]
+        {
+            self.render_mode == RenderMode::Web && self.webview_failed
+        }
+        #[cfg(not(feature = "webview"))]
+        {
+            false
+        }
+    }
+
+    /// Create the web view window on first use and load `msg` into it unless
+    /// it is already the document on screen (`force` reloads regardless).
+    #[cfg(feature = "webview")]
+    fn load_into_web_view(&mut self, msg: &MailMessage, html: &str, force: bool) {
+        if self.webview.is_none() {
+            match crate::webview::WebView::spawn() {
+                Some(view) => self.webview = Some(view),
+                None => {
+                    self.webview_failed = true;
+                    return;
+                }
+            }
+        }
+        let Some(view) = &self.webview else { return };
+        if force || self.webview_uid.as_deref() != Some(msg.uid.as_str()) {
+            let title = format!("Jimao — {}", msg.subject);
+            view.show(&title, &crate::webview::document(html, &msg.inline_images));
+            self.webview_uid = Some(msg.uid.clone());
+        }
+    }
+
+    /// Reading-pane placeholder for a message the web view window is showing.
+    #[cfg(feature = "webview")]
+    fn web_view_note(&mut self, ui: &mut egui::Ui, msg: &MailMessage, html: &str) {
+        ui.add_space(8.0);
+        ui.label(egui::RichText::new("Rendered in the web view window (WebKitGTK).").weak());
+        ui.add_space(2.0);
+        if ui.button("Show the window").clicked() {
+            self.load_into_web_view(msg, html, true);
+        }
+        ui.add_space(4.0);
+        ui.label(
+            egui::RichText::new(
+                "Closing that window hides it; it comes back when you pick another message.",
+            )
+            .small()
+            .weak(),
+        );
+    }
+
+    /// Switch HTML mail between the in-app renderer and the web view, and
+    /// remember the choice in `settings.json`.
+    #[cfg(feature = "webview")]
+    fn toggle_render_mode(&mut self) {
+        self.render_mode = self.render_mode.other();
+        if self.render_mode == RenderMode::Simple {
+            if let Some(view) = &self.webview {
+                view.hide();
+            }
+            self.webview_uid = None;
+        }
+        let _ = storage::save_settings(&Settings {
+            theme: self.theme.as_str().to_string(),
+            render_mode: self.render_mode.as_str().to_string(),
+        });
+    }
+
     /// Apply the selected theme to the context, resolving "system" against
     /// the cached OS preference.
     fn apply_theme(&self, ctx: &egui::Context) {
@@ -615,6 +770,7 @@ impl JimaoApp {
             }
             let _ = storage::save_settings(&Settings {
                 theme: self.theme.as_str().to_string(),
+                render_mode: self.render_mode.as_str().to_string(),
             });
         }
         theme_resp.on_hover_text(format!(
@@ -622,8 +778,41 @@ impl JimaoApp {
             self.theme.label()
         ));
 
+        // HTML mail renderer switch (simple ↔ web view), left of the theme
+        // switch. Only present in builds with the `webview` feature.
+        #[cfg(feature = "webview")]
+        let render_rect = {
+            let rect = egui::Rect::from_min_max(
+                egui::pos2(theme_rect.left() - TITLEBAR_BUTTON_WIDTH, bar.top()),
+                egui::pos2(theme_rect.left(), bar.bottom()),
+            );
+            let resp = ui.interact(rect, egui::Id::new("titlebar-render"), egui::Sense::click());
+            if resp.hovered() {
+                ui.painter()
+                    .rect_filled(rect, 0.0, visuals.widgets.hovered.bg_fill);
+            }
+            let active = self.render_mode == RenderMode::Web;
+            let color = if active {
+                visuals.selection.bg_fill
+            } else {
+                visuals.text_color()
+            };
+            paint_render_icon(ui.painter(), rect, color, active);
+            if resp.clicked() {
+                self.toggle_render_mode();
+            }
+            resp.on_hover_text(format!(
+                "HTML mail: {} — click for {}",
+                self.render_mode.label(),
+                self.render_mode.other().label()
+            ));
+            rect
+        };
+        #[cfg(not(feature = "webview"))]
+        let render_rect = theme_rect;
+
         // --- left content row, kept clear of the window buttons ---
-        let content_right = theme_rect.left();
+        let content_right = render_rect.left();
         let row_size = egui::vec2((content_right - bar.left()).max(0.0), bar.height());
         let content_end = ui
             .allocate_ui_with_layout(
@@ -1027,7 +1216,26 @@ impl JimaoApp {
                 .auto_shrink([false, false])
                 .show(ui, |ui| {
                     ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Wrap);
-                    if let Some(html) = &msg.body_html {
+                    let html = msg.body_html.as_deref();
+                    let web_view =
+                        html.is_some_and(|html| self.show_in_web_view(&msg, html, false));
+                    if web_view {
+                        #[cfg(feature = "webview")]
+                        {
+                            if let Some(html) = html {
+                                self.web_view_note(ui, &msg, html);
+                            }
+                        }
+                    } else if let Some(html) = html {
+                        if self.web_view_unavailable() {
+                            ui.label(
+                                egui::RichText::new(
+                                    "Web view unavailable — using the simple renderer.",
+                                )
+                                .small()
+                                .weak(),
+                            );
+                        }
                         // Give the renderer what is already loaded and collect
                         // the URLs it still wants.
                         let textures: HashMap<String, egui::TextureHandle> = self
@@ -1403,6 +1611,33 @@ fn paint_theme_icon(p: &egui::Painter, rect: egui::Rect, color: egui::Color32) {
         egui::pos2(c.x, c.y + r + 0.5),
     );
     p.with_clip_rect(left_half).circle_filled(c, r - 0.9, color);
+}
+
+/// Renderer toggle glyph: stacked text lines for the simple renderer, a
+/// globe for the web view.
+#[cfg(feature = "webview")]
+fn paint_render_icon(p: &egui::Painter, rect: egui::Rect, color: egui::Color32, web: bool) {
+    let c = rect.center();
+    if web {
+        let r = 5.5;
+        p.circle_stroke(c, r, egui::Stroke::new(1.2_f32, color));
+        p.line_segment(
+            [egui::pos2(c.x - r, c.y), egui::pos2(c.x + r, c.y)],
+            egui::Stroke::new(1.0_f32, color),
+        );
+        p.line_segment(
+            [egui::pos2(c.x, c.y - r), egui::pos2(c.x, c.y + r)],
+            egui::Stroke::new(1.0_f32, color),
+        );
+    } else {
+        for (i, width) in [7.0_f32, 7.0, 4.0].into_iter().enumerate() {
+            let y = c.y - 3.0 + i as f32 * 3.0;
+            p.line_segment(
+                [egui::pos2(c.x - 4.0, y), egui::pos2(c.x - 4.0 + width, y)],
+                egui::Stroke::new(1.2_f32, color),
+            );
+        }
+    }
 }
 
 /// Best-effort OS dark-mode detection without spawning processes or talking
