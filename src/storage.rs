@@ -36,6 +36,31 @@ pub fn load_accounts() -> Vec<Account> {
         .unwrap_or_default()
 }
 
+/// UI settings (`~/.config/jimao/settings.json`).
+#[derive(Default, Clone, Serialize, Deserialize)]
+pub struct Settings {
+    /// "system" | "light" | "dark"; anything else behaves as "system".
+    #[serde(default)]
+    pub theme: String,
+}
+
+pub fn load_settings() -> Settings {
+    fs::read_to_string(config_dir().join("settings.json"))
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default()
+}
+
+pub fn save_settings(settings: &Settings) -> std::io::Result<()> {
+    let dir = config_dir();
+    fs::create_dir_all(&dir)?;
+    fs::write(
+        dir.join("settings.json"),
+        serde_json::to_string_pretty(settings)?,
+    )?;
+    Ok(())
+}
+
 pub fn save_accounts(accounts: &[Account]) -> std::io::Result<()> {
     let dir = config_dir();
     fs::create_dir_all(&dir)?;
@@ -88,6 +113,18 @@ pub fn delete_cache(account_id: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn settings_round_trip_and_default() {
+        let s = Settings {
+            theme: "dark".into(),
+        };
+        let json = serde_json::to_string(&s).unwrap();
+        let back: Settings = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.theme, "dark");
+        let missing: Settings = serde_json::from_str("{}").unwrap();
+        assert_eq!(missing.theme, "");
+    }
 
     #[test]
     fn cache_round_trip() {

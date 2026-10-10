@@ -99,6 +99,9 @@ Event (mpsc) ──► drain_events() at frame start ──► merge into Accoun
 - `~/.config/jimao/accounts.json` — the account list, **including passwords,
   in plain text**. This is a documented, accepted limitation for now; do not
   silently change the format, and do not add a secrets daemon (see rule 1).
+- `~/.config/jimao/settings.json` — UI settings (currently just the theme:
+  `system`/`light`/`dark`; "system" resolves via GTK/KDE config files, no
+  subprocesses or D-Bus).
 - `~/.local/share/jimao/cache/<account-id>.json` — `AccountCache` with one
   `FolderCache` per folder (name, uidvalidity, synced flag, messages).
 
@@ -120,7 +123,8 @@ Event (mpsc) ──► drain_events() at frame start ──► merge into Accoun
   filter box, right reading pane with a "No mail selected" placeholder.
 - The window is undecorated on purpose (`with_decorations(false)` in
   `main.rs`): `titlebar()` in `app.rs` draws the custom title bar — nav
-  toggle, account menu (switch/add/remove), sync button, drag area,
+  toggle, account menu (switch/add/remove), sync button, theme switcher
+  (system/light/dark, persisted in `settings.json`), drag area,
   double-click maximize, and the minimize/maximize/close buttons sent as
   `ViewportCommand`s. Don't re-enable system decorations.
 - When touching the UI, actually run `cargo run` and click through it; the

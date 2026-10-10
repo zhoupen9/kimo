@@ -10,11 +10,55 @@ use std::collections::HashMap;
 use std::sync::mpsc;
 
 use crate::models::{Account, MailMessage, Protocol, TlsMode};
-use crate::storage::{self, FolderCache};
+use crate::storage::{self, FolderCache, Settings};
 use crate::sync::{self, Event, Job};
 
 /// Below this window width the navigation bar collapses automatically.
 const NAV_AUTO_COLLAPSE_WIDTH: f32 = 640.0;
+
+/// UI color scheme. "System" follows the OS preference (best-effort
+/// detection, see `system_prefers_dark`).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Theme {
+    System,
+    Light,
+    Dark,
+}
+
+impl Theme {
+    /// Button click order: system → light → dark → system.
+    fn next(self) -> Self {
+        match self {
+            Theme::System => Theme::Light,
+            Theme::Light => Theme::Dark,
+            Theme::Dark => Theme::System,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Theme::System => "System",
+            Theme::Light => "Light",
+            Theme::Dark => "Dark",
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Theme::System => "system",
+            Theme::Light => "light",
+            Theme::Dark => "dark",
+        }
+    }
+
+    fn parse(s: &str) -> Self {
+        match s {
+            "light" => Theme::Light,
+            "dark" => Theme::Dark,
+            _ => Theme::System,
+        }
+    }
+}
 
 pub struct JimaoApp {
     ctx: egui::Context,
@@ -33,6 +77,11 @@ pub struct JimaoApp {
     /// Whether the window was narrow last frame, so auto-collapse only
     /// triggers when crossing the threshold (not every frame).
     was_narrow: bool,
+    theme: Theme,
+    /// Cached OS dark-mode preference, so "system" resolution does not hit
+    /// the filesystem every frame. Refreshed on startup and whenever the
+    /// theme cycles back to System.
+    system_dark: bool,
 }
 
 #[derive(Default)]
@@ -98,6 +147,8 @@ impl JimaoApp {
             confirm_delete: None,
             nav_collapsed: false,
             was_narrow: false,
+            theme: Theme::parse(&storage::load_settings().theme),
+            system_dark: system_prefers_dark(),
         };
 
         app.selected_account = app.accounts.first().map(|a| a.id.clone());
@@ -332,6 +383,21 @@ impl JimaoApp {
 
     // ----- queries ----------------------------------------------------------
 
+    /// Apply the selected theme to the context, resolving "system" against
+    /// the cached OS preference.
+    fn apply_theme(&self, ctx: &egui::Context) {
+        let dark = match self.theme {
+            Theme::Dark => true,
+            Theme::Light => false,
+            Theme::System => self.system_dark,
+        };
+        ctx.set_visuals(if dark {
+            egui::Visuals::dark()
+        } else {
+            egui::Visuals::light()
+        });
+    }
+
     /// Messages of the currently selected folder, filtered and sorted for display.
     fn current_messages(&self) -> Vec<MailMessage> {
         let Some(account_id) = &self.selected_account else {
@@ -385,9 +451,9 @@ impl JimaoApp {
 
     /// Custom window title bar (the window is created undecorated in
     /// `main.rs`). Left to right: nav collapse toggle, app title, account
-    /// menu, sync button, per-account status. Right edge: minimize /
-    /// maximize / close. The leftover space drags the window (double-click
-    /// toggles maximize).
+    /// menu, sync button, per-account status. Right edge: theme switch,
+    /// then minimize / maximize / close. The leftover space drags the
+    /// window (double-click toggles maximize).
     fn titlebar(&mut self, ui: &mut egui::Ui) {
         let bar = ui.available_rect_before_wrap();
         let visuals = ui.visuals().clone();
@@ -422,7 +488,12 @@ impl JimaoApp {
                     _ => visuals.widgets.hovered.bg_fill,
                 };
                 ui.painter().rect_filled(rect, 0.0, bg);
-                egui::Color32::WHITE
+                match ctrl {
+                    // White reads best on the close red; elsewhere keep the
+                    // theme text color so the glyph survives light visuals.
+                    Ctrl::Close => egui::Color32::WHITE,
+                    _ => visuals.text_color(),
+                }
             } else {
                 visuals.text_color()
             };
@@ -447,8 +518,38 @@ impl JimaoApp {
             }
         }
 
+        // Theme switch (system → light → dark), just left of the controls.
+        let theme_right = bar.right() - TITLEBAR_BUTTON_WIDTH * buttons.len() as f32;
+        let theme_rect = egui::Rect::from_min_max(
+            egui::pos2(theme_right - TITLEBAR_BUTTON_WIDTH, bar.top()),
+            egui::pos2(theme_right, bar.bottom()),
+        );
+        let theme_resp = ui.interact(
+            theme_rect,
+            egui::Id::new("titlebar-theme"),
+            egui::Sense::click(),
+        );
+        if theme_resp.hovered() {
+            ui.painter()
+                .rect_filled(theme_rect, 0.0, visuals.widgets.hovered.bg_fill);
+        }
+        paint_theme_icon(ui.painter(), theme_rect, visuals.text_color());
+        if theme_resp.clicked() {
+            self.theme = self.theme.next();
+            if self.theme == Theme::System {
+                self.system_dark = system_prefers_dark();
+            }
+            let _ = storage::save_settings(&Settings {
+                theme: self.theme.as_str().to_string(),
+            });
+        }
+        theme_resp.on_hover_text(format!(
+            "Theme: {} — click to switch (system → light → dark)",
+            self.theme.label()
+        ));
+
         // --- left content row, kept clear of the window buttons ---
-        let content_right = bar.right() - TITLEBAR_BUTTON_WIDTH * buttons.len() as f32;
+        let content_right = theme_rect.left();
         let row_size = egui::vec2((content_right - bar.left()).max(0.0), bar.height());
         let content_end = ui
             .allocate_ui_with_layout(
@@ -914,6 +1015,7 @@ impl JimaoApp {
 impl eframe::App for JimaoApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.drain_events();
+        self.apply_theme(ctx);
 
         // Collapse the nav bar automatically when the window becomes narrow;
         // re-expanding is a manual choice and stays until the next crossing.
@@ -1008,6 +1110,63 @@ fn paint_close_icon(p: &egui::Painter, rect: egui::Rect, color: egui::Color32) {
         [egui::pos2(c.x - r, c.y + r), egui::pos2(c.x + r, c.y - r)],
         egui::Stroke::new(1.5_f32, color),
     );
+}
+
+/// Half-filled circle — the classic theme/contrast glyph.
+fn paint_theme_icon(p: &egui::Painter, rect: egui::Rect, color: egui::Color32) {
+    let c = rect.center();
+    let r = 5.5;
+    p.circle_stroke(c, r, egui::Stroke::new(1.2_f32, color));
+    let left_half = egui::Rect::from_min_max(
+        egui::pos2(c.x - r - 0.5, c.y - r - 0.5),
+        egui::pos2(c.x, c.y + r + 0.5),
+    );
+    p.with_clip_rect(left_half).circle_filled(c, r - 0.9, color);
+}
+
+/// Best-effort OS dark-mode detection without spawning processes or talking
+/// to D-Bus: read the common GTK3/GTK4 and KDE configuration files.
+fn system_prefers_dark() -> bool {
+    let config_home = std::env::var_os("XDG_CONFIG_HOME")
+        .map(std::path::PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".config")));
+    let Some(config_home) = config_home else {
+        return false;
+    };
+    for rel in ["gtk-4.0/settings.ini", "gtk-3.0/settings.ini"] {
+        if let Ok(text) = std::fs::read_to_string(config_home.join(rel)) {
+            if ini_flag_is_true(&text, "gtk-application-prefer-dark-theme") {
+                return true;
+            }
+        }
+    }
+    if let Ok(text) = std::fs::read_to_string(config_home.join("kdeglobals")) {
+        if kde_scheme_is_dark(&text) {
+            return true;
+        }
+    }
+    false
+}
+
+/// `key = true` (or 1/yes) in an INI-style file.
+fn ini_flag_is_true(text: &str, key: &str) -> bool {
+    text.lines().any(|line| match line.trim().split_once('=') {
+        Some((k, v)) => {
+            let v = v.trim();
+            k.trim() == key
+                && (v == "1" || v.eq_ignore_ascii_case("true") || v.eq_ignore_ascii_case("yes"))
+        }
+        None => false,
+    })
+}
+
+/// KDE `ColorScheme=…` containing "dark" (e.g. BreezeDark).
+fn kde_scheme_is_dark(text: &str) -> bool {
+    text.lines().any(|line| {
+        let line = line.trim().to_ascii_lowercase();
+        line.strip_prefix("colorscheme=")
+            .is_some_and(|scheme| scheme.contains("dark"))
+    })
 }
 
 fn sort_messages(messages: &mut [MailMessage]) {
@@ -1107,6 +1266,48 @@ fn install_cjk_font(ctx: &egui::Context) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn theme_cycles_system_light_dark() {
+        assert_eq!(Theme::System.next(), Theme::Light);
+        assert_eq!(Theme::Light.next(), Theme::Dark);
+        assert_eq!(Theme::Dark.next(), Theme::System);
+    }
+
+    #[test]
+    fn theme_parses_known_values_and_defaults_to_system() {
+        assert_eq!(Theme::parse("dark"), Theme::Dark);
+        assert_eq!(Theme::parse("light"), Theme::Light);
+        assert_eq!(Theme::parse("nonsense"), Theme::System);
+        assert_eq!(Theme::parse(""), Theme::System);
+    }
+
+    #[test]
+    fn gtk_dark_flag_parsing() {
+        assert!(ini_flag_is_true(
+            "[Settings]\ngtk-application-prefer-dark-theme=true\n",
+            "gtk-application-prefer-dark-theme"
+        ));
+        assert!(ini_flag_is_true(
+            "[Settings]\ngtk-application-prefer-dark-theme = 1\n",
+            "gtk-application-prefer-dark-theme"
+        ));
+        assert!(!ini_flag_is_true(
+            "[Settings]\ngtk-application-prefer-dark-theme=0\n",
+            "gtk-application-prefer-dark-theme"
+        ));
+        assert!(!ini_flag_is_true(
+            "[Settings]\n",
+            "gtk-application-prefer-dark-theme"
+        ));
+    }
+
+    #[test]
+    fn kde_dark_scheme_parsing() {
+        assert!(kde_scheme_is_dark("[General]\nColorScheme=BreezeDark\n"));
+        assert!(!kde_scheme_is_dark("[General]\nColorScheme=BreezeLight\n"));
+        assert!(!kde_scheme_is_dark("[General]\n"));
+    }
 
     #[test]
     fn slug_sanitizes_names() {
