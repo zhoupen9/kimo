@@ -42,10 +42,6 @@ pub struct Settings {
     /// "system" | "light" | "dark"; anything else behaves as "system".
     #[serde(default)]
     pub theme: String,
-    /// HTML mail renderer: "simple" (in-app, default) or "web" (WebKitGTK
-    /// window; only meaningful in builds with the `webview` feature).
-    #[serde(default)]
-    pub render_mode: String,
 }
 
 pub fn load_settings() -> Settings {
@@ -147,16 +143,18 @@ mod tests {
     fn settings_round_trip_and_default() {
         let s = Settings {
             theme: "dark".into(),
-            render_mode: "web".into(),
         };
         let json = serde_json::to_string(&s).unwrap();
         let back: Settings = serde_json::from_str(&json).unwrap();
         assert_eq!(back.theme, "dark");
-        assert_eq!(back.render_mode, "web");
-        // settings.json written before render_mode existed must still load.
+        // settings.json with missing keys must still load.
         let missing: Settings = serde_json::from_str("{}").unwrap();
         assert_eq!(missing.theme, "");
-        assert_eq!(missing.render_mode, "");
+        // settings.json written when the web view renderer still existed
+        // carries a render_mode field; it is ignored, not an error.
+        let legacy: Settings = serde_json::from_str(r#"{"theme":"light","render_mode":"web"}"#)
+            .expect("unknown fields must be ignored");
+        assert_eq!(legacy.theme, "light");
     }
 
     #[test]

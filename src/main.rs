@@ -12,8 +12,6 @@ mod protocol;
 mod storage;
 mod sync;
 mod tray;
-#[cfg(feature = "webview")]
-mod webview;
 
 fn main() -> eframe::Result {
     // Pure-Rust TLS: install rustls' `ring` crypto provider process-wide so

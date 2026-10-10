@@ -34,16 +34,6 @@ base64 = "0.22"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
-# Opt-in WebKitGTK HTML mail renderer ("web view" mode). These link C/C++
-# libraries and need webkit2gtk-4.1 + gtk+-3.0 at build time, so they are
-# OFF by default: a plain `cargo build` stays pure Rust (hard rule 1).
-# Enable with `cargo run --features webview`; see AGENTS.md.
-gtk = { version = "0.18", optional = true }
-webkit2gtk = { version = "2.0", optional = true }
-
-[features]
-webview = ["dep:gtk", "dep:webkit2gtk"]
-
 [profile.release]
 lto = true
 strip = true

@@ -15,10 +15,8 @@ Jimao is a desktop **email client** GUI written in pure Rust:
 - **HTML mail:** parsed with html5ever (via `scraper`) and rendered as egui
   widgets in `src/html.rs`, with a small CSS subset (`src/css.rs`). Remote
   images and stylesheets load **by default** on worker threads (see the
-  conventions below). There is no JavaScript. A WebKitGTK "web view" renderer
-  lives in `src/webview.rs` behind the non-default `webview` feature (the
-  documented exception to rule 1) and is picked from the titlebar; a plain
-  `cargo build` stays pure Rust.
+  conventions below). There is no JavaScript and no embedded browser
+  engine — the egui renderer is the only renderer.
 - **Charsets:** mail-parser is built with the `full_encoding` feature
   (pulling in `encoding_rs`, pure Rust) so GB2312/GBK/GB18030/Big5/
   Shift-JIS/… mail decodes to proper UTF-8 instead of Latin-1 mojibake.
@@ -44,11 +42,9 @@ Jimao is a desktop **email client** GUI written in pure Rust:
    `aws-lc-rs`, `keyring`, etc. are all unacceptable. TLS goes through
    `rustls` (keep `default-features = false` + the `ring` feature). If a
    candidate crate needs pkg-config/Make/cmake at build time, it is wrong
-   for this project. The single exception is the optional `webview` feature
-   (`gtk` + `webkit2gtk`): it is off by default, so plain `cargo
-   build`/`test`/`clippy` stay pure Rust, and only
-   `cargo build --features webview` links C libraries and needs the
-   webkit2gtk-4.1 + gtk+-3.0 development packages.
+   for this project. (A WebKitGTK "web view" renderer used to exist behind
+   an optional `webview` feature; it has been removed. Do not reintroduce
+   C-library exceptions to this rule.)
 2. **No async runtime.** Networking runs on short-lived `std::thread` jobs
    (see `src/sync.rs`); results come back over `std::sync::mpsc`. Do not
    introduce tokio, async-std, or an executor.
@@ -89,7 +85,6 @@ src/mail.rs             raw RFC 5322 bytes → MailMessage (mail-parser; HTML ke
 src/html.rs             HTML mail → egui widgets (subset: blocks, lists, tables, links, inline styles)
 src/css.rs              tiny CSS subset (decls, tag/class/id selectors) for HTML mail
 src/tray.rs             StatusNotifierItem over raw D-Bus (session bus, std::thread) + svg→ARGB icon
-src/webview.rs          optional WebKitGTK mail window (feature `webview`, off by default)
 src/sync.rs             Job/Event enums, worker threads, per-protocol sync logic
 src/protocol/mod.rs     protocol modules
 src/protocol/stream.rs  TcpStream/TLS transport (MailStream, STARTTLS upgrade, buffered Conn)
@@ -133,8 +128,8 @@ Event (mpsc) ──► drain_events() at frame start ──► merge into Accoun
   silently change the format, and do not add a secrets daemon (see rule 1).
 - `~/.config/jimao/settings.json` — UI settings: the theme
   (`system`/`light`/`dark`; "system" resolves via GTK/KDE config files, no
-  subprocesses or D-Bus) and `render_mode` (`simple` in-app renderer, or
-  `web` for the feature-gated WebKitGTK window).
+  subprocesses or D-Bus). Older files may still carry a `render_mode` field
+  from the removed WebKitGTK renderer; it is ignored on load.
 - `~/.local/share/jimao/cache/<account-id>.json` — `AccountCache` with one
   `FolderCache` per folder (name, uidvalidity, synced flag, messages).
   Messages carry inline `cid:` images as base64, so caches of image-heavy
@@ -165,8 +160,7 @@ Event (mpsc) ──► drain_events() at frame start ──► merge into Accoun
 - The window is undecorated on purpose (`with_decorations(false)` in
   `main.rs`): `titlebar()` in `app.rs` draws the custom title bar — nav
   toggle, account menu (switch/add/remove), sync button, theme switcher
-  (system/light/dark, persisted in `settings.json`), the HTML mail
-  renderer toggle (simple ↔ web view; `webview` builds only), drag area,
+  (system/light/dark, persisted in `settings.json`), drag area,
   double-click maximize, and the minimize/maximize/close buttons sent as
   `ViewportCommand`s. Don't re-enable system decorations.
 - When touching the UI, actually run `cargo run` and click through it; the
@@ -186,10 +180,8 @@ Do not "fix" these casually — they are known:
   mail) render as flowing full-width rows, because egui Grid sizes columns
   to the minimum wrapped width. `cid:` inline images render from the
   attachment bytes stored on the message (`InlineImage`, base64 in the
-  cache). A browser-grade renderer does exist, but only with
-  `--features webview`: WebKitGTK renders in its own window (it cannot be
-  embedded in the egui window on Wayland), reached through the titlebar
-  toggle.
+  cache). There is deliberately no browser-engine fallback; improving
+  fidelity means improving this renderer.
 - POP3 sync re-downloads bodies every time (UIDL lets us skip but is not
   wired through the Job yet).
 - No IDLE/push for IMAP; sync is manual or on-startup.
