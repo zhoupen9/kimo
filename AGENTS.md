@@ -24,9 +24,11 @@ Jimao is a desktop **email client** GUI written in pure Rust:
 - **Tray icon:** `src/tray.rs` implements StatusNotifierItem by speaking the
   D-Bus wire protocol directly on a `std::thread` — deliberately not zbus
   (async executor, rule 2) or the GTK tray crates (C, rule 1). The icon is
-  `assets/app.svg`, embedded with `include_str!` and rasterized by resvg
-  (pure Rust, no default features). Missing StatusNotifierWatcher disables
-  the tray silently.
+  `assets/app.png` (48px, rasterized from the multi-color `assets/app.svg`
+  — regenerate with any svg→png tool, e.g. `rsvg-convert -w 48 -h 48`),
+  embedded with `include_bytes!` and decoded with the image crate, keeping
+  its own colors (the purple circle works on any panel). Missing
+  StatusNotifierWatcher disables the tray silently.
 - **Persistence:** JSON files under XDG dirs (`~/.config/jimao/accounts.json`,
   `~/.local/share/jimao/cache/<account>.json`). No external database.
 

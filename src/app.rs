@@ -174,12 +174,7 @@ impl JimaoApp {
         app.selected_folder = Some("INBOX".to_string());
 
         // System-tray icon (best effort; StatusNotifierItem over D-Bus).
-        let tray_dark = match app.theme {
-            Theme::Dark => true,
-            Theme::Light => false,
-            Theme::System => app.system_dark,
-        };
-        crate::tray::spawn(app.ctx.clone(), tray_dark);
+        crate::tray::spawn(app.ctx.clone());
 
         for account in app.accounts.clone() {
             sync::spawn(Job::Sync { account }, app.ctx.clone(), app.tx.clone());

@@ -5,16 +5,18 @@
 //! module speaks just enough of the D-Bus wire protocol, over the session
 //! bus, on one dedicated `std::thread`: it registers a
 //! `org.kde.StatusNotifierItem` and serves the properties/activations that
-//! KDE Plasma and compatible trays query. The icon is `assets/app.svg`,
-//! embedded at compile time and rasterized with resvg (pure Rust). A
-//! missing StatusNotifierWatcher (e.g. GNOME without an extension) simply
-//! disables the tray — the app keeps running.
+//! KDE Plasma and compatible trays query. The icon is `assets/app.png`
+//! (rasterized from `assets/app.svg`), embedded at compile time, decoded
+//! with the pure-Rust image crate with its colors kept as-is. A missing
+//! StatusNotifierWatcher (e.g. GNOME without an extension) simply disables
+//! the tray — the app keeps running.
 
 use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
 
-/// The application icon, embedded at compile time.
-pub(crate) const APP_SVG: &str = include_str!("../assets/app.svg");
+/// The application icon (a monochrome silhouette rasterized from
+/// `assets/app.svg`), embedded at compile time.
+pub(crate) const APP_PNG: &[u8] = include_bytes!("../assets/app.png");
 
 /// D-Bus message types. (Signals, type 4, are received and skipped.)
 const MSG_METHOD_CALL: u8 = 1;
@@ -498,35 +500,17 @@ fn current_uid() -> Option<String> {
 
 // ----- SNI service -----------------------------------------------------------
 
-/// Rasterize `svg` to a straight-alpha big-endian ARGB32 pixmap (the SNI
-/// IconPixmap format), sized `size × size`.
-fn render_icon_argb(svg: &str, size: u32) -> Option<Vec<u8>> {
-    let tree = resvg::usvg::Tree::from_str(svg, &resvg::usvg::Options::default()).ok()?;
-    let bounds = tree.size();
-    let scale = size as f32 / bounds.width().max(bounds.height()).max(1.0);
-    let mut pixmap = resvg::tiny_skia::Pixmap::new(size, size)?;
-    let mut target = pixmap.as_mut();
-    resvg::render(
-        &tree,
-        resvg::tiny_skia::Transform::from_scale(scale, scale),
-        &mut target,
-    );
-    let rgba = pixmap.take(); // RGBA, premultiplied
+/// Decode the embedded PNG icon into the SNI IconPixmap format: straight
+/// alpha, ARGB32 in network byte order. The icon's own colors are kept.
+fn icon_argb(png: &[u8]) -> Option<Vec<u8>> {
+    let decoded = image::load_from_memory(png).ok()?;
+    let rgba = decoded.to_rgba8();
     let mut out = Vec::with_capacity(rgba.len());
-    for px in rgba.as_chunks::<4>().0 {
-        let (r, g, b, a) = (px[0], px[1], px[2], px[3]);
-        // Premultiplied → straight alpha, then network-byte-order ARGB.
-        let straight = |c: u8| {
-            if a == 0 {
-                0
-            } else {
-                ((c as u16 * 255) / a as u16).min(255) as u8
-            }
-        };
-        out.push(a);
-        out.push(straight(r));
-        out.push(straight(g));
-        out.push(straight(b));
+    for px in rgba.as_raw().as_chunks::<4>().0 {
+        out.push(px[3]); // a
+        out.push(px[0]); // r
+        out.push(px[1]); // g
+        out.push(px[2]); // b
     }
     Some(out)
 }
@@ -655,16 +639,10 @@ fn serve(bus: &mut Bus, ctx: &egui::Context, pixmap: &[u8]) -> Result<(), String
 }
 
 /// Spawn the tray thread. Failure is non-fatal: it is logged and the app
-/// runs without a tray icon. `dark` picks an icon tint that survives the
-/// panel background.
-pub fn spawn(ctx: egui::Context, dark: bool) {
-    let tinted = if dark {
-        APP_SVG.replace("#000000", "#FFFFFF")
-    } else {
-        APP_SVG.to_string()
-    };
-    let Some(pixmap) = render_icon_argb(&tinted, 48) else {
-        eprintln!("jimao tray: could not rasterize the icon");
+/// runs without a tray icon.
+pub fn spawn(ctx: egui::Context) {
+    let Some(pixmap) = icon_argb(APP_PNG) else {
+        eprintln!("jimao tray: could not decode the tray icon");
         return;
     };
     let result = std::thread::Builder::new()
@@ -810,12 +788,17 @@ mod tests {
     }
 
     #[test]
-    fn svg_rasterizes_to_argb() {
-        let svg = "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 2 2\">\
-                   <rect width=\"2\" height=\"2\" fill=\"#ff0000\"/></svg>";
-        let px = render_icon_argb(svg, 8).expect("rasterizes");
-        assert_eq!(px.len(), 8 * 8 * 4);
-        // Fully opaque red: A=255, R=255, G=0, B=0.
-        assert_eq!(&px[..4], &[255, 255, 0, 0]);
+    fn embedded_png_decodes_with_its_colors() {
+        let argb = icon_argb(APP_PNG).expect("decodes");
+        assert_eq!(argb.len(), 48 * 48 * 4);
+        // The icon's background circle is #835be1 (131, 91, 225): the
+        // pixmap must contain it as straight ARGB — a regression guard
+        // against recoloring that once flattened the icon into a blob.
+        assert!(
+            argb.as_chunks::<4>().0.contains(&[255, 131, 91, 225]),
+            "purple background pixels must survive"
+        );
+        // Corners are outside the circle: fully transparent.
+        assert_eq!(&argb[..4], &[0, 0, 0, 0]);
     }
 }
