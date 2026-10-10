@@ -7,7 +7,8 @@ use crate::models::MailMessage;
 
 pub fn parse(raw: &[u8], uid: &str, seen: bool) -> MailMessage {
     let parsed = MessageParser::default().parse(raw);
-    let (subject, from, to, date, timestamp, body_text, body_html, attachments) = match parsed {
+    let (subject, from, to, date, timestamp, body_text, body_html, attachments, inline_images) =
+        match parsed {
             Some(m) => {
                 let dt = m.date().copied();
                 // The body accessors convert between flavors, so look at the
@@ -33,6 +34,7 @@ pub fn parse(raw: &[u8], uid: &str, seen: bool) -> MailMessage {
                     m.attachments()
                         .filter_map(|part| part.attachment_name().map(|n| n.to_string()))
                         .collect(),
+                    collect_inline_images(&m),
                 )
             }
             None => (
@@ -43,6 +45,7 @@ pub fn parse(raw: &[u8], uid: &str, seen: bool) -> MailMessage {
                 None,
                 String::from_utf8_lossy(raw).into_owned(),
                 None,
+                Vec::new(),
                 Vec::new(),
             ),
         };
@@ -79,7 +82,32 @@ pub fn parse(raw: &[u8], uid: &str, seen: bool) -> MailMessage {
         body_html,
         preview,
         attachment_names: attachments,
+        inline_images,
     }
+}
+
+/// Attachment parts that are images with a Content-ID — the `cid:` targets
+/// of HTML mail — with their decoded bytes, base64 for the JSON cache.
+fn collect_inline_images(m: &mail_parser::Message<'_>) -> Vec<crate::models::InlineImage> {
+    use base64::Engine as _;
+    m.attachments()
+        .filter_map(|part| {
+            let cid = part.content_id()?.trim_matches(['<', '>']).to_string();
+            let content_type = part.content_type()?;
+            if cid.is_empty() || !content_type.ctype().eq_ignore_ascii_case("image") {
+                return None;
+            }
+            let mime = match content_type.subtype() {
+                Some(sub) => format!("{}/{}", content_type.ctype(), sub),
+                None => content_type.ctype().to_string(),
+            };
+            Some(crate::models::InlineImage {
+                cid,
+                content_type: mime,
+                data_base64: base64::engine::general_purpose::STANDARD.encode(part.contents()),
+            })
+        })
+        .collect()
 }
 
 /// Preview length in characters.
@@ -188,6 +216,41 @@ mod tests {
             !msg.preview.contains("color"),
             "style text must not leak into previews"
         );
+    }
+
+    #[test]
+    fn inline_cid_images_are_captured_with_their_bytes() {
+        // multipart/related: an HTML body plus a base64 image with a
+        // Content-ID, exactly like Outlook inline logos.
+        let raw = b"From: Alice <alice@example.com>\r\n\
+                    Subject: Inline art\r\n\
+                    MIME-Version: 1.0\r\n\
+                    Content-Type: multipart/related; boundary=\"XYZ\"\r\n\
+                    \r\n\
+                    --XYZ\r\n\
+                    Content-Type: text/html; charset=utf-8\r\n\
+                    \r\n\
+                    <p>See <img src=\"cid:logo@example.com\"></p>\r\n\
+                    --XYZ\r\n\
+                    Content-Type: image/png; name=\"logo.png\"\r\n\
+                    Content-Transfer-Encoding: base64\r\n\
+                    Content-ID: <logo@example.com>\r\n\
+                    Content-Disposition: inline; filename=\"logo.png\"\r\n\
+                    \r\n\
+                    aGVsbG8gaW5saW5lIQ==\r\n\
+                    --XYZ--\r\n";
+        let msg = parse(raw, "12", false);
+        assert!(msg.body_html.is_some());
+        assert!(msg.attachment_names.iter().any(|n| n.contains("logo.png")));
+        let inline = msg.inline_images.first().expect("inline image captured");
+        assert_eq!(inline.cid, "logo@example.com");
+        assert_eq!(inline.content_type, "image/png");
+        // "aGVsbG8gaW5saW5lIQ==" decodes to "hello inline!".
+        use base64::Engine as _;
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(&inline.data_base64)
+            .unwrap();
+        assert_eq!(bytes, b"hello inline!");
     }
 
     #[test]

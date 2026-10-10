@@ -53,6 +53,17 @@ pub struct Account {
     pub tls: TlsMode,
 }
 
+/// An inline image attachment, referenced from HTML mail via `cid:`.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct InlineImage {
+    /// Content-ID without angle brackets, as used in `cid:` references.
+    pub cid: String,
+    /// MIME type, e.g. `image/png`.
+    pub content_type: String,
+    /// Raw image bytes, base64-encoded for JSON storage.
+    pub data_base64: String,
+}
+
 /// A single message as stored locally. `uid` is the IMAP UID (within a
 /// UIDVALIDITY generation) or the POP3 UIDL string.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -75,6 +86,10 @@ pub struct MailMessage {
     #[serde(default)]
     pub preview: String,
     pub attachment_names: Vec<String>,
+    /// Inline images (attachments with a Content-ID), rendered for `cid:`
+    /// references in the HTML body.
+    #[serde(default)]
+    pub inline_images: Vec<InlineImage>,
 }
 
 #[cfg(test)]

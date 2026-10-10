@@ -88,6 +88,10 @@ pub struct JimaoApp {
     /// Remote stylesheets for HTML mail: `Some(text)` once loaded, `None`
     /// while loading or after a failure (no retry).
     stylesheets: HashMap<String, Option<String>>,
+    /// Decoded `cid:` inline images, keyed by `"<message-uid>/<cid>"`;
+    /// `None` marks a decode failure (not retried). Decoding happens once
+    /// when a message is first rendered.
+    inline_textures: HashMap<String, Option<egui::TextureHandle>>,
 }
 
 enum ImageStatus {
@@ -163,6 +167,7 @@ impl JimaoApp {
             system_dark: system_prefers_dark(),
             images: HashMap::new(),
             stylesheets: HashMap::new(),
+            inline_textures: HashMap::new(),
         };
 
         app.selected_account = app.accounts.first().map(|a| a.id.clone());
@@ -1045,8 +1050,23 @@ impl JimaoApp {
                                 text.as_ref().map(|t| (url.clone(), t.clone()))
                             })
                             .collect();
+                        // Inline `cid:` attachments of this message, decoded
+                        // once and cached per (uid, cid).
+                        let egui_ctx = self.ctx.clone();
+                        let mut inline_map: HashMap<String, egui::TextureHandle> = HashMap::new();
+                        for image in &msg.inline_images {
+                            let key = format!("{}/{}", msg.uid, image.cid);
+                            let texture = self
+                                .inline_textures
+                                .entry(key)
+                                .or_insert_with(|| decode_inline_image(&egui_ctx, image));
+                            if let Some(texture) = texture {
+                                inline_map.insert(image.cid.clone(), texture.clone());
+                            }
+                        }
                         let mut html_ctx = crate::html::HtmlContext {
                             images: &textures,
+                            inline_images: &inline_map,
                             stylesheets: &sheets,
                             missing_images: Vec::new(),
                             missing_stylesheets: Vec::new(),
@@ -1242,6 +1262,25 @@ const AVATAR_COLORS: &[egui::Color32] = &[
     egui::Color32::from_rgb(121, 85, 72),
     egui::Color32::from_rgb(236, 64, 122),
 ];
+
+/// Decode a stored inline image (base64) into an egui texture. Runs on the
+/// UI thread but only once per message/cid; inline mail images are small.
+fn decode_inline_image(
+    ctx: &egui::Context,
+    image: &crate::models::InlineImage,
+) -> Option<egui::TextureHandle> {
+    use base64::Engine as _;
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(&image.data_base64)
+        .ok()?;
+    let decoded = image::load_from_memory(&bytes).ok()?;
+    let rgba = decoded.to_rgba8();
+    let pixels = egui::ColorImage::from_rgba_unmultiplied(
+        [rgba.width() as usize, rgba.height() as usize],
+        &rgba,
+    );
+    Some(ctx.load_texture("inline-image", pixels, Default::default()))
+}
 
 fn sender_color(from: &str) -> egui::Color32 {
     let hash = from
@@ -1601,6 +1640,7 @@ mod tests {
                 body_text: String::new(),
                 body_html: None,
                 preview: String::new(),
+                inline_images: vec![],
                 attachment_names: vec![],
             },
             MailMessage {
@@ -1614,6 +1654,7 @@ mod tests {
                 body_text: String::new(),
                 body_html: None,
                 preview: String::new(),
+                inline_images: vec![],
                 attachment_names: vec![],
             },
         ];

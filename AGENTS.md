@@ -124,6 +124,8 @@ Event (mpsc) ──► drain_events() at frame start ──► merge into Accoun
   subprocesses or D-Bus).
 - `~/.local/share/jimao/cache/<account-id>.json` — `AccountCache` with one
   `FolderCache` per folder (name, uidvalidity, synced flag, messages).
+  Messages carry inline `cid:` images as base64, so caches of image-heavy
+  mail can grow to a few MB.
 
 ## Conventions
 
@@ -168,7 +170,9 @@ Do not "fix" these casually — they are known:
   compound selectors and layout CSS are ignored. Simple tables render as
   aligned grids; layout tables (block elements inside cells — most HTML
   mail) render as flowing full-width rows, because egui Grid sizes columns
-  to the minimum wrapped width. A real webview would violate rule 1.
+  to the minimum wrapped width. `cid:` inline images render from the
+  attachment bytes stored on the message (`InlineImage`, base64 in the
+  cache). A real webview would violate rule 1.
 - POP3 sync re-downloads bodies every time (UIDL lets us skip but is not
   wired through the Job yet).
 - No IDLE/push for IMAP; sync is manual or on-startup.

@@ -17,11 +17,15 @@ use scraper::{Html, Node};
 
 use crate::css;
 
-/// Remote resources available to the renderer plus the URLs it wants
-/// fetched. The app supplies what it has (loaded textures and stylesheets)
-/// and turns the missing lists into `Job::FetchImage` / `FetchStylesheet`.
+/// Remote and inline resources available to the renderer plus the URLs it
+/// wants fetched. The app supplies what it has (loaded textures, fetched
+/// stylesheets, and the selected message's `cid:` inline images) and turns
+/// the missing lists into `Job::FetchImage` / `FetchStylesheet`.
 pub struct HtmlContext<'a> {
     pub images: &'a HashMap<String, egui::TextureHandle>,
+    /// Inline attachments of the message being rendered, keyed by
+    /// Content-ID (no angle brackets) — the `cid:` reference targets.
+    pub inline_images: &'a HashMap<String, egui::TextureHandle>,
     pub stylesheets: &'a HashMap<String, String>,
     pub missing_images: Vec<String>,
     pub missing_stylesheets: Vec<String>,
@@ -171,12 +175,22 @@ impl Renderer<'_, '_> {
 
     /// Render an image: the fetched texture if available, otherwise a
     /// placeholder — and, for remote URLs, a fetch request.
+    /// Render an image: an inline `cid:` attachment when available, else a
+    /// fetched remote texture, else a placeholder — and, for remote URLs, a
+    /// fetch request.
     fn image(&mut self, ui: &mut Ui, el: &scraper::node::Element) {
         self.flush(ui);
         let src = el.attr("src").unwrap_or("").trim();
         let alt = el.attr("alt").unwrap_or("").trim();
         let remote = src.starts_with("http://") || src.starts_with("https://");
-        match self.ctx.images.get(src).filter(|_| !src.is_empty()) {
+        let cid = src
+            .strip_prefix("cid:")
+            .map(|c| c.trim_matches(['<', '>']).to_string());
+        let texture = match cid.as_deref() {
+            Some(cid) if !cid.is_empty() => self.ctx.inline_images.get(cid),
+            _ => self.ctx.images.get(src).filter(|_| !src.is_empty()),
+        };
+        match texture {
             Some(texture) => {
                 ui.add(egui::Image::from_texture(texture).max_width(ui.available_width().max(1.0)));
             }
@@ -645,10 +659,12 @@ mod tests {
     /// An empty HtmlContext for tests that don't care about resources.
     fn empty_ctx<'a>(
         images: &'a HashMap<String, egui::TextureHandle>,
+        inline_images: &'a HashMap<String, egui::TextureHandle>,
         stylesheets: &'a HashMap<String, String>,
     ) -> HtmlContext<'a> {
         HtmlContext {
             images,
+            inline_images,
             stylesheets,
             missing_images: Vec::new(),
             missing_stylesheets: Vec::new(),
@@ -668,8 +684,9 @@ mod tests {
 
     fn with_empty_ctx<R>(f: impl FnOnce(&mut Renderer<'_, '_>) -> R) -> R {
         let images = HashMap::new();
+        let inline = HashMap::new();
         let sheets = HashMap::new();
-        let mut hctx = empty_ctx(&images, &sheets);
+        let mut hctx = empty_ctx(&images, &inline, &sheets);
         let mut r = test_renderer(&mut hctx);
         f(&mut r)
     }
@@ -774,8 +791,9 @@ mod tests {
         let ctx = egui::Context::default();
         let _ = ctx.run(raw, |ctx| {
             let images = HashMap::new();
+            let inline = HashMap::new();
             let sheets = HashMap::new();
-            let mut hctx = empty_ctx(&images, &sheets);
+            let mut hctx = empty_ctx(&images, &inline, &sheets);
             egui::CentralPanel::default().show(ctx, |ui| {
                 render(ui, &html, &mut hctx);
                 assert!(
@@ -803,8 +821,9 @@ mod tests {
         let ctx = egui::Context::default();
         let _ = ctx.run(raw, |ctx| {
             let images = HashMap::new();
+            let inline = HashMap::new();
             let sheets = HashMap::new();
-            let mut hctx = empty_ctx(&images, &sheets);
+            let mut hctx = empty_ctx(&images, &inline, &sheets);
             egui::CentralPanel::default().show(ctx, |ui| {
                 render(ui, html, &mut hctx);
                 assert!(
@@ -825,8 +844,9 @@ mod tests {
         let ctx = egui::Context::default();
         let _ = ctx.run(egui::RawInput::default(), |ctx| {
             let images = HashMap::new();
+            let inline = HashMap::new();
             let sheets = HashMap::new();
-            let mut hctx = empty_ctx(&images, &sheets);
+            let mut hctx = empty_ctx(&images, &inline, &sheets);
             egui::CentralPanel::default().show(ctx, |ui| {
                 render(
                     ui,
@@ -847,8 +867,9 @@ mod tests {
         let ctx = egui::Context::default();
         let _ = ctx.run(egui::RawInput::default(), |ctx| {
             let images = HashMap::new();
+            let inline = HashMap::new();
             let sheets = HashMap::new();
-            let mut hctx = empty_ctx(&images, &sheets);
+            let mut hctx = empty_ctx(&images, &inline, &sheets);
             egui::CentralPanel::default().show(ctx, |ui| {
                 render(
                     ui,
@@ -865,12 +886,37 @@ mod tests {
     }
 
     #[test]
-    fn inline_styles_and_style_blocks_apply_without_panic() {
+    fn cid_images_render_from_the_inline_map() {
         let ctx = egui::Context::default();
         let _ = ctx.run(egui::RawInput::default(), |ctx| {
             let images = HashMap::new();
             let sheets = HashMap::new();
-            let mut hctx = empty_ctx(&images, &sheets);
+            let pixels =
+                egui::ColorImage::from_rgba_unmultiplied([2, 2], &[255u8, 0, 0, 255].repeat(4));
+            let texture = ctx.load_texture("cid-test", pixels, Default::default());
+            let inline = HashMap::from([("logo@example.com".to_string(), texture)]);
+            let mut hctx = empty_ctx(&images, &inline, &sheets);
+            egui::CentralPanel::default().show(ctx, |ui| {
+                render(
+                    ui,
+                    "<p>x <img src=\"cid:logo@example.com\"> y</p>",
+                    &mut hctx,
+                );
+                render(ui, "<img src=\"cid:missing\">", &mut hctx);
+            });
+            // cid: references never become remote fetches, resolved or not.
+            assert!(hctx.missing_images.is_empty());
+        });
+    }
+
+    #[test]
+    fn inline_styles_and_style_blocks_apply_without_panic() {
+        let ctx = egui::Context::default();
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            let images = HashMap::new();
+            let inline = HashMap::new();
+            let sheets = HashMap::new();
+            let mut hctx = empty_ctx(&images, &inline, &sheets);
             egui::CentralPanel::default().show(ctx, |ui| {
                 render(
                     ui,
