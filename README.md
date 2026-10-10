@@ -1,13 +1,13 @@
-# Jimao
+# Kimo
 
 A desktop email client written in **pure Rust**, with an immediate-mode GUI
-built on [eframe/egui](https://github.com/emilk/egui). Jimao speaks exactly
+built on [eframe/egui](https://github.com/emilk/egui). Kimo speaks exactly
 two mail retrieval protocols: **IMAP4rev1** and **POP3** — both implemented
 by hand in `src/protocol/` on top of `std::net::TcpStream` + rustls. There is
 no C library in the dependency tree: TLS uses rustls with the `ring` crypto
 provider and Mozilla's root certificates.
 
-> Jimao is receive-only by design: there is no SMTP, so composing or sending
+> Kimo is receive-only by design: there is no SMTP, so composing or sending
 > mail is out of scope.
 
 ## Features
@@ -18,7 +18,7 @@ provider and Mozilla's root certificates.
 - Message list with unread markers, text preview, attachment names
 - `\Seen` flag synchronization (IMAP server-side, POP3 local-only)
 - Offline-first: messages are cached as JSON under
-  `~/.local/share/jimao/cache/`; accounts live in `~/.config/jimao/accounts.json`
+  `~/.local/share/kimo/cache/`; accounts live in `~/.config/kimo/accounts.json`
 - CJK font fallback when a system Noto/WenQuanYi font is installed
 
 ## Build & run
@@ -34,7 +34,7 @@ Linux users need the usual GUI stack headers available at runtime
 ## Security note
 
 Account credentials are currently stored in **plain text** in
-`~/.config/jimao/accounts.json`. Treat that file accordingly.
+`~/.config/kimo/accounts.json`. Treat that file accordingly.
 
 ## Development
 

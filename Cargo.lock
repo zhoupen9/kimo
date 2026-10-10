@@ -2171,33 +2171,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8f42a60cbdf9a97f5d2305f08a87dc4e09308d1276d28c869c684d7777685682"
 
 [[package]]
-name = "jimao"
-version = "0.1.0"
-dependencies = [
- "anyrender",
- "anyrender_vello_cpu",
- "base64 0.22.1",
- "blitz-dom",
- "blitz-html",
- "blitz-paint",
- "blitz-traits",
- "eframe",
- "ego-tree",
- "egui",
- "image",
- "kurbo",
- "mail-parser",
- "parley",
- "rustls",
- "scraper",
- "serde",
- "serde_json",
- "sha1_smol",
- "ureq",
- "webpki-roots 0.26.11",
-]
-
-[[package]]
 name = "jni"
 version = "0.22.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2303,6 +2276,33 @@ name = "khronos_api"
 version = "3.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e2db585e1d738fc771bf08a151420d3ed193d9d895a36df7f6f8a9456b911ddc"
+
+[[package]]
+name = "kimo"
+version = "0.1.0"
+dependencies = [
+ "anyrender",
+ "anyrender_vello_cpu",
+ "base64 0.22.1",
+ "blitz-dom",
+ "blitz-html",
+ "blitz-paint",
+ "blitz-traits",
+ "eframe",
+ "ego-tree",
+ "egui",
+ "image",
+ "kurbo",
+ "mail-parser",
+ "parley",
+ "rustls",
+ "scraper",
+ "serde",
+ "serde_json",
+ "sha1_smol",
+ "ureq",
+ "webpki-roots 0.26.11",
+]
 
 [[package]]
 name = "kurbo"

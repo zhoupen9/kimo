@@ -120,7 +120,7 @@ impl HtmlRenderer {
     }
 }
 
-pub struct JimaoApp {
+pub struct KimoApp {
     ctx: egui::Context,
     tx: mpsc::Sender<Event>,
     rx: mpsc::Receiver<Event>,
@@ -234,7 +234,7 @@ impl Default for AddAccountForm {
     }
 }
 
-impl JimaoApp {
+impl KimoApp {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
         install_cjk_font(&cc.egui_ctx);
 
@@ -1003,7 +1003,7 @@ impl JimaoApp {
                         "Hide folders"
                     });
 
-                    row.label(egui::RichText::new("Jimao").small().strong());
+                    row.label(egui::RichText::new("Kimo").small().strong());
                     row.separator();
 
                     // Account menu: switch accounts, add, remove (two-step confirm).
@@ -1191,7 +1191,7 @@ impl JimaoApp {
     fn mail_list(&mut self, ui: &mut egui::Ui) {
         if self.accounts.is_empty() || self.selected_account.is_none() {
             ui.centered_and_justified(|ui| {
-                ui.heading("Jimao");
+                ui.heading("Kimo");
             });
             return;
         }
@@ -1576,7 +1576,7 @@ impl JimaoApp {
     }
 }
 
-impl eframe::App for JimaoApp {
+impl eframe::App for KimoApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.drain_events();
         self.apply_theme(ctx);
@@ -1966,13 +1966,13 @@ fn install_cjk_font(ctx: &egui::Context) {
             let mut fonts = egui::FontDefinitions::default();
             fonts
                 .font_data
-                .insert("jimao_cjk".into(), egui::FontData::from_owned(bytes).into());
+                .insert("kimo_cjk".into(), egui::FontData::from_owned(bytes).into());
             for family in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
                 fonts
                     .families
                     .entry(family)
                     .or_default()
-                    .push("jimao_cjk".into());
+                    .push("kimo_cjk".into());
             }
             ctx.set_fonts(fonts);
             return;

@@ -1,8 +1,8 @@
 [package]
-name = "jimao"
+name = "kimo"
 version = "0.1.0"
 edition = "2021"
-description = "Jimao — a pure-Rust email client (IMAP & POP3) with an egui interface"
+description = "Kimo — a pure-Rust email client (IMAP & POP3) with an egui interface"
 license = "MIT"
 
 [dependencies]

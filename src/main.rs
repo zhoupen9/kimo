@@ -1,4 +1,4 @@
-//! Jimao — a pure-Rust email client (IMAP & POP3) with an egui interface.
+//! Kimo — a pure-Rust email client (IMAP & POP3) with an egui interface.
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
@@ -22,15 +22,15 @@ fn main() -> eframe::Result {
 
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_title("Jimao")
+            .with_title("Kimo")
             .with_decorations(false) // custom titlebar drawn in app.rs
             .with_inner_size([1280.0, 800.0]),
         ..Default::default()
     };
 
     eframe::run_native(
-        "Jimao",
+        "Kimo",
         options,
-        Box::new(|cc| Ok(Box::new(app::JimaoApp::new(cc)))),
+        Box::new(|cc| Ok(Box::new(app::KimoApp::new(cc)))),
     )
 }

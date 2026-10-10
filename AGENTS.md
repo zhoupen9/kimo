@@ -1,11 +1,11 @@
 # AGENTS.md
 
-Working agreements for AI agents (and humans) contributing to **Jimao**.
+Working agreements for AI agents (and humans) contributing to **Kimo**.
 Read this before changing anything.
 
 ## What this project is
 
-Jimao is a desktop **email client** GUI written in pure Rust:
+Kimo is a desktop **email client** GUI written in pure Rust:
 
 - **GUI:** eframe/egui (immediate mode, pinned to the 0.31 line for now).
 - **Protocols:** IMAP4rev1 and POP3 **only**, implemented by hand in
@@ -37,8 +37,8 @@ Jimao is a desktop **email client** GUI written in pure Rust:
   object at `/Menu` (Show / Quit) served by the same thread. Missing
   StatusNotifierWatcher disables the tray silently, and `IconPixmap` must
   stay `a(iiay)` — hosts cannot read a bare byte array.
-- **Persistence:** JSON files under XDG dirs (`~/.config/jimao/accounts.json`,
-  `~/.local/share/jimao/cache/<account>.json`). No external database.
+- **Persistence:** JSON files under XDG dirs (`~/.config/kimo/accounts.json`,
+  `~/.local/share/kimo/cache/<account>.json`). No external database.
 
 ## Hard rules
 
@@ -82,7 +82,7 @@ done. There is no CI yet — that discipline is on you.
 
 ```
 src/main.rs             entry point; installs rustls ring provider, launches eframe
-src/app.rs              all UI: JimaoApp state, panels, add-account window, event handling
+src/app.rs              all UI: KimoApp state, panels, add-account window, event handling
 src/models.rs           Account / Protocol / TlsMode / MailMessage (serde types)
 src/error.rs            MailError + MailResult
 src/storage.rs          XDG paths, accounts.json, per-account FolderCache/AccountCache
@@ -119,8 +119,8 @@ Event (mpsc) ──► drain_events() at frame start ──► merge into Accoun
   reader's IP and open timing to senders (tracking pixels). Fetches run as
   `Job::FetchImage`/`FetchStylesheet` on worker threads via ureq (pure
   Rust, rustls + ring), are capped in size, cached on disk at
-  `~/.local/share/jimao/cache/resources/` (SHA-1 of the URL) and held in
-  `JimaoApp::images`/`stylesheets`. The renderer reports missing URLs via
+  `~/.local/share/kimo/cache/resources/` (SHA-1 of the URL) and held in
+  `KimoApp::images`/`stylesheets`. The renderer reports missing URLs via
   `html::HtmlContext`; never fetch on the UI thread.
 - `FETCH_LIMIT` (in `sync.rs`) caps how many of the newest messages are
   fetched per folder per sync.
@@ -138,18 +138,23 @@ Event (mpsc) ──► drain_events() at frame start ──► merge into Accoun
 
 ### Storage layout
 
-- `~/.config/jimao/accounts.json` — the account list, **including passwords,
+- `~/.config/kimo/accounts.json` — the account list, **including passwords,
   in plain text**. This is a documented, accepted limitation for now; do not
   silently change the format, and do not add a secrets daemon (see rule 1).
-- `~/.config/jimao/settings.json` — UI settings: the theme
+- `~/.config/kimo/settings.json` — UI settings: the theme
   (`system`/`light`/`dark`; "system" resolves via GTK/KDE config files, no
   subprocesses or D-Bus) and `html_renderer` (`egui`/`blitz`, absent means
   `egui`). Older files may still carry a `render_mode` field from the
   removed WebKitGTK renderer; it is ignored on load — do not reuse that name.
-- `~/.local/share/jimao/cache/<account-id>.json` — `AccountCache` with one
+- `~/.local/share/kimo/cache/<account-id>.json` — `AccountCache` with one
   `FolderCache` per folder (name, uidvalidity, synced flag, messages).
   Messages carry inline `cid:` images as base64, so caches of image-heavy
   mail can grow to a few MB.
+- The project was renamed from Jimao, so a pre-rename `jimao` directory under
+  either XDG root is moved to the `kimo` name the first time those paths are
+  used (`storage::migrate_legacy_dir`); an existing `kimo` directory wins and
+  failures are ignored. Drop that helper and `LEGACY_APP_DIR` once no
+  installation can still predate the rename.
 
 ## Conventions
 
@@ -183,7 +188,7 @@ Event (mpsc) ──► drain_events() at frame start ──► merge into Accoun
 - When touching the UI, actually run `cargo run` and click through it; the
   layout has no golden tests. `blitz_render` has a developer tool for
   eyeballing fidelity without the GUI:
-  `JIMAO_RENDER_HTML=mail.html cargo test -- --ignored dump_render` writes
+  `KIMO_RENDER_HTML=mail.html cargo test -- --ignored dump_render` writes
   `mail.png` next to the input.
 - Blitz is built with `blitz-dom`'s default features **off**: its
   `system-fonts` feature would link fontconfig (a C library, hard rule 1).

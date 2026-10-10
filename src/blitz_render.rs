@@ -46,7 +46,7 @@ const BASE64_NO_PAD: base64::engine::general_purpose::GeneralPurpose =
 /// relative references), and HTML mail uses relative image URLs constantly.
 /// The host is reserved by RFC 2606 and [`MailNet`] refuses to fetch from it,
 /// so such references stay unresolved instead of hitting the network.
-const BASE_URL: &str = "https://mail.jimao.invalid/";
+const BASE_URL: &str = "https://mail.kimo.invalid/";
 
 /// Physical-pixel caps for one page: a pathological mail must not be able to
 /// exhaust memory on a worker thread.
@@ -975,22 +975,22 @@ mod tests {
     /// Developer tool: rasterize an HTML file to PNG so the result can be
     /// eyeballed (the UI has no golden test).
     ///
-    ///     JIMAO_RENDER_HTML=mail.html cargo test -- --ignored dump_render
+    ///     KIMO_RENDER_HTML=mail.html cargo test -- --ignored dump_render
     ///
-    /// `JIMAO_RENDER_WIDTH` and `JIMAO_RENDER_SCALE` (device pixels per CSS
+    /// `KIMO_RENDER_WIDTH` and `KIMO_RENDER_SCALE` (device pixels per CSS
     /// pixel) mirror the reading pane's geometry.
     #[test]
-    #[ignore = "developer tool; needs JIMAO_RENDER_HTML"]
+    #[ignore = "developer tool; needs KIMO_RENDER_HTML"]
     fn dump_render() {
-        let Some(path) = std::env::var_os("JIMAO_RENDER_HTML") else {
+        let Some(path) = std::env::var_os("KIMO_RENDER_HTML") else {
             return;
         };
         let html = std::fs::read_to_string(&path).expect("read html");
-        let width = std::env::var("JIMAO_RENDER_WIDTH")
+        let width = std::env::var("KIMO_RENDER_WIDTH")
             .ok()
             .and_then(|value| value.parse().ok())
             .unwrap_or(1000);
-        let scale = std::env::var("JIMAO_RENDER_SCALE")
+        let scale = std::env::var("KIMO_RENDER_SCALE")
             .ok()
             .and_then(|value| value.parse().ok())
             .unwrap_or(1.0);

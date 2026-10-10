@@ -2,7 +2,7 @@
 
 use serde::{Deserialize, Serialize};
 
-/// The two (and only two) mail retrieval protocols Jimao speaks.
+/// The two (and only two) mail retrieval protocols Kimo speaks.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Protocol {

@@ -2,7 +2,7 @@
 //! stored as JSON under the XDG config/data directories.
 
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
@@ -14,18 +14,43 @@ fn home() -> PathBuf {
         .unwrap_or_else(|_| PathBuf::from("."))
 }
 
-pub fn config_dir() -> PathBuf {
-    match std::env::var("XDG_CONFIG_HOME") {
-        Ok(dir) if !dir.is_empty() => PathBuf::from(dir).join("jimao"),
-        _ => home().join(".config").join("jimao"),
+/// The application directory before the project was renamed to Kimo. Kept
+/// only so an existing installation can be moved over; drop this and
+/// [`migrate_legacy_dir`] once no installation can still predate the
+/// rename.
+const LEGACY_APP_DIR: &str = "jimao";
+
+/// Move a pre-rename `jimao` directory to its `kimo` name, so the rename does
+/// not orphan an account list or a message cache.
+///
+/// A `kimo` directory that already exists always wins, and failures are
+/// ignored: the app then simply starts from defaults.
+fn migrate_legacy_dir(current: &Path, legacy: &Path) {
+    if current.exists() || !legacy.exists() {
+        return;
     }
+    if let Some(parent) = current.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    let _ = fs::rename(legacy, current);
+}
+
+pub fn config_dir() -> PathBuf {
+    let dir = match std::env::var("XDG_CONFIG_HOME") {
+        Ok(dir) if !dir.is_empty() => PathBuf::from(dir).join("kimo"),
+        _ => home().join(".config").join("kimo"),
+    };
+    migrate_legacy_dir(&dir, &dir.with_file_name(LEGACY_APP_DIR));
+    dir
 }
 
 pub fn data_dir() -> PathBuf {
-    match std::env::var("XDG_DATA_HOME") {
-        Ok(dir) if !dir.is_empty() => PathBuf::from(dir).join("jimao"),
-        _ => home().join(".local").join("share").join("jimao"),
-    }
+    let dir = match std::env::var("XDG_DATA_HOME") {
+        Ok(dir) if !dir.is_empty() => PathBuf::from(dir).join("kimo"),
+        _ => home().join(".local").join("share").join("kimo"),
+    };
+    migrate_legacy_dir(&dir, &dir.with_file_name(LEGACY_APP_DIR));
+    dir
 }
 
 pub fn load_accounts() -> Vec<Account> {
@@ -36,7 +61,7 @@ pub fn load_accounts() -> Vec<Account> {
         .unwrap_or_default()
 }
 
-/// UI settings (`~/.config/jimao/settings.json`).
+/// UI settings (`~/.config/kimo/settings.json`).
 #[derive(Default, Clone, Serialize, Deserialize)]
 pub struct Settings {
     /// "system" | "light" | "dark"; anything else behaves as "system".
@@ -118,7 +143,7 @@ pub fn delete_cache(account_id: &str) {
 
 /// Disk cache for fetched remote mail resources (images, stylesheets),
 /// keyed by the SHA-1 of the URL:
-/// `~/.local/share/jimao/cache/resources/<sha1hex>.bin`.
+/// `~/.local/share/kimo/cache/resources/<sha1hex>.bin`.
 fn resource_path(url: &str) -> PathBuf {
     let digest = sha1_smol::Sha1::from(url).digest().to_string();
     data_dir()
@@ -162,6 +187,27 @@ mod tests {
         let legacy: Settings = serde_json::from_str(r#"{"theme":"light","render_mode":"web"}"#)
             .expect("unknown fields must be ignored");
         assert_eq!(legacy.theme, "light");
+    }
+
+    #[test]
+    fn legacy_jimao_directory_is_migrated() {
+        let root = std::env::temp_dir().join(format!("kimo-storage-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let legacy = root.join("jimao");
+        let current = root.join("kimo");
+        fs::create_dir_all(&legacy).unwrap();
+        fs::write(legacy.join("accounts.json"), "[]").unwrap();
+
+        migrate_legacy_dir(&current, &legacy);
+        assert!(current.join("accounts.json").exists(), "content moved over");
+        assert!(!legacy.exists(), "legacy directory is gone");
+
+        // Once a `kimo` directory exists it wins, and the legacy one is left be.
+        fs::create_dir_all(&legacy).unwrap();
+        migrate_legacy_dir(&current, &legacy);
+        assert!(legacy.exists(), "an existing kimo directory wins");
+
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]

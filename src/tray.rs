@@ -887,8 +887,8 @@ fn quit(ctx: &egui::Context) {
 fn sni_property(name: &str, icon: &Icon) -> Option<Value> {
     match name {
         "Category" => Some(Value::Str("ApplicationStatus".into())),
-        "Id" => Some(Value::Str("jimao".into())),
-        "Title" => Some(Value::Str("Jimao".into())),
+        "Id" => Some(Value::Str("kimo".into())),
+        "Title" => Some(Value::Str("Kimo".into())),
         "Status" => Some(Value::Str("Active".into())),
         "WindowId" => Some(Value::Int32(0)),
         "IconName" => Some(Value::Str(String::new())),
@@ -903,7 +903,7 @@ fn sni_property(name: &str, icon: &Icon) -> Option<Value> {
                 signature: "(ii)".to_string(),
                 values: Vec::new(),
             },
-            Value::Str("Jimao".into()),
+            Value::Str("Kimo".into()),
             Value::Str(String::new()),
         ])),
         "ItemIsMenu" => Some(Value::Bool(false)),
@@ -1080,16 +1080,16 @@ fn serve(bus: &mut Bus, ctx: &egui::Context, icon: &Icon) -> Result<(), String> 
 /// runs without a tray icon.
 pub fn spawn(ctx: egui::Context) {
     let Some(icon) = icon_argb(APP_PNG) else {
-        eprintln!("jimao tray: could not decode the tray icon");
+        eprintln!("kimo tray: could not decode the tray icon");
         return;
     };
     let result = std::thread::Builder::new()
-        .name("jimao-tray".to_string())
+        .name("kimo-tray".to_string())
         .spawn(move || {
             let mut bus = match Bus::connect() {
                 Ok(bus) => bus,
                 Err(e) => {
-                    eprintln!("jimao tray: {e}");
+                    eprintln!("kimo tray: {e}");
                     return;
                 }
             };
@@ -1140,11 +1140,11 @@ pub fn spawn(ctx: egui::Context) {
                 serve(&mut bus, &ctx, &icon)
             };
             if let Err(e) = run() {
-                eprintln!("jimao tray: {e}");
+                eprintln!("kimo tray: {e}");
             }
         });
     if let Err(e) = result {
-        eprintln!("jimao tray: could not spawn thread: {e}");
+        eprintln!("kimo tray: could not spawn thread: {e}");
     }
 }
 
@@ -1181,7 +1181,7 @@ mod tests {
 
     #[test]
     fn method_call_message_round_trips() {
-        let (signature, body) = build_body(&[Value::Str("jimao".into()), Value::UInt32(4)]);
+        let (signature, body) = build_body(&[Value::Str("kimo".into()), Value::UInt32(4)]);
         let fields = vec![
             (FIELD_DESTINATION, Value::Str("org.freedesktop.DBus".into())),
             (FIELD_PATH, Value::ObjectPath("/x".into())),
@@ -1198,7 +1198,7 @@ mod tests {
         assert_eq!(msg.signature.as_deref(), Some("su"));
         // Body: string + u32.
         let mut u = Unmarshal::new(&msg.body);
-        assert_eq!(u.string().as_deref(), Some("jimao"));
+        assert_eq!(u.string().as_deref(), Some("kimo"));
         assert_eq!(u.uint32(), Some(4));
     }
 
@@ -1414,7 +1414,7 @@ mod tests {
 
     #[test]
     fn uid_parses_from_proc_status() {
-        let sample = "Name:\tjimao\nUid:\t1000\t1000\t1000\t1000\nGid:\t1000\n";
+        let sample = "Name:\tkimo\nUid:\t1000\t1000\t1000\t1000\nGid:\t1000\n";
         // Reuse the same parsing logic on a sample.
         let line = sample.lines().find(|l| l.starts_with("Uid:")).unwrap();
         assert_eq!(line.split_whitespace().nth(1), Some("1000"));
