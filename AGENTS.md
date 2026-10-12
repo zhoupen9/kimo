@@ -94,6 +94,7 @@ src/models.rs           Account / Protocol / TlsMode / MailMessage (serde types)
 src/error.rs            MailError + MailResult
 src/fonts.rs            installed-font discovery (ttf-parser scan) + egui font installation
 src/storage.rs          XDG paths, accounts.json, per-account FolderCache/AccountCache
+src/theme.rs            theme choice + the light/dark color schemes and their egui Visuals
 src/mail.rs             raw RFC 5322 bytes → MailMessage (mail-parser; HTML kept for rendering)
 src/html.rs             HTML mail → egui widgets (subset: blocks, lists, tables, links, inline styles)
 src/blitz_render.rs     HTML mail → rasterized page via Blitz (headless render, net provider, fonts)
@@ -167,7 +168,9 @@ Event (mpsc) ──► drain_events() at frame start ──► merge into Accoun
   fallback). Family *names* are stored, not paths, so the file survives font
   updates; a name that no longer resolves is simply ignored. Older files may
   still carry a `render_mode` field from the removed WebKitGTK renderer; it
-  is ignored on load — do not reuse that name.
+  is ignored on load — do not reuse that name. The palette that the theme
+  resolves to is *not* in this file; it is a compiled-in default, see the
+  color-scheme bullet under Conventions.
 - `~/.local/share/kimo/cache/<account-id>.json` — `AccountCache` with one
   `FolderCache` per folder (name, uidvalidity, synced flag, messages).
   Messages carry inline `cid:` images as base64, so caches of image-heavy
@@ -213,10 +216,35 @@ Event (mpsc) ──► drain_events() at frame start ──► merge into Accoun
   `egui::Modal` (backdrop click or Escape closes it) with a sidebar of
   pages — **Accounts** (account list, use/remove, and the add-account form
   in place of the list) and **Appearance** (theme, Simple/Blitz HTML
-  renderer, and the interface/fixed-width fonts, all persisted in
-  `settings.json`). Configuration belongs on a page there, not as another
+  renderer, the interface/fixed-width fonts — all persisted in
+  `settings.json` — plus a read-only preview of the palette the theme
+  resolves to). Configuration belongs on a page there, not as another
   title-bar toggle; the title bar keeps only actions (switching accounts,
   syncing, window controls).
+- Colors live in one place, `src/theme.rs`. `Theme` (system/light/dark — the
+  only part that is persisted) resolves to a `ColorScheme`, and both defaults
+  are filled in slot by slot, `ColorScheme::light()` and
+  `ColorScheme::dark()`: surfaces (panel, window, card, hover, input, code,
+  border), text and weak text, accent / selection / link, warn / danger /
+  danger_hover, and the avatar palette — shared by both themes on purpose, so
+  that a sender keeps its color when the theme changes.
+  `ColorScheme::visuals()` maps the scheme onto egui's `Visuals` for every
+  stock widget, while `theme::install` also parks the scheme in the context,
+  where the hand-painted UI (title bar, folder rows, message cards, avatars,
+  spinners) reads it back through `theme::of`. So a color is added to the
+  scheme and nowhere else — no literals in `app.rs` — and stock-widget slots
+  stay reachable through egui itself (`ui.visuals().error_fg_color` is the
+  scheme's `danger`, `widgets.active.bg_fill` its `selection`). egui derives
+  its own weak/strong text variants by tinting the body color towards the
+  panel, so `RichText::weak()` is close to, but not the same as, the scheme's
+  `text_weak`; the folder and message rows use the latter. Preferences →
+  Appearance previews the resolved scheme (`ColorScheme::swatches`,
+  `theme::hex`) but the palette is not editable yet, which is why nothing
+  about it is written back to `settings.json`. `theme.rs`'s tests pin the
+  contrast floors (body text ≥ 4.5:1 on its panel, accent ≥ 3:1, text on the
+  selection and hover fills ≥ 4.5:1, the close glyph on its red ≥ 4.5:1, both
+  schemes' surfaces on opposite sides of the brightness scale); keep them green
+  when you touch a color.
 - Fonts are discovered, never fetched through fontconfig (hard rule 1):
   `fonts::scan()` walks the usual directories and reads each face's `name`
   table with ttf-parser. That took ~210 ms for the ~1000 installed faces on

@@ -8,7 +8,8 @@
 //!
 //! Preferences open from the title bar's cog as an `egui::Modal`: the
 //! Accounts page holds the account list and the add-account form, the
-//! Appearance page the theme and the HTML renderer. That renderer draws the
+//! Appearance page the theme (which resolves to a `theme::ColorScheme`), the
+//! HTML renderer and the fonts. That renderer draws the
 //! mail either as egui widgets (`crate::html`) or rasterized by Blitz
 //! (`crate::blitz_render`) on a worker thread.
 
@@ -21,44 +22,10 @@ use crate::fonts::FontFamily;
 use crate::models::{Account, MailMessage, Protocol, TlsMode};
 use crate::storage::{self, FolderCache, Settings};
 use crate::sync::{self, Event, Job};
+use crate::theme::{self, ColorScheme, Theme};
 
 /// Below this window width the navigation bar collapses automatically.
 const NAV_AUTO_COLLAPSE_WIDTH: f32 = 640.0;
-
-/// UI color scheme. "System" follows the OS preference (best-effort
-/// detection, see `system_prefers_dark`).
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum Theme {
-    System,
-    Light,
-    Dark,
-}
-
-impl Theme {
-    fn label(self) -> &'static str {
-        match self {
-            Theme::System => "System",
-            Theme::Light => "Light",
-            Theme::Dark => "Dark",
-        }
-    }
-
-    fn as_str(self) -> &'static str {
-        match self {
-            Theme::System => "system",
-            Theme::Light => "light",
-            Theme::Dark => "dark",
-        }
-    }
-
-    fn parse(s: &str) -> Self {
-        match s {
-            "light" => Theme::Light,
-            "dark" => Theme::Dark,
-            _ => Theme::System,
-        }
-    }
-}
 
 /// Which renderer draws the HTML body in the reading pane.
 ///
@@ -848,7 +815,7 @@ impl KimoApp {
             _ => {
                 ui.vertical_centered(|ui| {
                     ui.add_space(24.0);
-                    ui.spinner();
+                    ui.add(egui::Spinner::new().color(theme::of(ui.ctx()).accent));
                     ui.label(
                         egui::RichText::new("Rendering HTML with Blitz…")
                             .small()
@@ -892,18 +859,10 @@ impl KimoApp {
     }
 
     /// Apply the selected theme to the context, resolving "system" against
-    /// the cached OS preference.
+    /// the cached OS preference. The resolved scheme is what the hand-painted
+    /// parts of the UI read back through `theme::of`.
     fn apply_theme(&self, ctx: &egui::Context) {
-        let dark = match self.theme {
-            Theme::Dark => true,
-            Theme::Light => false,
-            Theme::System => self.system_dark,
-        };
-        ctx.set_visuals(if dark {
-            egui::Visuals::dark()
-        } else {
-            egui::Visuals::light()
-        });
+        theme::install(ctx, self.theme.scheme(self.system_dark));
     }
 
     /// Messages of the currently selected folder, filtered and sorted for display.
@@ -965,6 +924,7 @@ impl KimoApp {
     fn titlebar(&mut self, ui: &mut egui::Ui) {
         let bar = ui.available_rect_before_wrap();
         let visuals = ui.visuals().clone();
+        let scheme = theme::of(ui.ctx());
         let maximized = ui.input(|i| i.viewport().maximized.unwrap_or(false));
 
         #[derive(Clone, Copy)]
@@ -992,14 +952,15 @@ impl KimoApp {
             );
             let fg = if resp.hovered() {
                 let bg = match ctrl {
-                    Ctrl::Close => egui::Color32::from_rgb(232, 17, 35),
+                    Ctrl::Close => scheme.danger_hover,
                     _ => visuals.widgets.hovered.bg_fill,
                 };
                 ui.painter().rect_filled(rect, 0.0, bg);
                 match ctrl {
-                    // White reads best on the close red; elsewhere keep the
-                    // theme text color so the glyph survives light visuals.
-                    Ctrl::Close => egui::Color32::WHITE,
+                    // The scheme's on-danger color reads best on the close
+                    // red; elsewhere keep the theme text color so the glyph
+                    // survives light visuals.
+                    Ctrl::Close => scheme.on_danger,
                     _ => visuals.text_color(),
                 }
             } else {
@@ -1135,10 +1096,10 @@ impl KimoApp {
                             continue;
                         };
                         if state.syncing {
-                            row.spinner()
+                            row.add(egui::Spinner::new().color(scheme.accent))
                                 .on_hover_text(format!("{}: syncing…", account.name));
                         } else if let Some(err) = &state.error {
-                            row.label(egui::RichText::new("⚠").color(egui::Color32::RED))
+                            row.label(egui::RichText::new("⚠").color(scheme.danger))
                                 .on_hover_text(format!("{}: {err}", account.name));
                         }
                     }
@@ -1177,6 +1138,7 @@ impl KimoApp {
 
     /// Left column: folders of the selected account.
     fn nav(&mut self, ui: &mut egui::Ui) {
+        let scheme = theme::of(ui.ctx());
         egui::ScrollArea::vertical()
             .auto_shrink([false, false])
             .show(ui, |ui| {
@@ -1221,14 +1183,14 @@ impl KimoApp {
                     // mailboxes keep one glyph.
                     let open = selected && kind == FolderKind::Folder;
                     let icon = self.folder_icons.get(&(kind, open)).cloned();
-                    let row = folder_row(ui, icon.as_ref(), &display, unread, selected);
+                    let row = folder_row(ui, scheme, icon.as_ref(), &display, unread, selected);
                     if row.clicked() {
                         self.select_folder(account.id.clone(), folder, account.protocol);
                     }
                 }
                 if syncing && folders_were_empty {
                     ui.add_space(4.0);
-                    ui.spinner();
+                    ui.add(egui::Spinner::new().color(scheme.accent));
                 }
                 if let Some(err) = error {
                     ui.add_space(4.0);
@@ -1236,7 +1198,7 @@ impl KimoApp {
                     ui.label(
                         egui::RichText::new(format!("⚠ {err}"))
                             .small()
-                            .color(egui::Color32::RED),
+                            .color(scheme.danger),
                     );
                 }
             });
@@ -1293,7 +1255,7 @@ impl KimoApp {
     /// subject and a content preview stacked on the right.
     fn message_row(&mut self, ui: &mut egui::Ui, msg: &MailMessage) {
         let is_selected = self.selected_message.as_deref() == Some(msg.uid.as_str());
-        let visuals = ui.visuals().clone();
+        let scheme = theme::of(ui.ctx());
         let (rect, resp) = ui.allocate_exact_size(
             egui::vec2(ui.available_width(), MESSAGE_ROW_HEIGHT),
             egui::Sense::click(),
@@ -1301,13 +1263,13 @@ impl KimoApp {
 
         let painter = ui.painter();
         if is_selected {
-            painter.rect_filled(rect.shrink(1.0), 4.0, visuals.selection.bg_fill);
+            painter.rect_filled(rect.shrink(1.0), 4.0, scheme.selection);
         } else if resp.hovered() {
-            painter.rect_filled(rect.shrink(1.0), 4.0, visuals.faint_bg_color);
+            painter.rect_filled(rect.shrink(1.0), 4.0, scheme.hover);
         }
         painter.line_segment(
             [rect.left_bottom(), rect.right_bottom()],
-            egui::Stroke::new(1.0_f32, visuals.widgets.noninteractive.bg_stroke.color),
+            egui::Stroke::new(1.0_f32, scheme.border),
         );
 
         // Avatar: deterministic color per sender, initial centered in it.
@@ -1315,23 +1277,23 @@ impl KimoApp {
         painter.circle_filled(
             avatar_center,
             AVATAR_DIAMETER / 2.0,
-            sender_color(&msg.from),
+            sender_color(scheme, &msg.from),
         );
         painter.text(
             avatar_center,
             egui::Align2::CENTER_CENTER,
             sender_initial(&msg.from),
             egui::FontId::proportional(AVATAR_FONT_SIZE),
-            egui::Color32::WHITE,
+            scheme.avatar_text,
         );
 
         let text_left = avatar_center.x + AVATAR_DIAMETER / 2.0 + 10.0;
         let text_right = rect.right() - 10.0;
         // Unread mail keeps the full-contrast text color; read mail is muted.
         let main_color = if msg.seen {
-            visuals.weak_text_color()
+            scheme.text_weak
         } else {
-            visuals.text_color()
+            scheme.text
         };
 
         // First row: timestamp right-aligned, sender truncated before it.
@@ -1339,14 +1301,14 @@ impl KimoApp {
             f.layout_no_wrap(
                 display_date(msg),
                 egui::FontId::proportional(12.0),
-                visuals.weak_text_color(),
+                scheme.text_weak,
             )
         });
         let date_pos = egui::pos2(
             text_right - date_galley.size().x,
             rect.top() + 20.0 - date_galley.size().y * 0.5,
         );
-        painter.galley(date_pos, date_galley, visuals.weak_text_color());
+        painter.galley(date_pos, date_galley, scheme.text_weak);
         let sender_max_width = (date_pos.x - text_left - 12.0).max(40.0);
         let sender = truncate_galley(ui.ctx(), &msg.from, 14.0, main_color, sender_max_width);
         painter.galley(
@@ -1379,13 +1341,13 @@ impl KimoApp {
             ui.ctx(),
             &preview,
             12.0,
-            visuals.weak_text_color(),
+            scheme.text_weak,
             text_right - text_left,
         );
         painter.galley(
             egui::pos2(text_left, rect.top() + 57.0 - preview.size().y * 0.5),
             preview,
-            visuals.weak_text_color(),
+            scheme.text_weak,
         );
 
         if resp.clicked() {
@@ -1598,7 +1560,7 @@ impl KimoApp {
                         let confirming =
                             self.confirm_delete.as_deref() == Some(account.id.as_str());
                         let label = if confirming {
-                            egui::RichText::new("Remove?").color(egui::Color32::RED)
+                            egui::RichText::new("Remove?").color(ui.visuals().error_fg_color)
                         } else {
                             egui::RichText::new("Remove")
                         };
@@ -1754,7 +1716,7 @@ impl KimoApp {
     fn appearance_page(&mut self, ui: &mut egui::Ui) {
         ui.label(egui::RichText::new("Theme").strong());
         ui.horizontal(|ui| {
-            for theme in [Theme::System, Theme::Light, Theme::Dark] {
+            for theme in Theme::ALL {
                 if ui.radio(self.theme == theme, theme.label()).clicked() {
                     self.theme = theme;
                     if theme == Theme::System {
@@ -1837,7 +1799,61 @@ impl KimoApp {
             self.persist_settings();
             self.apply_fonts();
         }
+
+        ui.add_space(12.0);
+        ui.separator();
+        ui.add_space(8.0);
+
+        color_scheme_preview(ui, self.theme.scheme(self.system_dark));
     }
+}
+
+/// Preferences → Appearance: the palette the selected theme resolves to, so
+/// the defaults are visible without a mail open. Read-only: the scheme is not
+/// configurable yet, it only documents what the app draws with.
+fn color_scheme_preview(ui: &mut egui::Ui, scheme: ColorScheme) {
+    ui.label(egui::RichText::new("Color scheme").strong());
+    ui.label(
+        egui::RichText::new(format!("{} — the defaults Kimo ships with.", scheme.name))
+            .small()
+            .weak(),
+    );
+    ui.add_space(4.0);
+    egui::Grid::new("color-swatches")
+        .num_columns(2)
+        .spacing([16.0, 4.0])
+        .show(ui, |ui| {
+            for (index, (name, color)) in scheme.swatches().into_iter().enumerate() {
+                ui.horizontal(|ui| {
+                    swatch(ui, color);
+                    ui.label(egui::RichText::new(format!("{name} {}", theme::hex(color))).small());
+                });
+                if index % 2 == 1 {
+                    ui.end_row();
+                }
+            }
+        });
+    ui.add_space(6.0);
+    ui.horizontal(|ui| {
+        ui.label(egui::RichText::new("Avatars").small().weak());
+        for color in scheme.avatar {
+            let (rect, _) = ui.allocate_exact_size(egui::vec2(12.0, 12.0), egui::Sense::hover());
+            ui.painter().circle_filled(rect.center(), 6.0, color);
+        }
+    });
+}
+
+/// One color chip in the Appearance preview, outlined so that the near-white
+/// slots stay visible on a light panel.
+fn swatch(ui: &mut egui::Ui, color: egui::Color32) {
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(12.0, 12.0), egui::Sense::hover());
+    ui.painter().rect_filled(rect, 2.0, color);
+    ui.painter().rect_stroke(
+        rect,
+        2.0,
+        egui::Stroke::new(1.0_f32, ui.visuals().widgets.noninteractive.bg_stroke.color),
+        egui::StrokeKind::Inside,
+    );
 }
 
 impl eframe::App for KimoApp {
@@ -1978,6 +1994,8 @@ fn draw_blitz_page(ui: &mut egui::Ui, page: &RasterizedPage) {
     let uv = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
     for tile in &page.tiles {
         let rect = egui::Rect::from_min_size(origin + tile.offset * fit, tile.size * fit);
+        // White is egui's "no tint" (it multiplies), not a scheme color: the
+        // page is shown exactly as Blitz rasterized it.
         ui.painter()
             .image(tile.texture.id(), rect, uv, egui::Color32::WHITE);
     }
@@ -2012,18 +2030,6 @@ const AVATAR_DIAMETER: f32 = 32.0;
 /// Font size of the avatar's initial, ~0.47 of the diameter (as at 38.0).
 const AVATAR_FONT_SIZE: f32 = 15.0;
 
-/// Deterministic, readable-on-white-text avatar colors (Material palette).
-const AVATAR_COLORS: &[egui::Color32] = &[
-    egui::Color32::from_rgb(229, 57, 53),
-    egui::Color32::from_rgb(66, 133, 244),
-    egui::Color32::from_rgb(52, 168, 83),
-    egui::Color32::from_rgb(251, 140, 0),
-    egui::Color32::from_rgb(142, 36, 170),
-    egui::Color32::from_rgb(0, 150, 136),
-    egui::Color32::from_rgb(121, 85, 72),
-    egui::Color32::from_rgb(236, 64, 122),
-];
-
 /// Decode a stored inline image (base64) into an egui texture. Runs on the
 /// UI thread but only once per message/cid; inline mail images are small.
 fn decode_inline_image(
@@ -2043,11 +2049,13 @@ fn decode_inline_image(
     Some(ctx.load_texture("inline-image", pixels, Default::default()))
 }
 
-fn sender_color(from: &str) -> egui::Color32 {
+/// Deterministic avatar fill for a sender, from the scheme's palette — the
+/// same palette in both themes, so a sender keeps its color.
+fn sender_color(scheme: ColorScheme, from: &str) -> egui::Color32 {
     let hash = from
         .bytes()
         .fold(0u32, |h, b| h.wrapping_mul(31).wrapping_add(b as u32));
-    AVATAR_COLORS[(hash as usize) % AVATAR_COLORS.len()]
+    scheme.avatar[(hash as usize) % scheme.avatar.len()]
 }
 
 /// First character of the display name (or e-mail local part), for avatars.
@@ -2103,9 +2111,12 @@ fn truncate_galley(
 /// One row of the folder list: kind icon, name, and the unread count on the
 /// right. The whole row is the click target and carries the selection
 /// highlight — a `selectable_label` would leave the icon outside its own
-/// highlight and put the count inside the name.
+/// highlight and put the count inside the name. The colors come straight from
+/// the scheme instead of from egui's widget states, which is what lets an
+/// unread folder read brighter than a read one.
 fn folder_row(
     ui: &mut egui::Ui,
+    scheme: ColorScheme,
     icon: Option<&egui::TextureHandle>,
     name: &str,
     unread: usize,
@@ -2121,18 +2132,18 @@ fn folder_row(
     if !ui.is_rect_visible(rect) {
         return response;
     }
-    let visuals = ui.style().interact_selectable(&response, selected);
-    if selected || response.hovered() {
-        ui.painter()
-            .rect_filled(rect, 3.0_f32, visuals.weak_bg_fill);
+    // The scheme, not egui's widget states: a selected row gets the selection
+    // fill, a hovered one the hover fill, and nothing else.
+    if selected {
+        ui.painter().rect_filled(rect, 3.0_f32, scheme.selection);
+    } else if response.hovered() {
+        ui.painter().rect_filled(rect, 3.0_f32, scheme.hover);
     }
     // Unread folders read brighter than read ones, as the plain labels did.
-    let color = if selected {
-        visuals.text_color()
-    } else if unread > 0 {
-        ui.visuals().strong_text_color()
+    let color = if selected || unread > 0 {
+        scheme.text
     } else {
-        ui.visuals().weak_text_color()
+        scheme.text_weak
     };
 
     let mut left = rect.left() + 4.0;
@@ -2548,14 +2559,6 @@ mod tests {
     }
 
     #[test]
-    fn theme_parses_known_values_and_defaults_to_system() {
-        assert_eq!(Theme::parse("dark"), Theme::Dark);
-        assert_eq!(Theme::parse("light"), Theme::Light);
-        assert_eq!(Theme::parse("nonsense"), Theme::System);
-        assert_eq!(Theme::parse(""), Theme::System);
-    }
-
-    #[test]
     fn gtk_dark_flag_parsing() {
         assert!(ini_flag_is_true(
             "[Settings]\ngtk-application-prefer-dark-theme=true\n",
@@ -2599,8 +2602,14 @@ mod tests {
 
     #[test]
     fn sender_color_is_deterministic() {
-        assert_eq!(sender_color("a@b.c"), sender_color("a@b.c"));
-        assert_ne!(sender_color("a@b.c"), sender_color("other@b.c"));
+        assert_eq!(
+            sender_color(theme::DARK, "a@b.c"),
+            sender_color(theme::LIGHT, "a@b.c")
+        );
+        assert_ne!(
+            sender_color(theme::DARK, "a@b.c"),
+            sender_color(theme::DARK, "other@b.c")
+        );
     }
 
     #[test]

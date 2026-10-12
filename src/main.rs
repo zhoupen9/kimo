@@ -17,6 +17,7 @@ mod protocol;
 mod render_bench;
 mod storage;
 mod sync;
+mod theme;
 mod tray;
 
 fn main() -> eframe::Result {
