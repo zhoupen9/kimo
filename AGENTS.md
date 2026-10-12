@@ -202,11 +202,12 @@ Event (mpsc) ──► drain_events() at frame start ──► merge into Accoun
   `search::run` on a worker and answers `Event::SearchResults { seq, hits }`.
   Every request takes a new `seq`, and the UI drops an answer whose `seq` is not
   the current one, so a query typed over never shows the previous mail. The
-  popup waits for the typing to stop (`SEARCH_SETTLE`, `search_settle`) and
-  Enter skips the wait; `search_applied` is the query the results on screen
-  already answer, which is what keeps an unchanged query from searching again
-  every frame. The request is pumped from `KimoApp::update`, not from the
-  message list: the popup that edits the query can be open over any column.
+  title-bar field and the popup both wait for the typing to stop
+  (`SEARCH_SETTLE`, `search_settle`) and Enter skips the wait;
+  `search_applied` is the query the results on screen already answer, which is
+  what keeps an unchanged query from searching again every frame. The request
+  is pumped from `KimoApp::update`, not from the message list: the field and
+  the popup that edit the query sit outside every column.
 - Remote mutations are limited to `UID STORE +FLAGS.SILENT (\Seen)` (IMAP).
   POP3 never deletes or mutates anything server-side.
 
@@ -305,18 +306,19 @@ Event (mpsc) ──► drain_events() at frame start ──► merge into Accoun
   active the list shows `search_results` instead of the selected folder, and
   `message_card` paints both kinds of row), and the reading pane on the right
   with a "No mail selected" placeholder.
-- Search is a popup, not a bar in the column. The title-bar magnifier (or
-  Ctrl+F) opens `search_modal`, an `egui::Modal` holding the free text, the
-  scope combo and the filter grid the column used to carry, with the live
+- Search lives in the title bar and in the popup it opens, never in the
+  column. The title-bar field *is* the query — one string, so whatever the
+  popup holds is what the field shows, and typing in either searches as you
+  stop (`SEARCH_SETTLE`); Enter in the field opens the popup, as does a click
+  on the magnifier beside it or Ctrl+F. `search_modal`, an `egui::Modal`, adds
+  the scope combo and the filter grid the column used to carry, with the live
   result count along its bottom; Enter in any of its boxes (or the Search
   button) applies the query and closes it, and Clear empties it without
-  closing. The search runs while the popup is open (`SEARCH_SETTLE` after the
-  last keystroke), so closing it is not a cancel. Nothing else about a search
+  closing, so closing the popup is never a cancel. Nothing else about a search
   is drawn: the message list starts straight at the rows — the folder's mail or
   the hits — because a header over them was noise the project owner asked to
-  drop, and the only sign that a query is what the column shows is the
-  magnifier turning accent-colored. The popup is therefore also the only place
-  to change or end a query, and nothing about one is persisted.
+  drop, and the magnifier turning accent-colored is the only sign that a query
+  is what the column shows. Nothing about a query is persisted.
 - A message row (`message_card`; the folder list and the search results share
   it, only the third line differs — the preview, or *account · folder — match*)
   separates unread mail by *weight*, not by color: the sender
@@ -339,10 +341,10 @@ Event (mpsc) ──► drain_events() at frame start ──► merge into Accoun
   application icon (the brand, and the leftmost thing in the bar: the same
   embedded PNG the tray serves, downscaled once at startup because egui has
   no mipmaps to filter a 256 px source down to 18 pt), the nav collapse
-  toggle, the icon-only sync and search buttons, the preferences cog, drag area,
-  double-click maximize, and the minimize/maximize/close buttons sent as
-  `ViewportCommand`s. Don't
-  re-enable system decorations.
+  toggle, the icon-only sync button, the search field with its magnifier, the
+  preferences cog, drag area, double-click maximize, and the
+  minimize/maximize/close buttons sent as `ViewportCommand`s. Don't re-enable
+  system decorations.
 - `preferences_modal()` is the one place to configure Kimo: an
   `egui::Modal` (backdrop click or Escape closes it) with a sidebar of
   pages — **Accounts** (account list with use/edit/remove, and the

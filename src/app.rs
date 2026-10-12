@@ -7,10 +7,10 @@
 //! as a collapsible section of its folders), message list, reading pane.
 //!
 //! Two `egui::Modal`s open from the title bar. The magnifier is search: the
-//! free text, the scope and the filters, which used to be a bar above the
-//! message list. The column itself carries no search chrome — only the
-//! magnifier turning accent-colored says a search is what it is showing. The
-//! cog is Preferences:
+//! free text lives in the field beside it, the scope and the filters in the
+//! popup, all of it once a bar above the message list. The column carries no
+//! search chrome of its own — the magnifier turning accent-colored is what says
+//! a search is what it is showing. The cog is Preferences:
 //! its Accounts page holds the account list and the add/edit account form, its
 //! Appearance page the theme (which resolves to a `theme::ColorScheme`), the
 //! HTML renderer and the fonts. That renderer draws the mail either as egui
@@ -1283,12 +1283,14 @@ impl KimoApp {
                     paint_sync_icon(row.painter(), sync.rect, visuals.text_color());
                     sync.on_hover_text("Sync all accounts");
 
-                    // Search: the query and its filters live in the popup this
-                    // opens. The glyph takes the accent while a search is what
-                    // the message list is showing, so the title bar says so
-                    // even when the strip above the results is scrolled away.
+                    // Search: the magnifier opens the popup (scope, filters and
+                    // the count), and the field beside it is the same query —
+                    // one string, so whatever is searched for anywhere is what
+                    // is written here. Typing in the field searches as you
+                    // stop, like typing in the popup does; the glyph takes the
+                    // accent while a search is what the message list shows.
                     let searching = self.search.is_active();
-                    let search = row.add_sized([24.0, 22.0], egui::Button::new(""));
+                    let search = row.add_sized([22.0, 22.0], egui::Button::new(""));
                     if search.clicked() {
                         self.open_search();
                     }
@@ -1298,11 +1300,17 @@ impl KimoApp {
                         visuals.text_color()
                     };
                     paint_search_icon(row.painter(), search.rect, search_color);
-                    search.on_hover_text(if searching {
-                        "Search mail — one is active (Ctrl+F)"
-                    } else {
-                        "Search mail (Ctrl+F)"
-                    });
+                    search.on_hover_text("Search mail — filters and scope (Ctrl+F)");
+                    let field = row.add(
+                        egui::TextEdit::singleline(&mut self.search.text)
+                            .hint_text("Search mail…")
+                            .desired_width(TITLEBAR_SEARCH_WIDTH),
+                    );
+                    if entered(&field, row) {
+                        // Enter opens the popup, where the query can be
+                        // narrowed; the search itself already ran live.
+                        self.open_search();
+                    }
 
                     // Per-account status: spinner while syncing, warning on error.
                     for account in self.accounts.clone() {
@@ -2530,6 +2538,10 @@ impl eframe::App for KimoApp {
 
 const TITLEBAR_HEIGHT: f32 = 30.0;
 const TITLEBAR_BUTTON_WIDTH: f32 = 42.0;
+/// Width of the title bar's search field. Fixed rather than filling: the bar
+/// also carries the drag surface, and it should not move around with the
+/// length of a query.
+const TITLEBAR_SEARCH_WIDTH: f32 = 190.0;
 /// Side of the square brand icon at the left of the title bar.
 const BRAND_ICON_SIZE: f32 = 18.0;
 
