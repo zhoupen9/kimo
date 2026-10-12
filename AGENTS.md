@@ -311,12 +311,12 @@ Event (mpsc) ──► drain_events() at frame start ──► merge into Accoun
   result count along its bottom; Enter in any of its boxes (or the Search
   button) applies the query and closes it, and Clear empties it without
   closing. The search runs while the popup is open (`SEARCH_SETTLE` after the
-  last keystroke), so closing it is not a cancel — which is why
-  `search_strip` sits above the results: one line naming what they answer
-  (`query_label`, with an account or folder scope included), the count, an
-  Edit button and a ✕ that clears the search and goes back to the folder. The
-  title-bar magnifier turns accent-colored while a search is active, and
-  nothing about a query is persisted.
+  last keystroke), so closing it is not a cancel. Nothing else about a search
+  is drawn: the message list starts straight at the rows — the folder's mail or
+  the hits — because a header over them was noise the project owner asked to
+  drop, and the only sign that a query is what the column shows is the
+  magnifier turning accent-colored. The popup is therefore also the only place
+  to change or end a query, and nothing about one is persisted.
 - A message row (`message_card`; the folder list and the search results share
   it, only the third line differs — the preview, or *account · folder — match*)
   separates unread mail by *weight*, not by color: the sender

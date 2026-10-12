@@ -8,8 +8,9 @@
 //!
 //! Two `egui::Modal`s open from the title bar. The magnifier is search: the
 //! free text, the scope and the filters, which used to be a bar above the
-//! message list, plus a one-line strip over the results saying what the query
-//! currently is — the popup is not always on screen. The cog is Preferences:
+//! message list. The column itself carries no search chrome — only the
+//! magnifier turning accent-colored says a search is what it is showing. The
+//! cog is Preferences:
 //! its Accounts page holds the account list and the add/edit account form, its
 //! Appearance page the theme (which resolves to a `theme::ColorScheme`), the
 //! HTML renderer and the fonts. That renderer draws the mail either as egui
@@ -1461,12 +1462,12 @@ impl KimoApp {
             return;
         }
 
-        // The query itself is edited in the popup; all the column shows is
-        // what it answers and the way back to the folders. Running the search
-        // — and the settle clock — is the frame's business, since the popup
-        // can be open over any of this.
+        // No search chrome in the column: the query, its count and the way out
+        // of it are the popup's (the title-bar magnifier opens it, Clear or an
+        // emptied box ends the search). Running the search — and the settle
+        // clock — is the frame's business, since the popup can be open over
+        // any of this.
         if self.search.is_active() {
-            self.search_strip(ui);
             self.search_results(ui);
         } else {
             self.folder_messages(ui);
@@ -1640,77 +1641,6 @@ impl KimoApp {
         }
         self.show_search = open;
         run_now
-    }
-
-    /// The line above the results while a search is active: what it answers,
-    /// how many hits, and the two ways out of it. The popup is not always on
-    /// screen, so this is what keeps an active query — and a filter set ten
-    /// minutes ago — from being invisible.
-    fn search_strip(&mut self, ui: &mut egui::Ui) {
-        let scheme = theme::of(ui.ctx());
-        let summary = self.search_summary();
-        let mut edit = false;
-        let mut clear = false;
-        ui.horizontal(|ui| {
-            let (icon, _) = ui.allocate_exact_size(egui::vec2(14.0, 14.0), egui::Sense::hover());
-            paint_search_icon(ui.painter(), icon, scheme.text_weak);
-            ui.label(egui::RichText::new(summary).small().color(scheme.text));
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                // U+00D7, not a fancier cross: the UI font has no glyph for
-                // the typographic one, and a missing glyph is a tofu box.
-                if ui
-                    .small_button("×")
-                    .on_hover_text("Clear the search")
-                    .clicked()
-                {
-                    clear = true;
-                }
-                if ui
-                    .small_button("Edit")
-                    .on_hover_text("Change the query (Ctrl+F)")
-                    .clicked()
-                {
-                    edit = true;
-                }
-                if self.search_running {
-                    ui.spinner();
-                } else {
-                    ui.label(
-                        egui::RichText::new(results_label(self.search_hits.len()))
-                            .small()
-                            .weak(),
-                    );
-                }
-            });
-        });
-        ui.separator();
-        if edit {
-            self.open_search();
-        }
-        if clear {
-            self.clear_search();
-        }
-    }
-
-    /// End the search: the middle column goes back to the selected folder, and
-    /// the worker is told at once instead of waiting out the settle clock.
-    fn clear_search(&mut self) {
-        self.search = SearchQuery::default();
-        self.search_pending = None;
-        self.spawn_search();
-    }
-
-    /// One line naming what the results on screen answer; see `query_label`.
-    fn search_summary(&self) -> String {
-        let account = match &self.search.scope {
-            Scope::Account(id) => self
-                .accounts
-                .iter()
-                .find(|account| &account.id == id)
-                .map(|account| account.name.as_str()),
-            _ => None,
-        };
-        query_label(&self.search, account)
     }
 
     /// The middle column while no search is active: the selected folder's mail.
@@ -2652,31 +2582,6 @@ fn results_label(count: usize) -> String {
     } else {
         format!("{count} results")
     }
-}
-
-/// One line naming what a query asks for: the free text (or "Filters" when only
-/// the boxes are set) and any scope narrower than all mail. `account` is the
-/// display name for an account scope, when it is known; an inactive query is the
-/// empty string.
-fn query_label(query: &SearchQuery, account: Option<&str>) -> String {
-    if !query.is_active() {
-        return String::new();
-    }
-    let mut parts = Vec::new();
-    let text = query.text.trim();
-    if text.is_empty() {
-        parts.push("Filters".to_string());
-    } else {
-        parts.push(format!("“{text}”"));
-    }
-    match &query.scope {
-        Scope::AllMail => {}
-        Scope::Account(_) => parts.push(account.unwrap_or("one account").to_string()),
-        Scope::Folder { folder, .. } => {
-            parts.push(crate::protocol::imap::decode_mailbox_name(folder))
-        }
-    }
-    parts.join(" · ")
 }
 
 /// What to do about the search popup's current contents.
@@ -3682,63 +3587,5 @@ mod tests {
         assert_eq!(results_label(12), "12 results");
         // At the limit the database stopped asking, so the count is a floor.
         assert_eq!(results_label(SEARCH_LIMIT), "200+ results");
-    }
-
-    #[test]
-    fn the_strip_names_what_the_results_answer() {
-        // Nothing asked for: no strip at all.
-        assert_eq!(query_label(&SearchQuery::default(), None), "");
-
-        // The free text is the whole story.
-        let typed = SearchQuery {
-            text: "  invoice  ".to_string(),
-            ..SearchQuery::default()
-        };
-        assert_eq!(query_label(&typed, None), "“invoice”");
-
-        // A search with only boxes set says so: the text is not the only way
-        // to ask for something.
-        let unread = SearchQuery {
-            unread_only: true,
-            ..SearchQuery::default()
-        };
-        assert_eq!(query_label(&unread, None), "Filters");
-        let mixed = SearchQuery {
-            text: "report".to_string(),
-            from: "caiwu".to_string(),
-            ..SearchQuery::default()
-        };
-        assert_eq!(
-            query_label(&mixed, None),
-            "“report”",
-            "the boxes are the popup's detail, not the strip's"
-        );
-
-        // A narrower scope is named; an account's name comes from the caller.
-        let scoped = SearchQuery {
-            text: "report".to_string(),
-            scope: Scope::Account("work".to_string()),
-            ..SearchQuery::default()
-        };
-        assert_eq!(query_label(&scoped, Some("Work")), "“report” · Work");
-        assert_eq!(query_label(&scoped, None), "“report” · one account");
-
-        // A folder scope shows the readable name of a wire-form mailbox.
-        let folder = SearchQuery {
-            text: "report".to_string(),
-            scope: Scope::Folder {
-                account_id: "work".to_string(),
-                folder: "&XfJT0ZAB-".to_string(),
-            },
-            ..SearchQuery::default()
-        };
-        assert_eq!(query_label(&folder, None), "“report” · 已发送");
-
-        // All mail narrows nothing, so it adds nothing.
-        let every = SearchQuery {
-            text: "report".to_string(),
-            ..SearchQuery::default()
-        };
-        assert_eq!(query_label(&every, Some("Work")), "“report”");
     }
 }
