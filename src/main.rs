@@ -23,6 +23,11 @@ fn main() -> eframe::Result {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("Kimo")
+            // Wayland app_id. winit only calls xdg_toplevel.set_app_id when
+            // this is set, so without it compositors (niri, sway, …) report an
+            // empty App ID and window rules cannot match. Matches the XDG
+            // directory names (and a future kimo.desktop basename).
+            .with_app_id("kimo")
             .with_decorations(false) // custom titlebar drawn in app.rs
             .with_inner_size([1280.0, 800.0]),
         ..Default::default()
