@@ -1,7 +1,7 @@
 //! Test-only measurement harness for the two mail body renderers.
 //!
 //!     cargo test --release -- --ignored --nocapture bench_render
-//!     KIMO_BENCH_CACHE=~/.local/share/kimo/cache/ACCOUNT.json \
+//!     KIMO_BENCH_DB=~/.local/share/kimo/mail.db \
 //!         cargo test --release -- --ignored --nocapture bench_render
 //!
 //! The built-in renderer draws a message on *every* frame the reading pane is
@@ -16,8 +16,6 @@
 
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
-
-use base64::Engine as _;
 
 use crate::blitz_render::{self, Cancellation, PageRequest};
 use crate::html::{self, HtmlContext};
@@ -37,8 +35,8 @@ const REPS: usize = 7;
 struct Case {
     name: String,
     html: String,
-    /// Inline cid: parts as (Content-ID, base64 PNG).
-    inline: Vec<(String, String)>,
+    /// Inline cid: parts as (Content-ID, PNG bytes).
+    inline: Vec<(String, Vec<u8>)>,
 }
 
 impl Case {
@@ -111,8 +109,8 @@ const DIGEST: &[(&str, &str)] = &[
 /// product grid and a footer. Roughly 20 KB - the p90 of the mail cached on
 /// this machine (the largest is 97 KB).
 fn complex_mail() -> Case {
-    let logo = png_base64(96, 32);
-    let hero = png_base64(600, 180);
+    let logo = png_bytes(96, 32);
+    let hero = png_bytes(600, 180);
     let mut html = String::with_capacity(32 * 1024);
     html.push_str(
         "<!doctype html><html><head><meta charset=\"utf-8\"><title>Weekly digest</title><style>\
@@ -229,9 +227,9 @@ fn complex_mail() -> Case {
     }
 }
 
-/// A small PNG as base64, the way inline images are cached, so both renderers
-/// get the same bytes the app would hand them.
-fn png_base64(width: u32, height: u32) -> String {
+/// A small PNG, the way inline images are stored, so both renderers get the
+/// same bytes the app would hand them.
+fn png_bytes(width: u32, height: u32) -> Vec<u8> {
     let image = image::RgbaImage::from_fn(width, height, |x, y| {
         image::Rgba([(x % 256) as u8, (y % 256) as u8, 190, 255])
     });
@@ -239,54 +237,58 @@ fn png_base64(width: u32, height: u32) -> String {
     image::DynamicImage::ImageRgba8(image)
         .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
         .expect("encode png");
-    base64::engine::general_purpose::STANDARD.encode(&png)
+    png
 }
 
-/// Real mail from the on-disk cache, when KIMO_BENCH_CACHE names an
-/// AccountCache JSON: the median-sized and the largest HTML body, so the
-/// fixtures above can be checked against what this client actually receives.
+/// Real mail from the mail database, when KIMO_BENCH_DB names a `mail.db`: the
+/// median-sized and the largest HTML body, so the fixtures above can be checked
+/// against what this client actually receives.
 fn cached_cases() -> Vec<Case> {
-    let Some(path) = std::env::var_os("KIMO_BENCH_CACHE") else {
+    let Some(path) = std::env::var_os("KIMO_BENCH_DB") else {
         return Vec::new();
     };
-    let text = std::fs::read_to_string(&path).expect("read cache");
-    let cache: crate::storage::AccountCache = serde_json::from_str(&text).expect("parse cache");
-    let mut messages: Vec<&crate::models::MailMessage> = cache
-        .folders
-        .iter()
-        .flat_map(|folder| folder.messages.iter())
-        .filter(|message| message.body_html.is_some())
+    let conn = rusqlite::Connection::open(&path).expect("open the mail database");
+    let rows: Vec<(i64, String, String)> = conn
+        .prepare(
+            "SELECT id, subject, body_html FROM messages
+              WHERE body_html IS NOT NULL ORDER BY length(body_html)",
+        )
+        .expect("prepare")
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+        .expect("query")
+        .filter_map(Result::ok)
         .collect();
-    if messages.is_empty() {
-        println!("KIMO_BENCH_CACHE has no HTML bodies");
+    if rows.is_empty() {
+        println!("KIMO_BENCH_DB has no HTML bodies");
         return Vec::new();
     }
-    messages.sort_by_key(|message| message.body_html.as_deref().unwrap_or("").len());
-    let mut picked: Vec<&crate::models::MailMessage> = Vec::new();
-    if let Some(median) = messages.get(messages.len() / 2) {
-        picked.push(median);
-    }
-    if let Some(largest) = messages.last() {
+    let mut picked: Vec<&(i64, String, String)> = vec![&rows[rows.len() / 2]];
+    if let Some(largest) = rows.last() {
         picked.push(largest);
     }
     let mut seen = HashSet::new();
     picked
         .into_iter()
-        .filter(|message| seen.insert(message.uid.clone()))
-        .map(|message| {
-            let html = message.body_html.clone().unwrap_or_default();
+        .filter(|row| seen.insert(row.0))
+        .map(|(id, subject, html)| {
             let kb = html.len() as f64 / 1024.0;
-            let subject: String = message.subject.chars().take(24).collect();
+            let subject: String = subject.chars().take(24).collect();
             Case {
                 name: format!("cache {kb:.1} KB  {subject}"),
-                html,
-                inline: message
-                    .inline_images
-                    .iter()
-                    .map(|image| (image.cid.clone(), image.data_base64.clone()))
-                    .collect(),
+                html: html.clone(),
+                inline: inline_images(&conn, *id),
             }
         })
+        .collect()
+}
+
+/// The inline `cid:` parts of one stored message, as the renderer wants them.
+fn inline_images(conn: &rusqlite::Connection, message_id: i64) -> Vec<(String, Vec<u8>)> {
+    conn.prepare("SELECT cid, data FROM inline_images WHERE message_id = ?1 ORDER BY cid")
+        .expect("prepare")
+        .query_map([message_id], |row| Ok((row.get(0)?, row.get(1)?)))
+        .expect("query")
+        .filter_map(Result::ok)
         .collect()
 }
 
@@ -416,10 +418,7 @@ fn inline_textures(ctx: &egui::Context, case: &Case) -> HashMap<String, egui::Te
     case.inline
         .iter()
         .filter_map(|(cid, data)| {
-            let bytes = base64::engine::general_purpose::STANDARD
-                .decode(data)
-                .ok()?;
-            let decoded = image::load_from_memory(&bytes).ok()?.to_rgba8();
+            let decoded = image::load_from_memory(data).ok()?.to_rgba8();
             let size = [decoded.width() as usize, decoded.height() as usize];
             let pixels = egui::ColorImage::from_rgba_unmultiplied(size, decoded.as_raw());
             let key = format!("bench-{cid}");
@@ -515,8 +514,8 @@ fn bench_render() {
         PANE_HEIGHT_PT,
         (PANE_WIDTH_PT * SCALE).round(),
     );
-    if std::env::var_os("KIMO_BENCH_CACHE").is_none() {
-        println!("(set KIMO_BENCH_CACHE=<account>.json to add real cached mail)");
+    if std::env::var_os("KIMO_BENCH_DB").is_none() {
+        println!("(set KIMO_BENCH_DB=<mail.db> to add real cached mail)");
     }
     println!();
 

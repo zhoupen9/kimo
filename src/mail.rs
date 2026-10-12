@@ -86,10 +86,9 @@ pub fn parse(raw: &[u8], uid: &str, seen: bool) -> MailMessage {
     }
 }
 
-/// Attachment parts that are images with a Content-ID — the `cid:` targets
-/// of HTML mail — with their decoded bytes, base64 for the JSON cache.
+/// Attachment parts that are images with a Content-ID — the `cid:` targets of
+/// HTML mail — with their raw bytes, which is how the database stores them.
 fn collect_inline_images(m: &mail_parser::Message<'_>) -> Vec<crate::models::InlineImage> {
-    use base64::Engine as _;
     m.attachments()
         .filter_map(|part| {
             let cid = part.content_id()?.trim_matches(['<', '>']).to_string();
@@ -104,7 +103,7 @@ fn collect_inline_images(m: &mail_parser::Message<'_>) -> Vec<crate::models::Inl
             Some(crate::models::InlineImage {
                 cid,
                 content_type: mime,
-                data_base64: base64::engine::general_purpose::STANDARD.encode(part.contents()),
+                data: part.contents().to_vec(),
             })
         })
         .collect()
@@ -245,12 +244,8 @@ mod tests {
         let inline = msg.inline_images.first().expect("inline image captured");
         assert_eq!(inline.cid, "logo@example.com");
         assert_eq!(inline.content_type, "image/png");
-        // "aGVsbG8gaW5saW5lIQ==" decodes to "hello inline!".
-        use base64::Engine as _;
-        let bytes = base64::engine::general_purpose::STANDARD
-            .decode(&inline.data_base64)
-            .unwrap();
-        assert_eq!(bytes, b"hello inline!");
+        // The part's base64 ("aGVsbG8gaW5saW5lIQ==") is already decoded here.
+        assert_eq!(inline.data, b"hello inline!");
     }
 
     #[test]

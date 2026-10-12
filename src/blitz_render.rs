@@ -167,8 +167,8 @@ pub struct PageRequest {
     pub viewport_height: u32,
     /// Device pixels per CSS pixel (`egui::Context::pixels_per_point`).
     pub scale: f32,
-    /// Inline `cid:` parts of this message: `(Content-ID, base64 data)`.
-    pub inline_images: Vec<(String, String)>,
+    /// Inline `cid:` parts of this message: `(Content-ID, raw bytes)`.
+    pub inline_images: Vec<(String, Vec<u8>)>,
     /// This render's place in the queue; see `Cancellation`.
     pub ticket: Ticket,
 }
@@ -452,12 +452,10 @@ struct Budget {
 }
 
 impl MailNet {
-    fn new(inline_images: &[(String, String)]) -> Self {
+    fn new(inline_images: &[(String, Vec<u8>)]) -> Self {
         let mut inline = HashMap::new();
         for (cid, data) in inline_images {
-            if let Some(bytes) = decode_base64(data) {
-                inline.insert(cid.clone(), bytes);
-            }
+            inline.insert(cid.clone(), data.clone());
         }
         Self {
             inline,
@@ -852,7 +850,7 @@ mod tests {
 
     #[test]
     fn cid_parts_reach_the_net_provider() {
-        let net = MailNet::new(&[("logo@example.com".into(), "UE5H".into())]);
+        let net = MailNet::new(&[("logo@example.com".into(), b"PNG".to_vec())]);
         assert_eq!(net.load("cid:logo@example.com"), b"PNG");
         assert_eq!(net.load("cid:missing@example.com"), Vec::<u8>::new());
         // Reserved base host: relative references are never fetched.

@@ -37,8 +37,23 @@ ureq = { version = "2.10", features = ["tls", "gzip"] }
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp", "bmp"] }
 sha1_smol = "1.0"
 
-# Inline cid: images are cached as base64 in the JSON message cache.
+# Base64 for `data:` URLs in HTML mail (Blitz decodes those); inline `cid:`
+# images are raw bytes in the mail database, not base64.
 base64 = "0.22"
+
+# Mail storage: a single SQLite database (`~/.local/share/kimo/mail.db`) holds
+# the accounts and all cached mail, and its FTS5 index backs the search UI.
+# This is the project's one C dependency and an owner-approved exception to hard
+# rule 1: `bundled` compiles the SQLite amalgamation — with FTS5 — through `cc`
+# at build time and links it statically, so there is no system library, no
+# pkg-config and no runtime requirement; the requested storage is specifically
+# SQLite + FTS5. Everything else stays pure Rust: do not widen this into a habit.
+# default-features off drops rusqlite's wasm FFI crate (sqlite-wasm-rs),
+# which a native build never uses; "cache" keeps its statement cache.
+rusqlite = { version = "0.40", default-features = false, features = [
+    "bundled",
+    "cache",
+] }
 
 # Full-fidelity HTML mail renderer (optional second content renderer, see
 # src/blitz_render.rs): Blitz is a pure-Rust DOM/CSS/layout engine — stylo for

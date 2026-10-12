@@ -10,7 +10,13 @@ pub enum MailError {
     Protocol(String),
     /// Login or authentication was rejected.
     Auth(String),
+    /// A settings file could not be read or written.
     Json(serde_json::Error),
+    /// The mail database (SQLite) failed.
+    Db(rusqlite::Error),
+    /// The storage layer failed without SQLite being at fault: the database
+    /// could not be opened, an old cache file could not be read, …
+    Storage(String),
 }
 
 impl fmt::Display for MailError {
@@ -20,7 +26,9 @@ impl fmt::Display for MailError {
             MailError::Tls(e) => write!(f, "TLS error: {e}"),
             MailError::Protocol(msg) => write!(f, "protocol error: {msg}"),
             MailError::Auth(msg) => write!(f, "authentication failed: {msg}"),
-            MailError::Json(e) => write!(f, "storage error: {e}"),
+            MailError::Json(e) => write!(f, "settings error: {e}"),
+            MailError::Db(e) => write!(f, "storage error: {e}"),
+            MailError::Storage(message) => write!(f, "storage error: {message}"),
         }
     }
 }
@@ -31,7 +39,8 @@ impl std::error::Error for MailError {
             MailError::Io(e) => Some(e),
             MailError::Tls(e) => Some(e),
             MailError::Json(e) => Some(e),
-            MailError::Protocol(_) | MailError::Auth(_) => None,
+            MailError::Db(e) => Some(e),
+            MailError::Storage(_) | MailError::Protocol(_) | MailError::Auth(_) => None,
         }
     }
 }
@@ -51,6 +60,12 @@ impl From<rustls::Error> for MailError {
 impl From<serde_json::Error> for MailError {
     fn from(e: serde_json::Error) -> Self {
         MailError::Json(e)
+    }
+}
+
+impl From<rusqlite::Error> for MailError {
+    fn from(e: rusqlite::Error) -> Self {
+        MailError::Db(e)
     }
 }
 

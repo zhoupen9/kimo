@@ -57,8 +57,9 @@ Kimo is a desktop **email client** GUI written in pure Rust:
   `image-missing` placeholder without a desktop file. `Exec=kimo` has to
   resolve in `$PATH` — GLib silently rejects a desktop file whose `Exec`
   names a program it cannot find — which the file's header comments record.
-- **Persistence:** JSON files under XDG dirs (`~/.config/kimo/accounts.json`,
-  `~/.local/share/kimo/cache/<account>.json`). No external database.
+- **Persistence:** accounts and cached mail live in one SQLite database,
+  `~/.local/share/kimo/mail.db` (mode 0600, WAL), with an FTS5 index over the
+  mail. `~/.config/kimo/settings.json` is the only JSON left.
 
 ## Hard rules
 
@@ -70,6 +71,14 @@ Kimo is a desktop **email client** GUI written in pure Rust:
    for this project. (A WebKitGTK "web view" renderer used to exist behind
    an optional `webview` feature; it has been removed. Do not reintroduce
    C-library exceptions to this rule.)
+   **One exception, approved by the project owner:** `rusqlite` with the
+   `bundled` feature, for the mail database. `bundled` compiles the SQLite
+   amalgamation (with FTS5) through `cc` at build time and links it
+   statically — no system library, no pkg-config, no runtime dependency —
+   because the storage the project asked for is specifically SQLite + FTS5.
+   It is the only C in the tree: do not let it become a precedent, and do not
+   swap it for `bundled-sqlcipher`, a `libsqlite3-sys` built against a system
+   library, or any other C crate.
 2. **No async runtime.** Networking runs on short-lived `std::thread` jobs
    (see `src/sync.rs`); results come back over `std::sync::mpsc`. Do not
    introduce tokio, async-std, or an executor.
@@ -103,10 +112,12 @@ done. There is no CI yet — that discipline is on you.
 ```
 src/main.rs             entry point; installs the rustls provider (ring + FFDHE), launches eframe
 src/app.rs              all UI: KimoApp state, panels, preferences modal, event handling
-src/models.rs           Account / Protocol / TlsMode / MailMessage (serde types)
+src/models.rs           Account / Protocol / TlsMode / MailMessage (plain types: nothing is serialised any more)
 src/error.rs            MailError + MailResult
 src/fonts.rs            installed-font discovery (ttf-parser scan) + egui font installation
-src/storage.rs          XDG paths, accounts.json, per-account FolderCache/AccountCache
+src/storage.rs          XDG paths, settings.json, remote-resource cache, Mailbox/Folder (in memory)
+src/db.rs               the mail database: schema + migrations, accounts, folders, messages, the old-JSON import
+src/search.rs           mail search: the CJK bigram index that feeds the FTS `cjk` column
 src/theme.rs            theme choice + the light/dark color schemes and their egui Visuals
 src/mail.rs             raw RFC 5322 bytes → MailMessage (mail-parser; HTML kept for rendering)
 src/html.rs             HTML mail → egui widgets (subset: blocks, lists, tables, links, inline styles)
@@ -127,18 +138,25 @@ src/protocol/pop3.rs    minimal POP3 client (USER/PASS, STAT, UIDL, RETR w/ de-s
 
 ```
 UI (app.rs update)
-   │  spawn(Job)                                   UI thread — no sockets, ever
+   │  spawn(Job)                                   UI thread — no sockets, no DB writes
    ▼
 worker thread (sync.rs)
    │  ImapClient / Pop3Client over MailStream      blocking I/O is fine here
+   │  db::save_messages / db::set_seen             the only place the DB is written
    ▼
 Event (mpsc) ──► drain_events() at frame start ──► merge into AccountUiState
-                                                    └► storage::save_cache
 ```
 
+- The UI thread touches the database exactly once, in `KimoApp::new`
+  (`db::load_accounts` + `db::load_mailboxes`, replacing the JSON parse that
+  used to happen there); every frame after that works from the in-memory
+  `AccountUiState`, and every write is a worker's (see `src/db.rs`).
 - Merge identity: IMAP messages are keyed by `(UIDVALIDITY, UID)` per folder
-  (a UIDVALIDITY change clears the folder cache); POP3 messages are keyed by
-  their UIDL string, and `\Seen` is local-only.
+  (a UIDVALIDITY change clears the folder); POP3 messages are keyed by their
+  UIDL string, and `\Seen` is local-only. The database does the same in SQL:
+  `db::save_messages` upserts on `(account_id, folder, uid)`, deletes a
+  folder's rows first when its UIDVALIDITY moved, and keeps `seen` monotonic
+  (`max(messages.seen, excluded.seen)`).
 - Remote HTML-mail resources (images, stylesheets) load by default — an
   explicit decision by the project owner, accepting that this leaks the
   reader's IP and open timing to senders (tracking pixels). Fetches run as
@@ -171,16 +189,29 @@ Event (mpsc) ──► drain_events() at frame start ──► merge into Accoun
 
 ### Storage layout
 
-- `~/.config/kimo/accounts.json` — the account list, **including passwords,
-  in plain text**. This is a documented, accepted limitation for now; do not
-  silently change the format, and do not add a secrets daemon (see rule 1).
-  An account's `id` is minted once (the slug of its name, numbered if taken)
-  and is never reused: it names the account's cache file, so renaming an
-  account in Preferences keeps its cached mail on disk. Editing an account is
-  an in-place update of the same id; the cached mail is thrown away only when
-  the form's endpoint (protocol, host, port, username) changed, because only
-  then can the old cache describe somebody else's mailbox
-  (`AccountForm::points_elsewhere`).
+- `~/.local/share/kimo/mail.db` — the one database (SQLite, WAL, mode 0600
+  because it holds the passwords). `accounts` (id, name, protocol, host,
+  port, username, password, tls, position), `folders` (account_id, name,
+  uidvalidity, synced), `messages` keyed by `(account_id, folder, uid)` with
+  the subject, addresses, both bodies, the preview and the bigram column,
+  `attachments` and `inline_images` (raw bytes, not base64) as children of a
+  message, and the external-content FTS5 table `messages_fts`, which only the
+  three triggers in `db::SCHEMA_SQL` ever write. `PRAGMA foreign_keys = ON`
+  per connection and `ON DELETE CASCADE` all the way down, so
+  `Job::DeleteAccount` is one `DELETE FROM accounts`. `PRAGMA user_version`
+  is the schema version: a change to the DDL is a new `if version < n` branch
+  in `db::migrate`, never an edit to what an existing database already has.
+- The account list is **in the database, passwords in plain text**. That is a
+  documented, accepted limitation; do not add a secrets daemon (rule 1). An
+  account's `id` is minted once (the slug of its name, numbered if taken) and
+  is never reused: it is the key of the account's row and of all of its mail,
+  so renaming an account in Preferences keeps both. `position` is the
+  navigation column's order (new accounts append, an edit keeps its place).
+  Editing an account is an in-place update of the same id; its stored mail is
+  purged only when the form's endpoint (protocol, host, port, username)
+  changed, because only then can it describe somebody else's mailbox
+  (`AccountForm::points_elsewhere` — the purge runs inside the same sync job,
+  `Job::Sync { purge }`, so nothing can reorder those two steps).
 - `~/.config/kimo/settings.json` — UI settings: the theme
   (`system`/`light`/`dark`; "system" resolves via GTK/KDE config files, no
   subprocesses or D-Bus), `html_renderer` (`egui`/`blitz`, absent means
@@ -192,10 +223,14 @@ Event (mpsc) ──► drain_events() at frame start ──► merge into Accoun
   is ignored on load — do not reuse that name. The palette that the theme
   resolves to is *not* in this file; it is a compiled-in default, see the
   color-scheme bullet under Conventions.
-- `~/.local/share/kimo/cache/<account-id>.json` — `AccountCache` with one
-  `FolderCache` per folder (name, uidvalidity, synced flag, messages).
-  Messages carry inline `cid:` images as base64, so caches of image-heavy
-  mail can grow to a few MB.
+- `~/.local/share/kimo/cache/resources/<sha1hex>.bin` — fetched remote
+  mail resources, keyed by the SHA-1 of their URL. The rest of that directory
+  is what the pre-database layout left behind: `<account-id>.json` mail
+  caches and `~/.config/kimo/accounts.json`. `db::import_legacy_json` reads
+  both once, at `user_version` 0, imports them through the normal upsert path
+  and deletes each file it has read (one it cannot parse is left alone, and a
+  cache file whose account id is unknown is not imported at all). Keep that
+  code until no installation can still predate the database.
 - The project was renamed from Jimao, so a pre-rename `jimao` directory under
   either XDG root is moved to the `kimo` name the first time those paths are
   used (`storage::migrate_legacy_dir`); an existing `kimo` directory wins and
@@ -205,8 +240,10 @@ Event (mpsc) ──► drain_events() at frame start ──► merge into Accoun
 ## Conventions
 
 - Errors: return `MailResult<T>`; convert with `?` (From impls exist for
-  io/rustls/serde_json). Map server auth refusals to `MailError::Auth` so the
-  UI shows them distinctly from protocol bugs.
+  io/rustls/serde_json/rusqlite). `MailError::Db` is SQLite's own error and
+  `MailError::Storage` everything else the storage layer can fail at. Map
+  server auth refusals to `MailError::Auth` so the UI shows them distinctly
+  from protocol bugs.
 - Protocol clients are synchronous and single-purpose; add a method only
   when a sync job actually needs it.
 - Finite-field DH lives in `src/protocol/ffdhe.rs` and is deliberately narrow:
@@ -222,7 +259,7 @@ Event (mpsc) ──► drain_events() at frame start ──► merge into Accoun
   do not know. Supporting another such server means adding its prime to
   `GROUPS`, not loosening that equality check.
 - IMAP mailbox names stay in their wire form (possibly modified UTF-7) in
-  `Event`s, state and caches; `imap::decode_mailbox_name` decodes them for
+  `Event`s, state and the database; `imap::decode_mailbox_name` decodes them for
   display only. SELECT/UID STORE must always use the wire form — do not
   re-encode decoded names by hand.
 - Pure parsing helpers (e.g. `extract_uid`, `literal_size`, `html_to_text`)
@@ -347,8 +384,8 @@ Event (mpsc) ──► drain_events() at frame start ──► merge into Accoun
   `render_bench` (test-only, asserts nothing):
   `cargo test --release -- --ignored --nocapture bench_render` times both
   renderers on a short mail, a newsletter-shaped fixture and — with
-  `KIMO_BENCH_CACHE=<account>.json` — the median-sized and largest HTML
-  bodies in the disk cache. Note what the two numbers mean: the built-in
+  `KIMO_BENCH_DB=~/.local/share/kimo/mail.db` — the median-sized and largest
+  HTML bodies in the database. Note what the two numbers mean: the built-in
   renderer re-parses and re-lays out the body on *every* frame the reading
   pane is visible (there is no cache of the widget tree), while Blitz pays
   once per (message, pane width) on a worker thread.
@@ -381,15 +418,17 @@ Do not "fix" these casually — they are known:
   another size, or yet another custom prime, still fails the handshake with
   `SelectedUnofferedKxGroup`; see the FFDHE convention above for what to add.
 - No message deletion/expunge (IMAP `\Deleted` + EXPUNGE, POP3 `DELE`).
-- Credentials in plain text (see above); no OAuth2/XOAUTH2.
+- Credentials in plain text in `mail.db` (mode 0600, see above); no
+  OAuth2/XOAUTH2. The database is not encrypted, and the app never renames or
+  deletes it on its own: a corrupt file is the user's to move aside.
 - HTML mail renders through the in-egui subset renderer (`src/html.rs`).
   CSS is the `src/css.rs` subset (colors, fonts, sizes, display/visibility);
   compound selectors and layout CSS are ignored. Simple tables render as
   aligned grids; layout tables (block elements inside cells — most HTML
   mail) render as flowing full-width rows, because egui Grid sizes columns
   to the minimum wrapped width. `cid:` inline images render from the
-  attachment bytes stored on the message (`InlineImage`, base64 in the
-  cache). Improving fidelity here means improving this renderer — Blitz mode
+  attachment bytes stored on the message (`InlineImage.data`, the
+  `inline_images` table). Improving fidelity here means improving this renderer — Blitz mode
   is the escape hatch for mail this subset cannot lay out, not a replacement.
 - Blitz renders tables in the *separate* borders model: `blitz_render`'s
   `COMPAT_CSS` overrides `border-collapse` because blitz's collapsing paints
@@ -414,5 +453,7 @@ Do not "fix" these casually — they are known:
   image-heavy mail can take a few seconds (the disk cache makes the second
   one fast). Fonts are the curated disk set, not fontconfig's.
 - POP3 sync re-downloads bodies every time (UIDL lets us skip but is not
-  wired through the Job yet).
+  wired through the Job yet). The database upsert makes that a no-op for mail
+  that did not change — `ON CONFLICT … WHERE` returns no row and the message's
+  children are left alone — but the fetch itself still happens.
 - No IDLE/push for IMAP; sync is manual or on-startup.

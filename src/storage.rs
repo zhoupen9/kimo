@@ -1,12 +1,20 @@
-//! Local persistence: account configuration and per-account message caches,
-//! stored as JSON under the XDG config/data directories.
+//! Local persistence paths and settings.
+//!
+//! Accounts and cached mail live in the SQLite database (`crate::db`), at
+//! `~/.local/share/kimo/mail.db`. Before that they were JSON: the account list
+//! in `~/.config/kimo/accounts.json` and one `<account-id>.json` per account
+//! under the data directory. `db::import_legacy_json` reads those files once,
+//! on the first start after the upgrade, and deletes them.
+//!
+//! What is left here: the XDG paths, `settings.json` (UI preferences), and the
+//! on-disk cache for remote HTML-mail resources.
 
 use std::fs;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use crate::models::{Account, MailMessage};
+use crate::models::MailMessage;
 
 fn home() -> PathBuf {
     std::env::var("HOME")
@@ -53,12 +61,17 @@ pub fn data_dir() -> PathBuf {
     dir
 }
 
-pub fn load_accounts() -> Vec<Account> {
-    let path = config_dir().join("accounts.json");
-    fs::read_to_string(path)
-        .ok()
-        .and_then(|s| serde_json::from_str(&s).ok())
-        .unwrap_or_default()
+/// The one database holding every account and every cached message, plus its
+/// `-wal`/`-shm` sidecars once it is open.
+pub fn mail_db_path() -> PathBuf {
+    data_dir().join("mail.db")
+}
+
+/// The message cache directory of the pre-database layout:
+/// `<account-id>.json` files, imported once by `crate::db` and then deleted.
+/// The remote-resource cache lives in a subdirectory of it.
+pub fn cache_dir() -> PathBuf {
+    data_dir().join("cache")
 }
 
 /// UI settings (`~/.config/kimo/settings.json`).
@@ -98,20 +111,10 @@ pub fn save_settings(settings: &Settings) -> std::io::Result<()> {
     Ok(())
 }
 
-pub fn save_accounts(accounts: &[Account]) -> std::io::Result<()> {
-    let dir = config_dir();
-    fs::create_dir_all(&dir)?;
-    fs::write(
-        dir.join("accounts.json"),
-        serde_json::to_string_pretty(accounts)?,
-    )?;
-    Ok(())
-}
-
-/// Messages cached for one folder. IMAP folders also remember their
-/// UIDVALIDITY generation so a change invalidates stale UIDs.
-#[derive(Default, Clone, Serialize, Deserialize)]
-pub struct FolderCache {
+/// One folder's mail, as the app keeps it in memory. IMAP folders also
+/// remember their UIDVALIDITY generation so a change invalidates stale UIDs.
+#[derive(Default, Clone)]
+pub struct Folder {
     pub name: String,
     pub uidvalidity: Option<u32>,
     /// False until the first successful sync, so the UI can distinguish
@@ -120,31 +123,10 @@ pub struct FolderCache {
     pub messages: Vec<MailMessage>,
 }
 
-#[derive(Default, Clone, Serialize, Deserialize)]
-pub struct AccountCache {
-    pub folders: Vec<FolderCache>,
-}
-
-pub fn load_cache(account_id: &str) -> AccountCache {
-    let path = data_dir().join("cache").join(format!("{account_id}.json"));
-    fs::read_to_string(path)
-        .ok()
-        .and_then(|s| serde_json::from_str(&s).ok())
-        .unwrap_or_default()
-}
-
-pub fn save_cache(account_id: &str, cache: &AccountCache) -> std::io::Result<()> {
-    let dir = data_dir().join("cache");
-    fs::create_dir_all(&dir)?;
-    fs::write(
-        dir.join(format!("{account_id}.json")),
-        serde_json::to_string_pretty(cache)?,
-    )?;
-    Ok(())
-}
-
-pub fn delete_cache(account_id: &str) {
-    let _ = fs::remove_file(data_dir().join("cache").join(format!("{account_id}.json")));
+/// Every folder of one account, loaded from the database at startup.
+#[derive(Default, Clone)]
+pub struct Mailbox {
+    pub folders: Vec<Folder>,
 }
 
 // ----- remote resource cache -------------------------------------------------
@@ -154,10 +136,7 @@ pub fn delete_cache(account_id: &str) {
 /// `~/.local/share/kimo/cache/resources/<sha1hex>.bin`.
 fn resource_path(url: &str) -> PathBuf {
     let digest = sha1_smol::Sha1::from(url).digest().to_string();
-    data_dir()
-        .join("cache")
-        .join("resources")
-        .join(format!("{digest}.bin"))
+    cache_dir().join("resources").join(format!("{digest}.bin"))
 }
 
 pub fn load_resource(url: &str) -> Option<Vec<u8>> {
@@ -222,20 +201,5 @@ mod tests {
         assert!(legacy.exists(), "an existing kimo directory wins");
 
         let _ = fs::remove_dir_all(&root);
-    }
-
-    #[test]
-    fn cache_round_trip() {
-        let mut cache = AccountCache::default();
-        cache.folders.push(FolderCache {
-            name: "INBOX".into(),
-            uidvalidity: Some(7),
-            synced: true,
-            messages: vec![],
-        });
-        let json = serde_json::to_string(&cache).unwrap();
-        let back: AccountCache = serde_json::from_str(&json).unwrap();
-        assert_eq!(back.folders[0].name, "INBOX");
-        assert_eq!(back.folders[0].uidvalidity, Some(7));
     }
 }

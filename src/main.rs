@@ -5,6 +5,7 @@
 mod app;
 mod blitz_render;
 mod css;
+mod db;
 mod error;
 mod folders;
 mod fonts;
@@ -15,6 +16,7 @@ mod protocol;
 // Test-only measurement harness for the two HTML renderers; see the file.
 #[cfg(test)]
 mod render_bench;
+mod search;
 mod storage;
 mod sync;
 mod theme;

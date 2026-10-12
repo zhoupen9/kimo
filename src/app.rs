@@ -20,7 +20,7 @@ use std::time::{Duration, Instant};
 use crate::folders::{self, FolderKind};
 use crate::fonts::FontFamily;
 use crate::models::{Account, MailMessage, Protocol, TlsMode};
-use crate::storage::{self, FolderCache, Settings};
+use crate::storage::{self, Settings};
 use crate::sync::{self, Event, Job};
 use crate::theme::{self, ColorScheme, Theme};
 
@@ -123,6 +123,9 @@ pub struct KimoApp {
     /// the filesystem every frame. Refreshed on startup and whenever the
     /// theme cycles back to System.
     system_dark: bool,
+    /// Why the mail database is not being written to disk, when that is the
+    /// case; drawn as a one-line banner above the message list.
+    storage_warning: Option<String>,
     /// Remote images for HTML mail, keyed by URL; fetched on worker threads
     /// and cached in memory as egui textures (disk cache in storage).
     images: HashMap<String, ImageStatus>,
@@ -201,7 +204,9 @@ enum ImageStatus {
 #[derive(Default)]
 pub struct AccountUiState {
     pub folders: Vec<String>,
-    pub cache: storage::AccountCache,
+    /// The account's folders and their cached mail, loaded from the database
+    /// at startup and kept in memory (the DB is the durable copy).
+    pub mailbox: storage::Mailbox,
     pub syncing: bool,
     pub error: Option<String>,
 }
@@ -309,11 +314,24 @@ impl KimoApp {
         crate::fonts::install(&cc.egui_ctx, None, None);
 
         let settings = storage::load_settings();
-        let accounts = storage::load_accounts();
+        // The accounts and their mail live in the database; this is the one
+        // piece of storage I/O the UI thread does, and it replaces the JSON
+        // parse the app used to do here. Workers do everything else.
+        let accounts = crate::db::load_accounts().unwrap_or_else(|error| {
+            eprintln!("kimo: cannot read the accounts: {error}");
+            Vec::new()
+        });
+        let mailboxes = crate::db::load_mailboxes(
+            &accounts
+                .iter()
+                .map(|account| account.id.clone())
+                .collect::<Vec<_>>(),
+        )
+        .unwrap_or_default();
         let mut states = HashMap::new();
         for account in &accounts {
             let state = AccountUiState {
-                cache: storage::load_cache(&account.id),
+                mailbox: mailboxes.get(&account.id).cloned().unwrap_or_default(),
                 ..AccountUiState::default()
             };
             states.insert(account.id.clone(), state);
@@ -346,6 +364,7 @@ impl KimoApp {
             brand_icon,
             theme: Theme::parse(&settings.theme),
             system_dark: system_prefers_dark(),
+            storage_warning: crate::db::warning(),
             images: HashMap::new(),
             stylesheets: HashMap::new(),
             inline_textures: HashMap::new(),
@@ -372,7 +391,14 @@ impl KimoApp {
         sync::spawn(Job::ScanFonts, app.ctx.clone(), app.tx.clone());
 
         for account in app.accounts.clone() {
-            sync::spawn(Job::Sync { account }, app.ctx.clone(), app.tx.clone());
+            sync::spawn(
+                Job::Sync {
+                    account,
+                    purge: false,
+                },
+                app.ctx.clone(),
+                app.tx.clone(),
+            );
         }
         app
     }
@@ -407,10 +433,11 @@ impl KimoApp {
                 uidvalidity,
                 messages,
             } => {
-                let mut snapshot = None;
+                // The worker has already stored this batch; what follows is
+                // the in-memory copy the list and the reading pane draw from.
                 if let Some(state) = self.states.get_mut(&account_id) {
-                    if state.cache.folders.iter().all(|f| f.name != folder) {
-                        state.cache.folders.push(FolderCache {
+                    if state.mailbox.folders.iter().all(|f| f.name != folder) {
+                        state.mailbox.folders.push(storage::Folder {
                             name: folder.clone(),
                             uidvalidity: None,
                             synced: false,
@@ -418,7 +445,7 @@ impl KimoApp {
                         });
                     }
                     let fc = state
-                        .cache
+                        .mailbox
                         .folders
                         .iter_mut()
                         .find(|f| f.name == folder)
@@ -442,20 +469,11 @@ impl KimoApp {
                     }
                     sort_messages(&mut fc.messages);
                     fc.synced = true;
-                    snapshot = Some(state.cache.clone());
-                }
-                if let Some(cache) = snapshot {
-                    let _ = storage::save_cache(&account_id, &cache);
                 }
             }
             Event::SyncDone { account_id } => {
-                let mut snapshot = None;
                 if let Some(state) = self.states.get_mut(&account_id) {
                     state.syncing = false;
-                    snapshot = Some(state.cache.clone());
-                }
-                if let Some(cache) = snapshot {
-                    let _ = storage::save_cache(&account_id, &cache);
                 }
             }
             Event::SyncFailed { account_id, error } => {
@@ -504,7 +522,14 @@ impl KimoApp {
 
     fn sync_all(&mut self) {
         for account in self.accounts.clone() {
-            sync::spawn(Job::Sync { account }, self.ctx.clone(), self.tx.clone());
+            sync::spawn(
+                Job::Sync {
+                    account,
+                    purge: false,
+                },
+                self.ctx.clone(),
+                self.tx.clone(),
+            );
         }
     }
 
@@ -512,7 +537,7 @@ impl KimoApp {
     fn folder_unread(&self, account_id: &str, folder: &str) -> usize {
         self.states
             .get(account_id)
-            .and_then(|state| state.cache.folders.iter().find(|f| f.name == folder))
+            .and_then(|state| state.mailbox.folders.iter().find(|f| f.name == folder))
             .map(|f| f.messages.iter().filter(|m| !m.seen).count())
             .unwrap_or(0)
     }
@@ -525,7 +550,7 @@ impl KimoApp {
             .get(account_id)
             .map(|state| {
                 state
-                    .cache
+                    .mailbox
                     .folders
                     .iter()
                     .flat_map(|folder| folder.messages.iter())
@@ -541,7 +566,7 @@ impl KimoApp {
         self.selected_message = None;
 
         let needs_fetch = match self.states.get(&account_id) {
-            Some(state) => match state.cache.folders.iter().find(|f| f.name == folder) {
+            Some(state) => match state.mailbox.folders.iter().find(|f| f.name == folder) {
                 Some(fc) => !fc.synced,
                 None => true,
             },
@@ -553,7 +578,10 @@ impl KimoApp {
         if let Some(account) = self.accounts.iter().find(|a| a.id == account_id).cloned() {
             let job = match protocol {
                 Protocol::Imap => Job::SyncFolder { account, folder },
-                Protocol::Pop3 => Job::Sync { account },
+                Protocol::Pop3 => Job::Sync {
+                    account,
+                    purge: false,
+                },
             };
             sync::spawn(job, self.ctx.clone(), self.tx.clone());
         }
@@ -569,35 +597,28 @@ impl KimoApp {
         };
         let folder = self.selected_folder.clone().unwrap_or_default();
 
-        // Mark seen locally first so the UI reacts immediately.
-        let mut snapshot = None;
+        // Mark seen locally first so the UI reacts immediately; the row in the
+        // database is written by the job below, never on this thread.
         if let Some(state) = self.states.get_mut(&account_id) {
-            if let Some(fc) = state.cache.folders.iter_mut().find(|f| f.name == folder) {
+            if let Some(fc) = state.mailbox.folders.iter_mut().find(|f| f.name == folder) {
                 if let Some(existing) = fc.messages.iter_mut().find(|m| m.uid == msg.uid) {
                     existing.seen = true;
-                    snapshot = Some(state.cache.clone());
                 }
             }
-        }
-        if let Some(cache) = snapshot {
-            let _ = storage::save_cache(&account_id, &cache);
         }
 
-        // Then push the flag to the server (IMAP only; POP3 is local-only).
+        // Then hand the flag to a worker: IMAP pushes `\\Seen` to the server,
+        // POP3 has nothing to push, and both store it locally.
         if let Some(account) = self.accounts.iter().find(|a| a.id == account_id).cloned() {
-            if account.protocol == Protocol::Imap {
-                if let Ok(uid) = msg.uid.parse::<u32>() {
-                    sync::spawn(
-                        Job::MarkSeen {
-                            account,
-                            folder,
-                            uid,
-                        },
-                        self.ctx.clone(),
-                        self.tx.clone(),
-                    );
-                }
-            }
+            sync::spawn(
+                Job::MarkSeen {
+                    account,
+                    folder,
+                    uid: msg.uid.clone(),
+                },
+                self.ctx.clone(),
+                self.tx.clone(),
+            );
         }
     }
 
@@ -609,8 +630,15 @@ impl KimoApp {
             self.selected_folder = Some("INBOX".to_string());
             self.selected_message = None;
         }
-        let _ = storage::save_accounts(&self.accounts);
-        storage::delete_cache(account_id);
+        // The account row, and through its cascades every message of it, goes
+        // on a worker thread; the UI has already dropped its own copy.
+        sync::spawn(
+            Job::DeleteAccount {
+                account_id: account_id.to_string(),
+            },
+            self.ctx.clone(),
+            self.tx.clone(),
+        );
         self.forget_blitz_pages(account_id);
     }
 
@@ -643,18 +671,25 @@ impl KimoApp {
         };
 
         if switches_mailbox {
-            // The cache describes the mailbox the old settings reached, and
-            // the new ones may be a different server entirely: drop it
-            // rather than show mail from an account that is gone. The
-            // in-flight renders of its pages have to go too.
+            // What is stored describes the mailbox the old settings reached,
+            // and the new ones may be a different server entirely, so the job
+            // below purges it before fetching rather than show mail from an
+            // account that is gone. Its in-flight renders go too.
             self.states
                 .insert(account_id.clone(), AccountUiState::default());
-            storage::delete_cache(&account_id);
             self.forget_blitz_pages(&account_id);
         }
 
-        let _ = storage::save_accounts(&self.accounts);
-        sync::spawn(Job::Sync { account }, self.ctx.clone(), self.tx.clone());
+        // One job saves the account row, purges the mail when the endpoint
+        // moved and then syncs, so no second job can reorder those steps.
+        sync::spawn(
+            Job::Sync {
+                account,
+                purge: switches_mailbox,
+            },
+            self.ctx.clone(),
+            self.tx.clone(),
+        );
 
         if edited.is_none() {
             // Adding an account takes the window, like it always did.
@@ -781,7 +816,7 @@ impl KimoApp {
             inline_images: msg
                 .inline_images
                 .iter()
-                .map(|image| (image.cid.clone(), image.data_base64.clone()))
+                .map(|image| (image.cid.clone(), image.data.clone()))
                 .collect(),
             ticket,
         };
@@ -1018,7 +1053,7 @@ impl KimoApp {
         let Some(state) = self.states.get(account_id) else {
             return Vec::new();
         };
-        let Some(fc) = state.cache.folders.iter().find(|f| f.name == *folder) else {
+        let Some(fc) = state.mailbox.folders.iter().find(|f| f.name == *folder) else {
             return Vec::new();
         };
         let needle = self.filter.trim().to_lowercase();
@@ -1044,7 +1079,7 @@ impl KimoApp {
             return false;
         };
         state
-            .cache
+            .mailbox
             .folders
             .iter()
             .find(|f| f.name == *folder)
@@ -1345,6 +1380,16 @@ impl KimoApp {
 
     /// Middle column: filter bar plus the message list.
     fn mail_list(&mut self, ui: &mut egui::Ui) {
+        // The database could not be opened: the session works, nothing is
+        // saved, and this is the only place that says so.
+        if let Some(warning) = &self.storage_warning {
+            ui.label(
+                egui::RichText::new(format!("Mail is not being saved: {warning}"))
+                    .small()
+                    .color(theme::of(ui.ctx()).danger),
+            );
+            ui.separator();
+        }
         if self.accounts.is_empty() || self.selected_account.is_none() {
             ui.centered_and_justified(|ui| {
                 ui.heading("Kimo");
@@ -2209,17 +2254,13 @@ const ROW_DATE_FONT_SIZE: f32 = 11.0;
 const ROW_TITLE_FONT_SIZE: f32 = 12.0;
 const ROW_PREVIEW_FONT_SIZE: f32 = 11.0;
 
-/// Decode a stored inline image (base64) into an egui texture. Runs on the
-/// UI thread but only once per message/cid; inline mail images are small.
+/// Decode a stored inline image into an egui texture. Runs on the UI thread
+/// but only once per message/cid; inline mail images are small.
 fn decode_inline_image(
     ctx: &egui::Context,
     image: &crate::models::InlineImage,
 ) -> Option<egui::TextureHandle> {
-    use base64::Engine as _;
-    let bytes = base64::engine::general_purpose::STANDARD
-        .decode(&image.data_base64)
-        .ok()?;
-    let decoded = image::load_from_memory(&bytes).ok()?;
+    let decoded = image::load_from_memory(&image.data).ok()?;
     let rgba = decoded.to_rgba8();
     let pixels = egui::ColorImage::from_rgba_unmultiplied(
         [rgba.width() as usize, rgba.height() as usize],

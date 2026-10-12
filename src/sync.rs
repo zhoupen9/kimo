@@ -1,6 +1,7 @@
 //! Background sync jobs. The UI spawns a short-lived `std::thread` per job;
 //! results stream back as `Event`s over an mpsc channel and the egui context
-//! is nudged to repaint. The UI thread itself never touches a socket.
+//! is nudged to repaint. The UI thread itself never touches a socket, and it
+//! never writes to the database either: these jobs do that (see `crate::db`).
 //! Besides mail sync, jobs also fetch remote HTML-mail resources (images,
 //! stylesheets) over HTTPS.
 
@@ -8,6 +9,7 @@ use std::io::Read;
 use std::sync::mpsc::Sender;
 use std::time::Duration;
 
+use crate::db;
 use crate::error::{MailError, MailResult};
 use crate::mail;
 use crate::models::{Account, MailMessage, Protocol};
@@ -26,15 +28,21 @@ const FETCH_READ_TIMEOUT: Duration = Duration::from_secs(20);
 
 pub enum Job {
     /// Folder list (IMAP) plus the INBOX contents; for POP3, the whole drop.
-    Sync { account: Account },
+    /// `purge` drops the account's stored mail before fetching — for a new
+    /// account, or one whose endpoint just moved to another mailbox.
+    Sync { account: Account, purge: bool },
     /// Fetch one specific IMAP folder.
     SyncFolder { account: Account, folder: String },
-    /// Push `\Seen` back to the server (IMAP only).
+    /// Push `\Seen` back to the server (IMAP only) and store the flag in the
+    /// database (both protocols; POP3 has no server-side flags).
     MarkSeen {
         account: Account,
         folder: String,
-        uid: u32,
+        uid: String,
     },
+    /// Remove an account: its row, its folders and, through the cascades, every
+    /// message cached for it.
+    DeleteAccount { account_id: String },
     /// Download and decode a remote image referenced by HTML mail.
     FetchImage { url: String },
     /// Download a remote stylesheet referenced by HTML mail.
@@ -145,34 +153,66 @@ pub fn spawn(job: Job, ctx: egui::Context, tx: Sender<Event>) {
             let _ = tx.send(Event::FontsScanned(crate::fonts::scan()));
             ctx.request_repaint();
         }
+        Job::MarkSeen {
+            account,
+            folder,
+            uid,
+        } => {
+            // Not a sync: no spinner for a flag write, and the local half is
+            // stored whether or not the server accepts the push.
+            if let Err(error) = mark_seen(&account, &folder, &uid) {
+                let _ = tx.send(Event::SyncFailed {
+                    account_id: account.id.clone(),
+                    error: error.to_string(),
+                });
+            }
+            ctx.request_repaint();
+        }
+        Job::DeleteAccount { account_id } => {
+            if let Err(error) = db::delete_account(&account_id) {
+                let _ = tx.send(Event::SyncFailed {
+                    account_id,
+                    error: error.to_string(),
+                });
+            }
+            ctx.request_repaint();
+        }
         account_job => {
             let account_id = match &account_job {
-                Job::Sync { account }
-                | Job::SyncFolder { account, .. }
-                | Job::MarkSeen { account, .. } => account.id.clone(),
+                Job::Sync { account, .. } | Job::SyncFolder { account, .. } => account.id.clone(),
                 Job::FetchImage { .. }
                 | Job::FetchStylesheet { .. }
                 | Job::RenderHtml { .. }
-                | Job::ScanFonts => unreachable!(),
+                | Job::ScanFonts
+                | Job::MarkSeen { .. }
+                | Job::DeleteAccount { .. } => unreachable!(),
             };
             let _ = tx.send(Event::SyncStarted {
                 account_id: account_id.clone(),
             });
             let result = match account_job {
-                Job::Sync { account } => match account.protocol {
-                    Protocol::Imap => sync_imap_inbox(&account, &tx),
-                    Protocol::Pop3 => sync_pop3(&account, &tx),
-                },
+                Job::Sync { account, purge } => {
+                    // The account row comes first: the mail below refers to it,
+                    // and a brand-new account has to be durable before its mail
+                    // is. Purging, when the endpoint moved, is part of the same
+                    // job so nothing can reorder those steps.
+                    db::save_account(&account).and_then(|()| {
+                        if purge {
+                            db::purge_mail(&account.id)?;
+                        }
+                        match account.protocol {
+                            Protocol::Imap => sync_imap_inbox(&account, &tx),
+                            Protocol::Pop3 => sync_pop3(&account, &tx),
+                        }
+                    })
+                }
                 Job::SyncFolder { account, folder } => sync_imap_folder(&account, &folder, &tx),
-                Job::MarkSeen {
-                    account,
-                    folder,
-                    uid,
-                } => imap_mark_seen(&account, &folder, uid),
                 Job::FetchImage { .. }
                 | Job::FetchStylesheet { .. }
                 | Job::RenderHtml { .. }
-                | Job::ScanFonts => unreachable!(),
+                | Job::ScanFonts
+                | Job::MarkSeen { .. }
+                | Job::DeleteAccount { .. } => unreachable!(),
             };
             let _ = match result {
                 Ok(()) => tx.send(Event::SyncDone { account_id }),
@@ -268,6 +308,10 @@ fn sync_imap_inbox(account: &Account, tx: &Sender<Event>) -> MailResult<()> {
         let folders = client
             .list_folders()
             .unwrap_or_else(|_| vec!["INBOX".to_string()]);
+        // Remember the mailboxes first: a folder the database does not know
+        // would refuse the mail fetched for it below (the messages table has a
+        // foreign key onto folders).
+        db::save_folder_list(&account.id, &folders)?;
         let _ = tx.send(Event::Folders {
             account_id: account.id.clone(),
             folders,
@@ -302,12 +346,29 @@ fn fetch_folder_into(
             messages.push(mail::parse(&fetched.raw, &fetched.uid.to_string(), seen));
         }
     }
+    // Store before announcing: nothing may appear in the window that the
+    // database does not already have.
+    db::save_messages(&account.id, folder, info.uidvalidity, &messages)?;
     let _ = tx.send(Event::Messages {
         account_id: account.id.clone(),
         folder: folder.to_string(),
         uidvalidity: info.uidvalidity,
         messages,
     });
+    Ok(())
+}
+
+/// Store the flag locally and, for IMAP, push it to the server. The local
+/// write happens first: the mail is read either way, and a server that refuses
+/// the `STORE` must not lose that.
+fn mark_seen(account: &Account, folder: &str, uid: &str) -> MailResult<()> {
+    db::set_seen(&account.id, folder, uid)?;
+    if account.protocol == Protocol::Imap {
+        let number = uid
+            .parse::<u32>()
+            .map_err(|_| MailError::Protocol(format!("not an IMAP UID: {uid}")))?;
+        imap_mark_seen(account, folder, number)?;
+    }
     Ok(())
 }
 
@@ -334,6 +395,7 @@ fn sync_pop3(account: &Account, tx: &Sender<Event>) -> MailResult<()> {
             let raw = client.retr(num)?;
             messages.push(mail::parse(&raw, &uid, false));
         }
+        db::save_messages(&account.id, "INBOX", None, &messages)?;
         let _ = tx.send(Event::Messages {
             account_id: account.id.clone(),
             folder: "INBOX".to_string(),
