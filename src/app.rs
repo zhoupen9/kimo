@@ -1289,18 +1289,18 @@ impl KimoApp {
 
         let text_left = avatar_center.x + AVATAR_DIAMETER / 2.0 + 10.0;
         let text_right = rect.right() - 10.0;
-        // Unread mail keeps the full-contrast text color; read mail is muted.
-        let main_color = if msg.seen {
-            scheme.text_weak
-        } else {
-            scheme.text
-        };
+        // Sender and subject always take the body color — read mail is not
+        // muted — and unread mail is set heavier instead, so the two states
+        // stay apart without dimming half the list. Only the preview below is
+        // muted, always.
+        let title_color = scheme.text;
+        let unread = !msg.seen;
 
         // First row: timestamp right-aligned, sender truncated before it.
         let date_galley = ui.ctx().fonts(|f| {
             f.layout_no_wrap(
                 display_date(msg),
-                egui::FontId::proportional(12.0),
+                egui::FontId::proportional(ROW_DATE_FONT_SIZE),
                 scheme.text_weak,
             )
         });
@@ -1310,25 +1310,35 @@ impl KimoApp {
         );
         painter.galley(date_pos, date_galley, scheme.text_weak);
         let sender_max_width = (date_pos.x - text_left - 12.0).max(40.0);
-        let sender = truncate_galley(ui.ctx(), &msg.from, 14.0, main_color, sender_max_width);
-        painter.galley(
+        let sender = truncate_galley(
+            ui.ctx(),
+            &msg.from,
+            ROW_TITLE_FONT_SIZE,
+            title_color,
+            sender_max_width,
+        );
+        paint_row_text(
+            painter,
             egui::pos2(text_left, rect.top() + 20.0 - sender.size().y * 0.5),
             sender,
-            main_color,
+            title_color,
+            unread,
         );
 
         // Second row: subject.
         let subject = truncate_galley(
             ui.ctx(),
             &msg.subject,
-            14.0,
-            main_color,
+            ROW_TITLE_FONT_SIZE,
+            title_color,
             text_right - text_left,
         );
-        painter.galley(
+        paint_row_text(
+            painter,
             egui::pos2(text_left, rect.top() + 40.0 - subject.size().y * 0.5),
             subject,
-            main_color,
+            title_color,
+            unread,
         );
 
         // Third row: content preview, always muted.
@@ -1340,7 +1350,7 @@ impl KimoApp {
         let preview = truncate_galley(
             ui.ctx(),
             &preview,
-            12.0,
+            ROW_PREVIEW_FONT_SIZE,
             scheme.text_weak,
             text_right - text_left,
         );
@@ -2027,8 +2037,14 @@ fn draw_blitz_page(ui: &mut egui::Ui, page: &RasterizedPage) {
 /// Message-card geometry in the mail list.
 const MESSAGE_ROW_HEIGHT: f32 = 68.0;
 const AVATAR_DIAMETER: f32 = 32.0;
-/// Font size of the avatar's initial, ~0.47 of the diameter (as at 38.0).
-const AVATAR_FONT_SIZE: f32 = 15.0;
+/// Font size of the avatar's initial — a bit under half the diameter.
+const AVATAR_FONT_SIZE: f32 = 14.0;
+/// Font sizes of the row's three lines, in points: the timestamp, the title
+/// line (sender over subject, the one that carries the unread weight) and the
+/// muted preview under it.
+const ROW_DATE_FONT_SIZE: f32 = 11.0;
+const ROW_TITLE_FONT_SIZE: f32 = 12.0;
+const ROW_PREVIEW_FONT_SIZE: f32 = 11.0;
 
 /// Decode a stored inline image (base64) into an egui texture. Runs on the
 /// UI thread but only once per message/cid; inline mail images are small.
@@ -2106,6 +2122,30 @@ fn truncate_galley(
     }
     let cut: String = chars[..lo].iter().collect::<String>() + "…";
     ctx.fonts(|f| f.layout_no_wrap(cut, font, color))
+}
+
+/// How far the second strike of bold text sits from the first, in points.
+const BOLD_STRIKE: f32 = 0.5;
+
+/// Draw one line of the message list, heavier when the mail is unread.
+///
+/// epaint has no synthetic bold (`FontTweak` only scales and shifts glyphs),
+/// and the installed face may ship no bold at all — Adwaita Sans, the default
+/// on this desktop, has only Regular and Italic. Striking the same galley twice,
+/// half a point apart, thickens the stems enough to read as bold at list sizes,
+/// and costs nothing: the layout was already measured for one strike, so the
+/// row cannot reflow.
+fn paint_row_text(
+    painter: &egui::Painter,
+    pos: egui::Pos2,
+    galley: std::sync::Arc<egui::Galley>,
+    color: egui::Color32,
+    bold: bool,
+) {
+    painter.galley(pos, galley.clone(), color);
+    if bold {
+        painter.galley(pos + egui::vec2(BOLD_STRIKE, 0.0), galley, color);
+    }
 }
 
 /// One row of the folder list: kind icon, name, and the unread count on the

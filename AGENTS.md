@@ -203,6 +203,21 @@ Event (mpsc) ──► drain_events() at frame start ──► merge into Accoun
   cards: sender + timestamp, subject, content preview — see
   `message_row`), right reading pane with a "No mail selected"
   placeholder.
+- A message row separates unread mail by *weight*, not by color: the sender
+  and the subject always take the scheme's `text` (read mail is not dimmed),
+  the preview always takes `text_weak`, and an unread row's sender and
+  subject are struck twice half a point apart (`paint_row_text`, see
+  `BOLD_STRIKE`). That strike is a deliberate stand-in for real bold: epaint
+  has no synthetic bold (`FontTweak` only scales and shifts glyphs) and the
+  picked face may ship no bold at all — Adwaita Sans, the desktop default
+  here, has only Regular and Italic, which is why the fonts module's
+  one-face-per-family model cannot supply one. The second strike is sub-pixel
+  and does not change the layout the galley was measured for, so the ellipsis
+  cut and the right-aligned timestamp stay exactly where they were. The row's
+  font sizes are the `ROW_DATE_FONT_SIZE` / `ROW_TITLE_FONT_SIZE` /
+  `ROW_PREVIEW_FONT_SIZE` constants next to `MESSAGE_ROW_HEIGHT` (a 68 pt
+  row whose three lines are centred at y = 20 / 40 / 57), so retuning the list
+  is one edit instead of a hunt for literals.
 - The window is undecorated on purpose (`with_decorations(false)` in
   `main.rs`): `titlebar()` in `app.rs` draws the custom title bar — the
   application icon (the brand, and the leftmost thing in the bar: the same
