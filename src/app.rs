@@ -527,12 +527,14 @@ impl KimoApp {
                     Job::Sync {
                         account,
                         purge: false,
+                        folder: None,
                     },
                     app.ctx.clone(),
                     app.tx.clone(),
                 );
             }
         }
+
         app
     }
 
@@ -668,12 +670,26 @@ impl KimoApp {
 
     // ----- actions ----------------------------------------------------------
 
+    /// Every account's folder list and new mail — and, for the account whose
+    /// folder is open, that folder's *first* fetch when it has none. The column
+    /// says "Not fetched yet — click Sync in the title bar" for exactly that
+    /// case, so the button has to honour it: the sweep only revisits folders
+    /// that already carry a mark.
     fn sync_all(&mut self) {
         for account in self.accounts.clone() {
+            let open = match (&self.selected_account, &self.selected_folder) {
+                (Some(selected), Some(folder))
+                    if *selected == account.id && !self.selected_folder_synced() =>
+                {
+                    Some(folder.clone())
+                }
+                _ => None,
+            };
             sync::spawn(
                 Job::Sync {
                     account,
                     purge: false,
+                    folder: open,
                 },
                 self.ctx.clone(),
                 self.tx.clone(),
@@ -732,6 +748,7 @@ impl KimoApp {
                 Protocol::Pop3 => Job::Sync {
                     account,
                     purge: false,
+                    folder: None,
                 },
             };
             sync::spawn(job, self.ctx.clone(), self.tx.clone());
@@ -837,6 +854,7 @@ impl KimoApp {
             Job::Sync {
                 account,
                 purge: switches_mailbox,
+                folder: None,
             },
             self.ctx.clone(),
             self.tx.clone(),
@@ -1379,7 +1397,8 @@ impl KimoApp {
                             self.sync_all();
                         }
                         sync.on_hover_text(
-                            "Sync all accounts — Debug mode does not sync on its own",
+                            "Sync all accounts — Debug mode does not sync on its own. The \
+                             folder you have open is fetched too, if it was never fetched.",
                         );
                     }
 

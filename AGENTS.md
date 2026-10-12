@@ -186,7 +186,11 @@ Event (mpsc) ──► drain_events() at frame start ──► merge into Accoun
   startup sweep nor the fetch-on-first-open happens, the cached mail still loads
   from the database, and only the title-bar Sync button — which only Debug
   shows, since Release has nothing for it to add — and `Save & sync` in
-  Preferences reach the server. It is a per-installation setting rather than a
+  Preferences reach the server. The button sweeps every account and, for the one
+  whose folder is open, fetches that folder even when it has no mark: the column
+  says "Not fetched yet — click Sync in the title bar" for exactly that folder,
+  and a folder with no mark is not part of a sweep — `sync_queue` is what puts
+  it first, so the message is not a lie in the one mode that shows the button. It is a per-installation setting rather than a
   build flag so that a development build can be pointed at a real account
   without a sync on every start.
 - The Blitz renderer is a `Job::RenderHtml` on a worker thread: it parses,

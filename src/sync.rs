@@ -50,11 +50,19 @@ const FETCH_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const FETCH_READ_TIMEOUT: Duration = Duration::from_secs(20);
 
 pub enum Job {
-    /// Folder list (IMAP) plus new mail: INBOX and every folder that has been
-    /// fetched before. For POP3, the new messages of the drop. `purge` drops
-    /// the account's stored mail before fetching — for a new account, or one
-    /// whose endpoint just moved to another mailbox.
-    Sync { account: Account, purge: bool },
+    /// Folder list (IMAP) plus new mail: INBOX, every folder that has been
+    /// fetched before and, when it is given, `folder` — the one the window is
+    /// looking at, which a manual sync has to include because a folder with no
+    /// mark yet is never part of the sweep. For POP3, the new messages of the
+    /// drop. `purge` drops the account's stored mail before fetching — for a
+    /// new account, or one whose endpoint just moved to another mailbox.
+    Sync {
+        account: Account,
+        purge: bool,
+        /// A folder to fetch even though it has no mark; ignored when the
+        /// server no longer lists it.
+        folder: Option<String>,
+    },
     /// Fetch one specific IMAP folder.
     SyncFolder { account: Account, folder: String },
     /// Push `\Seen` back to the server (IMAP only) and store the flag in the
@@ -243,7 +251,11 @@ pub fn spawn(job: Job, ctx: egui::Context, tx: Sender<Event>) {
                 account_id: account_id.clone(),
             });
             let result = match account_job {
-                Job::Sync { account, purge } => {
+                Job::Sync {
+                    account,
+                    purge,
+                    folder,
+                } => {
                     // The account row comes first: the mail below refers to it,
                     // and a brand-new account has to be durable before its mail
                     // is. Purging, when the endpoint moved, is part of the same
@@ -253,7 +265,7 @@ pub fn spawn(job: Job, ctx: egui::Context, tx: Sender<Event>) {
                             db::purge_mail(&account.id)?;
                         }
                         match account.protocol {
-                            Protocol::Imap => sync_imap(&account, &tx),
+                            Protocol::Imap => sync_imap(&account, folder.as_deref(), &tx),
                             Protocol::Pop3 => sync_pop3(&account, &tx),
                         }
                     })
@@ -355,7 +367,37 @@ fn with_imap<T>(
     result
 }
 
-fn sync_imap(account: &Account, tx: &Sender<Event>) -> MailResult<()> {
+/// The folders one sync of an account sweeps, in order: the folder the window
+/// is looking at when it was asked for — the column says "Not fetched yet —
+/// click Sync" for a folder with no mark at all, and such a folder is never
+/// part of the sweep by itself — then INBOX, which is where mail arrives, then
+/// everything that has been fetched before, so a warm sync catches up instead
+/// of refetching. A folder the server no longer lists is skipped; the mail
+/// cached for it stays.
+fn sync_queue(open: Option<&str>, listed: &[String], warmed: &[String]) -> Vec<String> {
+    let mut queue: Vec<String> = Vec::new();
+    if let Some(open) = open.filter(|open| listed.iter().any(|known| known == open)) {
+        queue.push(open.to_string());
+    }
+    if !queue
+        .iter()
+        .any(|queued| queued.eq_ignore_ascii_case("INBOX"))
+    {
+        queue.push("INBOX".to_string());
+    }
+    for folder in warmed {
+        if folder.eq_ignore_ascii_case("INBOX")
+            || !listed.contains(folder)
+            || queue.contains(folder)
+        {
+            continue;
+        }
+        queue.push(folder.clone());
+    }
+    queue
+}
+
+fn sync_imap(account: &Account, open: Option<&str>, tx: &Sender<Event>) -> MailResult<()> {
     with_imap(account, |client| {
         client.login(&account.username, &account.password)?;
         let folders = client
@@ -369,18 +411,7 @@ fn sync_imap(account: &Account, tx: &Sender<Event>) -> MailResult<()> {
             account_id: account.id.clone(),
             folders: folders.clone(),
         });
-        // INBOX first — it is the one the window is looking at — then every
-        // folder that has been fetched before, so a sync catches up instead of
-        // refetching. A folder the user never opened has no mark and waits for
-        // its first click: that is where the backfill belongs. A folder the
-        // server no longer lists is skipped; its cached mail stays.
-        let mut queue = vec!["INBOX".to_string()];
-        for folder in db::synced_folders(&account.id)? {
-            if folder.eq_ignore_ascii_case("INBOX") || !folders.contains(&folder) {
-                continue;
-            }
-            queue.push(folder);
-        }
+        let queue = sync_queue(open, &folders, &db::synced_folders(&account.id)?);
         // One folder that fails — a mailbox the server refuses, a connection
         // that dropped — must not cost the others their sync. The first error
         // is reported once the rest is done.
@@ -536,6 +567,47 @@ mod tests {
         assert_eq!(backfill_start(BACKFILL_LIMIT as usize), 1);
         assert_eq!(backfill_start(BACKFILL_LIMIT as usize + 1), 2);
         assert_eq!(backfill_start(5000), 5000 - BACKFILL_LIMIT as usize + 1);
+    }
+
+    /// The order a sync sweeps folders in: what the user asked for, INBOX, then
+    /// the warm ones — each asked for once, and only if the server still lists
+    /// it.
+    #[test]
+    fn a_sync_sweeps_the_open_folder_then_inbox_then_the_warm_ones() {
+        let listed: Vec<String> = ["INBOX", "Archive", "Confidential"]
+            .iter()
+            .map(|name| name.to_string())
+            .collect();
+        let warm = |names: &[&str]| {
+            names
+                .iter()
+                .map(|name| name.to_string())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            sync_queue(None, &listed, &warm(&["Archive"])),
+            ["INBOX", "Archive"]
+        );
+        // The folder the window is looking at goes first: it is the one the
+        // user just asked for, and it has no mark, so the warm list is not
+        // where it would have come from.
+        assert_eq!(
+            sync_queue(Some("Confidential"), &listed, &warm(&["Archive"])),
+            ["Confidential", "INBOX", "Archive"]
+        );
+        // Not twice when it is warm as well, and INBOX not twice when it is the
+        // open folder.
+        assert_eq!(
+            sync_queue(Some("Archive"), &listed, &warm(&["Archive"])),
+            ["Archive", "INBOX"]
+        );
+        assert_eq!(sync_queue(Some("INBOX"), &listed, &[]), ["INBOX"]);
+        // A folder the server no longer lists is asked for nowhere: neither the
+        // open one nor a warm one.
+        assert_eq!(
+            sync_queue(Some("Gone"), &listed, &warm(&["Old"])),
+            ["INBOX"]
+        );
     }
 
     #[test]
