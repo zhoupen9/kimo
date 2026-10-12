@@ -165,8 +165,22 @@ Event (mpsc) ──► drain_events() at frame start ──► merge into Accoun
   `~/.local/share/kimo/cache/resources/` (SHA-1 of the URL) and held in
   `KimoApp::images`/`stylesheets`. The renderer reports missing URLs via
   `html::HtmlContext`; never fetch on the UI thread.
-- `FETCH_LIMIT` (in `sync.rs`) caps how many of the newest messages are
-  fetched per folder per sync.
+- Syncing is incremental, and the state that makes it so lives in the database:
+  a folder carries its marks (`folders.uid_next` and `folders.first_num`, read
+  through `db::FolderSync`). IMAP resumes at `uid_next` — `UID FETCH <next>:*`,
+  the `by_uid` half of `imap::fetch_bodies`; a mark from another UIDVALIDITY
+  generation is dropped and the folder fetched afresh — while POP3 asks for the
+  UIDLs it does not already store (`db::stored_uids`). `db::save_messages` moves
+  an IMAP folder's mark to one past the highest UID it holds, in the same
+  transaction as the batch, so a crash can never advance past mail that did not
+  reach the disk. `BACKFILL_LIMIT` (in `sync.rs`) is the size of a folder's
+  *first* fetch: the newest messages only, because everything older is
+  deliberately out of scope — the mark is what says so. `Job::Sync` (startup
+  and the title-bar button) fetches the folder list, INBOX and every folder that
+  has been fetched before, and a folder that fails does not cost the others
+  theirs (the first error is reported at the end). A folder the user never
+  opened has no mark and waits for its first click, which is where its backfill
+  happens; a warm folder with nothing new neither writes nor emits.
 - The Blitz renderer is a `Job::RenderHtml` on a worker thread: it parses,
   styles, lays out and rasterizes the body, resolving every sub-resource
   through `blitz_render::MailNet` (a blocking `NetProvider` that reuses the
@@ -200,15 +214,24 @@ Event (mpsc) ──► drain_events() at frame start ──► merge into Accoun
 - `~/.local/share/kimo/mail.db` — the one database (SQLite, WAL, mode 0600
   because it holds the passwords). `accounts` (id, name, protocol, host,
   port, username, password, tls, position), `folders` (account_id, name,
-  uidvalidity, synced), `messages` keyed by `(account_id, folder, uid)` with
+  uidvalidity, uid_next, first_num, synced — the middle two are the sync marks
+  of the bullet above), `messages` keyed by `(account_id, folder, uid)` with
   the subject, addresses, both bodies, the preview and the bigram column,
   `attachments` and `inline_images` (raw bytes, not base64) as children of a
   message, and the external-content FTS5 table `messages_fts`, which only the
   three triggers in `db::SCHEMA_SQL` ever write. `PRAGMA foreign_keys = ON`
   per connection and `ON DELETE CASCADE` all the way down, so
   `Job::DeleteAccount` is one `DELETE FROM accounts`. `PRAGMA user_version`
-  is the schema version: a change to the DDL is a new `if version < n` branch
-  in `db::migrate`, never an edit to what an existing database already has.
+  is the schema version, walked one step at a time by `db::migrate`, and
+  `SCHEMA_SQL` is the schema a *new* database is born with. Change the DDL and
+  you change both: a database born before the change is brought forward by a new
+  `if start < n` step, which is one transaction with the `user_version` write
+  inside it — a crash rolls the whole step back instead of leaving a database
+  half a step forward. The version-1 step is the shape to copy: it adds the sync
+  marks and derives `uid_next` from the UIDs the database already holds
+  (`derive_imap_marks`, sharing `DERIVE_UID_NEXT_SQL` with `save_messages`, so
+  the two can never disagree), which is what keeps an upgrade from refetching a
+  batch it has.
 - The account list is **in the database, passwords in plain text**. That is a
   documented, accepted limitation; do not add a secrets daemon (rule 1). An
   account's `id` is minted once (the slug of its name, numbered if taken) and
@@ -479,8 +502,15 @@ Do not "fix" these casually — they are known:
   resources are fetched during the render, so the first view of an
   image-heavy mail can take a few seconds (the disk cache makes the second
   one fast). Fonts are the curated disk set, not fontconfig's.
-- POP3 sync re-downloads bodies every time (UIDL lets us skip but is not
-  wired through the Job yet). The database upsert makes that a no-op for mail
-  that did not change — `ON CONFLICT … WHERE` returns no row and the message's
-  children are left alone — but the fetch itself still happens.
+- POP3 never deletes or mutates anything server-side, and a sync does not
+  notice deletions either: mail removed in another client stays in the database
+  and in the list forever. What a sync does is incremental by UIDL — a message
+  already stored is never downloaded again — and bounded below by the
+  `first_num` floor the first sync chose, so the messages a first sync skipped
+  are never fetched, on purpose.
+- Flags of mail that is already stored are not read back from the server. IMAP
+  `\Seen` is taken for a message as it is fetched, and from then on the local
+  flag is the only truth (`seen` only ever grows). Sync used to refresh the
+  newest batch for free by refetching it; now that a warm sync fetches nothing
+  it already has, mail read in another client keeps the unread mark it had here.
 - No IDLE/push for IMAP; sync is manual or on-startup.

@@ -120,12 +120,15 @@ impl ImapClient {
         Ok(info)
     }
 
-    /// FETCH `seq_set` (UID FLAGS BODY.PEEK[]) and return each message with
-    /// its raw RFC 5322 bytes. Handles `{n}` literal framing.
-    pub fn fetch_bodies(&mut self, seq_set: &str) -> MailResult<Vec<Fetched>> {
+    /// FETCH `set` (UID FLAGS BODY.PEEK[]) and return each message with its raw
+    /// RFC 5322 bytes. `set` is a sequence set, or a UID set when `by_uid` —
+    /// the caller knows which range it asked for. Handles `{n}` literal
+    /// framing.
+    pub fn fetch_bodies(&mut self, set: &str, by_uid: bool) -> MailResult<Vec<Fetched>> {
         let tag = self.next_tag();
+        let command = if by_uid { "UID FETCH" } else { "FETCH" };
         self.conn
-            .write_line(&format!("{tag} FETCH {seq_set} (UID FLAGS BODY.PEEK[])"))?;
+            .write_line(&format!("{tag} {command} {set} (UID FLAGS BODY.PEEK[])"))?;
         let mut out = Vec::new();
         loop {
             let line = self.read_text_line()?;
@@ -364,6 +367,8 @@ fn decode_mutf7_segment(segment: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::models::Protocol;
+    use std::io::{BufRead, Write};
 
     #[test]
     fn quotes_are_escaped() {
@@ -433,5 +438,75 @@ mod tests {
             parse_mailbox_name("(\\HasNoChildren) \"/\" INBOX"),
             Some("INBOX".to_string())
         );
+    }
+
+    /// A canned IMAP server on a loopback port: greet, then answer each
+    /// (command, response) pair, asserting the command is exactly what the test
+    /// expected — a UID set sent as a sequence set is the kind of mistake that
+    /// quietly fetches the wrong mail. `{tag}` in a response is replaced with
+    /// the tag of the command it answers.
+    fn one_shot_server(
+        script: Vec<(&'static str, String)>,
+    ) -> (Account, std::thread::JoinHandle<Vec<String>>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            socket.write_all(b"* OK ready\r\n").unwrap();
+            let mut reader = std::io::BufReader::new(socket.try_clone().unwrap());
+            let mut commands = Vec::new();
+            for (expected, response) in script {
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                let line = line.trim_end().to_string();
+                let (tag, command) = line.split_once(' ').expect("a tagged command");
+                assert_eq!(command, expected, "the client sent a different command");
+                socket
+                    .write_all(response.replace("{tag}", tag).as_bytes())
+                    .unwrap();
+                commands.push(line);
+            }
+            commands
+        });
+        let account = Account {
+            id: "local".to_string(),
+            name: "Local".to_string(),
+            protocol: Protocol::Imap,
+            host: "127.0.0.1".to_string(),
+            port,
+            username: "me".to_string(),
+            password: "secret".to_string(),
+            tls: TlsMode::Plain,
+        };
+        (account, server)
+    }
+
+    #[test]
+    fn the_fetch_command_matches_the_range_it_was_given() {
+        let uid_response = concat!(
+            "* 1 FETCH (UID 1813 FLAGS (\\Seen) BODY[] {11}\r\n",
+            "hello world",
+            ")\r\n",
+            "{tag} OK FETCH completed\r\n",
+        )
+        .to_string();
+        let sequence_response =
+            "* 1 FETCH (UID 7 FLAGS ())\r\n{tag} OK FETCH completed\r\n".to_string();
+        let (account, server) = one_shot_server(vec![
+            ("UID FETCH 1813:* (UID FLAGS BODY.PEEK[])", uid_response),
+            ("FETCH 1:50 (UID FLAGS BODY.PEEK[])", sequence_response),
+        ]);
+        let mut client = ImapClient::connect(&account).unwrap();
+
+        let fetched = client.fetch_bodies("1813:*", true).unwrap();
+        assert_eq!(fetched.len(), 1);
+        assert_eq!(fetched[0].uid, 1813);
+        assert_eq!(fetched[0].flags, ["\\Seen"]);
+        assert_eq!(fetched[0].raw, b"hello world");
+
+        // A response with no literal carries no body and is skipped: that is
+        // what makes a flags-only answer harmless.
+        assert!(client.fetch_bodies("1:50", false).unwrap().is_empty());
+        assert_eq!(server.join().unwrap().len(), 2);
     }
 }

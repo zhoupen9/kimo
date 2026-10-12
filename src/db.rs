@@ -13,9 +13,13 @@
 //! # Schema
 //!
 //! `PRAGMA user_version` carries the schema version: 0 means "no database yet",
-//! so the DDL runs and the JSON of the old layout is imported once. A later
-//! change adds an `if version < n { … }` branch, never an edit to the DDL that
-//! an existing database would then miss.
+//! so the DDL runs and the JSON of the old layout is imported once. `SCHEMA_SQL`
+//! is the schema a *new* database is born with; a change to it also needs a step
+//! in `migrate` that brings a database born before it to the same shape.
+//!
+//! `folders` carries each folder's sync marks as well — `uid_next` for IMAP,
+//! `first_num` for POP3. They are what makes a sync fetch only the mail that is
+//! not stored yet (see the sync marks section below and `crate::sync`).
 //!
 //! `messages_fts` is an external-content FTS5 table over `messages`: the three
 //! triggers in `SCHEMA_SQL` keep the index in step, so nothing else writes to
@@ -31,7 +35,7 @@
 //! Keep the mirror structs at the bottom of this file until no installation can
 //! still predate the database, like `storage::migrate_legacy_dir`.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::Path;
 use std::sync::{Mutex, MutexGuard, OnceLock};
@@ -46,15 +50,17 @@ use crate::models::{Account, InlineImage, MailMessage, Protocol, TlsMode};
 use crate::storage::{self, Folder, Mailbox};
 
 /// The schema version this build writes and understands.
-pub const SCHEMA_VERSION: i64 = 1;
+pub const SCHEMA_VERSION: i64 = 2;
 
 /// How long a statement waits for another writer before giving up. Jobs hold
 /// the connection only around their SQL, so this is a backstop, not a plan.
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// The whole schema, created in one go at `user_version` 0. Every statement is
-/// `IF NOT EXISTS`, so a database left half-built by a crash (or by an import
-/// that failed) is simply finished on the next start.
+/// The schema a new database is born with, created in one go at
+/// `user_version` 0. Every statement is `IF NOT EXISTS`, so a database left
+/// half-built by a crash (or by an import that failed) is simply finished on
+/// the next start. A database that already existed is walked to the same shape
+/// by the steps in `migrate`, one per version.
 const SCHEMA_SQL: &str = r#"
 CREATE TABLE IF NOT EXISTS accounts (
     id       TEXT PRIMARY KEY,
@@ -74,6 +80,12 @@ CREATE TABLE IF NOT EXISTS folders (
     account_id  TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
     name        TEXT NOT NULL,          -- IMAP wire form (modified UTF-7)
     uidvalidity INTEGER,                -- NULL for POP3
+    -- How far this folder has been fetched; NULL until it has been synced once.
+    -- IMAP: one past the highest UID stored, so every UID below it is here.
+    -- POP3: the lowest message number this drop is fetched from — the first
+    -- sync takes the newest messages and the older ones stay out of scope.
+    uid_next    INTEGER,
+    first_num   INTEGER,
     synced      INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (account_id, name)
 );
@@ -150,6 +162,30 @@ BEGIN
     INSERT INTO messages_fts (rowid, subject, from_addr, to_addr, body_text, cjk)
     VALUES (new.id, new.subject, new.from_addr, new.to_addr, new.body_text, new.cjk);
 END;
+"#;
+
+/// The step from `user_version` 1 to 2: a sync mark per folder. An existing
+/// database then gets its IMAP marks derived from the UIDs it already holds
+/// (`derive_imap_marks`), so the upgrade does not refetch a batch it has.
+const MIGRATE_V2_SQL: &str = r#"
+ALTER TABLE folders ADD COLUMN uid_next  INTEGER;
+ALTER TABLE folders ADD COLUMN first_num INTEGER;
+"#;
+
+/// IMAP's sync mark as a function of what is stored: one past the highest UID
+/// the folder holds, clamped to the UID space (a stored `u32::MAX` would not
+/// otherwise fit the column). Both `save_messages` and the version-1 step of
+/// `migrate` derive the mark with this, so the two can never disagree. A POP3
+/// folder is left alone by the protocol test inside it: its `uid` is a UIDL
+/// string, not a number.
+const DERIVE_UID_NEXT_SQL: &str = r#"
+UPDATE folders SET uid_next = (
+        SELECT MIN(MAX(CAST(m.uid AS INTEGER)) + 1, 4294967295)
+          FROM messages m
+         WHERE m.account_id = ?1 AND m.folder = ?2
+    )
+  WHERE account_id = ?1 AND name = ?2
+    AND (SELECT protocol FROM accounts WHERE id = ?1) = 'imap'
 "#;
 
 /// The message upsert. `seen` only ever grows locally (the `\Seen` the server
@@ -331,26 +367,70 @@ fn configure(conn: &Connection) -> MailResult<()> {
 /// Create the schema and, on a fresh database, import the JSON of the old
 /// layout. `legacy` is `None` for an in-memory database, which has no business
 /// deleting files it reads.
+///
+/// A database that already existed is walked forward one version at a time,
+/// each step one transaction with the `user_version` write inside it (see the
+/// ladder below).
 fn migrate(conn: &mut Connection, legacy: Option<(&Path, &Path)>) -> MailResult<()> {
-    let version: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
-    if version >= SCHEMA_VERSION {
+    let start: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+    if start >= SCHEMA_VERSION {
         return Ok(());
     }
-    if version == 0 {
+    if start == 0 {
+        // Born whole: the schema a new database is created with already has
+        // everything the steps below add, so it skips them. Every statement is
+        // `IF NOT EXISTS`, which is what lets a database whose import failed —
+        // its version stays 0 — walk this path again.
         conn.execute_batch(SCHEMA_SQL)?;
-        match legacy {
-            Some((config_dir, cache_dir)) => match import_legacy_json(conn, config_dir, cache_dir) {
-                // Ported: the old files are gone, so this never runs again.
-                Ok(()) => conn.pragma_update(None, "user_version", SCHEMA_VERSION)?,
+        if let Some((config_dir, cache_dir)) = legacy {
+            if let Err(error) = import_legacy_json(conn, config_dir, cache_dir) {
                 // A half-imported database is not a broken one: leave the
                 // version at 0 so the next start finishes the job (the import
                 // upserts each message and deletes each file it has read).
-                Err(error) => eprintln!(
+                eprintln!(
                     "kimo: importing the old JSON storage failed, retrying on the next start: {error}"
-                ),
-            },
-            None => conn.pragma_update(None, "user_version", SCHEMA_VERSION)?,
+                );
+                return Ok(());
+            }
         }
+        conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
+        return Ok(());
+    }
+
+    // A database that already existed walks the ladder, one step per version.
+    // Each step is one transaction, `user_version` included — the version and
+    // the schema it describes are written together, so a crash rolls the whole
+    // step back and the next start runs it again instead of finding a database
+    // half a step forward. Later steps go below, in order.
+    if start < 2 {
+        let tx = conn.transaction()?;
+        tx.execute_batch(MIGRATE_V2_SQL)?;
+        derive_imap_marks(&tx)?;
+        tx.pragma_update(None, "user_version", 2)?;
+        tx.commit()?;
+    }
+    Ok(())
+}
+
+/// Give every IMAP folder the mark its stored mail implies. A database born
+/// before version 2 has the UIDs but not the mark; deriving one is what keeps
+/// the upgrade from refetching a batch it already holds.
+fn derive_imap_marks(conn: &Connection) -> MailResult<()> {
+    let folders: Vec<(String, String)> = {
+        let mut stmt = conn.prepare(
+            "SELECT account_id, name FROM folders
+              WHERE (SELECT protocol FROM accounts WHERE id = folders.account_id) = 'imap'",
+        )?;
+        let rows = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
+        let mut folders = Vec::new();
+        for row in rows {
+            folders.push(row?);
+        }
+        folders
+    };
+    let mut derive = conn.prepare(DERIVE_UID_NEXT_SQL)?;
+    for (account_id, folder) in &folders {
+        derive.execute(params![account_id, folder])?;
     }
     Ok(())
 }
@@ -464,6 +544,117 @@ fn purge_mail_on(conn: &mut Connection, account_id: &str) -> MailResult<()> {
     tx.execute("DELETE FROM folders WHERE account_id = ?1", [account_id])?;
     tx.commit()?;
     Ok(())
+}
+
+// ----- sync marks ------------------------------------------------------------
+
+/// What the database remembers about a folder's last sync — the marks that let
+/// a sync fetch what is not stored yet instead of refetching a batch every time
+/// (see `crate::sync`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct FolderSync {
+    /// The IMAP generation `uid_next` belongs to: UIDs stored under another
+    /// UIDVALIDITY describe mail that is no longer there.
+    pub uidvalidity: Option<u32>,
+    /// IMAP: one past the highest UID stored, and therefore the first UID a
+    /// sync asks for. `save_messages` keeps it in step with the rows.
+    pub uid_next: Option<u32>,
+    /// POP3: the lowest message number this drop is synced from. The first sync
+    /// of a drop picks it (`sync::BACKFILL_LIMIT` newest messages); the mail
+    /// below it is deliberately out of scope.
+    pub first_num: Option<u32>,
+}
+
+/// What one folder remembers. A folder the database does not know, or one that
+/// has never been fetched, reads as the default — every mark `None`, which is
+/// what tells a sync to start from scratch.
+pub fn folder_sync(account_id: &str, folder: &str) -> MailResult<FolderSync> {
+    let db = db()?;
+    folder_sync_on(db.conn(), account_id, folder)
+}
+
+fn folder_sync_on(conn: &Connection, account_id: &str, folder: &str) -> MailResult<FolderSync> {
+    let mark = conn
+        .query_row(
+            "SELECT uidvalidity, uid_next, first_num FROM folders
+              WHERE account_id = ?1 AND name = ?2",
+            params![account_id, folder],
+            |row| {
+                Ok(FolderSync {
+                    uidvalidity: row.get(0)?,
+                    uid_next: row.get(1)?,
+                    first_num: row.get(2)?,
+                })
+            },
+        )
+        .optional()?;
+    Ok(mark.unwrap_or_default())
+}
+
+/// POP3 only: remember the message number the drop is synced from. Written
+/// *before* the batch it belongs to, so the window is never lost: a folder with
+/// a floor and no mail is simply fetched from that floor next time, which can
+/// cost a repeated pass but never a message.
+pub fn set_first_num(account_id: &str, folder: &str, first_num: u32) -> MailResult<()> {
+    let db = db()?;
+    set_first_num_on(db.conn(), account_id, folder, first_num)
+}
+
+fn set_first_num_on(
+    conn: &Connection,
+    account_id: &str,
+    folder: &str,
+    first_num: u32,
+) -> MailResult<()> {
+    conn.execute(
+        "INSERT INTO folders (account_id, name, uidvalidity, synced, first_num)
+         VALUES (?1, ?2, NULL, 0, ?3)
+         ON CONFLICT(account_id, name) DO UPDATE SET first_num = excluded.first_num",
+        params![account_id, folder, first_num],
+    )?;
+    Ok(())
+}
+
+/// The folders of one account that have been fetched at least once — what a
+/// sync catches up on. A folder that was never opened is left out: its first
+/// fetch is where the backfill belongs.
+pub fn synced_folders(account_id: &str) -> MailResult<Vec<String>> {
+    let db = db()?;
+    synced_folders_on(db.conn(), account_id)
+}
+
+fn synced_folders_on(conn: &Connection, account_id: &str) -> MailResult<Vec<String>> {
+    let mut stmt = conn
+        .prepare("SELECT name FROM folders WHERE account_id = ?1 AND synced = 1 ORDER BY name")?;
+    let rows = stmt.query_map([account_id], |row| row.get::<_, String>(0))?;
+    let mut folders = Vec::new();
+    for row in rows {
+        folders.push(row?);
+    }
+    Ok(folders)
+}
+
+/// Every `uid` stored for one folder. POP3 is what needs this: a UIDL is the
+/// only identity a message has there, so a sync asks for the ones it does not
+/// already hold.
+pub fn stored_uids(account_id: &str, folder: &str) -> MailResult<HashSet<String>> {
+    let db = db()?;
+    stored_uids_on(db.conn(), account_id, folder)
+}
+
+fn stored_uids_on(
+    conn: &Connection,
+    account_id: &str,
+    folder: &str,
+) -> MailResult<HashSet<String>> {
+    let mut stmt =
+        conn.prepare("SELECT uid FROM messages WHERE account_id = ?1 AND folder = ?2")?;
+    let rows = stmt.query_map(params![account_id, folder], |row| row.get::<_, String>(0))?;
+    let mut uids = HashSet::new();
+    for row in rows {
+        uids.insert(row?);
+    }
+    Ok(uids)
 }
 
 // ----- mail ------------------------------------------------------------------
@@ -625,7 +816,9 @@ fn save_folder_list_on(
     Ok(())
 }
 
-/// Store a freshly fetched batch for one folder.
+/// Store a freshly fetched batch for one folder. For an IMAP account the same
+/// transaction moves the folder's mark to one past the highest UID stored, so a
+/// sync can only ever advance past mail that reached the disk.
 pub fn save_messages(
     account_id: &str,
     folder: &str,
@@ -717,6 +910,12 @@ fn save_messages_on(
             }
         }
     }
+
+    // The mark is a function of what is stored, not of the batch: a batch that
+    // changed nothing (the server answered a UID set with a message already
+    // held) cannot move it, and a UIDVALIDITY rotation — whose rows were
+    // deleted above — starts the folder over from the new batch.
+    tx.execute(DERIVE_UID_NEXT_SQL, params![account_id, folder])?;
 
     tx.commit()?;
     Ok(())
@@ -1367,6 +1566,202 @@ mod tests {
     }
 
     #[test]
+    fn the_imap_mark_follows_what_is_stored() {
+        let (mut conn, dir) = test_db("imap-mark");
+        save_account_on(&conn, &account("work")).unwrap();
+        assert_eq!(
+            folder_sync_on(&conn, "work", "INBOX").unwrap(),
+            FolderSync::default(),
+            "a folder nobody has fetched has no mark"
+        );
+
+        save_messages_on(
+            &mut conn,
+            "work",
+            "INBOX",
+            Some(7),
+            &[message("10", "a", "a"), message("12", "b", "b")],
+        )
+        .unwrap();
+        let mark = folder_sync_on(&conn, "work", "INBOX").unwrap();
+        assert_eq!(mark.uidvalidity, Some(7));
+        assert_eq!(mark.uid_next, Some(13), "one past the highest UID stored");
+
+        save_messages_on(
+            &mut conn,
+            "work",
+            "INBOX",
+            Some(7),
+            &[message("20", "c", "c")],
+        )
+        .unwrap();
+        assert_eq!(
+            folder_sync_on(&conn, "work", "INBOX").unwrap().uid_next,
+            Some(21)
+        );
+
+        // Storing what is already there moves nothing: the mark is what is
+        // stored, not what was in the batch.
+        save_messages_on(
+            &mut conn,
+            "work",
+            "INBOX",
+            Some(7),
+            &[message("20", "c", "c")],
+        )
+        .unwrap();
+        assert_eq!(
+            folder_sync_on(&conn, "work", "INBOX").unwrap().uid_next,
+            Some(21)
+        );
+
+        // Another UIDVALIDITY generation starts the folder over.
+        save_messages_on(
+            &mut conn,
+            "work",
+            "INBOX",
+            Some(8),
+            &[message("3", "d", "d")],
+        )
+        .unwrap();
+        let mark = folder_sync_on(&conn, "work", "INBOX").unwrap();
+        assert_eq!(mark.uidvalidity, Some(8));
+        assert_eq!(mark.uid_next, Some(4));
+        integrity_check_on(&conn).unwrap();
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn pop3_keeps_its_own_mark_and_knows_its_uidls() {
+        let (mut conn, dir) = test_db("pop3-mark");
+        let mut pop = account("pop");
+        pop.protocol = Protocol::Pop3;
+        save_account_on(&conn, &pop).unwrap();
+
+        save_messages_on(
+            &mut conn,
+            "pop",
+            "INBOX",
+            None,
+            &[message("UIDL-1", "a", "a"), message("UIDL-2", "b", "b")],
+        )
+        .unwrap();
+        let mark = folder_sync_on(&conn, "pop", "INBOX").unwrap();
+        assert_eq!(mark.uid_next, None, "a UIDL is not a UID");
+        assert_eq!(mark.first_num, None, "nothing chose a floor yet");
+
+        assert_eq!(
+            stored_uids_on(&conn, "pop", "INBOX").unwrap(),
+            HashSet::from(["UIDL-1".to_string(), "UIDL-2".to_string()])
+        );
+
+        set_first_num_on(&conn, "pop", "INBOX", 4951).unwrap();
+        let mark = folder_sync_on(&conn, "pop", "INBOX").unwrap();
+        assert_eq!(mark.first_num, Some(4951));
+        assert_eq!(mark.uid_next, None, "a POP3 folder never gets a UID mark");
+        integrity_check_on(&conn).unwrap();
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn only_fetched_folders_are_listed_for_a_catch_up() {
+        let (mut conn, dir) = test_db("synced-folders");
+        save_account_on(&conn, &account("work")).unwrap();
+        save_folder_list_on(
+            &mut conn,
+            "work",
+            &["INBOX".to_string(), "Sent".to_string()],
+        )
+        .unwrap();
+        assert!(
+            synced_folders_on(&conn, "work").unwrap().is_empty(),
+            "a folder the LIST knows is not a folder that was fetched"
+        );
+
+        save_messages_on(
+            &mut conn,
+            "work",
+            "Sent",
+            Some(3),
+            &[message("1", "a", "a")],
+        )
+        .unwrap();
+        save_messages_on(&mut conn, "work", "INBOX", Some(3), &[]).unwrap();
+        assert_eq!(
+            synced_folders_on(&conn, "work").unwrap(),
+            ["INBOX", "Sent"],
+            "INBOX counts even when the fetch found nothing"
+        );
+        integrity_check_on(&conn).unwrap();
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_version_1_database_gets_its_imap_mark_derived() {
+        let (mut conn, dir) = test_db("migrate-v2");
+        save_account_on(&conn, &account("work")).unwrap();
+        save_messages_on(
+            &mut conn,
+            "work",
+            "INBOX",
+            Some(4),
+            &[message("10", "a", "a"), message("12", "b", "b")],
+        )
+        .unwrap();
+        let mut pop = account("pop");
+        pop.protocol = Protocol::Pop3;
+        save_account_on(&conn, &pop).unwrap();
+        save_messages_on(&mut conn, "pop", "INBOX", None, &[message("1", "a", "a")]).unwrap();
+
+        // Rewind to the shape version 1 shipped: no marks at all, and the
+        // version that says so.
+        conn.execute_batch(
+            "ALTER TABLE folders DROP COLUMN uid_next;
+             ALTER TABLE folders DROP COLUMN first_num;",
+        )
+        .unwrap();
+        conn.pragma_update(None, "user_version", 1).unwrap();
+
+        migrate(&mut conn, None).unwrap();
+        assert_eq!(
+            count(&conn, "SELECT * FROM pragma_user_version"),
+            SCHEMA_VERSION
+        );
+        assert_eq!(
+            folder_sync_on(&conn, "work", "INBOX").unwrap().uid_next,
+            Some(13),
+            "the upgrade does not refetch a batch it already holds"
+        );
+        assert_eq!(
+            folder_sync_on(&conn, "pop", "INBOX").unwrap().uid_next,
+            None,
+            "a POP3 UIDL is not a UID, however numeric it looks"
+        );
+        integrity_check_on(&conn).unwrap();
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_database_left_at_version_0_is_finished() {
+        // A crash between the DDL and the version write, or an import that
+        // failed, leaves a database that has the schema but says 0. The next
+        // start has to be able to walk that path again — every statement is
+        // `IF NOT EXISTS` — without losing what is already in it.
+        let (mut conn, dir) = test_db("half-built");
+        conn.pragma_update(None, "user_version", 0).unwrap();
+        save_account_on(&conn, &account("work")).unwrap();
+
+        migrate(&mut conn, None).unwrap();
+        assert_eq!(
+            count(&conn, "SELECT * FROM pragma_user_version"),
+            SCHEMA_VERSION
+        );
+        assert_eq!(load_accounts_on(&conn).unwrap().len(), 1);
+        integrity_check_on(&conn).unwrap();
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn attachments_and_inline_images_survive_as_bytes() {
         let (mut conn, dir) = test_db("children");
         save_account_on(&conn, &account("work")).unwrap();
@@ -1601,6 +1996,20 @@ mod tests {
                 "  {id}: {} folders, {messages} messages ({unread} unread, {inline} inline images)",
                 mailbox.folders.len()
             );
+            // What each folder will resume from: the upgrade derives an IMAP
+            // mark from the imported UIDs, so the first sync after it fetches
+            // only what arrived since the cache was written.
+            for folder in &mailbox.folders {
+                let mark = folder_sync_on(&conn, id, &folder.name).unwrap();
+                println!(
+                    "    {:<34} {:>4} msgs  uidvalidity={:?} uid_next={:?} first_num={:?}",
+                    folder.name,
+                    folder.messages.len(),
+                    mark.uidvalidity,
+                    mark.uid_next,
+                    mark.first_num
+                );
+            }
         }
         println!(
             "database: {} ({} bytes)",

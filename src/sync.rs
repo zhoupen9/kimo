@@ -17,8 +17,31 @@ use crate::protocol::imap::ImapClient;
 use crate::protocol::pop3::Pop3Client;
 use crate::storage;
 
-/// How many of the newest messages to fetch per folder per sync.
-pub const FETCH_LIMIT: u32 = 50;
+/// How many of the newest messages the *first* sync of a folder takes. Later
+/// syncs are incremental — the folder's marks say what is already stored — so
+/// this is the size of the one-off backfill, not of a sync.
+pub const BACKFILL_LIMIT: u32 = 50;
+
+/// The lowest 1-based position a first sync reaches: the newest
+/// `BACKFILL_LIMIT` messages of `total`. Everything older is out of scope, and
+/// the mark the sync stores is what says so.
+fn backfill_start(total: usize) -> usize {
+    total.saturating_sub(BACKFILL_LIMIT as usize) + 1
+}
+
+/// The UID a fetch resumes from, or `None` when the folder has to be fetched
+/// afresh. Both sides have to agree on the UIDVALIDITY generation: a mark from
+/// another one describes mail that is gone, and a server that reports none does
+/// not promise its UIDs survive the session — such a folder keeps the old
+/// behaviour of refetching the newest messages rather than risking a skip.
+fn resume_uid(mark: &db::FolderSync, selected: Option<u32>) -> Option<u32> {
+    match (mark.uidvalidity, selected) {
+        (Some(stored), Some(selected)) if stored == selected => {
+            mark.uid_next.filter(|uid| *uid > 0)
+        }
+        _ => None,
+    }
+}
 
 /// Hard caps for remote mail resources (images / stylesheets).
 pub const MAX_IMAGE_BYTES: u64 = 10 * 1024 * 1024;
@@ -27,9 +50,10 @@ const FETCH_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const FETCH_READ_TIMEOUT: Duration = Duration::from_secs(20);
 
 pub enum Job {
-    /// Folder list (IMAP) plus the INBOX contents; for POP3, the whole drop.
-    /// `purge` drops the account's stored mail before fetching — for a new
-    /// account, or one whose endpoint just moved to another mailbox.
+    /// Folder list (IMAP) plus new mail: INBOX and every folder that has been
+    /// fetched before. For POP3, the new messages of the drop. `purge` drops
+    /// the account's stored mail before fetching — for a new account, or one
+    /// whose endpoint just moved to another mailbox.
     Sync { account: Account, purge: bool },
     /// Fetch one specific IMAP folder.
     SyncFolder { account: Account, folder: String },
@@ -229,7 +253,7 @@ pub fn spawn(job: Job, ctx: egui::Context, tx: Sender<Event>) {
                             db::purge_mail(&account.id)?;
                         }
                         match account.protocol {
-                            Protocol::Imap => sync_imap_inbox(&account, &tx),
+                            Protocol::Imap => sync_imap(&account, &tx),
                             Protocol::Pop3 => sync_pop3(&account, &tx),
                         }
                     })
@@ -331,7 +355,7 @@ fn with_imap<T>(
     result
 }
 
-fn sync_imap_inbox(account: &Account, tx: &Sender<Event>) -> MailResult<()> {
+fn sync_imap(account: &Account, tx: &Sender<Event>) -> MailResult<()> {
     with_imap(account, |client| {
         client.login(&account.username, &account.password)?;
         let folders = client
@@ -343,9 +367,33 @@ fn sync_imap_inbox(account: &Account, tx: &Sender<Event>) -> MailResult<()> {
         db::save_folder_list(&account.id, &folders)?;
         let _ = tx.send(Event::Folders {
             account_id: account.id.clone(),
-            folders,
+            folders: folders.clone(),
         });
-        fetch_folder_into(client, "INBOX", account, tx)
+        // INBOX first — it is the one the window is looking at — then every
+        // folder that has been fetched before, so a sync catches up instead of
+        // refetching. A folder the user never opened has no mark and waits for
+        // its first click: that is where the backfill belongs. A folder the
+        // server no longer lists is skipped; its cached mail stays.
+        let mut queue = vec!["INBOX".to_string()];
+        for folder in db::synced_folders(&account.id)? {
+            if folder.eq_ignore_ascii_case("INBOX") || !folders.contains(&folder) {
+                continue;
+            }
+            queue.push(folder);
+        }
+        // One folder that fails — a mailbox the server refuses, a connection
+        // that dropped — must not cost the others their sync. The first error
+        // is reported once the rest is done.
+        let mut failure: Option<MailError> = None;
+        for folder in queue {
+            if let Err(error) = fetch_folder_into(client, &folder, account, tx) {
+                failure = failure.or(Some(error));
+            }
+        }
+        match failure {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
     })
 }
 
@@ -363,11 +411,26 @@ fn fetch_folder_into(
     tx: &Sender<Event>,
 ) -> MailResult<()> {
     let info = client.select(folder)?;
+    let resume = resume_uid(&db::folder_sync(&account.id, folder)?, info.uidvalidity);
     let mut messages = Vec::new();
     if info.exists > 0 {
-        let end = info.exists;
-        let start = end.saturating_sub(FETCH_LIMIT - 1).max(1);
-        for fetched in client.fetch_bodies(&format!("{start}:{end}"))? {
+        // A folder that was fetched before is asked for the UIDs it does not
+        // have yet: `<next>:*` is everything from the mark on. A server may
+        // answer that with the last message when the mark is already past the
+        // end, which the filter drops. A folder that was never fetched takes
+        // the newest `BACKFILL_LIMIT` messages, by sequence number.
+        let fetched = match resume {
+            Some(next) => client
+                .fetch_bodies(&format!("{next}:*"), true)?
+                .into_iter()
+                .filter(|message| message.uid >= next)
+                .collect(),
+            None => {
+                let start = backfill_start(info.exists as usize) as u32;
+                client.fetch_bodies(&format!("{start}:{}", info.exists), false)?
+            }
+        };
+        for fetched in fetched {
             let seen = fetched
                 .flags
                 .iter()
@@ -376,14 +439,18 @@ fn fetch_folder_into(
         }
     }
     // Store before announcing: nothing may appear in the window that the
-    // database does not already have.
-    db::save_messages(&account.id, folder, info.uidvalidity, &messages)?;
-    let _ = tx.send(Event::Messages {
-        account_id: account.id.clone(),
-        folder: folder.to_string(),
-        uidvalidity: info.uidvalidity,
-        messages,
-    });
+    // database does not already have. The batch moves the folder's mark in the
+    // same transaction. A warm folder with nothing new is left untouched: no
+    // write, and no event for a list that did not change.
+    if resume.is_none() || !messages.is_empty() {
+        db::save_messages(&account.id, folder, info.uidvalidity, &messages)?;
+        let _ = tx.send(Event::Messages {
+            account_id: account.id.clone(),
+            folder: folder.to_string(),
+            uidvalidity: info.uidvalidity,
+            messages,
+        });
+    }
     Ok(())
 }
 
@@ -415,24 +482,88 @@ fn sync_pop3(account: &Account, tx: &Sender<Event>) -> MailResult<()> {
         client.login(&account.username, &account.password)?;
         let count = client.stat()?;
         let uidls = client.uidl()?;
-        let start = count.saturating_sub(FETCH_LIMIT as usize) + 1;
+        let mark = db::folder_sync(&account.id, "INBOX")?;
+        let known = db::stored_uids(&account.id, "INBOX")?;
+        // The first sync of a drop takes the newest messages only; the floor it
+        // remembers is what keeps every later sync from coming back for the
+        // thousands it deliberately skipped. UIDL identity is what makes those
+        // later syncs incremental — a message already stored is never
+        // downloaded again, whatever its number. The newest-messages window is
+        // still consulted, so a drop that shrank below the floor (mail deleted
+        // elsewhere, and the numbering with it) cannot disappear.
+        let cold = mark.first_num.is_none();
+        let window = backfill_start(count);
+        let floor = mark
+            .first_num
+            .map_or(window, |floor| (floor as usize).min(window));
         let mut messages = Vec::new();
         for (num, uid) in uidls {
-            if num < start {
+            if num < floor || known.contains(&uid) {
                 continue;
             }
             let raw = client.retr(num)?;
             messages.push(mail::parse(&raw, &uid, false));
         }
-        db::save_messages(&account.id, "INBOX", None, &messages)?;
-        let _ = tx.send(Event::Messages {
-            account_id: account.id.clone(),
-            folder: "INBOX".to_string(),
-            uidvalidity: None,
-            messages,
-        });
+        // The floor goes first: a folder with a floor and no mail is fetched
+        // from that floor next time, so this order can cost a repeated pass but
+        // never a message.
+        if cold {
+            db::set_first_num(&account.id, "INBOX", window as u32)?;
+        }
+        if cold || !messages.is_empty() {
+            db::save_messages(&account.id, "INBOX", None, &messages)?;
+            let _ = tx.send(Event::Messages {
+                account_id: account.id.clone(),
+                folder: "INBOX".to_string(),
+                uidvalidity: None,
+                messages,
+            });
+        }
         Ok(())
     })();
     client.quit();
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_first_sync_takes_the_newest_messages() {
+        assert_eq!(backfill_start(0), 1);
+        assert_eq!(backfill_start(1), 1);
+        assert_eq!(backfill_start(BACKFILL_LIMIT as usize), 1);
+        assert_eq!(backfill_start(BACKFILL_LIMIT as usize + 1), 2);
+        assert_eq!(backfill_start(5000), 5000 - BACKFILL_LIMIT as usize + 1);
+    }
+
+    #[test]
+    fn a_folder_resumes_from_its_mark_unless_the_uidvalidity_moved() {
+        let mark = db::FolderSync {
+            uidvalidity: Some(7),
+            uid_next: Some(13),
+            first_num: None,
+        };
+        assert_eq!(resume_uid(&mark, Some(7)), Some(13));
+        // Another generation: the stored UIDs describe mail that is gone.
+        assert_eq!(resume_uid(&mark, Some(8)), None);
+        // A server that reports no UIDVALIDITY promises nothing about its UIDs
+        // surviving, so the folder is fetched afresh, as it always was.
+        assert_eq!(resume_uid(&mark, None), None);
+
+        // Nothing stored, a mark without a generation, or a nonsense UID.
+        assert_eq!(resume_uid(&db::FolderSync::default(), Some(7)), None);
+        let generation_only = db::FolderSync {
+            uidvalidity: Some(7),
+            ..Default::default()
+        };
+        assert_eq!(resume_uid(&generation_only, Some(7)), None);
+        let nonsense = db::FolderSync {
+            uidvalidity: Some(7),
+            uid_next: Some(0),
+            ..Default::default()
+        };
+        assert_eq!(resume_uid(&nonsense, Some(7)), None, "UID 0 is no UID");
+    }
 }
