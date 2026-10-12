@@ -87,9 +87,90 @@ impl HtmlRenderer {
     }
 }
 
+/// How much Kimo does on its own.
+///
+/// `Release` is the ordinary client: it syncs every account at startup and
+/// fetches a folder the first time it is opened. `Debug` keeps every automatic
+/// sync off — for working on the app against a real account — leaving the
+/// title-bar Sync button and `Save & sync` in Preferences as the only ways to
+/// reach the server. The choice lives in Preferences → General and is
+/// remembered in `settings.json`; a file that names no mode follows the build,
+/// so a debug build starts quiet and a release build behaves as it always has.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum WorkingMode {
+    Debug,
+    Release,
+}
+
+impl WorkingMode {
+    /// The modes, in the order the Preferences radios show them.
+    const ALL: [WorkingMode; 2] = [WorkingMode::Release, WorkingMode::Debug];
+
+    /// What a settings file that says nothing means: how this binary was built.
+    fn from_build() -> Self {
+        if cfg!(debug_assertions) {
+            WorkingMode::Debug
+        } else {
+            WorkingMode::Release
+        }
+    }
+
+    /// Short label for the Preferences radios.
+    fn label(self) -> &'static str {
+        match self {
+            WorkingMode::Debug => "Debug",
+            WorkingMode::Release => "Release",
+        }
+    }
+
+    /// Value stored in `settings.json`.
+    fn as_str(self) -> &'static str {
+        match self {
+            WorkingMode::Debug => "debug",
+            WorkingMode::Release => "release",
+        }
+    }
+
+    /// `None` for anything unrecognised, so a hand-edited file falls back to
+    /// the build instead of silently turning something off.
+    fn parse(value: &str) -> Option<Self> {
+        match value {
+            "debug" => Some(WorkingMode::Debug),
+            "release" => Some(WorkingMode::Release),
+            _ => None,
+        }
+    }
+
+    /// The mode a settings value names, or the build's when it names none.
+    fn from_settings(value: Option<&str>) -> Self {
+        value
+            .and_then(WorkingMode::parse)
+            .unwrap_or_else(WorkingMode::from_build)
+    }
+
+    /// One-line explanation shown under the mode radios.
+    fn description(self) -> &'static str {
+        match self {
+            WorkingMode::Debug => {
+                "No automatic syncing: mail is fetched only when you press Sync, or Save & sync for one account."
+            }
+            WorkingMode::Release => {
+                "Syncs every account at startup and fetches each folder the first time you open it."
+            }
+        }
+    }
+
+    /// Whether Kimo may start a sync nobody asked for. A mode that says no
+    /// still syncs from the title-bar button and from the account form.
+    fn syncs_automatically(self) -> bool {
+        matches!(self, WorkingMode::Release)
+    }
+}
+
 /// Pages of the preferences modal.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum PrefsTab {
+    General,
     Accounts,
     Appearance,
 }
@@ -166,6 +247,8 @@ pub struct KimoApp {
     inline_textures: HashMap<String, Option<egui::TextureHandle>>,
     /// Which renderer the reading pane uses for HTML bodies.
     html_renderer: HtmlRenderer,
+    /// Whether Kimo may sync without being asked (Preferences → General).
+    working_mode: WorkingMode,
     /// Installed font families for the Appearance pickers; `None` while the
     /// worker scan (`Job::ScanFonts`) is still running.
     font_families: Option<Vec<FontFamily>>,
@@ -405,6 +488,7 @@ impl KimoApp {
             stylesheets: HashMap::new(),
             inline_textures: HashMap::new(),
             html_renderer: HtmlRenderer::parse(settings.html_renderer.as_deref().unwrap_or("")),
+            working_mode: WorkingMode::from_settings(settings.working_mode.as_deref()),
             font_families: None,
             ui_font: settings.ui_font.clone(),
             mono_font: settings.mono_font.clone(),
@@ -426,15 +510,20 @@ impl KimoApp {
         // picked families are applied when the result arrives.
         sync::spawn(Job::ScanFonts, app.ctx.clone(), app.tx.clone());
 
-        for account in app.accounts.clone() {
-            sync::spawn(
-                Job::Sync {
-                    account,
-                    purge: false,
-                },
-                app.ctx.clone(),
-                app.tx.clone(),
-            );
+        // The one sync nobody asks for. Debug mode skips it: the cached mail
+        // still loads from the database, and the title-bar button is there for
+        // when the network is wanted.
+        if app.working_mode.syncs_automatically() {
+            for account in app.accounts.clone() {
+                sync::spawn(
+                    Job::Sync {
+                        account,
+                        purge: false,
+                    },
+                    app.ctx.clone(),
+                    app.tx.clone(),
+                );
+            }
         }
         app
     }
@@ -623,7 +712,10 @@ impl KimoApp {
             },
             None => false,
         };
-        if !needs_fetch {
+        // A folder nobody has fetched is fetched on the click that opens it —
+        // unless the working mode keeps Kimo off the network, in which case the
+        // column says "Not fetched yet" and the title-bar Sync does the fetch.
+        if !needs_fetch || !self.working_mode.syncs_automatically() {
             return;
         }
         if let Some(account) = self.accounts.iter().find(|a| a.id == account_id).cloned() {
@@ -1064,6 +1156,7 @@ impl KimoApp {
         let _ = storage::save_settings(&Settings {
             theme: self.theme.as_str().to_string(),
             html_renderer: Some(self.html_renderer.as_str().to_string()),
+            working_mode: Some(self.working_mode.as_str().to_string()),
             ui_font: self.ui_font.clone(),
             mono_font: self.mono_font.clone(),
         });
@@ -1281,7 +1374,11 @@ impl KimoApp {
                         self.sync_all();
                     }
                     paint_sync_icon(row.painter(), sync.rect, visuals.text_color());
-                    sync.on_hover_text("Sync all accounts");
+                    sync.on_hover_text(if self.working_mode.syncs_automatically() {
+                        "Sync all accounts"
+                    } else {
+                        "Sync all accounts — Debug mode does not sync on its own"
+                    });
 
                     // Search, as one box: the field is the query — one
                     // string, so whatever is searched for anywhere is what is
@@ -2116,6 +2213,7 @@ impl KimoApp {
                 ui.vertical(|ui| {
                     ui.set_width(150.0);
                     for (tab, label) in [
+                        (PrefsTab::General, "General"),
                         (PrefsTab::Accounts, "Accounts"),
                         (PrefsTab::Appearance, "Appearance"),
                     ] {
@@ -2129,6 +2227,7 @@ impl KimoApp {
                     ui.set_min_width(390.0);
                     ui.set_min_height(330.0);
                     match self.prefs_tab {
+                        PrefsTab::General => self.general_page(ui),
                         PrefsTab::Accounts => self.accounts_page(ui),
                         PrefsTab::Appearance => self.appearance_page(ui),
                     }
@@ -2352,6 +2451,32 @@ impl KimoApp {
                 self.save_account_form();
             }
         });
+    }
+
+    /// Preferences → General: the working mode, persisted on change.
+    fn general_page(&mut self, ui: &mut egui::Ui) {
+        ui.label(egui::RichText::new("Working mode").strong());
+        ui.horizontal(|ui| {
+            for mode in WorkingMode::ALL {
+                if ui.radio(self.working_mode == mode, mode.label()).clicked() {
+                    self.working_mode = mode;
+                    self.persist_settings();
+                }
+            }
+        });
+        ui.label(
+            egui::RichText::new(self.working_mode.description())
+                .small()
+                .weak(),
+        );
+        ui.add_space(4.0);
+        ui.label(
+            egui::RichText::new(
+                "A settings file that names no mode follows the build: debug builds start in Debug,                  release builds in Release.",
+            )
+            .small()
+            .weak(),
+        );
     }
 
     /// Preferences → Appearance: theme and HTML renderer, both persisted to
@@ -3354,6 +3479,45 @@ mod tests {
         assert_eq!(HtmlRenderer::parse(""), HtmlRenderer::Simple);
         assert_eq!(HtmlRenderer::Blitz.as_str(), "blitz");
         assert_eq!(HtmlRenderer::Simple.as_str(), "egui");
+    }
+
+    #[test]
+    fn the_working_mode_round_trips_and_falls_back_to_the_build() {
+        // The two names the file may carry, and nothing else: a typo or a mode
+        // from a future version is no mode at all, so the build decides rather
+        // than some mode being silently switched off.
+        for mode in WorkingMode::ALL {
+            assert_eq!(WorkingMode::parse(mode.as_str()), Some(mode));
+        }
+        assert_eq!(WorkingMode::parse("debug"), Some(WorkingMode::Debug));
+        assert_eq!(WorkingMode::parse("release"), Some(WorkingMode::Release));
+        assert_eq!(WorkingMode::parse(""), None);
+        assert_eq!(WorkingMode::parse("Debug"), None);
+        assert_eq!(WorkingMode::parse("d3bug"), None);
+
+        assert_eq!(
+            WorkingMode::from_settings(None),
+            WorkingMode::from_build(),
+            "a file that names no mode follows the build"
+        );
+        assert_eq!(
+            WorkingMode::from_settings(Some("nonsense")),
+            WorkingMode::from_build()
+        );
+        assert_eq!(
+            WorkingMode::from_settings(Some("release")),
+            WorkingMode::Release
+        );
+
+        // Only Release reaches the network on its own.
+        assert!(!WorkingMode::Debug.syncs_automatically());
+        assert!(WorkingMode::Release.syncs_automatically());
+        let expected = if cfg!(debug_assertions) {
+            WorkingMode::Debug
+        } else {
+            WorkingMode::Release
+        };
+        assert_eq!(WorkingMode::from_build(), expected);
     }
 
     #[test]

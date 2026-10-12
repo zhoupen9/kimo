@@ -180,7 +180,14 @@ Event (mpsc) ──► drain_events() at frame start ──► merge into Accoun
   has been fetched before, and a folder that fails does not cost the others
   theirs (the first error is reported at the end). A folder the user never
   opened has no mark and waits for its first click, which is where its backfill
-  happens; a warm folder with nothing new neither writes nor emits.
+  happens; a warm folder with nothing new neither writes nor emits. The working
+  mode (Preferences → General; `settings.json`'s `working_mode`, absent meaning
+  the build) can switch the automatic half of that off: in **Debug** neither the
+  startup sweep nor the fetch-on-first-open happens, the cached mail still loads
+  from the database, and only the title-bar Sync button and `Save & sync` in
+  Preferences reach the server. It is a per-installation setting rather than a
+  build flag so that a development build can be pointed at a real account
+  without a sync on every start.
 - The Blitz renderer is a `Job::RenderHtml` on a worker thread: it parses,
   styles, lays out and rasterizes the body, resolving every sub-resource
   through `blitz_render::MailNet` (a blocking `NetProvider` that reuses the
@@ -248,9 +255,10 @@ Event (mpsc) ──► drain_events() at frame start ──► merge into Accoun
 - `~/.config/kimo/settings.json` — UI settings: the theme
   (`system`/`light`/`dark`; "system" resolves via GTK/KDE config files, no
   subprocesses or D-Bus), `html_renderer` (`egui`/`blitz`, absent means
-  `egui`), and the font families picked in Preferences → Appearance
-  (`ui_font`, `mono_font`; absent means egui's built-in font plus the CJK
-  fallback). Family *names* are stored, not paths, so the file survives font
+  `egui`), `working_mode` (`debug`/`release`, absent means the build — see the
+  syncing bullet above), and the font families picked in Preferences →
+  Appearance (`ui_font`, `mono_font`; absent means egui's built-in font plus
+  the CJK fallback). Family *names* are stored, not paths, so the file survives font
   updates; a name that no longer resolves is simply ignored. Older files may
   still carry a `render_mode` field from the removed WebKitGTK renderer; it
   is ignored on load — do not reuse that name. The palette that the theme
@@ -349,10 +357,10 @@ Event (mpsc) ──► drain_events() at frame start ──► merge into Accoun
   system decorations.
 - `preferences_modal()` is the one place to configure Kimo: an
   `egui::Modal` (backdrop click or Escape closes it) with a sidebar of
-  pages — **Accounts** (account list with use/edit/remove, and the
-  add/edit account form in place of the list: it is pre-filled from the
-  account it was opened on, and `Save & sync` updates that account and
-  syncs it) and **Appearance** (theme, Simple/Blitz HTML
+  pages — **General** (the working mode), **Accounts** (account list with
+  use/edit/remove, and the add/edit account form in place of the list: it is
+  pre-filled from the account it was opened on, and `Save & sync` updates that
+  account and syncs it) and **Appearance** (theme, Simple/Blitz HTML
   renderer, the interface/fixed-width fonts — all persisted in
   `settings.json` — plus a read-only preview of the palette the theme
   resolves to). Configuration belongs on a page there, not as another
