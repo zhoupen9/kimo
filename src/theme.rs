@@ -107,8 +107,17 @@ pub struct ColorScheme {
     pub input: Color32,
     /// Background of inline code in HTML mail.
     pub code: Color32,
-    /// Hairlines: separators, widget outlines, row bottom borders.
+    /// Hairlines: widget outlines, window strokes, egui's own separators.
     pub border: Color32,
+    /// The mail rows' edges — the left and right side of a row, and its bottom
+    /// — one step *fainter* than [`ColorScheme::border`], which is what the
+    /// rule between two rows used to be. Fainter, not merely lighter: the dark
+    /// scheme draws its lines lighter than the surface they sit on, so there
+    /// "fainter" means closer to `content`.
+    pub row_edge: Color32,
+    /// A row's top edge, fainter still: with the row above's bottom edge it
+    /// makes the two pixels that separate two mails.
+    pub row_edge_top: Color32,
 
     // --- text ---
     /// Body text.
@@ -157,6 +166,8 @@ impl ColorScheme {
             input: Color32::from_rgb(255, 255, 255), // #FFFFFF
             code: Color32::from_rgb(238, 239, 243),  // #EEEFF3
             border: Color32::from_rgb(215, 218, 225), // #D7DAE1
+            row_edge: Color32::from_rgb(229, 231, 237), // #E5E7ED
+            row_edge_top: Color32::from_rgb(240, 241, 245), // #F0F1F5
             text: Color32::from_rgb(30, 34, 40),     // #1E2228
             // Dark enough for AA on the gray chrome as well as on the
             // near-white content surface.
@@ -183,20 +194,22 @@ impl ColorScheme {
             // card, its gutter and the list's hairlines are the step between
             // these two slots, so a content equal to the panel is a reading
             // pane with no card in it.
-            content: Color32::from_rgb(32, 35, 41), // #202329
-            window: Color32::from_rgb(34, 37, 43),  // #22252B
-            card: Color32::from_rgb(36, 39, 46),    // #24272E
-            hover: Color32::from_rgb(46, 51, 60),   // #2E333C
-            input: Color32::from_rgb(20, 22, 26),   // #14161A
-            code: Color32::from_rgb(43, 48, 56),    // #2B3038
-            border: Color32::from_rgb(54, 60, 70),  // #363C46
-            text: Color32::from_rgb(230, 232, 236), // #E6E8EC
+            content: Color32::from_rgb(32, 35, 41),  // #202329
+            window: Color32::from_rgb(34, 37, 43),   // #22252B
+            card: Color32::from_rgb(36, 39, 46),     // #24272E
+            hover: Color32::from_rgb(46, 51, 60),    // #2E333C
+            input: Color32::from_rgb(20, 22, 26),    // #14161A
+            code: Color32::from_rgb(43, 48, 56),     // #2B3038
+            border: Color32::from_rgb(54, 60, 70),   // #363C46
+            row_edge: Color32::from_rgb(44, 48, 56), // #2C3038
+            row_edge_top: Color32::from_rgb(38, 42, 49), // #262A31
+            text: Color32::from_rgb(230, 232, 236),  // #E6E8EC
             text_weak: Color32::from_rgb(154, 161, 172), // #9AA1AC
             on_danger: Color32::from_rgb(255, 255, 255), // #FFFFFF
             accent: Color32::from_rgb(139, 123, 240), // #8B7BF0
             selection: Color32::from_rgb(58, 53, 104), // #3A3568
-            link: Color32::from_rgb(127, 168, 255), // #7FA8FF
-            warn: Color32::from_rgb(224, 163, 58),  // #E0A33A
+            link: Color32::from_rgb(127, 168, 255),  // #7FA8FF
+            warn: Color32::from_rgb(224, 163, 58),   // #E0A33A
             danger: Color32::from_rgb(255, 107, 107), // #FF6B6B
             danger_hover: Color32::from_rgb(232, 17, 35), // #E81123
             avatar: AVATAR,
@@ -259,7 +272,7 @@ impl ColorScheme {
 
     /// Labeled colors for the Appearance page preview, in the order the fields
     /// are declared.
-    pub fn swatches(self) -> [(&'static str, Color32); 16] {
+    pub fn swatches(self) -> [(&'static str, Color32); 18] {
         [
             ("Panel", self.panel),
             ("Content", self.content),
@@ -269,6 +282,8 @@ impl ColorScheme {
             ("Input", self.input),
             ("Code", self.code),
             ("Border", self.border),
+            ("Mail edge", self.row_edge),
+            ("Mail edge top", self.row_edge_top),
             ("Text", self.text),
             ("Text weak", self.text_weak),
             ("Accent", self.accent),
@@ -379,6 +394,8 @@ mod tests {
             ("input", LIGHT.input, DARK.input),
             ("code", LIGHT.code, DARK.code),
             ("border", LIGHT.border, DARK.border),
+            ("row edge", LIGHT.row_edge, DARK.row_edge),
+            ("row edge top", LIGHT.row_edge_top, DARK.row_edge_top),
         ] {
             assert!(
                 luminance(light) > luminance(dark),
@@ -400,6 +417,27 @@ mod tests {
         for (name, scheme) in [("light", LIGHT), ("dark", DARK)] {
             let step = luminance(scheme.content) / luminance(scheme.panel);
             assert!(step >= 1.1, "{name}: content is only {step:.2}x the panel");
+        }
+    }
+
+    /// A mail row's edges are separations, not rules: every one of them has to
+    /// be *fainter* against the list than a hairline is, and the top edge — the
+    /// one facing the mail above — fainter than the rest, because that pair of
+    /// faint lines is the whole of the space between two mails.
+    #[test]
+    fn the_mail_rows_are_separated_by_a_softer_line_than_a_hairline() {
+        for (name, scheme) in [("light", LIGHT), ("dark", DARK)] {
+            let hairline = contrast(scheme.border, scheme.content);
+            let edge = contrast(scheme.row_edge, scheme.content);
+            let top = contrast(scheme.row_edge_top, scheme.content);
+            assert!(
+                edge < hairline,
+                "{name}: a row edge is {edge:.2}:1 against the list, a hairline {hairline:.2}:1"
+            );
+            assert!(
+                top < edge,
+                "{name}: a row's top edge is {top:.2}:1 against the list, its sides {edge:.2}:1"
+            );
         }
     }
 

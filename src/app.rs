@@ -1625,10 +1625,12 @@ impl KimoApp {
         // message_card), and a hairline down each side frames it.
         let column = ui.max_rect();
         self.list_column = column;
-        // A hairline down each side, in both schemes: the chrome is the step
-        // outside the column and the card's gutter the step outside that, and
-        // the hairline is what keeps either from touching the rows.
-        let stroke = egui::Stroke::new(1.0_f32, scheme.border);
+        // The mails' own left and right edges, drawn down the whole column so
+        // that it stays framed above and below the rows too: the chrome is the
+        // step outside the column and the card's gutter the step outside that,
+        // and this line is what keeps either from touching the rows. Every row
+        // paints it again over its own fill (see message_card).
+        let stroke = egui::Stroke::new(1.0_f32, scheme.row_edge);
         ui.painter()
             .vline(column.left() + 0.5, column.y_range(), stroke);
         ui.painter()
@@ -1859,18 +1861,17 @@ impl KimoApp {
         egui::ScrollArea::vertical()
             .auto_shrink([false, false])
             .show(ui, |ui| {
-                // The padding is inside the scroll area, not on the column's
-                // frame: that is what lets the scroll bar reach the column's
-                // edge.
-                egui::Frame::new().inner_margin(LIST_MARGIN).show(ui, |ui| {
-                    // No gap between rows: a row's highlight has to reach
-                    // the rule above it, and those rules are what separates
-                    // the mails.
-                    ui.spacing_mut().item_spacing.y = 0.0;
-                    for (index, msg) in messages.iter().enumerate() {
-                        self.message_row(ui, msg, index == 0);
-                    }
-                });
+                egui::Frame::new()
+                    .inner_margin(LIST_PADDING)
+                    .show(ui, |ui| {
+                        // No gap between rows: the two pixels that separate two
+                        // mails are the rows' own edges, so the layout must not
+                        // add space of its own between them.
+                        ui.spacing_mut().item_spacing.y = 0.0;
+                        for msg in &messages {
+                            self.message_row(ui, msg);
+                        }
+                    });
             });
     }
 
@@ -1900,12 +1901,14 @@ impl KimoApp {
         egui::ScrollArea::vertical()
             .auto_shrink([false, false])
             .show(ui, |ui| {
-                egui::Frame::new().inner_margin(LIST_MARGIN).show(ui, |ui| {
-                    ui.spacing_mut().item_spacing.y = 0.0;
-                    for (index, hit) in hits.iter().enumerate() {
-                        self.search_row(ui, hit, index == 0);
-                    }
-                });
+                egui::Frame::new()
+                    .inner_margin(LIST_PADDING)
+                    .show(ui, |ui| {
+                        ui.spacing_mut().item_spacing.y = 0.0;
+                        for hit in &hits {
+                            self.search_row(ui, hit);
+                        }
+                    });
             });
         self.search_hits = hits;
     }
@@ -1994,9 +1997,8 @@ impl KimoApp {
         }
     }
 
-    /// One message card in the folder list. `first` is the topmost row, which
-    /// carries no rule over it.
-    fn message_row(&mut self, ui: &mut egui::Ui, msg: &MailMessage, first: bool) {
+    /// One message card in the folder list.
+    fn message_row(&mut self, ui: &mut egui::Ui, msg: &MailMessage) {
         let selected = self.selected_message.as_deref() == Some(msg.uid.as_str());
         let preview = if msg.preview.is_empty() {
             " ".to_string()
@@ -2011,7 +2013,7 @@ impl KimoApp {
             unread: !msg.seen,
             selected,
         };
-        let response = self.message_card(ui, &card, first);
+        let response = self.message_card(ui, &card);
         if response.clicked() {
             self.open_message(msg);
         }
@@ -2019,7 +2021,7 @@ impl KimoApp {
 
     /// One search result: the same card, with where the mail lives and the line
     /// the query matched as its third line.
-    fn search_row(&mut self, ui: &mut egui::Ui, hit: &SearchHit, first: bool) {
+    fn search_row(&mut self, ui: &mut egui::Ui, hit: &SearchHit) {
         let selected = self.selected_message.as_deref() == Some(hit.uid.as_str())
             && self.selected_folder.as_deref() == Some(hit.folder.as_str());
         let account = self
@@ -2040,7 +2042,7 @@ impl KimoApp {
             unread: !hit.seen,
             selected,
         };
-        let response = self.message_card(ui, &card, first);
+        let response = self.message_card(ui, &card);
         if response.clicked() {
             self.open_hit(hit);
         }
@@ -2049,7 +2051,7 @@ impl KimoApp {
     /// One card in the middle column: avatar on the left; sender + timestamp,
     /// title and a muted third line stacked on the right. The folder list and
     /// the search results share it — only what the three lines say differs.
-    fn message_card(&self, ui: &mut egui::Ui, card: &CardText, first: bool) -> egui::Response {
+    fn message_card(&self, ui: &mut egui::Ui, card: &CardText) -> egui::Response {
         let scheme = theme::of(ui.ctx());
         let (rect, resp) = ui.allocate_exact_size(
             egui::vec2(ui.available_width(), MESSAGE_ROW_HEIGHT),
@@ -2073,20 +2075,49 @@ impl KimoApp {
                 .with_clip_rect(column)
                 .rect_filled(full, 0.0, scheme.hover);
         }
-        // The rule between two rows belongs to the lower one and sits at its
-        // top edge: drawn after the row above, a highlight that reaches this far
-        // cannot cover it (the rows are laid out with no gap between them). The
-        // first row has no rule over it — that would read as a border under the
-        // title bar.
-        if !first {
-            painter.with_clip_rect(column).line_segment(
+        // Every mail carries its own edges instead of sharing a rule with its
+        // neighbour: the two sides and the bottom take the faint `row_edge`,
+        // the top the fainter still `row_edge_top`, so what separates two
+        // mails is this row's top edge against the bottom edge of the row above
+        // — two pixels, no rule. Drawn after the highlight, which is what keeps
+        // a selected mail's frame visible across its fill.
+        let edge = egui::Stroke::new(1.0_f32, scheme.row_edge);
+        let top_edge = egui::Stroke::new(1.0_f32, scheme.row_edge_top);
+        let edges = painter.with_clip_rect(column);
+        // The top edge is what separates this mail from the one above, so the
+        // first mail of the list has none: it starts at the column's top edge,
+        // where an edge would draw a line under the title bar — and the bar has
+        // no bottom line by design.
+        if rect.top() >= column.top() + 1.0 {
+            edges.line_segment(
                 [
-                    egui::pos2(column.left(), rect.top()),
-                    egui::pos2(column.right(), rect.top()),
+                    egui::pos2(column.left(), rect.top() + 0.5),
+                    egui::pos2(column.right(), rect.top() + 0.5),
                 ],
-                egui::Stroke::new(1.0_f32, scheme.border),
+                top_edge,
             );
         }
+        edges.line_segment(
+            [
+                egui::pos2(column.left(), rect.bottom() - 0.5),
+                egui::pos2(column.right(), rect.bottom() - 0.5),
+            ],
+            edge,
+        );
+        edges.line_segment(
+            [
+                egui::pos2(column.left() + 0.5, rect.top()),
+                egui::pos2(column.left() + 0.5, rect.bottom()),
+            ],
+            edge,
+        );
+        edges.line_segment(
+            [
+                egui::pos2(column.right() - 0.5, rect.top()),
+                egui::pos2(column.right() - 0.5, rect.bottom()),
+            ],
+            edge,
+        );
 
         // Avatar: deterministic color per sender, initial centered in it.
         let avatar_center = egui::pos2(rect.left() + 8.0 + AVATAR_DIAMETER / 2.0, rect.center().y);
@@ -2942,13 +2973,25 @@ const TITLEBAR_SEARCH_HEIGHT: f32 = TITLEBAR_HEIGHT - 16.0;
 /// makes it read as the one field in the bar.
 const SEARCH_BOX_CORNER_RADIUS: u8 = 8;
 
-/// Padding inside the message list's column, which is the lighter surface: the
-/// hairlines `mail_list` draws down its sides sit just outside it.
+/// Padding on the sides of the message list's rows: the hairlines `mail_list`
+/// draws down the column's sides sit just outside it. There is none at the top
+/// — the first mail starts at the column's top edge, with no band of surface
+/// above it, and its own top edge would draw a line under the title bar.
 const LIST_MARGIN: i8 = 8;
+
+/// The rows' padding inside the list's scroll area — see `LIST_MARGIN` for
+/// why the top is zero. It belongs to the scroll area rather than to the
+/// column, which is what lets the scroll bar reach the column's edge.
+const LIST_PADDING: egui::Margin = egui::Margin {
+    left: LIST_MARGIN,
+    right: LIST_MARGIN,
+    top: 0,
+    bottom: LIST_MARGIN,
+};
 /// The gutter around the reading pane's card — the gap between the card and
-/// the list column. It doubles as the splitter: egui's drag area around the
-/// panel boundary covers it, and no line is drawn in it (the dark scheme keeps
-/// egui's separator there, since both surfaces are the same color).
+/// the list column, and the chrome showing between the card and the panel's
+/// other edges. It doubles as the splitter: egui's drag area around the panel
+/// boundary covers it, and no line is drawn in it.
 const CONTENT_GUTTER: f32 = 4.0;
 /// Padding between the card's edge and the mail on it — all four sides, so the
 /// subject and the body do not sit against the card's corners.

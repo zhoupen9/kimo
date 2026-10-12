@@ -325,13 +325,22 @@ Event (mpsc) ──► drain_events() at frame start ──► merge into Accoun
   (`CONTENT_CARD_CORNER_RADIUS`) inset by `CONTENT_GUTTER` into the chrome,
   whose left side doubles as the splitter; with nothing selected there is no
   card at all. Both highlights in the list are the mail's whole row: a square
-  block spanning the column edge to edge, and the rule between two rows belongs
-  to the lower one and sits at its *top* edge, with `item_spacing.y = 0`, so
-  nothing shows between a highlight and the rule above it (the first row has no
-  rule). Pane padding lives *inside* each scroll area
-  (`Frame::inner_margin(LIST_MARGIN)` around the rows, `mail_body` for the
-  mail), not on the panel's frame, which is what lets the scroll bars reach the
-  column's edge and the card's edge instead of stopping on the padding. egui's
+  block spanning the column edge to edge. A mail draws its own edges instead of
+  sharing a rule with its neighbour — left, right and bottom in `row_edge`, the
+  top in the fainter `row_edge_top`, each a pixel inside its own rect — so what
+  separates two mails is this row's top edge against the bottom edge of the row
+  above: two pixels, and `item_spacing.y = 0` keeps the layout from adding a
+  third. The list's first row draws no top edge — there is no mail above it to
+  be separated from, and the edge would land on the title bar's bottom edge,
+  which is deliberately bare. The column's hairlines are `row_edge` too and run its whole height,
+  and a row paints them again over its own highlight, which is what keeps a
+  selected mail's frame visible across its fill. Pane padding lives *inside*
+  each scroll area
+  (`Frame::inner_margin(LIST_PADDING)` around the rows — sides and bottom
+  only, so the first mail starts at the column's top edge — and `mail_body`
+  for the mail), not on the panel's frame, which is what lets the scroll bars
+  reach the column's edge and the card's edge instead of stopping on the
+  padding. egui's
   panel separators are off in both schemes (they would double those hairlines
   and the card's gutter) and the two boundary pixels are repainted with the
   chrome after the panels, so hovering a splitter draws no line at all.
@@ -410,7 +419,9 @@ Event (mpsc) ──► drain_events() at frame start ──► merge into Accoun
   only part that is persisted) resolves to a `ColorScheme`, and both defaults
   are filled in slot by slot, `ColorScheme::light()` and
   `ColorScheme::dark()`: surfaces (panel — the chrome; content — the message
-  list and the reading pane's card; window, card, hover, input, code, border),
+  list and the reading pane's card; window, card, hover, input, code, border;
+  and `row_edge` / `row_edge_top`, the two faint lines a mail row is drawn
+  with, fainter than a hairline and the top one fainter than the sides),
   text and weak text, accent / selection / link, warn / danger / danger_hover,
   and the avatar palette — shared by both themes on purpose, so that a sender
   keeps its color when the theme changes. `content` is the lighter of the two
@@ -434,7 +445,9 @@ Event (mpsc) ──► drain_events() at frame start ──► merge into Accoun
   contrast floors (body text ≥ 4.5:1 on its panel *and* on its content, accent
   ≥ 3:1, text on the selection and hover fills ≥ 4.5:1, the close glyph on its
   red ≥ 4.5:1, both schemes' surfaces on opposite sides of the brightness
-  scale); keep them green when you touch a color.
+  scale, and the mail rows' edges fainter against the list than a hairline,
+  with the top edge fainter than the sides); keep them green when you touch a
+  color.
 - Fonts are discovered, never fetched through fontconfig (hard rule 1):
   `fonts::scan()` walks the usual directories and reads each face's `name`
   table with ttf-parser. That took ~210 ms for the ~1000 installed faces on
