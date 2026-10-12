@@ -315,6 +315,23 @@ Event (mpsc) ──► drain_events() at frame start ──► merge into Accoun
   active the list shows `search_results` instead of the selected folder, and
   `message_card` paints both kinds of row), and the reading pane on the right
   with a "No mail selected" placeholder.
+  The chrome — title bar and navigation — is the scheme's `panel`; the message
+  list and the reading pane are the lighter `content`. In the light theme the
+  list column is framed by a hairline down each side (`mail_list`, drawn at the
+  column's own rect), and the reading pane is a card of `content`
+  (`CONTENT_CARD_CORNER_RADIUS`) inset by `CONTENT_GUTTER` into the chrome,
+  whose left side doubles as the splitter; with nothing selected there is no
+  card at all. Both highlights in the list are the mail's whole row: a square
+  block spanning the column edge to edge, and the rule between two rows belongs
+  to the lower one and sits at its *top* edge, with `item_spacing.y = 0`, so
+  nothing shows between a highlight and the rule above it (the first row has no
+  rule). Pane padding lives *inside* each scroll area
+  (`Frame::inner_margin(LIST_MARGIN)` around the rows, `mail_body` for the
+  mail), not on the panel's frame, which is what lets the scroll bars reach the
+  column's edge and the card's edge instead of stopping on the padding. egui's
+  panel separators are off in the light theme (they would double those
+  hairlines) and the two boundary pixels are repainted after the panels, so
+  hovering a splitter draws no line at all.
 - Search lives in the title bar and in the popup it opens, never in the
   column. The title-bar box shows the query with the magnifier drawn inside its
   left edge, and the whole box is one click target: a click anywhere in it —
@@ -369,6 +386,12 @@ Event (mpsc) ──► drain_events() at frame start ──► merge into Accoun
   the pointer. They are not `egui::Button`s for that reason — a stock button
   draws a card-colored frame with a border, which in a title bar reads as a
   widget among window chrome. Don't re-enable system decorations.
+  The bar is `TITLEBAR_HEIGHT` (48 pt) tall and the search box fills all but
+  16 pt of that (`TITLEBAR_SEARCH_HEIGHT`), with a rounder corner than the
+  stock widget radius (`SEARCH_BOX_CORNER_RADIUS`); its frame is stock
+  `TextEdit` chrome, so the radius is set on the widget visuals in a scope —
+  and because the field is deliberately non-interactive, the slot that matters
+  is `noninteractive` (egui picks the visuals by `Sense`, not by hover).
 - `preferences_modal()` is the one place to configure Kimo: an
   `egui::Modal` (backdrop click or Escape closes it) with a sidebar of
   pages — **General** (the working mode), **Accounts** (account list with
@@ -383,10 +406,13 @@ Event (mpsc) ──► drain_events() at frame start ──► merge into Accoun
 - Colors live in one place, `src/theme.rs`. `Theme` (system/light/dark — the
   only part that is persisted) resolves to a `ColorScheme`, and both defaults
   are filled in slot by slot, `ColorScheme::light()` and
-  `ColorScheme::dark()`: surfaces (panel, window, card, hover, input, code,
-  border), text and weak text, accent / selection / link, warn / danger /
-  danger_hover, and the avatar palette — shared by both themes on purpose, so
-  that a sender keeps its color when the theme changes.
+  `ColorScheme::dark()`: surfaces (panel — the chrome; content — the message
+  list and the reading pane's card; window, card, hover, input, code, border),
+  text and weak text, accent / selection / link, warn / danger / danger_hover,
+  and the avatar palette — shared by both themes on purpose, so that a sender
+  keeps its color when the theme changes. In the dark scheme `panel` and
+  `content` are the same color, so the light theme's card, gutter and list
+  hairlines are invisible there and egui's panel separators stay on.
   `ColorScheme::visuals()` maps the scheme onto egui's `Visuals` for every
   stock widget, while `theme::install` also parks the scheme in the context,
   where the hand-painted UI (title bar, folder rows, message cards, avatars,
@@ -400,10 +426,10 @@ Event (mpsc) ──► drain_events() at frame start ──► merge into Accoun
   Appearance previews the resolved scheme (`ColorScheme::swatches`,
   `theme::hex`) but the palette is not editable yet, which is why nothing
   about it is written back to `settings.json`. `theme.rs`'s tests pin the
-  contrast floors (body text ≥ 4.5:1 on its panel, accent ≥ 3:1, text on the
-  selection and hover fills ≥ 4.5:1, the close glyph on its red ≥ 4.5:1, both
-  schemes' surfaces on opposite sides of the brightness scale); keep them green
-  when you touch a color.
+  contrast floors (body text ≥ 4.5:1 on its panel *and* on its content, accent
+  ≥ 3:1, text on the selection and hover fills ≥ 4.5:1, the close glyph on its
+  red ≥ 4.5:1, both schemes' surfaces on opposite sides of the brightness
+  scale); keep them green when you touch a color.
 - Fonts are discovered, never fetched through fontconfig (hard rule 1):
   `fonts::scan()` walks the usual directories and reads each face's `name`
   table with ttf-parser. That took ~210 ms for the ~1000 installed faces on

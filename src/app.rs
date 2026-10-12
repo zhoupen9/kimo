@@ -275,6 +275,10 @@ pub struct KimoApp {
     /// Message the reading pane's scroll offset belongs to, so opening another
     /// mail starts at the top instead of mid-page.
     scrolled_message: Option<String>,
+    /// The message list's own rect this frame, set by `mail_list`. The rows'
+    /// rules span it so they reach the column's hairlines; nothing else reads
+    /// it.
+    list_column: egui::Rect,
 }
 
 /// A Blitz page: rendering, rendered, or failed.
@@ -500,6 +504,7 @@ impl KimoApp {
             blitz_cancel: crate::blitz_render::Cancellation::default(),
             pending_blitz_key: None,
             scrolled_message: None,
+            list_column: egui::Rect::ZERO,
         };
 
         app.selected_account = app.accounts.first().map(|a| a.id.clone());
@@ -1391,13 +1396,41 @@ impl KimoApp {
                         left: SEARCH_ICON_INSET,
                         ..egui::Margin::symmetric(4, 2)
                     };
-                    let field = row.add(
-                        egui::TextEdit::singleline(&mut self.search.text)
-                            .hint_text("Search mail…")
-                            .interactive(false)
-                            .desired_width(TITLEBAR_SEARCH_WIDTH)
-                            .margin(margin),
-                    );
+                    // The box's frame is stock `TextEdit` chrome, so its
+                    // corner radius is the widget visuals' — rounded here in a
+                    // scope, which leaves every other field in the app with
+                    // egui's tighter default. The field is deliberately
+                    // non-interactive and egui picks the visuals by `Sense`
+                    // rather than by hover, so `noninteractive` is the slot it
+                    // actually draws with; the rest are rounded as well, so that
+                    // making the field live again would not square the corners.
+                    let field = row
+                        .scope(|ui| {
+                            let radius = egui::CornerRadius::same(SEARCH_BOX_CORNER_RADIUS);
+                            let widgets = &mut ui.style_mut().visuals.widgets;
+                            for widget in [
+                                &mut widgets.noninteractive,
+                                &mut widgets.inactive,
+                                &mut widgets.hovered,
+                                &mut widgets.active,
+                                &mut widgets.open,
+                            ] {
+                                widget.corner_radius = radius;
+                            }
+                            ui.add(
+                                egui::TextEdit::singleline(&mut self.search.text)
+                                    .hint_text("Search mail…")
+                                    .interactive(false)
+                                    .desired_width(TITLEBAR_SEARCH_WIDTH)
+                                    // The bar is taller than a text row, so the
+                                    // field is grown to a fixed height and the
+                                    // query (or the hint) is centred in it.
+                                    .min_size(egui::vec2(0.0, TITLEBAR_SEARCH_HEIGHT))
+                                    .vertical_align(egui::Align::Center)
+                                    .margin(margin),
+                            )
+                        })
+                        .inner;
                     // `TextEdit` hands back its *inner* rect — the margins are
                     // already taken off it — so the box is that, grown back by
                     // the margins it was given.
@@ -1482,11 +1515,6 @@ impl KimoApp {
                     .send_viewport_cmd(egui::ViewportCommand::Maximized(!maximized));
             }
         }
-
-        ui.painter().line_segment(
-            [bar.left_bottom(), bar.right_bottom()],
-            egui::Stroke::new(1.0_f32, visuals.widgets.noninteractive.bg_stroke.color),
-        );
     }
 
     /// Left column: folders of the selected account.
@@ -1582,17 +1610,43 @@ impl KimoApp {
     }
 
     /// Middle column: the search strip, then the search results or the selected
-    /// folder's mail.
+    /// folder's mail — the lighter content surface, framed by a hairline down
+    /// each side in the light theme.
     fn mail_list(&mut self, ui: &mut egui::Ui) {
+        let scheme = theme::of(ui.ctx());
+        // The column's own rect is the whole ui the frame hands over — the
+        // padding moved inside the scroll area. The rows' rules span it (see
+        // message_card), and the light theme frames it with a hairline down
+        // each side.
+        let column = ui.max_rect();
+        self.list_column = column;
+        if !scheme.dark {
+            let stroke = egui::Stroke::new(1.0_f32, scheme.border);
+            ui.painter()
+                .vline(column.left() + 0.5, column.y_range(), stroke);
+            ui.painter()
+                .vline(column.right() - 0.5, column.y_range(), stroke);
+        }
         // The database could not be opened: the session works, nothing is
         // saved, and this is the only place that says so.
         if let Some(warning) = &self.storage_warning {
-            ui.label(
-                egui::RichText::new(format!("Mail is not being saved: {warning}"))
-                    .small()
-                    .color(theme::of(ui.ctx()).danger),
-            );
-            ui.separator();
+            // Padded like the rows are, since the column's frame no longer does
+            // it for anything.
+            egui::Frame::new()
+                .inner_margin(egui::Margin {
+                    left: LIST_MARGIN,
+                    right: LIST_MARGIN,
+                    top: LIST_MARGIN,
+                    bottom: 0,
+                })
+                .show(ui, |ui| {
+                    ui.label(
+                        egui::RichText::new(format!("Mail is not being saved: {warning}"))
+                            .small()
+                            .color(theme::of(ui.ctx()).danger),
+                    );
+                    ui.separator();
+                });
         }
         if self.accounts.is_empty() || self.selected_account.is_none() {
             ui.centered_and_justified(|ui| {
@@ -1799,9 +1853,18 @@ impl KimoApp {
         egui::ScrollArea::vertical()
             .auto_shrink([false, false])
             .show(ui, |ui| {
-                for msg in &messages {
-                    self.message_row(ui, msg);
-                }
+                // The padding is inside the scroll area, not on the column's
+                // frame: that is what lets the scroll bar reach the column's
+                // edge.
+                egui::Frame::new().inner_margin(LIST_MARGIN).show(ui, |ui| {
+                    // No gap between rows: a row's highlight has to reach
+                    // the rule above it, and those rules are what separates
+                    // the mails.
+                    ui.spacing_mut().item_spacing.y = 0.0;
+                    for (index, msg) in messages.iter().enumerate() {
+                        self.message_row(ui, msg, index == 0);
+                    }
+                });
             });
     }
 
@@ -1831,9 +1894,12 @@ impl KimoApp {
         egui::ScrollArea::vertical()
             .auto_shrink([false, false])
             .show(ui, |ui| {
-                for hit in &hits {
-                    self.search_row(ui, hit);
-                }
+                egui::Frame::new().inner_margin(LIST_MARGIN).show(ui, |ui| {
+                    ui.spacing_mut().item_spacing.y = 0.0;
+                    for (index, hit) in hits.iter().enumerate() {
+                        self.search_row(ui, hit, index == 0);
+                    }
+                });
             });
         self.search_hits = hits;
     }
@@ -1922,8 +1988,9 @@ impl KimoApp {
         }
     }
 
-    /// One message card in the folder list.
-    fn message_row(&mut self, ui: &mut egui::Ui, msg: &MailMessage) {
+    /// One message card in the folder list. `first` is the topmost row, which
+    /// carries no rule over it.
+    fn message_row(&mut self, ui: &mut egui::Ui, msg: &MailMessage, first: bool) {
         let selected = self.selected_message.as_deref() == Some(msg.uid.as_str());
         let preview = if msg.preview.is_empty() {
             " ".to_string()
@@ -1938,7 +2005,7 @@ impl KimoApp {
             unread: !msg.seen,
             selected,
         };
-        let response = self.message_card(ui, &card);
+        let response = self.message_card(ui, &card, first);
         if response.clicked() {
             self.open_message(msg);
         }
@@ -1946,7 +2013,7 @@ impl KimoApp {
 
     /// One search result: the same card, with where the mail lives and the line
     /// the query matched as its third line.
-    fn search_row(&mut self, ui: &mut egui::Ui, hit: &SearchHit) {
+    fn search_row(&mut self, ui: &mut egui::Ui, hit: &SearchHit, first: bool) {
         let selected = self.selected_message.as_deref() == Some(hit.uid.as_str())
             && self.selected_folder.as_deref() == Some(hit.folder.as_str());
         let account = self
@@ -1967,7 +2034,7 @@ impl KimoApp {
             unread: !hit.seen,
             selected,
         };
-        let response = self.message_card(ui, &card);
+        let response = self.message_card(ui, &card, first);
         if response.clicked() {
             self.open_hit(hit);
         }
@@ -1976,23 +2043,44 @@ impl KimoApp {
     /// One card in the middle column: avatar on the left; sender + timestamp,
     /// title and a muted third line stacked on the right. The folder list and
     /// the search results share it — only what the three lines say differs.
-    fn message_card(&self, ui: &mut egui::Ui, card: &CardText) -> egui::Response {
+    fn message_card(&self, ui: &mut egui::Ui, card: &CardText, first: bool) -> egui::Response {
         let scheme = theme::of(ui.ctx());
         let (rect, resp) = ui.allocate_exact_size(
             egui::vec2(ui.available_width(), MESSAGE_ROW_HEIGHT),
             egui::Sense::click(),
         );
 
+        // Both highlights are the mail's whole row: a square block that fills
+        // the column edge to edge, hairlines included, rather than a rounded
+        // pill inset from the text. The row's own rect only spans the mail's
+        // text column, and inside the scroll area the painter is clipped to the
+        // viewport, so the column is both the rectangle and the clip.
         let painter = ui.painter();
+        let column = self.list_column;
+        let full = egui::Rect::from_x_y_ranges(column.x_range(), rect.y_range());
         if card.selected {
-            painter.rect_filled(rect.shrink(1.0), 4.0, scheme.selection);
+            painter
+                .with_clip_rect(column)
+                .rect_filled(full, 0.0, scheme.selection);
         } else if resp.hovered() {
-            painter.rect_filled(rect.shrink(1.0), 4.0, scheme.hover);
+            painter
+                .with_clip_rect(column)
+                .rect_filled(full, 0.0, scheme.hover);
         }
-        painter.line_segment(
-            [rect.left_bottom(), rect.right_bottom()],
-            egui::Stroke::new(1.0_f32, scheme.border),
-        );
+        // The rule between two rows belongs to the lower one and sits at its
+        // top edge: drawn after the row above, a highlight that reaches this far
+        // cannot cover it (the rows are laid out with no gap between them). The
+        // first row has no rule over it — that would read as a border under the
+        // title bar.
+        if !first {
+            painter.with_clip_rect(column).line_segment(
+                [
+                    egui::pos2(column.left(), rect.top()),
+                    egui::pos2(column.right(), rect.top()),
+                ],
+                egui::Stroke::new(1.0_f32, scheme.border),
+            );
+        }
 
         // Avatar: deterministic color per sender, initial centered in it.
         let avatar_center = egui::pos2(rect.left() + 8.0 + AVATAR_DIAMETER / 2.0, rect.center().y);
@@ -2080,9 +2168,71 @@ impl KimoApp {
         resp
     }
 
-    /// Right column: the selected message, or a placeholder.
+    /// Right column: the selected message on the card the reading pane floats
+    /// on — the lighter content surface, inset in the chrome by
+    /// CONTENT_GUTTER, whose left side is also the splitter. With nothing
+    /// selected there is no card at all: the pane is bare chrome and the
+    /// placeholder sits directly on it.
     fn mail_content(&mut self, ui: &mut egui::Ui) {
+        let scheme = theme::of(ui.ctx());
+        // The chrome is painted here rather than by the panel's frame: a frame
+        // fills its *content's* rect, which the card is inset from, so the
+        // panel's right edge would be left unpainted.
+        let panel = ui.max_rect();
+        // Claim the whole panel. egui takes a side panel's *frame* rect as the
+        // width to give it next frame, and the card is inset from that, so
+        // without this the pane would shrink by the gutter on every frame
+        // until it hit its minimum.
+        ui.set_min_size(panel.size());
+        ui.painter().rect_filled(panel, 0.0, scheme.panel);
+
         let Some(msg) = self.selected_message_view() else {
+            self.mail_content_body(ui, None);
+            return;
+        };
+
+        // The card hugs the mail instead of always filling the pane, so its
+        // height is only known once the mail has been laid out: the painter
+        // reserves the shape here and it is filled in below, which is also what
+        // puts the card *behind* the text. An egui Frame cannot do this — it
+        // sizes itself to the content rect, which only works out when the
+        // content fills the pane.
+        let where_to_put_card = ui.painter().add(egui::Shape::Noop);
+        let card_left = panel.left() + CONTENT_GUTTER;
+        let card_right = panel.right() - CONTENT_GUTTER;
+        let card_top = panel.top() + CONTENT_GUTTER;
+        let card_bottom = panel.bottom() - CONTENT_GUTTER;
+        // The body gets the card's whole rect: its padding lives inside the
+        // scroll area (see mail_body), which is what lets the scroll bar sit on
+        // the card's edge rather than on the padding.
+        let inner = egui::Rect::from_min_max(
+            egui::pos2(card_left, card_top),
+            egui::pos2(card_right, card_bottom),
+        );
+        let content = ui
+            .allocate_new_ui(egui::UiBuilder::new().max_rect(inner), |ui| {
+                self.mail_content_body(ui, Some(msg))
+            })
+            .response
+            .rect;
+        let card = egui::Rect::from_min_max(
+            egui::pos2(card_left, card_top),
+            egui::pos2(
+                card_right,
+                (content.bottom() + CONTENT_PADDING.y).min(card_bottom),
+            ),
+        );
+        ui.painter().set(
+            where_to_put_card,
+            egui::Shape::rect_filled(card, CONTENT_CARD_CORNER_RADIUS, scheme.content),
+        );
+    }
+
+    /// What the pane holds: the selected message, or the empty-pane
+    /// placeholder. The message is passed in already resolved — resolving it
+    /// here would clone it a second time every frame.
+    fn mail_content_body(&mut self, ui: &mut egui::Ui, msg: Option<MailMessage>) {
+        let Some(msg) = msg else {
             ui.centered_and_justified(|ui| {
                 ui.label(egui::RichText::new("No mail selected").weak().heading());
             });
@@ -2090,32 +2240,46 @@ impl KimoApp {
         };
         ui.vertical(|ui| {
             ui.set_min_width(ui.available_width());
-            ui.heading(msg.subject.as_str());
-            ui.label(
-                egui::RichText::new(format!("From: {}", msg.from))
-                    .small()
-                    .weak(),
-            );
-            if !msg.to.is_empty() {
-                ui.label(
-                    egui::RichText::new(format!("To: {}", msg.to))
-                        .small()
-                        .weak(),
-                );
-            }
-            if !msg.date.is_empty() {
-                ui.label(
-                    egui::RichText::new(format!("Date: {}", msg.date))
-                        .small()
-                        .weak(),
-                );
-            }
-            if !msg.attachment_names.is_empty() {
-                ui.label(
-                    egui::RichText::new(format!("📎 {}", msg.attachment_names.join(", "))).small(),
-                );
-            }
-            ui.separator();
+            // The headers carry the card's padding themselves; the body below
+            // is padded inside its own scroll area.
+            egui::Frame::new()
+                .inner_margin(egui::Margin {
+                    left: CONTENT_PADDING.x as i8,
+                    right: CONTENT_PADDING.x as i8,
+                    top: CONTENT_PADDING.y as i8,
+                    bottom: 0,
+                })
+                .show(ui, |ui| {
+                    ui.heading(msg.subject.as_str());
+                    ui.label(
+                        egui::RichText::new(format!("From: {}", msg.from))
+                            .small()
+                            .weak(),
+                    );
+                    if !msg.to.is_empty() {
+                        ui.label(
+                            egui::RichText::new(format!("To: {}", msg.to))
+                                .small()
+                                .weak(),
+                        );
+                    }
+                    if !msg.date.is_empty() {
+                        ui.label(
+                            egui::RichText::new(format!("Date: {}", msg.date))
+                                .small()
+                                .weak(),
+                        );
+                    }
+                    if !msg.attachment_names.is_empty() {
+                        ui.label(
+                            egui::RichText::new(format!("📎 {}", msg.attachment_names.join(", ")))
+                                .small(),
+                        );
+                    }
+                    // The rule between the headers and the body spans the card, not
+                    // just the mail's text column.
+                    ui.add(egui::Separator::default().grow(CONTENT_PADDING.x));
+                });
             // A newly opened message starts at the top. The scroll offset is
             // per pane, not per message, so without this the next mail opens
             // wherever the previous one was left — for a Blitz page that means
@@ -2130,7 +2294,10 @@ impl KimoApp {
                 self.scrolled_message = Some(message_key);
             }
             let mut scroll = egui::ScrollArea::vertical()
-                .auto_shrink([false, false])
+                // Full width, but only as tall as the mail: the card around it
+                // hugs a short message instead of running to the pane's floor,
+                // while a long one still takes the pane and scrolls.
+                .auto_shrink([false, true])
                 // Switching renderers swaps the whole pane; a scroll offset
                 // from the other renderer would land in empty space.
                 .id_salt(("mail-content", self.html_renderer.as_str()));
@@ -2138,67 +2305,83 @@ impl KimoApp {
                 scroll = scroll.vertical_scroll_offset(0.0);
             }
             scroll.show(ui, |ui| {
-                ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Wrap);
-                let html = msg.body_html.as_deref();
-                // Blitz takes the whole body; the built-in renderer below
-                // needs the app's resource pipeline, so it stays as is.
-                if let (HtmlRenderer::Blitz, Some(html)) = (self.html_renderer, html) {
-                    self.blitz_view(ui, &msg, html);
-                    return;
-                }
-                if let Some(html) = html {
-                    // Give the renderer what is already loaded and collect
-                    // the URLs it still wants.
-                    let textures: HashMap<String, egui::TextureHandle> = self
-                        .images
-                        .iter()
-                        .filter_map(|(url, status)| match status {
-                            ImageStatus::Ready(texture) => Some((url.clone(), texture.clone())),
-                            _ => None,
-                        })
-                        .collect();
-                    let sheets: HashMap<String, String> = self
-                        .stylesheets
-                        .iter()
-                        .filter_map(|(url, text)| text.as_ref().map(|t| (url.clone(), t.clone())))
-                        .collect();
-                    // Inline `cid:` attachments of this message, decoded
-                    // once and cached per (uid, cid).
-                    let egui_ctx = self.ctx.clone();
-                    let mut inline_map: HashMap<String, egui::TextureHandle> = HashMap::new();
-                    for image in &msg.inline_images {
-                        let key = format!("{}/{}", msg.uid, image.cid);
-                        let texture = self
-                            .inline_textures
-                            .entry(key)
-                            .or_insert_with(|| decode_inline_image(&egui_ctx, image));
-                        if let Some(texture) = texture {
-                            inline_map.insert(image.cid.clone(), texture.clone());
-                        }
-                    }
-                    let mut html_ctx = crate::html::HtmlContext {
-                        images: &textures,
-                        inline_images: &inline_map,
-                        stylesheets: &sheets,
-                        missing_images: Vec::new(),
-                        missing_stylesheets: Vec::new(),
-                    };
-                    crate::html::render(ui, html, &mut html_ctx);
-                    let missing_images = std::mem::take(&mut html_ctx.missing_images);
-                    let missing_sheets = std::mem::take(&mut html_ctx.missing_stylesheets);
-                    for url in missing_images {
-                        self.request_image(url);
-                    }
-                    for url in missing_sheets {
-                        self.request_stylesheet(url);
-                    }
-                } else if !msg.body_text.is_empty() {
-                    ui.label(msg.body_text.as_str());
-                } else {
-                    ui.label(egui::RichText::new("(no text body)").weak());
-                }
+                // The mail is padded inside the scroll area: the bar has to
+                // reach the card's edge, so the pane's own rect is unpadded.
+                egui::Frame::new()
+                    .inner_margin(egui::Margin {
+                        left: CONTENT_PADDING.x as i8,
+                        right: CONTENT_PADDING.x as i8,
+                        top: 0,
+                        bottom: 0,
+                    })
+                    .show(ui, |ui| self.mail_body(ui, &msg));
             });
         });
+    }
+
+    /// The mail itself, laid out inside the pane's scroll area. Its padding
+    /// lives here instead of on the pane so the scroll bar can sit on the
+    /// card's edge.
+    fn mail_body(&mut self, ui: &mut egui::Ui, msg: &MailMessage) {
+        ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Wrap);
+        let html = msg.body_html.as_deref();
+        // Blitz takes the whole body; the built-in renderer below
+        // needs the app's resource pipeline, so it stays as is.
+        if let (HtmlRenderer::Blitz, Some(html)) = (self.html_renderer, html) {
+            self.blitz_view(ui, msg, html);
+            return;
+        }
+        if let Some(html) = html {
+            // Give the renderer what is already loaded and collect
+            // the URLs it still wants.
+            let textures: HashMap<String, egui::TextureHandle> = self
+                .images
+                .iter()
+                .filter_map(|(url, status)| match status {
+                    ImageStatus::Ready(texture) => Some((url.clone(), texture.clone())),
+                    _ => None,
+                })
+                .collect();
+            let sheets: HashMap<String, String> = self
+                .stylesheets
+                .iter()
+                .filter_map(|(url, text)| text.as_ref().map(|t| (url.clone(), t.clone())))
+                .collect();
+            // Inline `cid:` attachments of this message, decoded
+            // once and cached per (uid, cid).
+            let egui_ctx = self.ctx.clone();
+            let mut inline_map: HashMap<String, egui::TextureHandle> = HashMap::new();
+            for image in &msg.inline_images {
+                let key = format!("{}/{}", msg.uid, image.cid);
+                let texture = self
+                    .inline_textures
+                    .entry(key)
+                    .or_insert_with(|| decode_inline_image(&egui_ctx, image));
+                if let Some(texture) = texture {
+                    inline_map.insert(image.cid.clone(), texture.clone());
+                }
+            }
+            let mut html_ctx = crate::html::HtmlContext {
+                images: &textures,
+                inline_images: &inline_map,
+                stylesheets: &sheets,
+                missing_images: Vec::new(),
+                missing_stylesheets: Vec::new(),
+            };
+            crate::html::render(ui, html, &mut html_ctx);
+            let missing_images = std::mem::take(&mut html_ctx.missing_images);
+            let missing_sheets = std::mem::take(&mut html_ctx.missing_stylesheets);
+            for url in missing_images {
+                self.request_image(url);
+            }
+            for url in missing_sheets {
+                self.request_stylesheet(url);
+            }
+        } else if !msg.body_text.is_empty() {
+            ui.label(msg.body_text.as_str());
+        } else {
+            ui.label(egui::RichText::new("(no text body)").weak());
+        }
     }
 
     /// The preferences modal, opened from the title-bar cog: a sidebar of
@@ -2646,22 +2829,73 @@ impl eframe::App for KimoApp {
         }
         self.was_narrow = narrow;
 
+        // The chrome — title bar, navigation, and the gutter the reading
+        // pane's card floats in — is the scheme's panel color; the message list
+        // and the card are the lighter content surface.
+        let scheme = theme::of(ctx);
+        // In the light theme the list column draws its own hairlines and the
+        // card's gutter marks the reading pane, so egui's panel separators are
+        // redundant (and would double those hairlines). The dark scheme paints
+        // both surfaces the same color, where egui's separators are the only
+        // thing marking the columns apart.
+        let panel_separators = scheme.dark;
+
         egui::TopBottomPanel::top("titlebar")
             .exact_height(TITLEBAR_HEIGHT)
+            // egui draws a dim separator line along a panel's inner edge by
+            // default, which here reads as a rule under the bar; the bar runs
+            // into the columns below it instead.
+            .show_separator_line(false)
             .show(ctx, |ui| self.titlebar(ui));
         egui::SidePanel::right("mail_content")
             .resizable(true)
             .min_width(280.0)
             .default_width(460.0)
+            .show_separator_line(panel_separators)
+            // No frame: the gutter and the card are painted in mail_content.
+            .frame(egui::Frame::NONE)
             .show(ctx, |ui| self.mail_content(ui));
         if !self.nav_collapsed {
             egui::SidePanel::left("nav")
                 .resizable(true)
                 .min_width(150.0)
                 .default_width(200.0)
+                .show_separator_line(panel_separators)
                 .show(ctx, |ui| self.nav(ui));
         }
-        egui::CentralPanel::default().show(ctx, |ui| self.mail_list(ui));
+        // What the panels leave over is the message list's column; captured
+        // before the central panel takes it, for the splitter repaint below.
+        let list_column = ctx.available_rect();
+        // No padding on the frame: the column's padding lives inside its scroll
+        // area (see folder_messages), so the scroll bar can sit on the column's
+        // edge instead of on the padding.
+        egui::CentralPanel::default()
+            .frame(egui::Frame::new().fill(scheme.content))
+            .show(ctx, |ui| self.mail_list(ui));
+
+        // egui paints a brighter line along a panel boundary while its splitter
+        // is hovered or dragged, and this UI wants the splitters invisible: put
+        // those two pixels back the way they look at rest — nothing in the
+        // light theme, egui's own hairline in the dark one, where it is the
+        // only thing separating two equally dark columns. Painted after the
+        // panels, so it lands on top of whatever they drew there.
+        let boundary = if panel_separators {
+            scheme.border
+        } else {
+            scheme.panel
+        };
+        let splitter = ctx.layer_painter(egui::LayerId::background());
+        let splitter_stroke = egui::Stroke::new(1.0_f32, boundary);
+        splitter.vline(
+            list_column.left() - 0.5,
+            list_column.y_range(),
+            splitter_stroke,
+        );
+        splitter.vline(
+            list_column.right() + 0.5,
+            list_column.y_range(),
+            splitter_stroke,
+        );
 
         // Ctrl+F opens the search popup, the way every other application's
         // search does — the title-bar button is the discoverable half of it.
@@ -2695,12 +2929,34 @@ impl eframe::App for KimoApp {
 
 // ----- helpers --------------------------------------------------------------
 
-const TITLEBAR_HEIGHT: f32 = 30.0;
+const TITLEBAR_HEIGHT: f32 = 48.0;
 const TITLEBAR_BUTTON_WIDTH: f32 = 42.0;
 /// Width of the title bar's search box (the text part of it). Fixed rather
 /// than filling: the bar also carries the drag surface, and it should not move
 /// around with the length of a query.
 const TITLEBAR_SEARCH_WIDTH: f32 = 175.0;
+/// Height of that box: the bar's height less the breathing room above and
+/// below it, which is what makes the box read as a control rather than as a
+/// line of text in the bar.
+const TITLEBAR_SEARCH_HEIGHT: f32 = TITLEBAR_HEIGHT - 16.0;
+/// Corner radius of that box. egui's stock widget radius is 2, which is right
+/// for a button but leaves this box looking like a rectangle; a rounder corner
+/// makes it read as the one field in the bar.
+const SEARCH_BOX_CORNER_RADIUS: u8 = 8;
+
+/// Padding inside the message list's column, which is the lighter surface: the
+/// hairlines `mail_list` draws down its sides sit just outside it.
+const LIST_MARGIN: i8 = 8;
+/// The gutter around the reading pane's card — the gap between the card and
+/// the list column. It doubles as the splitter: egui's drag area around the
+/// panel boundary covers it, and no line is drawn in it (the dark scheme keeps
+/// egui's separator there, since both surfaces are the same color).
+const CONTENT_GUTTER: f32 = 4.0;
+/// Padding between the card's edge and the mail on it — all four sides, so the
+/// subject and the body do not sit against the card's corners.
+const CONTENT_PADDING: egui::Vec2 = egui::vec2(12.0, 12.0);
+/// Corner radius of the reading pane's card.
+const CONTENT_CARD_CORNER_RADIUS: u8 = 8;
 /// Room the magnifier takes inside the search box, and the glyph's size. The
 /// inset is the field's left margin, so the text begins after the icon.
 const SEARCH_ICON_INSET: i8 = 22;

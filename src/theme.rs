@@ -88,8 +88,12 @@ pub struct ColorScheme {
     pub dark: bool,
 
     // --- surfaces ---
-    /// Panels: title bar, navigation, message list, reading pane.
+    /// Chrome: the title bar and the navigation column.
     pub panel: Color32,
+    /// The working surface: the message list column, and the card the reading
+    /// pane floats on inside the chrome's gutter. Near-white in the light
+    /// scheme, so mail reads on paper with a darker chrome around it.
+    pub content: Color32,
     /// Background of modal windows and popups.
     pub window: Color32,
     /// Faint fills: striped rows, inset cards.
@@ -140,21 +144,26 @@ impl ColorScheme {
         Self {
             name: "Kimo Light",
             dark: false,
-            panel: Color32::from_rgb(250, 250, 251), // #FAFAFB
+            panel: Color32::from_rgb(237, 238, 241), // #EDEEF1
+            content: Color32::from_rgb(250, 250, 251), // #FAFAFB
             window: Color32::from_rgb(255, 255, 255), // #FFFFFF
             card: Color32::from_rgb(241, 242, 245),  // #F1F2F5
-            hover: Color32::from_rgb(231, 233, 239), // #E7E9EF
+            // Dark enough to read as a hover on both the near-white content
+            // surface and the gray chrome the navigation rows sit on.
+            hover: Color32::from_rgb(225, 228, 234), // #E1E4EA
             input: Color32::from_rgb(255, 255, 255), // #FFFFFF
             code: Color32::from_rgb(238, 239, 243),  // #EEEFF3
             border: Color32::from_rgb(215, 218, 225), // #D7DAE1
             text: Color32::from_rgb(30, 34, 40),     // #1E2228
-            text_weak: Color32::from_rgb(106, 114, 128), // #6A7280
+            // Dark enough for AA on the gray chrome as well as on the
+            // near-white content surface.
+            text_weak: Color32::from_rgb(95, 102, 115), // #5F6673
             on_danger: Color32::from_rgb(255, 255, 255), // #FFFFFF
-            accent: Color32::from_rgb(106, 69, 208), // #6A45D0
+            accent: Color32::from_rgb(106, 69, 208),    // #6A45D0
             selection: Color32::from_rgb(220, 224, 248), // #DCE0F8
-            link: Color32::from_rgb(11, 87, 208),    // #0B57D0
-            warn: Color32::from_rgb(161, 92, 0),     // #A15C00
-            danger: Color32::from_rgb(198, 40, 40),  // #C62828
+            link: Color32::from_rgb(11, 87, 208),       // #0B57D0
+            warn: Color32::from_rgb(154, 87, 0),        // #9A5700
+            danger: Color32::from_rgb(198, 40, 40),     // #C62828
             danger_hover: Color32::from_rgb(232, 17, 35), // #E81123
             avatar: AVATAR,
             avatar_text: Color32::from_rgb(255, 255, 255), // #FFFFFF
@@ -166,7 +175,10 @@ impl ColorScheme {
         Self {
             name: "Kimo Dark",
             dark: true,
-            panel: Color32::from_rgb(26, 28, 33),   // #1A1C21
+            panel: Color32::from_rgb(26, 28, 33), // #1A1C21
+            // Same as the chrome: the dark scheme keeps the flat look it had,
+            // so the card and the list column are felt only by their gutter.
+            content: Color32::from_rgb(26, 28, 33), // #1A1C21
             window: Color32::from_rgb(34, 37, 43),  // #22252B
             card: Color32::from_rgb(36, 39, 46),    // #24272E
             hover: Color32::from_rgb(46, 51, 60),   // #2E333C
@@ -242,9 +254,10 @@ impl ColorScheme {
 
     /// Labeled colors for the Appearance page preview, in the order the fields
     /// are declared.
-    pub fn swatches(self) -> [(&'static str, Color32); 15] {
+    pub fn swatches(self) -> [(&'static str, Color32); 16] {
         [
             ("Panel", self.panel),
+            ("Content", self.content),
             ("Window", self.window),
             ("Card", self.card),
             ("Hover", self.hover),
@@ -354,6 +367,7 @@ mod tests {
     fn surfaces_are_lighter_in_the_light_scheme() {
         for (name, light, dark) in [
             ("panel", LIGHT.panel, DARK.panel),
+            ("content", LIGHT.content, DARK.content),
             ("window", LIGHT.window, DARK.window),
             ("card", LIGHT.card, DARK.card),
             ("hover", LIGHT.hover, DARK.hover),
@@ -369,24 +383,35 @@ mod tests {
         // Body text goes the other way and so contrasts with its own panel.
         assert!(luminance(LIGHT.text) < luminance(LIGHT.panel));
         assert!(luminance(DARK.text) > luminance(DARK.panel));
+        // The light scheme's working surface is the lighter one: the chrome
+        // around the list and the reading pane's card has to read as a frame.
+        assert!(luminance(LIGHT.content) > luminance(LIGHT.panel));
+        assert!(luminance(LIGHT.panel) > luminance(LIGHT.hover));
     }
 
     #[test]
     fn foreground_colors_are_readable_on_their_panel() {
         for (name, scheme) in [("light", LIGHT), ("dark", DARK)] {
-            for (slot, color) in [
-                ("text", scheme.text),
-                ("text weak", scheme.text_weak),
-                ("link", scheme.link),
-                ("warn", scheme.warn),
-                ("danger", scheme.danger),
-            ] {
-                let ratio = contrast(color, scheme.panel);
-                assert!(ratio >= 4.5, "{name}: {slot} on panel is {ratio:.1}:1");
+            for (surface, background) in [("panel", scheme.panel), ("content", scheme.content)] {
+                for (slot, color) in [
+                    ("text", scheme.text),
+                    ("text weak", scheme.text_weak),
+                    ("link", scheme.link),
+                    ("warn", scheme.warn),
+                    ("danger", scheme.danger),
+                ] {
+                    let ratio = contrast(color, background);
+                    assert!(ratio >= 4.5, "{name}: {slot} on {surface} is {ratio:.1}:1");
+                }
             }
             // The accent is a fill and focus color, not text.
-            let accent = contrast(scheme.accent, scheme.panel);
-            assert!(accent >= 3.0, "{name}: accent on panel is {accent:.1}:1");
+            for (surface, background) in [("panel", scheme.panel), ("content", scheme.content)] {
+                let accent = contrast(scheme.accent, background);
+                assert!(
+                    accent >= 3.0,
+                    "{name}: accent on {surface} is {accent:.1}:1"
+                );
+            }
             // Weak text is dimmer than body text, but both stay readable.
             assert!(contrast(scheme.text, scheme.panel) > contrast(scheme.text_weak, scheme.panel));
             for (slot, fill) in [("selection", scheme.selection), ("hover", scheme.hover)] {
