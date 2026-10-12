@@ -6,6 +6,7 @@ mod app;
 mod blitz_render;
 mod css;
 mod error;
+mod folders;
 mod fonts;
 mod html;
 mod mail;

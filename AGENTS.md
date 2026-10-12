@@ -98,6 +98,7 @@ src/mail.rs             raw RFC 5322 bytes → MailMessage (mail-parser; HTML ke
 src/html.rs             HTML mail → egui widgets (subset: blocks, lists, tables, links, inline styles)
 src/blitz_render.rs     HTML mail → rasterized page via Blitz (headless render, net provider, fonts)
 src/css.rs              tiny CSS subset (decls, tag/class/id selectors) for HTML mail
+src/folders.rs          folder kind (name → special mailbox, incl. CJK) + embedded row icons
 src/render_bench.rs     test-only: times both HTML renderers for the same bodies (bench_render)
 src/tray.rs             StatusNotifierItem over raw D-Bus (session bus, std::thread) + svg→ARGB icon
 src/sync.rs             Job/Event enums, worker threads, per-protocol sync logic
@@ -226,6 +227,25 @@ Event (mpsc) ──► drain_events() at frame start ──► merge into Accoun
   the Appearance page previews through. Blitz keeps its own curated font set
   (`blitz_render::load_fonts`); the Preferences choice applies to the egui UI
   and to monospace text in the built-in HTML renderer.
+- The navigation column lists folders as custom rows — kind icon, name
+  (elided with an ellipsis), unread count right-aligned — because the whole
+  row should be the click target and carry the selection highlight, which
+  `selectable_label` cannot do once an icon sits in front of the text. The
+  icon comes from `folders::kind_of`, which classifies the *decoded* mailbox
+  name: an exact keyword first (`INBOX`, `Sent`, `Trash`, `归档`), then
+  keyword plus a standard ending (`已删除邮件` = 已删除 + 邮件,
+  `Sent Items` = Sent + Items), walking path segments from the right so
+  `[Gmail]/All Mail` and `项目/已发送/2026` match as well. Only those
+  endings, so `Sentinel` and `已发送的报表` stay ordinary folders. The
+  Chinese names are in the table because mailbox names arrive in the server's
+  language — that is data, not UI copy, and not an i18n framework (rule 6).
+  SPECIAL-USE attributes are still not read (the client never asks for the
+  capability), so the name is the only source of a kind. Row icons live in
+  `assets/folder-icons/`: white on transparency, 48 px, baked from the SVGs
+  in `assets/icons/` with `sed 's/currentColor/#ffffff/g'` plus
+  `rsvg-convert -w 48 -h 48`, and tinted per row. White matters because egui
+  tints by multiplying (a black bake could never take the text color), and
+  `folders.rs`'s test pins the size and the white/transparent pixels.
 - When touching the UI, actually run `cargo run` and click through it; the
   layout has no golden tests. `blitz_render` has a developer tool for
   eyeballing fidelity without the GUI:

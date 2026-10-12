@@ -16,6 +16,7 @@ use std::collections::HashMap;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
+use crate::folders::{self, FolderKind};
 use crate::fonts::FontFamily;
 use crate::models::{Account, MailMessage, Protocol, TlsMode};
 use crate::storage::{self, FolderCache, Settings};
@@ -139,6 +140,10 @@ pub struct KimoApp {
     /// Whether the window was narrow last frame, so auto-collapse only
     /// triggers when crossing the threshold (not every frame).
     was_narrow: bool,
+    /// Folder-list icons, keyed by (kind, open): only a generic folder has a
+    /// second, open glyph. Uploaded once at startup from the embedded PNGs
+    /// in `folders::FolderKind::ICONS`.
+    folder_icons: HashMap<(FolderKind, bool), egui::TextureHandle>,
     theme: Theme,
     /// Cached OS dark-mode preference, so "system" resolution does not hit
     /// the filesystem every frame. Refreshed on startup and whenever the
@@ -270,6 +275,9 @@ impl KimoApp {
             states.insert(account.id.clone(), state);
         }
 
+        // Folder-list icons: white PNGs (see `folders`), tinted per row.
+        let folder_icons = load_folder_icons(&cc.egui_ctx);
+
         let (tx, rx) = mpsc::channel();
         let mut app = Self {
             ctx: cc.egui_ctx.clone(),
@@ -288,6 +296,7 @@ impl KimoApp {
             confirm_delete: None,
             nav_collapsed: false,
             was_narrow: false,
+            folder_icons,
             theme: Theme::parse(&settings.theme),
             system_dark: system_prefers_dark(),
             images: HashMap::new(),
@@ -1193,14 +1202,16 @@ impl KimoApp {
                         .map(|f| f.messages.iter().filter(|m| !m.seen).count())
                         .unwrap_or(0);
                     // `folder` is the IMAP wire form (possibly modified
-                    // UTF-7); decode it just for the label.
+                    // UTF-7); decode it for the label and for the icon
+                    // lookup, which matches the readable name.
                     let display = crate::protocol::imap::decode_mailbox_name(folder.as_str());
-                    let text = if unread > 0 {
-                        egui::RichText::new(format!("📁 {display} ({unread})")).strong()
-                    } else {
-                        egui::RichText::new(format!("📁 {display}")).weak()
-                    };
-                    if ui.selectable_label(selected, text).clicked() {
+                    let kind = folders::kind_of(&display);
+                    // Only a generic folder has an open variant; the special
+                    // mailboxes keep one glyph.
+                    let open = selected && kind == FolderKind::Folder;
+                    let icon = self.folder_icons.get(&(kind, open)).cloned();
+                    let row = folder_row(ui, icon.as_ref(), &display, unread, selected);
+                    if row.clicked() {
                         self.select_folder(account.id.clone(), folder, account.protocol);
                     }
                 }
@@ -2074,6 +2085,101 @@ fn truncate_galley(
     }
     let cut: String = chars[..lo].iter().collect::<String>() + "…";
     ctx.fonts(|f| f.layout_no_wrap(cut, font, color))
+}
+
+/// One row of the folder list: kind icon, name, and the unread count on the
+/// right. The whole row is the click target and carries the selection
+/// highlight — a `selectable_label` would leave the icon outside its own
+/// highlight and put the count inside the name.
+fn folder_row(
+    ui: &mut egui::Ui,
+    icon: Option<&egui::TextureHandle>,
+    name: &str,
+    unread: usize,
+    selected: bool,
+) -> egui::Response {
+    const ROW_HEIGHT: f32 = 22.0;
+    const ICON_SIZE: f32 = 16.0;
+
+    let (rect, response) = ui.allocate_exact_size(
+        egui::vec2(ui.available_width(), ROW_HEIGHT),
+        egui::Sense::click(),
+    );
+    if !ui.is_rect_visible(rect) {
+        return response;
+    }
+    let visuals = ui.style().interact_selectable(&response, selected);
+    if selected || response.hovered() {
+        ui.painter()
+            .rect_filled(rect, 3.0_f32, visuals.weak_bg_fill);
+    }
+    // Unread folders read brighter than read ones, as the plain labels did.
+    let color = if selected {
+        visuals.text_color()
+    } else if unread > 0 {
+        ui.visuals().strong_text_color()
+    } else {
+        ui.visuals().weak_text_color()
+    };
+
+    let mut left = rect.left() + 4.0;
+    if let Some(icon) = icon {
+        let icon_rect = egui::Rect::from_min_size(
+            egui::pos2(left, rect.center().y - ICON_SIZE / 2.0),
+            egui::vec2(ICON_SIZE, ICON_SIZE),
+        );
+        // The icon is white on transparency, so this tint is its color.
+        ui.painter().image(
+            icon.id(),
+            icon_rect,
+            egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+            color,
+        );
+        left = icon_rect.right() + 6.0;
+    }
+
+    let mut right = rect.right() - 6.0;
+    if unread > 0 {
+        let small = egui::TextStyle::Small.resolve(ui.style());
+        let count = ui
+            .ctx()
+            .fonts(|fonts| fonts.layout_no_wrap(unread.to_string(), small, color));
+        right -= count.size().x;
+        ui.painter().galley(
+            egui::pos2(right, rect.center().y - count.size().y / 2.0),
+            count,
+            color,
+        );
+        right -= 6.0;
+    }
+
+    let body = egui::TextStyle::Body.resolve(ui.style());
+    let name = truncate_galley(ui.ctx(), name, body.size, color, (right - left).max(1.0));
+    ui.painter().galley(
+        egui::pos2(left, rect.center().y - name.size().y / 2.0),
+        name,
+        color,
+    );
+    response
+}
+
+/// Decode the embedded folder icons (see `folders::FolderKind::ICONS`) into
+/// textures, once at startup. A failed decode is skipped: that row then draws
+/// without its icon, which is a cosmetic loss at worst.
+fn load_folder_icons(ctx: &egui::Context) -> HashMap<(FolderKind, bool), egui::TextureHandle> {
+    FolderKind::ICONS
+        .iter()
+        .filter_map(|(kind, open, png)| {
+            let decoded = image::load_from_memory(png).ok()?.to_rgba8();
+            let size = [decoded.width() as usize, decoded.height() as usize];
+            let pixels = egui::ColorImage::from_rgba_unmultiplied(size, decoded.as_raw());
+            let name = format!("folder-{kind:?}-{open}");
+            Some((
+                (*kind, *open),
+                ctx.load_texture(name, pixels, Default::default()),
+            ))
+        })
+        .collect()
 }
 
 // Title bar window-control glyphs, painted as vector shapes so they render
