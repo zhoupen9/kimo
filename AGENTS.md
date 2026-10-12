@@ -94,6 +94,7 @@ src/mail.rs             raw RFC 5322 bytes → MailMessage (mail-parser; HTML ke
 src/html.rs             HTML mail → egui widgets (subset: blocks, lists, tables, links, inline styles)
 src/blitz_render.rs     HTML mail → rasterized page via Blitz (headless render, net provider, fonts)
 src/css.rs              tiny CSS subset (decls, tag/class/id selectors) for HTML mail
+src/render_bench.rs     test-only: times both HTML renderers for the same bodies (bench_render)
 src/tray.rs             StatusNotifierItem over raw D-Bus (session bus, std::thread) + svg→ARGB icon
 src/sync.rs             Job/Event enums, worker threads, per-protocol sync logic
 src/protocol/mod.rs     protocol modules
@@ -225,7 +226,15 @@ Event (mpsc) ──► drain_events() at frame start ──► merge into Accoun
   layout has no golden tests. `blitz_render` has a developer tool for
   eyeballing fidelity without the GUI:
   `KIMO_RENDER_HTML=mail.html cargo test -- --ignored dump_render` writes
-  `mail.png` next to the input.
+  `mail.png` next to the input. For cost rather than fidelity, use
+  `render_bench` (test-only, asserts nothing):
+  `cargo test --release -- --ignored --nocapture bench_render` times both
+  renderers on a short mail, a newsletter-shaped fixture and — with
+  `KIMO_BENCH_CACHE=<account>.json` — the median-sized and largest HTML
+  bodies in the disk cache. Note what the two numbers mean: the built-in
+  renderer re-parses and re-lays out the body on *every* frame the reading
+  pane is visible (there is no cache of the widget tree), while Blitz pays
+  once per (message, pane width) on a worker thread.
 - Blitz is built with `blitz-dom`'s default features **off**: its
   `system-fonts` feature would link fontconfig (a C library, hard rule 1).
   `blitz_render` therefore registers fonts from disk itself (a curated set —

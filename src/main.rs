@@ -11,6 +11,9 @@ mod html;
 mod mail;
 mod models;
 mod protocol;
+// Test-only measurement harness for the two HTML renderers; see the file.
+#[cfg(test)]
+mod render_bench;
 mod storage;
 mod sync;
 mod tray;
