@@ -117,7 +117,7 @@ src/error.rs            MailError + MailResult
 src/fonts.rs            installed-font discovery (ttf-parser scan) + egui font installation
 src/storage.rs          XDG paths, settings.json, remote-resource cache, Mailbox/Folder (in memory)
 src/db.rs               the mail database: schema + migrations, accounts, folders, messages, the old-JSON import
-src/search.rs           mail search: the CJK bigram index that feeds the FTS `cjk` column
+src/search.rs           mail search: the CJK bigram index, the FTS5 query builder and the filters they run against
 src/theme.rs            theme choice + the light/dark color schemes and their egui Visuals
 src/mail.rs             raw RFC 5322 bytes → MailMessage (mail-parser; HTML kept for rendering)
 src/html.rs             HTML mail → egui widgets (subset: blocks, lists, tables, links, inline styles)
@@ -184,6 +184,14 @@ Event (mpsc) ──► drain_events() at frame start ──► merge into Accoun
   stale gives up mid-layout (and between raster slices) and reports *nothing*,
   so a superseded render can never be mistaken for a failure of the newer one.
   Never render Blitz HTML on the UI thread.
+- Searching is a job like any other: `Job::Search { seq, query }` runs
+  `search::run` on a worker and answers `Event::SearchResults { seq, hits }`.
+  Every request takes a new `seq`, and the UI drops an answer whose `seq` is not
+  the current one, so a query typed over never shows the previous mail. The bar
+  itself waits for the typing to stop (`SEARCH_SETTLE`, `search_settle`) and
+  Enter skips the wait; `search_applied` is the query the results on screen
+  already answer, which is what keeps an unchanged bar from searching again
+  every frame.
 - Remote mutations are limited to `UID STORE +FLAGS.SILENT (\Seen)` (IMAP).
   POP3 never deletes or mutates anything server-side.
 
@@ -269,11 +277,16 @@ Event (mpsc) ──► drain_events() at frame start ──► merge into Accoun
   bumping, and expect API churn on upgrade (check the egui CHANGELOG).
 - Layout is a three-column mail client: left navigation (collapsible via
   the title-bar toggle; auto-collapses when the window is narrower than
-  640px — see `NAV_AUTO_COLLAPSE_WIDTH`), central message list (avatar
-  cards: sender + timestamp, subject, content preview — see
-  `message_row`), right reading pane with a "No mail selected"
-  placeholder.
-- A message row separates unread mail by *weight*, not by color: the sender
+  640px — see `NAV_AUTO_COLLAPSE_WIDTH`), the central column with the search
+  bar on top (its free text, scope combo, optional filter row and result count
+  — `search_bar`; while a search is active the list shows `search_results`
+  instead of the selected folder, and `message_card` paints both kinds of
+  row), and the reading pane on the right with a "No mail selected"
+  placeholder. Search is not a title-bar affair either: the bar belongs to the
+  column it filters, and nothing about it is persisted.
+- A message row (`message_card`; the folder list and the search results share
+  it, only the third line differs — the preview, or *account · folder — match*)
+  separates unread mail by *weight*, not by color: the sender
   and the subject always take the scheme's `text` (read mail is not dimmed),
   the preview always takes `text_weak`, and an unread row's sender and
   subject are struck twice half a point apart (`paint_row_text`, see
@@ -376,6 +389,20 @@ Event (mpsc) ──► drain_events() at frame start ──► merge into Accoun
   `rsvg-convert -w 48 -h 48`, and tinted per row. White matters because egui
   tints by multiplying (a black bake could never take the text color), and
   `folders.rs`'s test pins the size and the white/transparent pixels.
+- Search is local and over everything the database holds (there is no IMAP
+  `SEARCH`): `search::run` builds one statement over `messages`, joined to
+  `messages_fts` when there is text. The free text becomes FTS5 clauses — a
+  word is a *prefix* phrase across `{subject from_addr to_addr body_text}`, a
+  CJK run is one quoted phrase per bigram in `{cjk}`, AND-ed — and every word
+  is quoted, so query text can never be read as FTS5 syntax. The From/To/Subject
+  boxes are `LIKE '%term%'` filters instead (with the wildcards escaped), which
+  is why a sender substring like "peng" works even though the word index only
+  matches word starts. Dates are `YYYY-MM-DD` read as UTC midnight (the day the
+  list shows) and `before` includes that whole day. Results rank by
+  `bm25(messages_fts)` when there is text and by date when there is not, and
+  stop at `SEARCH_LIMIT` (the UI says "200+"). Snippets are built in Rust
+  (`search::snippet`), not by FTS5's `snippet()`, because the bigram column is
+  not text anybody should read.
 - When touching the UI, actually run `cargo run` and click through it; the
   layout has no golden tests. `blitz_render` has a developer tool for
   eyeballing fidelity without the GUI:

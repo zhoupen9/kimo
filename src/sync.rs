@@ -58,6 +58,12 @@ pub enum Job {
     /// Enumerate the installed font families for the Preferences pickers
     /// (see `crate::fonts`). Results come back as `Event::FontsScanned`.
     ScanFonts,
+    /// Run a search against the mail database (see `crate::search`). Results
+    /// come back as `Event::SearchResults`, tagged with `seq`.
+    Search {
+        seq: u64,
+        query: crate::search::SearchQuery,
+    },
 }
 
 pub enum Event {
@@ -109,6 +115,16 @@ pub enum Event {
     },
     /// The installed font families, sorted by name.
     FontsScanned(Vec<crate::fonts::FontFamily>),
+    /// The hits of one search. `seq` identifies the request: the UI drops an
+    /// answer for a query it has already replaced.
+    SearchResults {
+        seq: u64,
+        hits: Vec<crate::search::SearchHit>,
+    },
+    SearchFailed {
+        seq: u64,
+        error: String,
+    },
 }
 
 pub fn spawn(job: Job, ctx: egui::Context, tx: Sender<Event>) {
@@ -153,6 +169,17 @@ pub fn spawn(job: Job, ctx: egui::Context, tx: Sender<Event>) {
             let _ = tx.send(Event::FontsScanned(crate::fonts::scan()));
             ctx.request_repaint();
         }
+        Job::Search { seq, query } => {
+            let event = match db::db().and_then(|db| crate::search::run(db.conn(), &query)) {
+                Ok(hits) => Event::SearchResults { seq, hits },
+                Err(error) => Event::SearchFailed {
+                    seq,
+                    error: error.to_string(),
+                },
+            };
+            let _ = tx.send(event);
+            ctx.request_repaint();
+        }
         Job::MarkSeen {
             account,
             folder,
@@ -184,6 +211,7 @@ pub fn spawn(job: Job, ctx: egui::Context, tx: Sender<Event>) {
                 | Job::FetchStylesheet { .. }
                 | Job::RenderHtml { .. }
                 | Job::ScanFonts
+                | Job::Search { .. }
                 | Job::MarkSeen { .. }
                 | Job::DeleteAccount { .. } => unreachable!(),
             };
@@ -211,6 +239,7 @@ pub fn spawn(job: Job, ctx: egui::Context, tx: Sender<Event>) {
                 | Job::FetchStylesheet { .. }
                 | Job::RenderHtml { .. }
                 | Job::ScanFonts
+                | Job::Search { .. }
                 | Job::MarkSeen { .. }
                 | Job::DeleteAccount { .. } => unreachable!(),
             };

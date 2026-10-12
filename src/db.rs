@@ -963,6 +963,65 @@ struct LegacyInlineImage {
     data_base64: String,
 }
 
+/// Test scaffolding shared with `crate::search`: a throwaway database and the
+/// two ways to put mail in it.
+#[cfg(test)]
+pub(crate) mod test_support {
+    use super::*;
+    use std::path::PathBuf;
+
+    /// The account every test database gets.
+    pub(crate) const ACCOUNT: &str = "work";
+
+    /// A database of its own in the temp directory, schema and all.
+    pub(crate) fn temp_db(name: &str) -> (Connection, PathBuf) {
+        let dir = std::env::temp_dir().join(format!("kimo-db-{}-{name}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let mut conn = Connection::open(dir.join("mail.db")).unwrap();
+        configure(&conn).unwrap();
+        migrate(&mut conn, None).unwrap();
+        (conn, dir)
+    }
+
+    /// The account `save` stores into.
+    fn account(id: &str) -> Account {
+        Account {
+            id: id.to_string(),
+            name: format!("Account {id}"),
+            protocol: Protocol::Imap,
+            host: "imap.example.com".to_string(),
+            port: 993,
+            username: format!("{id}@example.com"),
+            password: "secret".to_string(),
+            tls: TlsMode::Implicit,
+        }
+    }
+
+    /// Store a batch for `ACCOUNT` — the public `save_messages` wants the
+    /// process-wide connection, which tests deliberately do not use.
+    pub(crate) fn save(
+        conn: &mut Connection,
+        folder: &str,
+        uidvalidity: Option<u32>,
+        messages: &[MailMessage],
+    ) -> MailResult<()> {
+        save_as(conn, ACCOUNT, folder, uidvalidity, messages)
+    }
+
+    /// Store a batch for an account of the caller's choosing, creating it.
+    pub(crate) fn save_as(
+        conn: &mut Connection,
+        account_id: &str,
+        folder: &str,
+        uidvalidity: Option<u32>,
+        messages: &[MailMessage],
+    ) -> MailResult<()> {
+        save_account_on(conn, &account(account_id))?;
+        save_messages_on(conn, account_id, folder, uidvalidity, messages)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -971,13 +1030,7 @@ mod tests {
     /// A database of its own in the temp directory, schema and all. Each test
     /// takes a distinct name: they run in parallel inside one process.
     fn test_db(name: &str) -> (Connection, PathBuf) {
-        let dir = std::env::temp_dir().join(format!("kimo-db-{}-{name}", std::process::id()));
-        let _ = fs::remove_dir_all(&dir);
-        fs::create_dir_all(&dir).unwrap();
-        let mut conn = Connection::open(dir.join("mail.db")).unwrap();
-        configure(&conn).unwrap();
-        migrate(&mut conn, None).unwrap();
-        (conn, dir)
+        super::test_support::temp_db(name)
     }
 
     fn account(id: &str) -> Account {

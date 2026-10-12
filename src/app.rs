@@ -20,12 +20,18 @@ use std::time::{Duration, Instant};
 use crate::folders::{self, FolderKind};
 use crate::fonts::FontFamily;
 use crate::models::{Account, MailMessage, Protocol, TlsMode};
+use crate::search::{Scope, SearchHit, SearchQuery, SEARCH_LIMIT};
 use crate::storage::{self, Settings};
 use crate::sync::{self, Event, Job};
 use crate::theme::{self, ColorScheme, Theme};
 
 /// Below this window width the navigation bar collapses automatically.
 const NAV_AUTO_COLLAPSE_WIDTH: f32 = 640.0;
+
+/// How long the search bar waits after the last keystroke before asking the
+/// database: long enough to swallow a burst of typing, short enough to feel
+/// immediate. Enter skips the wait.
+const SEARCH_SETTLE: Duration = Duration::from_millis(250);
 
 /// Which renderer draws the HTML body in the reading pane.
 ///
@@ -93,7 +99,22 @@ pub struct KimoApp {
     selected_account: Option<String>,
     selected_folder: Option<String>,
     selected_message: Option<String>,
-    filter: String,
+    /// What the search bar is asking for. While it is active the middle column
+    /// shows `search_hits` instead of the selected folder.
+    search: SearchQuery,
+    /// The sequence number of the search whose results are wanted, so a result
+    /// that arrives after the query changed can be dropped.
+    search_seq: u64,
+    /// The query the settle clock is running for, and since when.
+    search_pending: Option<(SearchQuery, Instant)>,
+    /// The query the current results (or the request in flight) answer, so the
+    /// unchanged bar is not searched again and again.
+    search_applied: Option<SearchQuery>,
+    search_hits: Vec<SearchHit>,
+    search_running: bool,
+    search_error: Option<String>,
+    /// Whether the filter row under the search bar is expanded.
+    show_filters: bool,
     /// Whether the preferences modal is open.
     show_preferences: bool,
     /// Which preferences page is selected.
@@ -351,7 +372,14 @@ impl KimoApp {
             selected_account: None,
             selected_folder: None,
             selected_message: None,
-            filter: String::new(),
+            search: SearchQuery::default(),
+            search_seq: 0,
+            search_pending: None,
+            search_applied: None,
+            search_hits: Vec::new(),
+            search_running: false,
+            search_error: None,
+            show_filters: false,
             show_preferences: false,
             prefs_tab: PrefsTab::Accounts,
             show_account_form: false,
@@ -508,6 +536,21 @@ impl KimoApp {
             Event::HtmlRenderFailed { key, error } => {
                 if let Some(slot) = self.blitz_pages.get_mut(&key) {
                     *slot = BlitzPage::Failed(error);
+                }
+            }
+            Event::SearchResults { seq, hits } => {
+                // A result for a query the user has moved on from never
+                // reaches the screen.
+                if seq == self.search_seq {
+                    self.search_hits = hits;
+                    self.search_running = false;
+                    self.search_error = None;
+                }
+            }
+            Event::SearchFailed { seq, error } => {
+                if seq == self.search_seq {
+                    self.search_running = false;
+                    self.search_error = Some(error);
                 }
             }
             Event::FontsScanned(families) => {
@@ -1042,7 +1085,8 @@ impl KimoApp {
         theme::install(ctx, self.theme.scheme(self.system_dark));
     }
 
-    /// Messages of the currently selected folder, filtered and sorted for display.
+    /// Messages of the currently selected folder, newest first — what the
+    /// list shows while no search is active.
     fn current_messages(&self) -> Vec<MailMessage> {
         let Some(account_id) = &self.selected_account else {
             return Vec::new();
@@ -1056,16 +1100,7 @@ impl KimoApp {
         let Some(fc) = state.mailbox.folders.iter().find(|f| f.name == *folder) else {
             return Vec::new();
         };
-        let needle = self.filter.trim().to_lowercase();
-        fc.messages
-            .iter()
-            .filter(|m| {
-                needle.is_empty()
-                    || m.subject.to_lowercase().contains(&needle)
-                    || m.from.to_lowercase().contains(&needle)
-            })
-            .cloned()
-            .collect()
+        fc.messages.clone()
     }
 
     fn selected_folder_synced(&self) -> bool {
@@ -1378,7 +1413,8 @@ impl KimoApp {
         ui.add_space(8.0);
     }
 
-    /// Middle column: filter bar plus the message list.
+    /// Middle column: the search bar, then the search results or the selected
+    /// folder's mail.
     fn mail_list(&mut self, ui: &mut egui::Ui) {
         // The database could not be opened: the session works, nothing is
         // saved, and this is the only place that says so.
@@ -1397,27 +1433,150 @@ impl KimoApp {
             return;
         }
 
-        ui.horizontal(|ui| {
-            ui.add(
-                egui::TextEdit::singleline(&mut self.filter)
-                    .hint_text("Filter by subject or sender…")
-                    .desired_width(200.0),
-            );
-            let count = self.current_messages().len();
-            ui.label(
-                egui::RichText::new(format!("{count} messages"))
-                    .small()
-                    .weak(),
-            );
-        });
+        let run_now = self.search_bar(ui);
         ui.separator();
+        if self.search.is_active() {
+            self.search_results(ui);
+        } else {
+            self.folder_messages(ui);
+        }
+        self.pump_search(run_now);
+        if self.search_pending.is_some() {
+            // The settle clock is time-based, so a pending search has to keep
+            // the frames coming even when nothing else is moving.
+            ui.ctx().request_repaint_after(SEARCH_SETTLE);
+        }
+    }
 
+    /// The search bar: free text, the scope, the filter row and the result
+    /// count. Returns true when Enter asks for a search right away.
+    fn search_bar(&mut self, ui: &mut egui::Ui) -> bool {
+        let mut run_now = false;
+        // Read before the closure: the bar edits `self.search`, and mixing
+        // that with a borrow of the whole account list inside one closure is
+        // more trouble than copying two strings.
+        let accounts: Vec<(String, String)> = self
+            .accounts
+            .iter()
+            .map(|account| (account.id.clone(), account.name.clone()))
+            .collect();
+        let folder_scope = self
+            .selected_account
+            .clone()
+            .zip(self.selected_folder.clone());
+
+        ui.horizontal(|ui| {
+            let response = ui.add(
+                egui::TextEdit::singleline(&mut self.search.text)
+                    .hint_text("Search all mail…")
+                    .desired_width(220.0),
+            );
+            if response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                run_now = true;
+            }
+
+            let label = match &self.search.scope {
+                Scope::AllMail => "All mail".to_string(),
+                Scope::Account(id) => accounts
+                    .iter()
+                    .find(|(account_id, _)| account_id == id)
+                    .map(|(_, name)| name.clone())
+                    .unwrap_or_else(|| "Account".to_string()),
+                Scope::Folder { .. } => "This folder".to_string(),
+            };
+            egui::ComboBox::from_id_salt("search-scope")
+                .selected_text(label)
+                .width(140.0)
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(&mut self.search.scope, Scope::AllMail, "All mail");
+                    for (id, name) in &accounts {
+                        ui.selectable_value(
+                            &mut self.search.scope,
+                            Scope::Account(id.clone()),
+                            name,
+                        );
+                    }
+                    if let Some((account_id, folder)) = &folder_scope {
+                        ui.selectable_value(
+                            &mut self.search.scope,
+                            Scope::Folder {
+                                account_id: account_id.clone(),
+                                folder: folder.clone(),
+                            },
+                            "This folder",
+                        );
+                    }
+                });
+
+            ui.toggle_value(&mut self.show_filters, "Filters");
+            if self.search.is_active() && ui.button("Clear").clicked() {
+                self.search = SearchQuery::default();
+                run_now = true;
+            }
+
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let text = if self.search_running {
+                    ui.spinner();
+                    None
+                } else if self.search.is_active() {
+                    let count = self.search_hits.len();
+                    Some(if count >= SEARCH_LIMIT {
+                        format!("{count}+ results")
+                    } else if count == 1 {
+                        "1 result".to_string()
+                    } else {
+                        format!("{count} results")
+                    })
+                } else {
+                    Some(format!("{} messages", self.current_messages().len()))
+                };
+                if let Some(text) = text {
+                    ui.label(egui::RichText::new(text).small().weak());
+                }
+            });
+        });
+
+        if self.show_filters {
+            ui.horizontal_wrapped(|ui| {
+                ui.label("From");
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.search.from)
+                        .hint_text("name or address")
+                        .desired_width(120.0),
+                );
+                ui.label("To");
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.search.to)
+                        .hint_text("name or address")
+                        .desired_width(120.0),
+                );
+                ui.label("Subject");
+                ui.add(egui::TextEdit::singleline(&mut self.search.subject).desired_width(120.0));
+                ui.label("After");
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.search.after)
+                        .hint_text("YYYY-MM-DD")
+                        .desired_width(90.0),
+                );
+                ui.label("Before");
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.search.before)
+                        .hint_text("YYYY-MM-DD")
+                        .desired_width(90.0),
+                );
+                ui.checkbox(&mut self.search.unread_only, "Unread only");
+                ui.checkbox(&mut self.search.has_attachment, "Has attachment");
+            });
+        }
+        run_now
+    }
+
+    /// The middle column while no search is active: the selected folder's mail.
+    fn folder_messages(&mut self, ui: &mut egui::Ui) {
         let messages = self.current_messages();
         if messages.is_empty() {
             ui.centered_and_justified(|ui| {
-                let text = if !self.filter.is_empty() {
-                    "No messages match the filter."
-                } else if self.selected_folder_synced() {
+                let text = if self.selected_folder_synced() {
                     "This folder is empty."
                 } else {
                     "Not fetched yet — click Sync in the title bar."
@@ -1435,10 +1594,178 @@ impl KimoApp {
             });
     }
 
-    /// One message card in the list: avatar on the left; sender + timestamp,
-    /// subject and a content preview stacked on the right.
+    /// The middle column while a search is active: one card per hit.
+    fn search_results(&mut self, ui: &mut egui::Ui) {
+        if let Some(error) = &self.search_error {
+            ui.label(
+                egui::RichText::new(error.as_str())
+                    .small()
+                    .color(theme::of(ui.ctx()).danger),
+            );
+        }
+        if self.search_hits.is_empty() {
+            ui.centered_and_justified(|ui| {
+                let text = if self.search_running {
+                    "Searching…"
+                } else {
+                    "No mail matches this search."
+                };
+                ui.label(egui::RichText::new(text).weak().heading());
+            });
+            return;
+        }
+        // Taken out for the duration so the rows can be painted while `self` is
+        // borrowed mutably (a click opens a mail); put back below.
+        let hits = std::mem::take(&mut self.search_hits);
+        egui::ScrollArea::vertical()
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                for hit in &hits {
+                    self.search_row(ui, hit);
+                }
+            });
+        self.search_hits = hits;
+    }
+
+    /// Ask for what the search bar is showing, once the query has held still;
+    /// `force` is Enter (or Clear), which skips the wait.
+    fn pump_search(&mut self, force: bool) {
+        if force {
+            self.search_pending = None;
+            self.spawn_search();
+            return;
+        }
+        if self.search_applied.as_ref() == Some(&self.search) {
+            return; // the bar has not changed since the last request
+        }
+        let now = Instant::now();
+        let pending = self
+            .search_pending
+            .as_ref()
+            .map(|(query, since)| (query, *since));
+        match search_settle(pending, &self.search, now) {
+            SearchWait::Wait => {}
+            SearchWait::Reset => {
+                if self.search.is_active() {
+                    self.search_pending = Some((self.search.clone(), now));
+                } else {
+                    // An emptied bar goes back to the folder view at once.
+                    self.search_pending = None;
+                    self.spawn_search();
+                }
+            }
+            SearchWait::Run => {
+                self.search_pending = None;
+                self.spawn_search();
+            }
+        }
+    }
+
+    /// Send the current query to a worker. `search_seq` makes the answer
+    /// identifiable, so a result for a query the user has moved on from is
+    /// dropped instead of shown.
+    fn spawn_search(&mut self) {
+        self.search_seq += 1;
+        self.search_applied = Some(self.search.clone());
+        if !self.search.is_active() {
+            self.search_hits.clear();
+            self.search_running = false;
+            self.search_error = None;
+            return;
+        }
+        self.search_running = true;
+        self.search_error = None;
+        sync::spawn(
+            Job::Search {
+                seq: self.search_seq,
+                query: self.search.clone(),
+            },
+            self.ctx.clone(),
+            self.tx.clone(),
+        );
+    }
+
+    /// Open a search result: switch to the account and folder it lives in, then
+    /// open the message the way a click in the list would.
+    fn open_hit(&mut self, hit: &SearchHit) {
+        let Some(protocol) = self
+            .accounts
+            .iter()
+            .find(|account| account.id == hit.account_id)
+            .map(|account| account.protocol)
+        else {
+            return;
+        };
+        self.select_folder(hit.account_id.clone(), hit.folder.clone(), protocol);
+        // The whole mailbox is in memory, so the hit is normally right there.
+        // If it is not (the account was edited under us), the pane stays empty
+        // instead of opening somebody else's mail.
+        let message = self
+            .states
+            .get(&hit.account_id)
+            .and_then(|state| state.mailbox.folders.iter().find(|f| f.name == hit.folder))
+            .and_then(|folder| folder.messages.iter().find(|m| m.uid == hit.uid))
+            .cloned();
+        if let Some(message) = message {
+            self.open_message(&message);
+        }
+    }
+
+    /// One message card in the folder list.
     fn message_row(&mut self, ui: &mut egui::Ui, msg: &MailMessage) {
-        let is_selected = self.selected_message.as_deref() == Some(msg.uid.as_str());
+        let selected = self.selected_message.as_deref() == Some(msg.uid.as_str());
+        let preview = if msg.preview.is_empty() {
+            " ".to_string()
+        } else {
+            msg.preview.clone()
+        };
+        let card = CardText {
+            from: &msg.from,
+            title: &msg.subject,
+            date: &date_label(msg.timestamp, &msg.date),
+            third: &preview,
+            unread: !msg.seen,
+            selected,
+        };
+        let response = self.message_card(ui, &card);
+        if response.clicked() {
+            self.open_message(msg);
+        }
+    }
+
+    /// One search result: the same card, with where the mail lives and the line
+    /// the query matched as its third line.
+    fn search_row(&mut self, ui: &mut egui::Ui, hit: &SearchHit) {
+        let selected = self.selected_message.as_deref() == Some(hit.uid.as_str())
+            && self.selected_folder.as_deref() == Some(hit.folder.as_str());
+        let account = self
+            .accounts
+            .iter()
+            .find(|account| account.id == hit.account_id)
+            .map(|account| account.name.as_str())
+            .unwrap_or(hit.account_id.as_str());
+        let folder = crate::protocol::imap::decode_mailbox_name(&hit.folder);
+        // The paperclip the reading pane uses, so a hit says when it has parts.
+        let clip = if hit.attachments > 0 { "📎 " } else { "" };
+        let third = format!("{clip}{account} · {folder} — {}", hit.snippet);
+        let card = CardText {
+            from: &hit.from,
+            title: &hit.subject,
+            date: &date_label(hit.timestamp, &hit.date),
+            third: &third,
+            unread: !hit.seen,
+            selected,
+        };
+        let response = self.message_card(ui, &card);
+        if response.clicked() {
+            self.open_hit(hit);
+        }
+    }
+
+    /// One card in the middle column: avatar on the left; sender + timestamp,
+    /// title and a muted third line stacked on the right. The folder list and
+    /// the search results share it — only what the three lines say differs.
+    fn message_card(&self, ui: &mut egui::Ui, card: &CardText) -> egui::Response {
         let scheme = theme::of(ui.ctx());
         let (rect, resp) = ui.allocate_exact_size(
             egui::vec2(ui.available_width(), MESSAGE_ROW_HEIGHT),
@@ -1446,7 +1773,7 @@ impl KimoApp {
         );
 
         let painter = ui.painter();
-        if is_selected {
+        if card.selected {
             painter.rect_filled(rect.shrink(1.0), 4.0, scheme.selection);
         } else if resp.hovered() {
             painter.rect_filled(rect.shrink(1.0), 4.0, scheme.hover);
@@ -1461,12 +1788,12 @@ impl KimoApp {
         painter.circle_filled(
             avatar_center,
             AVATAR_DIAMETER / 2.0,
-            sender_color(scheme, &msg.from),
+            sender_color(scheme, card.from),
         );
         painter.text(
             avatar_center,
             egui::Align2::CENTER_CENTER,
-            sender_initial(&msg.from),
+            sender_initial(card.from),
             egui::FontId::proportional(AVATAR_FONT_SIZE),
             scheme.avatar_text,
         );
@@ -1478,12 +1805,11 @@ impl KimoApp {
         // stay apart without dimming half the list. Only the preview below is
         // muted, always.
         let title_color = scheme.text;
-        let unread = !msg.seen;
 
         // First row: timestamp right-aligned, sender truncated before it.
         let date_galley = ui.ctx().fonts(|f| {
             f.layout_no_wrap(
-                display_date(msg),
+                card.date.to_string(),
                 egui::FontId::proportional(ROW_DATE_FONT_SIZE),
                 scheme.text_weak,
             )
@@ -1496,7 +1822,7 @@ impl KimoApp {
         let sender_max_width = (date_pos.x - text_left - 12.0).max(40.0);
         let sender = truncate_galley(
             ui.ctx(),
-            &msg.from,
+            card.from,
             ROW_TITLE_FONT_SIZE,
             title_color,
             sender_max_width,
@@ -1506,13 +1832,13 @@ impl KimoApp {
             egui::pos2(text_left, rect.top() + 20.0 - sender.size().y * 0.5),
             sender,
             title_color,
-            unread,
+            card.unread,
         );
 
         // Second row: subject.
         let subject = truncate_galley(
             ui.ctx(),
-            &msg.subject,
+            card.title,
             ROW_TITLE_FONT_SIZE,
             title_color,
             text_right - text_left,
@@ -1522,31 +1848,25 @@ impl KimoApp {
             egui::pos2(text_left, rect.top() + 40.0 - subject.size().y * 0.5),
             subject,
             title_color,
-            unread,
+            card.unread,
         );
 
-        // Third row: content preview, always muted.
-        let preview = if msg.preview.is_empty() {
-            " ".to_string()
-        } else {
-            msg.preview.clone()
-        };
-        let preview = truncate_galley(
+        // Third row: the preview — or, for a search result, where the mail
+        // lives and the line that matched — always muted.
+        let third = truncate_galley(
             ui.ctx(),
-            &preview,
+            card.third,
             ROW_PREVIEW_FONT_SIZE,
             scheme.text_weak,
             text_right - text_left,
         );
         painter.galley(
-            egui::pos2(text_left, rect.top() + 57.0 - preview.size().y * 0.5),
-            preview,
+            egui::pos2(text_left, rect.top() + 57.0 - third.size().y * 0.5),
+            third,
             scheme.text_weak,
         );
 
-        if resp.clicked() {
-            self.open_message(msg);
-        }
+        resp
     }
 
     /// Right column: the selected message, or a placeholder.
@@ -2136,6 +2456,38 @@ const BLITZ_SETTLE: Duration = Duration::from_millis(180);
 /// invalidating the very page that made it appear.
 const BLITZ_REUSE_RATIO: f32 = 1.25;
 
+/// What to do about the search bar's current contents.
+#[derive(Debug, PartialEq, Eq)]
+enum SearchWait {
+    /// The query changed: start (or restart) the clock.
+    Reset,
+    /// The query has not held still long enough yet.
+    Wait,
+    /// Settled: run it.
+    Run,
+}
+
+/// The search bar settles the way the Blitz pane does: the database is queried
+/// once the user stops typing. `pending` is the query the clock is running for,
+/// and when it started.
+fn search_settle(
+    pending: Option<(&SearchQuery, Instant)>,
+    current: &SearchQuery,
+    now: Instant,
+) -> SearchWait {
+    match pending {
+        Some((query, since)) if query == current => {
+            if now.duration_since(since) >= SEARCH_SETTLE {
+                SearchWait::Run
+            } else {
+                SearchWait::Wait
+            }
+        }
+        // A different query, or no clock yet: start over.
+        Some(_) | None => SearchWait::Reset,
+    }
+}
+
 /// What to do about a page that is not cached yet.
 #[derive(Debug, PartialEq, Eq)]
 enum BlitzWait {
@@ -2243,6 +2595,20 @@ fn draw_blitz_page(ui: &mut egui::Ui, page: &RasterizedPage) {
 }
 
 /// Message-card geometry in the mail list.
+/// What one card in the middle column says: three lines, and the two states
+/// that change how they are drawn. Bundled into one value so the folder list
+/// and the search results can share the painter.
+struct CardText<'a> {
+    from: &'a str,
+    title: &'a str,
+    date: &'a str,
+    third: &'a str,
+    /// The sender and the title are struck through: the codebase's stand-in
+    /// for bold, see the message-row convention in AGENTS.md.
+    unread: bool,
+    selected: bool,
+}
+
 const MESSAGE_ROW_HEIGHT: f32 = 68.0;
 const AVATAR_DIAMETER: f32 = 32.0;
 /// Font size of the avatar's initial — a bit under half the diameter.
@@ -2763,10 +3129,10 @@ fn slug(name: &str) -> String {
     }
 }
 
-fn display_date(m: &MailMessage) -> String {
-    m.timestamp
+fn date_label(timestamp: Option<i64>, date: &str) -> String {
+    timestamp
         .map(format_timestamp)
-        .unwrap_or_else(|| m.date.clone())
+        .unwrap_or_else(|| date.to_string())
 }
 
 fn format_timestamp(ts: i64) -> String {
@@ -2856,6 +3222,36 @@ mod tests {
                 start + BLITZ_SETTLE * 4
             ),
             BlitzWait::Wait(BLITZ_SETTLE)
+        );
+    }
+
+    #[test]
+    fn a_search_waits_for_the_typing_to_stop() {
+        let start = Instant::now();
+        let typed = SearchQuery {
+            text: "invoice".to_string(),
+            ..SearchQuery::default()
+        };
+        // The first keystroke starts the clock…
+        assert_eq!(search_settle(None, &typed, start), SearchWait::Reset);
+        // …which then waits…
+        assert_eq!(
+            search_settle(Some((&typed, start)), &typed, start + SEARCH_SETTLE / 2),
+            SearchWait::Wait
+        );
+        // …until the query has held still.
+        assert_eq!(
+            search_settle(Some((&typed, start)), &typed, start + SEARCH_SETTLE),
+            SearchWait::Run
+        );
+        // Another keystroke starts a new clock instead of running the old query.
+        let longer = SearchQuery {
+            text: "invoices".to_string(),
+            ..SearchQuery::default()
+        };
+        assert_eq!(
+            search_settle(Some((&typed, start)), &longer, start + SEARCH_SETTLE),
+            SearchWait::Reset
         );
     }
 
