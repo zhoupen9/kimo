@@ -315,6 +315,9 @@ Event (mpsc) ──► drain_events() at frame start ──► merge into Accoun
   active the list shows `search_results` instead of the selected folder, and
   `message_card` paints both kinds of row), and the reading pane on the right
   with a "No mail selected" placeholder.
+  Folders indent under their account (`Ui::indent`) without egui's faint guide
+  line down the left of the block (`indent_has_left_vline` cleared in
+  `nav`): in this column that line reads as a rule through the folder list.
   The chrome — title bar and navigation — is the scheme's `panel`; the message
   list and the reading pane are the lighter `content`. In the light theme the
   list column is framed by a hairline down each side (`mail_list`, drawn at the

@@ -1523,6 +1523,12 @@ impl KimoApp {
     /// picking a folder here, so the title bar needs no account menu.
     fn nav(&mut self, ui: &mut egui::Ui) {
         let scheme = theme::of(ui.ctx());
+        // Folders are indented under their account, but egui's `indent` also
+        // marks the indented block with a faint guide line down its left,
+        // which in this column reads as a rule drawn through the folder list.
+        // The HTML renderer's lists, the only other users of `indent`, keep
+        // theirs.
+        ui.visuals_mut().indent_has_left_vline = false;
         if self.accounts.is_empty() {
             ui.label("No accounts yet.");
             ui.label(
