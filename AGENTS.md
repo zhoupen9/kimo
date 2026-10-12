@@ -12,8 +12,8 @@ Kimo is a desktop **email client** GUI written in pure Rust:
   `src/protocol/` — no `imap`/`async-imap`/`pop` crates.
 - **TLS:** rustls with the pure-Rust `ring` crypto provider + webpki-roots.
   The `ring` provider is installed process-wide in `src/main.rs`.
-- **HTML mail:** two renderers, switched from the title bar and remembered
-  in `settings.json` (`html_renderer`).
+- **HTML mail:** two renderers, switched in Preferences → Appearance and
+  remembered in `settings.json` (`html_renderer`).
   *Simple* (the default) parses with html5ever (via `scraper`) and draws
   egui widgets in `src/html.rs` with a small CSS subset (`src/css.rs`):
   theme-following, selectable, clickable, no layout fidelity.  *Blitz* feeds
@@ -85,7 +85,7 @@ done. There is no CI yet — that discipline is on you.
 
 ```
 src/main.rs             entry point; installs rustls ring provider, launches eframe
-src/app.rs              all UI: KimoApp state, panels, add-account window, event handling
+src/app.rs              all UI: KimoApp state, panels, preferences modal, event handling
 src/models.rs           Account / Protocol / TlsMode / MailMessage (serde types)
 src/error.rs            MailError + MailResult
 src/storage.rs          XDG paths, accounts.json, per-account FolderCache/AccountCache
@@ -183,11 +183,16 @@ Event (mpsc) ──► drain_events() at frame start ──► merge into Accoun
   placeholder.
 - The window is undecorated on purpose (`with_decorations(false)` in
   `main.rs`): `titlebar()` in `app.rs` draws the custom title bar — nav
-  toggle, account menu (switch/add/remove), sync button, HTML renderer
-  switch (Simple/Blitz), theme switcher (system/light/dark, both persisted
-  in `settings.json`), drag area,
-  double-click maximize, and the minimize/maximize/close buttons sent as
-  `ViewportCommand`s. Don't re-enable system decorations.
+  toggle, account menu (switch only), sync button, the preferences cog,
+  drag area, double-click maximize, and the minimize/maximize/close buttons
+  sent as `ViewportCommand`s. Don't re-enable system decorations.
+- `preferences_modal()` is the one place to configure Kimo: an
+  `egui::Modal` (backdrop click or Escape closes it) with a sidebar of
+  pages — **Accounts** (account list, use/remove, and the add-account form
+  in place of the list) and **Appearance** (theme and Simple/Blitz HTML
+  renderer, both persisted in `settings.json`). Configuration belongs on a
+  page there, not as another title-bar toggle; the title bar keeps only
+  actions (switching accounts, syncing, window controls).
 - When touching the UI, actually run `cargo run` and click through it; the
   layout has no golden tests. `blitz_render` has a developer tool for
   eyeballing fidelity without the GUI:
