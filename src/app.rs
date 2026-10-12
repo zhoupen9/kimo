@@ -1266,7 +1266,7 @@ impl KimoApp {
             avatar_center,
             egui::Align2::CENTER_CENTER,
             sender_initial(&msg.from),
-            egui::FontId::proportional(18.0),
+            egui::FontId::proportional(AVATAR_FONT_SIZE),
             egui::Color32::WHITE,
         );
 
@@ -1690,7 +1690,9 @@ fn draw_blitz_page(ui: &mut egui::Ui, page: &RasterizedPage) {
 
 /// Message-card geometry in the mail list.
 const MESSAGE_ROW_HEIGHT: f32 = 68.0;
-const AVATAR_DIAMETER: f32 = 38.0;
+const AVATAR_DIAMETER: f32 = 32.0;
+/// Font size of the avatar's initial, ~0.47 of the diameter (as at 38.0).
+const AVATAR_FONT_SIZE: f32 = 15.0;
 
 /// Deterministic, readable-on-white-text avatar colors (Material palette).
 const AVATAR_COLORS: &[egui::Color32] = &[
