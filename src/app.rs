@@ -1311,15 +1311,14 @@ impl KimoApp {
             egui::pos2(cog_right - TITLEBAR_BUTTON_WIDTH, bar.top()),
             egui::pos2(cog_right, bar.bottom()),
         );
-        let cog_resp = ui.interact(
-            cog_rect,
-            egui::Id::new("titlebar-preferences"),
-            egui::Sense::click(),
+        let cog_resp = titlebar_hover(
+            ui,
+            ui.interact(
+                cog_rect,
+                egui::Id::new("titlebar-preferences"),
+                egui::Sense::click(),
+            ),
         );
-        if cog_resp.hovered() {
-            ui.painter()
-                .rect_filled(cog_rect, 0.0, visuals.widgets.hovered.bg_fill);
-        }
         paint_cog_icon(ui.painter(), cog_rect, visuals.text_color());
         if cog_resp.clicked() {
             self.show_preferences = true;
@@ -1343,21 +1342,13 @@ impl KimoApp {
                         );
                     }
 
-                    // Nav collapse toggle (hamburger, painted as lines).
-                    let toggle = row.add_sized([26.0, 22.0], egui::Button::new(""));
+                    // Nav collapse toggle (hamburger, painted as lines). An
+                    // icon cell rather than an `egui::Button`, so it carries no
+                    // outline: the bar's icons only fill under the pointer.
+                    let toggle = titlebar_icon_button(row, bar.height());
+                    paint_nav_icon(row.painter(), toggle.rect, visuals.text_color());
                     if toggle.clicked() {
                         self.nav_collapsed = !self.nav_collapsed;
-                    }
-                    let tr = toggle.rect;
-                    for i in -1i32..=1 {
-                        let y = tr.center().y + i as f32 * 4.0;
-                        row.painter().line_segment(
-                            [
-                                egui::pos2(tr.left() + 6.0, y),
-                                egui::pos2(tr.right() - 6.0, y),
-                            ],
-                            egui::Stroke::new(1.5_f32, visuals.text_color()),
-                        );
                     }
                     toggle.on_hover_text(if self.nav_collapsed {
                         "Show folders"
@@ -1377,11 +1368,11 @@ impl KimoApp {
                     // automatic syncing, so that is where asking for one has to
                     // be possible.
                     if self.working_mode == WorkingMode::Debug {
-                        let sync = row.add_sized([24.0, 22.0], egui::Button::new(""));
+                        let sync = titlebar_icon_button(row, bar.height());
+                        paint_sync_icon(row.painter(), sync.rect, visuals.text_color());
                         if sync.clicked() {
                             self.sync_all();
                         }
-                        paint_sync_icon(row.painter(), sync.rect, visuals.text_color());
                         sync.on_hover_text(
                             "Sync all accounts — Debug mode does not sync on its own",
                         );
@@ -1433,10 +1424,14 @@ impl KimoApp {
                     if search.clicked() {
                         self.open_search();
                     }
+                    // Grey while nothing is being asked for — the magnifier
+                    // then matches the field's own hint text instead of
+                    // reading as a live control — and the accent while a query
+                    // is what the message list shows.
                     let search_color = if self.search.is_active() {
                         scheme.accent
                     } else {
-                        visuals.text_color()
+                        visuals.weak_text_color()
                     };
                     let icon_rect = egui::Rect::from_center_size(
                         egui::pos2(
@@ -2713,6 +2708,31 @@ const SEARCH_ICON_SIZE: f32 = 15.0;
 /// Side of the square brand icon at the left of the title bar.
 const BRAND_ICON_SIZE: f32 = 18.0;
 
+/// One icon cell in the title bar's left row (the nav collapse toggle and the
+/// sync button): as wide as a window control and the full height of the bar,
+/// so every icon in the bar highlights the same shape.
+fn titlebar_icon_button(ui: &mut egui::Ui, height: f32) -> egui::Response {
+    let (_, response) = ui.allocate_exact_size(
+        egui::vec2(TITLEBAR_BUTTON_WIDTH, height),
+        egui::Sense::click(),
+    );
+    titlebar_hover(ui, response)
+}
+
+/// Fill a title-bar icon cell while the pointer is over it. This is the
+/// treatment the nav toggle, the sync button, the cog and the window controls
+/// share, and the reason the bar's buttons are hand-painted rather than
+/// `egui::Button`s: a stock button draws a card-colored frame with a border,
+/// which in a title bar reads as a widget among window chrome. The glyph is
+/// the caller's, painted afterwards so the fill cannot cover it.
+fn titlebar_hover(ui: &egui::Ui, response: egui::Response) -> egui::Response {
+    if response.hovered() {
+        ui.painter()
+            .rect_filled(response.rect, 0.0, ui.visuals().widgets.hovered.bg_fill);
+    }
+    response
+}
+
 /// Blitz reading pane: page margin, width quantization for renders, and how
 /// many rendered pages stay in memory (each is megabytes of texture).
 const BLITZ_PAGE_MARGIN: f32 = 8.0;
@@ -3364,6 +3384,18 @@ fn paint_search_icon(p: &egui::Painter, rect: egui::Rect, color: egui::Color32) 
     p.circle_stroke(c, r, stroke);
     let start = c + egui::vec2(r, r) * std::f32::consts::FRAC_1_SQRT_2;
     p.line_segment([start, start + egui::vec2(3.4, 3.4)], stroke);
+}
+
+/// Nav collapse glyph for the title-bar toggle: three stacked lines, drawn at
+/// the size of the window controls' glyphs rather than of the cell they sit
+/// in, which is as wide as a window control.
+fn paint_nav_icon(p: &egui::Painter, rect: egui::Rect, color: egui::Color32) {
+    let c = rect.center();
+    let stroke = egui::Stroke::new(1.5_f32, color);
+    for i in -1i32..=1 {
+        let y = c.y + i as f32 * 4.0;
+        p.line_segment([egui::pos2(c.x - 7.0, y), egui::pos2(c.x + 7.0, y)], stroke);
+    }
 }
 
 /// Cog / gear glyph for the preferences button: a hub ring with eight teeth.

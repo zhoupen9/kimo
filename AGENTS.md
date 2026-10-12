@@ -329,8 +329,11 @@ Event (mpsc) ──► drain_events() at frame start ──► merge into Accoun
   and Clear empties it without closing, so closing the popup is never a
   cancel. Nothing else about a search is drawn: the message list starts
   straight at the rows — the folder's mail or the hits — because a header over
-  them was noise the project owner asked to drop, and the magnifier turning
-  accent-colored is the only sign that a query is what the column shows.
+  them was noise the project owner asked to drop, and the magnifier is the only
+  sign left. It is grey while the box is empty — `visuals.weak_text_color()`,
+  the color of the hint text it sits next to, so the box reads as an empty
+  placeholder rather than a live control — and accent-colored once a query is
+  what the column shows.
   Nothing about a query is persisted.
 - A message row (`message_card`; the folder list and the search results share
   it, only the third line differs — the preview, or *account · folder — match*)
@@ -358,8 +361,14 @@ Event (mpsc) ──► drain_events() at frame start ──► merge into Accoun
   own), the search box (a field with the magnifier inside it, one widget,
   whose click opens the search popup), the preferences cog, drag area,
   double-click maximize, and the
-  minimize/maximize/close buttons sent as `ViewportCommand`s. Don't re-enable
-  system decorations.
+  minimize/maximize/close buttons sent as `ViewportCommand`s. The nav toggle,
+  the sync button and the cog are one hand-painted icon cell
+  (`titlebar_icon_button` + `titlebar_hover`, the cog positioning its rect
+  itself because it is right-aligned rather than laid out in the row): as wide
+  as a window control and as tall as the bar, flat at rest, and filled under
+  the pointer. They are not `egui::Button`s for that reason — a stock button
+  draws a card-colored frame with a border, which in a title bar reads as a
+  widget among window chrome. Don't re-enable system decorations.
 - `preferences_modal()` is the one place to configure Kimo: an
   `egui::Modal` (backdrop click or Escape closes it) with a sidebar of
   pages — **General** (the working mode), **Accounts** (account list with
