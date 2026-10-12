@@ -48,6 +48,15 @@ Kimo is a desktop **email client** GUI written in pure Rust:
   for hours at a time, so reads go through `read_full`: an idle read-timeout
   expiry must never end the thread (`read_exact` turned it into a fatal
   `WouldBlock`, and the icon vanished 30s after startup).
+- **Packaging:** `packaging/linux/kimo.desktop` is the launcher entry for the
+  `kimo` app_id, to be installed as
+  `~/.local/share/applications/kimo.desktop`. The icon on its own
+  (`~/.local/share/icons/hicolor/scalable/apps/kimo.svg`) satisfies
+  `niri/window`, which looks the app_id up in the icon theme, but waybar's
+  `wlr/taskbar` resolves a `Gio.DesktopAppInfo` instead and shows the grey
+  `image-missing` placeholder without a desktop file. `Exec=kimo` has to
+  resolve in `$PATH` — GLib silently rejects a desktop file whose `Exec`
+  names a program it cannot find — which the file's header comments record.
 - **Persistence:** JSON files under XDG dirs (`~/.config/kimo/accounts.json`,
   `~/.local/share/kimo/cache/<account>.json`). No external database.
 

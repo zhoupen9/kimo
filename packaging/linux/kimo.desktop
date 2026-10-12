@@ -1,0 +1,22 @@
+# Kimo's window icon, read by compositor bars and taskbars (waybar's
+# "niri/window" and "wlr/taskbar" modules, sway/window, taskbars, launchers).
+#
+# Install next to an icon named "kimo" in the icon theme, e.g.
+#   ~/.local/share/applications/kimo.desktop
+#   ~/.local/share/icons/hicolor/scalable/apps/kimo.svg   (from assets/app.svg)
+#   ~/.local/share/icons/hicolor/256x256/apps/kimo.png    (from assets/app.png)
+#
+# Exec must resolve through $PATH: GLib silently ignores a desktop file whose
+# Exec program cannot be found, and waybar's taskbar then draws its
+# image-missing placeholder instead of the icon. If kimo is not installed,
+# point Exec at the absolute path of the binary.
+[Desktop Entry]
+Type=Application
+Name=Kimo
+GenericName=Mail Client
+Comment=Receive-only IMAP/POP3 mail client
+Exec=kimo
+Icon=kimo
+Terminal=false
+Categories=Network;Email;
+StartupWMClass=kimo
