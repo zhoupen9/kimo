@@ -184,7 +184,8 @@ Event (mpsc) ──► drain_events() at frame start ──► merge into Accoun
   mode (Preferences → General; `settings.json`'s `working_mode`, absent meaning
   the build) can switch the automatic half of that off: in **Debug** neither the
   startup sweep nor the fetch-on-first-open happens, the cached mail still loads
-  from the database, and only the title-bar Sync button and `Save & sync` in
+  from the database, and only the title-bar Sync button — which only Debug
+  shows, since Release has nothing for it to add — and `Save & sync` in
   Preferences reach the server. It is a per-installation setting rather than a
   build flag so that a development build can be pointed at a real account
   without a sync on every start.
@@ -350,8 +351,9 @@ Event (mpsc) ──► drain_events() at frame start ──► merge into Accoun
   application icon (the brand, and the leftmost thing in the bar: the same
   embedded PNG the tray serves, downscaled once at startup because egui has
   no mipmaps to filter a 256 px source down to 18 pt), the nav collapse
-  toggle, the icon-only sync button, the search box (a field with the
-  magnifier inside it, one widget), the preferences cog, drag area,
+  toggle, the icon-only sync button (Debug mode only: Release syncs on its
+  own), the search box (a field with the magnifier inside it, one widget), the
+  preferences cog, drag area,
   double-click maximize, and the
   minimize/maximize/close buttons sent as `ViewportCommand`s. Don't re-enable
   system decorations.

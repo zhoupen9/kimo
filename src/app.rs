@@ -2,9 +2,10 @@
 //! `sync::Event`s drained at the top of every frame; opening a socket happens
 //! only in worker threads.
 //!
-//! Layout: custom title bar on top (nav toggle, sync, search, preferences cog,
-//! window controls), then three columns — collapsible navigation (every account
-//! as a collapsible section of its folders), message list, reading pane.
+//! Layout: custom title bar on top (nav toggle, sync in Debug mode, search,
+//! preferences cog, window controls), then three columns — collapsible
+//! navigation (every account as a collapsible section of its folders), message
+//! list, reading pane.
 //!
 //! Two `egui::Modal`s open from the title bar. The magnifier is search: the
 //! free text lives in the field beside it, the scope and the filters in the
@@ -92,8 +93,9 @@ impl HtmlRenderer {
 /// `Release` is the ordinary client: it syncs every account at startup and
 /// fetches a folder the first time it is opened. `Debug` keeps every automatic
 /// sync off — for working on the app against a real account — leaving the
-/// title-bar Sync button and `Save & sync` in Preferences as the only ways to
-/// reach the server. The choice lives in Preferences → General and is
+/// title-bar Sync button, which only Debug shows, and `Save & sync` in
+/// Preferences as the only ways to reach the server. The choice lives in
+/// Preferences → General and is
 /// remembered in `settings.json`; a file that names no mode follows the build,
 /// so a debug build starts quiet and a release build behaves as it always has.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -1368,17 +1370,21 @@ impl KimoApp {
                     // actions only (add/remove accounts lives in Preferences).
                     //
                     // Sync: icon-only, like the window controls — the tooltip
-                    // carries the label.
-                    let sync = row.add_sized([24.0, 22.0], egui::Button::new(""));
-                    if sync.clicked() {
-                        self.sync_all();
+                    // carries the label. Debug mode is the only one that shows
+                    // it: Release fetches on its own (at startup, and when a
+                    // folder is first opened), while Debug is the mode with no
+                    // automatic syncing, so that is where asking for one has to
+                    // be possible.
+                    if self.working_mode == WorkingMode::Debug {
+                        let sync = row.add_sized([24.0, 22.0], egui::Button::new(""));
+                        if sync.clicked() {
+                            self.sync_all();
+                        }
+                        paint_sync_icon(row.painter(), sync.rect, visuals.text_color());
+                        sync.on_hover_text(
+                            "Sync all accounts — Debug mode does not sync on its own",
+                        );
                     }
-                    paint_sync_icon(row.painter(), sync.rect, visuals.text_color());
-                    sync.on_hover_text(if self.working_mode.syncs_automatically() {
-                        "Sync all accounts"
-                    } else {
-                        "Sync all accounts — Debug mode does not sync on its own"
-                    });
 
                     // Search, as one box: the field is the query — one
                     // string, so whatever is searched for anywhere is what is
