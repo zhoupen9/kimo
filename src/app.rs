@@ -2,13 +2,15 @@
 //! `sync::Event`s drained at the top of every frame; opening a socket happens
 //! only in worker threads.
 //!
-//! Layout: custom title bar on top (nav toggle, account menu, sync, HTML
-//! renderer switch, theme, window controls), then three columns —
-//! collapsible navigation, message list, reading pane.
+//! Layout: custom title bar on top (nav toggle, account menu, sync,
+//! preferences cog, window controls), then three columns — collapsible
+//! navigation, message list, reading pane.
 //!
-//! The reading pane has two HTML renderers, switched from the title bar: the
-//! built-in one lays the mail out as egui widgets (`crate::html`), the other
-//! rasterizes it with Blitz (`crate::blitz_render`) on a worker thread.
+//! Preferences open from the title bar's cog as an `egui::Modal`: the
+//! Accounts page holds the account list and the add-account form, the
+//! Appearance page the theme and the HTML renderer. That renderer draws the
+//! mail either as egui widgets (`crate::html`) or rasterized by Blitz
+//! (`crate::blitz_render`) on a worker thread.
 
 use std::collections::HashMap;
 use std::sync::mpsc;
@@ -30,15 +32,6 @@ enum Theme {
 }
 
 impl Theme {
-    /// Button click order: system → light → dark → system.
-    fn next(self) -> Self {
-        match self {
-            Theme::System => Theme::Light,
-            Theme::Light => Theme::Dark,
-            Theme::Dark => Theme::System,
-        }
-    }
-
     fn label(self) -> &'static str {
         match self {
             Theme::System => "System",
@@ -69,8 +62,8 @@ impl Theme {
 /// `Simple` is the built-in renderer: the mail becomes native egui widgets,
 /// follows the app theme and stays interactive. `Blitz` runs the real browser
 /// engine over the same HTML and shows the rasterized page, which is much
-/// closer to what the sender designed. The choice is toggled from the title
-/// bar and remembered in `settings.json`.
+/// closer to what the sender designed. The choice lives in
+/// Preferences → Appearance and is remembered in `settings.json`.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum HtmlRenderer {
     Simple,
@@ -78,7 +71,7 @@ enum HtmlRenderer {
 }
 
 impl HtmlRenderer {
-    /// Title-bar label: short enough for a 42px button.
+    /// Short label for the Preferences radios.
     fn label(self) -> &'static str {
         match self {
             HtmlRenderer::Simple => "Simple",
@@ -101,23 +94,24 @@ impl HtmlRenderer {
         }
     }
 
-    fn toggled(self) -> Self {
-        match self {
-            HtmlRenderer::Simple => HtmlRenderer::Blitz,
-            HtmlRenderer::Blitz => HtmlRenderer::Simple,
-        }
-    }
-
-    fn tooltip(self) -> &'static str {
+    /// One-line explanation shown under the renderer radios.
+    fn description(self) -> &'static str {
         match self {
             HtmlRenderer::Simple => {
-                "HTML renderer: Simple — mail HTML drawn as native egui widgets. Click to render with Blitz."
+                "Mail HTML drawn as native egui widgets: theme-aware, selectable text, best-effort layout."
             }
             HtmlRenderer::Blitz => {
-                "HTML renderer: Blitz — full CSS layout, rasterized. Click for the built-in renderer."
+                "Full CSS layout rasterized by a browser engine: closest to the sender's design, but a static image."
             }
         }
     }
+}
+
+/// Pages of the preferences modal.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PrefsTab {
+    Accounts,
+    Appearance,
 }
 
 pub struct KimoApp {
@@ -130,7 +124,13 @@ pub struct KimoApp {
     selected_folder: Option<String>,
     selected_message: Option<String>,
     filter: String,
-    show_add_account: bool,
+    /// Whether the preferences modal is open.
+    show_preferences: bool,
+    /// Which preferences page is selected.
+    prefs_tab: PrefsTab,
+    /// Accounts page: the add-account form replaces the account list while
+    /// this is set.
+    show_account_form: bool,
     add_form: AddAccountForm,
     confirm_delete: Option<String>,
     nav_collapsed: bool,
@@ -259,7 +259,9 @@ impl KimoApp {
             selected_folder: None,
             selected_message: None,
             filter: String::new(),
-            show_add_account: false,
+            show_preferences: false,
+            prefs_tab: PrefsTab::Accounts,
+            show_account_form: false,
             add_form: AddAccountForm::default(),
             confirm_delete: None,
             nav_collapsed: false,
@@ -536,7 +538,7 @@ impl KimoApp {
         self.selected_account = Some(account_id);
         self.selected_folder = Some("INBOX".to_string());
         self.selected_message = None;
-        self.show_add_account = false;
+        self.show_account_form = false;
     }
 
     // ----- queries ----------------------------------------------------------
@@ -907,74 +909,31 @@ impl KimoApp {
             }
         }
 
-        // Theme switch (system → light → dark), just left of the controls.
-        let theme_right = bar.right() - TITLEBAR_BUTTON_WIDTH * buttons.len() as f32;
-        let theme_rect = egui::Rect::from_min_max(
-            egui::pos2(theme_right - TITLEBAR_BUTTON_WIDTH, bar.top()),
-            egui::pos2(theme_right, bar.bottom()),
+        // Preferences (cog), just left of the window controls: the theme and
+        // HTML renderer toggles used to sit here, and adding/removing accounts
+        // in the account menu below — all of it moved into this modal.
+        let cog_right = bar.right() - TITLEBAR_BUTTON_WIDTH * buttons.len() as f32;
+        let cog_rect = egui::Rect::from_min_max(
+            egui::pos2(cog_right - TITLEBAR_BUTTON_WIDTH, bar.top()),
+            egui::pos2(cog_right, bar.bottom()),
         );
-        let theme_resp = ui.interact(
-            theme_rect,
-            egui::Id::new("titlebar-theme"),
+        let cog_resp = ui.interact(
+            cog_rect,
+            egui::Id::new("titlebar-preferences"),
             egui::Sense::click(),
         );
-        if theme_resp.hovered() {
+        if cog_resp.hovered() {
             ui.painter()
-                .rect_filled(theme_rect, 0.0, visuals.widgets.hovered.bg_fill);
+                .rect_filled(cog_rect, 0.0, visuals.widgets.hovered.bg_fill);
         }
-        paint_theme_icon(ui.painter(), theme_rect, visuals.text_color());
-        if theme_resp.clicked() {
-            self.theme = self.theme.next();
-            if self.theme == Theme::System {
-                self.system_dark = system_prefers_dark();
-            }
-            self.persist_settings();
+        paint_cog_icon(ui.painter(), cog_rect, visuals.text_color());
+        if cog_resp.clicked() {
+            self.show_preferences = true;
         }
-        theme_resp.on_hover_text(format!(
-            "Theme: {} — click to switch (system → light → dark)",
-            self.theme.label()
-        ));
-
-        // HTML renderer switch (Simple ↔ Blitz), left of the theme button.
-        // Filled while Blitz is active, so the current renderer is visible at
-        // a glance.
-        let renderer_right = theme_rect.left();
-        let renderer_rect = egui::Rect::from_min_max(
-            egui::pos2(renderer_right - TITLEBAR_BUTTON_WIDTH, bar.top()),
-            egui::pos2(renderer_right, bar.bottom()),
-        );
-        let renderer_resp = ui.interact(
-            renderer_rect,
-            egui::Id::new("titlebar-html-renderer"),
-            egui::Sense::click(),
-        );
-        if renderer_resp.hovered() {
-            ui.painter()
-                .rect_filled(renderer_rect, 0.0, visuals.widgets.hovered.bg_fill);
-        }
-        if self.html_renderer == HtmlRenderer::Blitz {
-            ui.painter().rect_filled(
-                renderer_rect.shrink2(egui::vec2(6.0, 6.0)),
-                5.0,
-                visuals.selection.bg_fill,
-            );
-        }
-        ui.painter().text(
-            renderer_rect.center(),
-            egui::Align2::CENTER_CENTER,
-            self.html_renderer.label(),
-            egui::FontId::proportional(11.0),
-            visuals.text_color(),
-        );
-        if renderer_resp.clicked() {
-            self.html_renderer = self.html_renderer.toggled();
-            self.persist_settings();
-            self.pending_blitz_key = None;
-        }
-        renderer_resp.on_hover_text(self.html_renderer.tooltip());
+        cog_resp.on_hover_text("Preferences");
 
         // --- left content row, kept clear of the window buttons ---
-        let content_right = renderer_rect.left();
+        let content_right = cog_rect.left();
         let row_size = egui::vec2((content_right - bar.left()).max(0.0), bar.height());
         let content_end = ui
             .allocate_ui_with_layout(
@@ -1006,13 +965,13 @@ impl KimoApp {
                     row.label(egui::RichText::new("Kimo").small().strong());
                     row.separator();
 
-                    // Account menu: switch accounts, add, remove (two-step confirm).
+                    // Account menu: switch the active account. Adding and
+                    // removing accounts lives in Preferences → Accounts.
                     let selected_name = self
                         .current_account()
                         .map(|a| a.name)
                         .unwrap_or_else(|| "No account".to_string());
                     let mut switch_to: Option<Account> = None;
-                    let mut add_clicked = false;
                     egui::ComboBox::from_id_salt("account-selector")
                         .selected_text(selected_name)
                         .width(170.0)
@@ -1030,35 +989,6 @@ impl KimoApp {
                                     switch_to = Some(account.clone());
                                 }
                             }
-                            if !self.accounts.is_empty() {
-                                ui.separator();
-                            }
-                            if ui.button("+ Add account…").clicked() {
-                                add_clicked = true;
-                            }
-                            if let Some(current) = self
-                                .accounts
-                                .iter()
-                                .find(|a| self.selected_account.as_deref() == Some(a.id.as_str()))
-                            {
-                                let confirming =
-                                    self.confirm_delete.as_deref() == Some(current.id.as_str());
-                                let label = if confirming {
-                                    egui::RichText::new(format!("Remove \"{}\"?", current.name))
-                                        .color(egui::Color32::RED)
-                                } else {
-                                    egui::RichText::new(format!("Remove \"{}\"", current.name))
-                                };
-                                if ui.button(label).clicked() {
-                                    if confirming {
-                                        let id = current.id.clone();
-                                        self.delete_account(&id);
-                                        self.confirm_delete = None;
-                                    } else {
-                                        self.confirm_delete = Some(current.id.clone());
-                                    }
-                                }
-                            }
                         });
                     if let Some(account) = switch_to {
                         self.select_folder(
@@ -1067,11 +997,6 @@ impl KimoApp {
                             account.protocol,
                         );
                     }
-                    if add_clicked {
-                        self.add_form = AddAccountForm::default();
-                        self.show_add_account = true;
-                    }
-
                     if row.button("Sync").clicked() {
                         self.sync_all();
                     }
@@ -1130,7 +1055,7 @@ impl KimoApp {
                 let Some(account) = self.current_account() else {
                     ui.label("No account selected.");
                     ui.label(
-                        egui::RichText::new("Add one from the account menu in the title bar.")
+                        egui::RichText::new("Add one in Preferences (the cog in the title bar).")
                             .small()
                             .weak(),
                     );
@@ -1459,120 +1384,284 @@ impl KimoApp {
         });
     }
 
-    fn add_account_window(&mut self, ctx: &egui::Context) {
-        let mut open = self.show_add_account;
-        egui::Window::new("Add account")
-            .open(&mut open)
-            .resizable(false)
-            .show(ctx, |ui| {
-                let f = &mut self.add_form;
-                egui::Grid::new("add_account_grid")
-                    .num_columns(2)
-                    .spacing([10.0, 6.0])
-                    .show(ui, |ui| {
-                        ui.label("Account name");
-                        ui.add(egui::TextEdit::singleline(&mut f.name).hint_text("Personal mail"));
-                        ui.end_row();
-
-                        ui.label("Protocol");
-                        ui.horizontal(|ui| {
-                            let mut changed = false;
-                            if ui
-                                .radio_value(&mut f.protocol, Protocol::Imap, "IMAP")
-                                .changed()
-                            {
-                                changed = true;
-                            }
-                            if ui
-                                .radio_value(&mut f.protocol, Protocol::Pop3, "POP3")
-                                .changed()
-                            {
-                                changed = true;
-                            }
-                            if changed {
-                                f.port_str = f.protocol.default_port(f.tls).to_string();
-                            }
-                        });
-                        ui.end_row();
-
-                        ui.label("Server");
-                        ui.add(
-                            egui::TextEdit::singleline(&mut f.host).hint_text("imap.example.com"),
-                        );
-                        ui.end_row();
-
-                        ui.label("Security");
-                        ui.horizontal(|ui| {
-                            let mut changed = false;
-                            if ui
-                                .radio_value(&mut f.tls, TlsMode::Implicit, "TLS")
-                                .changed()
-                            {
-                                changed = true;
-                            }
-                            if ui
-                                .radio_value(&mut f.tls, TlsMode::StartTls, "STARTTLS")
-                                .changed()
-                            {
-                                changed = true;
-                            }
-                            if ui.radio_value(&mut f.tls, TlsMode::Plain, "None").changed() {
-                                changed = true;
-                            }
-                            if changed {
-                                f.port_str = f.protocol.default_port(f.tls).to_string();
-                            }
-                        });
-                        ui.end_row();
-
-                        ui.label("Port");
-                        ui.add(egui::TextEdit::singleline(&mut f.port_str).hint_text("993"));
-                        ui.end_row();
-
-                        ui.label("Username");
-                        ui.add(
-                            egui::TextEdit::singleline(&mut f.username)
-                                .hint_text("you@example.com"),
-                        );
-                        ui.end_row();
-
-                        ui.label("Password");
-                        ui.add(egui::TextEdit::singleline(&mut f.password).password(true));
-                        ui.end_row();
-                    });
-
-                ui.add_space(6.0);
-                ui.label(
-                    egui::RichText::new(
-                        "Note: credentials are stored in plain text on this machine.",
-                    )
-                    .small()
-                    .weak(),
-                );
-                ui.add_space(4.0);
-
-                let valid = {
-                    let f = &self.add_form;
-                    !f.name.trim().is_empty()
-                        && !f.host.trim().is_empty()
-                        && !f.username.trim().is_empty()
-                        && f.port_str.trim().parse::<u16>().is_ok()
-                };
-                ui.horizontal(|ui| {
-                    if ui.button("Cancel").clicked() {
-                        self.show_add_account = false;
-                    }
-                    if ui
-                        .add_enabled(valid, egui::Button::new("Save & connect"))
-                        .clicked()
-                    {
-                        self.save_new_account();
+    /// The preferences modal, opened from the title-bar cog: a sidebar of
+    /// pages with the account configuration (previously split between a
+    /// standalone window and the account menu) and the appearance switches
+    /// (previously title-bar buttons).
+    fn preferences_modal(&mut self, ctx: &egui::Context) {
+        let mut open = self.show_preferences;
+        let modal = egui::Modal::new(egui::Id::new("preferences")).show(ctx, |ui| {
+            ui.set_width(600.0);
+            ui.horizontal(|ui| {
+                ui.heading("Preferences");
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.button("Close").clicked() {
+                        open = false;
                     }
                 });
             });
-        if !open {
-            self.show_add_account = false;
+            ui.separator();
+            ui.horizontal_top(|ui| {
+                ui.vertical(|ui| {
+                    ui.set_width(150.0);
+                    for (tab, label) in [
+                        (PrefsTab::Accounts, "Accounts"),
+                        (PrefsTab::Appearance, "Appearance"),
+                    ] {
+                        if ui.selectable_label(self.prefs_tab == tab, label).clicked() {
+                            self.prefs_tab = tab;
+                        }
+                    }
+                });
+                ui.separator();
+                ui.vertical(|ui| {
+                    ui.set_min_width(390.0);
+                    ui.set_min_height(330.0);
+                    match self.prefs_tab {
+                        PrefsTab::Accounts => self.accounts_page(ui),
+                        PrefsTab::Appearance => self.appearance_page(ui),
+                    }
+                });
+            });
+        });
+        // Clicking the backdrop or pressing Escape closes the modal.
+        if modal.should_close() {
+            open = false;
         }
+        self.show_preferences = open;
+    }
+
+    /// Preferences → Accounts: the configured accounts, with the add-account
+    /// form taking over the page while it is open.
+    fn accounts_page(&mut self, ui: &mut egui::Ui) {
+        if self.show_account_form {
+            self.account_form(ui);
+            return;
+        }
+
+        let mut switch_to: Option<Account> = None;
+        let mut remove: Option<String> = None;
+
+        ui.label(
+            egui::RichText::new("Every account syncs; the one in use fills the window.")
+                .small()
+                .weak(),
+        );
+        ui.add_space(6.0);
+
+        if self.accounts.is_empty() {
+            ui.label("No accounts yet — add one below.");
+            ui.add_space(4.0);
+        }
+
+        for account in self.accounts.clone() {
+            let in_use = self.selected_account.as_deref() == Some(account.id.as_str());
+            egui::Frame::group(ui.style()).show(ui, |ui| {
+                ui.set_min_width(ui.available_width());
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new(&account.name).strong());
+                    if in_use {
+                        ui.label(egui::RichText::new("in use").small().weak());
+                    }
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        // Removal is a two-step confirm, like the old menu item.
+                        let confirming =
+                            self.confirm_delete.as_deref() == Some(account.id.as_str());
+                        let label = if confirming {
+                            egui::RichText::new("Remove?").color(egui::Color32::RED)
+                        } else {
+                            egui::RichText::new("Remove")
+                        };
+                        if ui.button(label).clicked() {
+                            if confirming {
+                                remove = Some(account.id.clone());
+                            } else {
+                                self.confirm_delete = Some(account.id.clone());
+                            }
+                        }
+                        if !in_use && ui.button("Use").clicked() {
+                            switch_to = Some(account.clone());
+                        }
+                    });
+                });
+                ui.label(
+                    egui::RichText::new(format!(
+                        "{} · {}:{} · {}",
+                        account.protocol.label(),
+                        account.host,
+                        account.port,
+                        account.username
+                    ))
+                    .small()
+                    .weak(),
+                );
+            });
+            ui.add_space(2.0);
+        }
+
+        ui.add_space(6.0);
+        if ui.button("+ Add account").clicked() {
+            self.add_form = AddAccountForm::default();
+            self.show_account_form = true;
+        }
+
+        if let Some(account) = switch_to {
+            self.select_folder(account.id.clone(), "INBOX".to_string(), account.protocol);
+        }
+        if let Some(id) = remove {
+            self.delete_account(&id);
+            self.confirm_delete = None;
+        }
+    }
+
+    /// Preferences → Accounts → new account: the form the standalone
+    /// "Add account" window used to show.
+    fn account_form(&mut self, ui: &mut egui::Ui) {
+        ui.label(egui::RichText::new("New account").strong());
+        ui.add_space(4.0);
+
+        let f = &mut self.add_form;
+        egui::Grid::new("account_form_grid")
+            .num_columns(2)
+            .spacing([10.0, 6.0])
+            .show(ui, |ui| {
+                ui.label("Account name");
+                ui.add(egui::TextEdit::singleline(&mut f.name).hint_text("Personal mail"));
+                ui.end_row();
+
+                ui.label("Protocol");
+                ui.horizontal(|ui| {
+                    let mut changed = false;
+                    if ui
+                        .radio_value(&mut f.protocol, Protocol::Imap, "IMAP")
+                        .changed()
+                    {
+                        changed = true;
+                    }
+                    if ui
+                        .radio_value(&mut f.protocol, Protocol::Pop3, "POP3")
+                        .changed()
+                    {
+                        changed = true;
+                    }
+                    if changed {
+                        f.port_str = f.protocol.default_port(f.tls).to_string();
+                    }
+                });
+                ui.end_row();
+
+                ui.label("Server");
+                ui.add(egui::TextEdit::singleline(&mut f.host).hint_text("imap.example.com"));
+                ui.end_row();
+
+                ui.label("Security");
+                ui.horizontal(|ui| {
+                    let mut changed = false;
+                    if ui
+                        .radio_value(&mut f.tls, TlsMode::Implicit, "TLS")
+                        .changed()
+                    {
+                        changed = true;
+                    }
+                    if ui
+                        .radio_value(&mut f.tls, TlsMode::StartTls, "STARTTLS")
+                        .changed()
+                    {
+                        changed = true;
+                    }
+                    if ui.radio_value(&mut f.tls, TlsMode::Plain, "None").changed() {
+                        changed = true;
+                    }
+                    if changed {
+                        f.port_str = f.protocol.default_port(f.tls).to_string();
+                    }
+                });
+                ui.end_row();
+
+                ui.label("Port");
+                ui.add(egui::TextEdit::singleline(&mut f.port_str).hint_text("993"));
+                ui.end_row();
+
+                ui.label("Username");
+                ui.add(egui::TextEdit::singleline(&mut f.username).hint_text("you@example.com"));
+                ui.end_row();
+
+                ui.label("Password");
+                ui.add(egui::TextEdit::singleline(&mut f.password).password(true));
+                ui.end_row();
+            });
+
+        ui.add_space(6.0);
+        ui.label(
+            egui::RichText::new("Note: credentials are stored in plain text on this machine.")
+                .small()
+                .weak(),
+        );
+        ui.add_space(4.0);
+
+        let valid = {
+            let f = &self.add_form;
+            !f.name.trim().is_empty()
+                && !f.host.trim().is_empty()
+                && !f.username.trim().is_empty()
+                && f.port_str.trim().parse::<u16>().is_ok()
+        };
+        ui.horizontal(|ui| {
+            if ui.button("Cancel").clicked() {
+                self.show_account_form = false;
+            }
+            if ui
+                .add_enabled(valid, egui::Button::new("Save & connect"))
+                .clicked()
+            {
+                self.save_new_account();
+            }
+        });
+    }
+
+    /// Preferences → Appearance: theme and HTML renderer, both persisted to
+    /// settings.json on change.
+    fn appearance_page(&mut self, ui: &mut egui::Ui) {
+        ui.label(egui::RichText::new("Theme").strong());
+        ui.horizontal(|ui| {
+            for theme in [Theme::System, Theme::Light, Theme::Dark] {
+                if ui.radio(self.theme == theme, theme.label()).clicked() {
+                    self.theme = theme;
+                    if theme == Theme::System {
+                        self.system_dark = system_prefers_dark();
+                    }
+                    self.persist_settings();
+                }
+            }
+        });
+        ui.label(
+            egui::RichText::new("“System” follows the GTK/KDE dark-mode setting.")
+                .small()
+                .weak(),
+        );
+
+        ui.add_space(12.0);
+        ui.separator();
+        ui.add_space(8.0);
+
+        ui.label(egui::RichText::new("HTML mail renderer").strong());
+        ui.horizontal(|ui| {
+            for renderer in [HtmlRenderer::Simple, HtmlRenderer::Blitz] {
+                if ui
+                    .radio(self.html_renderer == renderer, renderer.label())
+                    .clicked()
+                {
+                    self.html_renderer = renderer;
+                    self.persist_settings();
+                    self.pending_blitz_key = None;
+                }
+            }
+        });
+        ui.label(
+            egui::RichText::new(self.html_renderer.description())
+                .small()
+                .weak(),
+        );
     }
 }
 
@@ -1606,8 +1695,8 @@ impl eframe::App for KimoApp {
         }
         egui::CentralPanel::default().show(ctx, |ui| self.mail_list(ui));
 
-        if self.show_add_account {
-            self.add_account_window(ctx);
+        if self.show_preferences {
+            self.preferences_modal(ctx);
         }
     }
 }
@@ -1841,16 +1930,18 @@ fn paint_close_icon(p: &egui::Painter, rect: egui::Rect, color: egui::Color32) {
     );
 }
 
-/// Half-filled circle — the classic theme/contrast glyph.
-fn paint_theme_icon(p: &egui::Painter, rect: egui::Rect, color: egui::Color32) {
+/// Cog / gear glyph for the preferences button: a hub ring with eight teeth.
+fn paint_cog_icon(p: &egui::Painter, rect: egui::Rect, color: egui::Color32) {
     let c = rect.center();
     let r = 5.5;
-    p.circle_stroke(c, r, egui::Stroke::new(1.2_f32, color));
-    let left_half = egui::Rect::from_min_max(
-        egui::pos2(c.x - r - 0.5, c.y - r - 0.5),
-        egui::pos2(c.x, c.y + r + 0.5),
-    );
-    p.with_clip_rect(left_half).circle_filled(c, r - 0.9, color);
+    let stroke = egui::Stroke::new(1.2_f32, color);
+    p.circle_stroke(c, r * 0.55, stroke);
+    for i in 0..8 {
+        let angle = i as f32 * std::f32::consts::TAU / 8.0;
+        let (sin, cos) = angle.sin_cos();
+        let dir = egui::vec2(cos, sin);
+        p.line_segment([c + dir * (r * 0.62), c + dir * r], stroke);
+    }
 }
 
 /// Best-effort OS dark-mode detection without spawning processes or talking
@@ -1994,8 +2085,6 @@ mod tests {
         // falls back to the built-in renderer.
         assert_eq!(HtmlRenderer::parse("web"), HtmlRenderer::Simple);
         assert_eq!(HtmlRenderer::parse(""), HtmlRenderer::Simple);
-        assert_eq!(HtmlRenderer::Simple.toggled(), HtmlRenderer::Blitz);
-        assert_eq!(HtmlRenderer::Blitz.toggled(), HtmlRenderer::Simple);
         assert_eq!(HtmlRenderer::Blitz.as_str(), "blitz");
         assert_eq!(HtmlRenderer::Simple.as_str(), "egui");
     }
@@ -2007,13 +2096,6 @@ mod tests {
         assert_eq!(quantize(32.1, 32), 64);
         assert_eq!(quantize(1000.0, 128), 1024);
         assert_eq!(quantize(f32::NAN, 32), 32);
-    }
-
-    #[test]
-    fn theme_cycles_system_light_dark() {
-        assert_eq!(Theme::System.next(), Theme::Light);
-        assert_eq!(Theme::Light.next(), Theme::Dark);
-        assert_eq!(Theme::Dark.next(), Theme::System);
     }
 
     #[test]
