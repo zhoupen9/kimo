@@ -2,9 +2,9 @@
 //! `sync::Event`s drained at the top of every frame; opening a socket happens
 //! only in worker threads.
 //!
-//! Layout: custom title bar on top (nav toggle, account menu, sync,
-//! preferences cog, window controls), then three columns — collapsible
-//! navigation, message list, reading pane.
+//! Layout: custom title bar on top (nav toggle, sync, preferences cog, window
+//! controls), then three columns — collapsible navigation (every account as a
+//! collapsible section of its folders), message list, reading pane.
 //!
 //! Preferences open from the title bar's cog as an `egui::Modal`: the
 //! Accounts page holds the account list and the add/edit account form, the
@@ -13,7 +13,7 @@
 //! mail either as egui widgets (`crate::html`) or rasterized by Blitz
 //! (`crate::blitz_render`) on a worker thread.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
@@ -104,6 +104,10 @@ pub struct KimoApp {
     account_form: AccountForm,
     confirm_delete: Option<String>,
     nav_collapsed: bool,
+    /// Accounts whose section in the navigation column is collapsed; an
+    /// account is expanded unless its id is in here. Deliberately not
+    /// persisted: which accounts you are reading is a per-session thing.
+    collapsed_accounts: HashSet<String>,
     /// Whether the window was narrow last frame, so auto-collapse only
     /// triggers when crossing the threshold (not every frame).
     was_narrow: bool,
@@ -336,6 +340,7 @@ impl KimoApp {
             account_form: AccountForm::default(),
             confirm_delete: None,
             nav_collapsed: false,
+            collapsed_accounts: HashSet::new(),
             was_narrow: false,
             folder_icons,
             brand_icon,
@@ -503,11 +508,31 @@ impl KimoApp {
         }
     }
 
-    fn current_account(&self) -> Option<Account> {
-        self.accounts
-            .iter()
-            .find(|a| self.selected_account.as_deref() == Some(a.id.as_str()))
-            .cloned()
+    /// Unread mail in one folder, from the messages already cached for it.
+    fn folder_unread(&self, account_id: &str, folder: &str) -> usize {
+        self.states
+            .get(account_id)
+            .and_then(|state| state.cache.folders.iter().find(|f| f.name == folder))
+            .map(|f| f.messages.iter().filter(|m| !m.seen).count())
+            .unwrap_or(0)
+    }
+
+    /// Unread mail across every cached folder of one account — the number on
+    /// its header in the navigation column. Folders that were never fetched
+    /// are simply not counted; nothing here goes to the network.
+    fn account_unread(&self, account_id: &str) -> usize {
+        self.states
+            .get(account_id)
+            .map(|state| {
+                state
+                    .cache
+                    .folders
+                    .iter()
+                    .flat_map(|folder| folder.messages.iter())
+                    .filter(|message| !message.seen)
+                    .count()
+            })
+            .unwrap_or(0)
     }
 
     fn select_folder(&mut self, account_id: String, folder: String, protocol: Protocol) {
@@ -1166,38 +1191,11 @@ impl KimoApp {
                         "Hide folders"
                     });
 
-                    // Account menu: switch the active account. Adding and
-                    // removing accounts lives in Preferences → Accounts.
-                    let selected_name = self
-                        .current_account()
-                        .map(|a| a.name)
-                        .unwrap_or_else(|| "No account".to_string());
-                    let mut switch_to: Option<Account> = None;
-                    egui::ComboBox::from_id_salt("account-selector")
-                        .selected_text(selected_name)
-                        .width(170.0)
-                        .show_ui(row, |ui| {
-                            ui.set_min_width(240.0);
-                            for account in &self.accounts {
-                                let is_sel =
-                                    self.selected_account.as_deref() == Some(account.id.as_str());
-                                let text = egui::RichText::new(format!(
-                                    "{} · {}",
-                                    account.name,
-                                    account.protocol.label()
-                                ));
-                                if ui.selectable_label(is_sel, text).clicked() {
-                                    switch_to = Some(account.clone());
-                                }
-                            }
-                        });
-                    if let Some(account) = switch_to {
-                        self.select_folder(
-                            account.id.clone(),
-                            "INBOX".to_string(),
-                            account.protocol,
-                        );
-                    }
+                    // No account menu here: the navigation column lists
+                    // every account and its folders, so switching accounts is
+                    // picking a folder there. The title bar keeps the global
+                    // actions only (add/remove accounts lives in Preferences).
+                    //
                     // Sync: icon-only, like the window controls — the tooltip
                     // carries the label.
                     let sync = row.add_sized([24.0, 22.0], egui::Button::new(""));
@@ -1254,71 +1252,95 @@ impl KimoApp {
     }
 
     /// Left column: folders of the selected account.
+    /// Left column: every account as a collapsible section of its folders.
+    /// The selection can be a folder of any of them — switching accounts is
+    /// picking a folder here, so the title bar needs no account menu.
     fn nav(&mut self, ui: &mut egui::Ui) {
         let scheme = theme::of(ui.ctx());
+        if self.accounts.is_empty() {
+            ui.label("No accounts yet.");
+            ui.label(
+                egui::RichText::new("Add one in Preferences (the cog in the title bar).")
+                    .small()
+                    .weak(),
+            );
+            return;
+        }
+        let accounts = self.accounts.clone();
         egui::ScrollArea::vertical()
             .auto_shrink([false, false])
             .show(ui, |ui| {
-                let Some(account) = self.current_account() else {
-                    ui.label("No account selected.");
-                    ui.label(
-                        egui::RichText::new("Add one in Preferences (the cog in the title bar).")
-                            .small()
-                            .weak(),
-                    );
-                    return;
-                };
-                let (folders, syncing, error) = {
-                    let state = self.states.entry(account.id.clone()).or_default();
-                    (state.folders.clone(), state.syncing, state.error.clone())
-                };
-
-                ui.label(egui::RichText::new("MAILBOXES").small().weak());
-                ui.add_space(4.0);
-
-                let folders_were_empty = folders.is_empty();
-                let folder_list = if folders.is_empty() {
-                    vec!["INBOX".to_string()]
-                } else {
-                    folders
-                };
-                for folder in folder_list {
-                    let selected = self.selected_account.as_deref() == Some(account.id.as_str())
-                        && self.selected_folder.as_deref() == Some(folder.as_str());
-                    let unread = self
-                        .states
-                        .get(&account.id)
-                        .and_then(|s| s.cache.folders.iter().find(|f| f.name == folder))
-                        .map(|f| f.messages.iter().filter(|m| !m.seen).count())
-                        .unwrap_or(0);
-                    // `folder` is the IMAP wire form (possibly modified
-                    // UTF-7); decode it for the label and for the icon
-                    // lookup, which matches the readable name.
-                    let display = crate::protocol::imap::decode_mailbox_name(folder.as_str());
-                    let kind = folders::kind_of(&display);
-                    // Only a generic folder has an open variant; the special
-                    // mailboxes keep one glyph.
-                    let open = selected && kind == FolderKind::Folder;
-                    let icon = self.folder_icons.get(&(kind, open)).cloned();
-                    let row = folder_row(ui, scheme, icon.as_ref(), &display, unread, selected);
-                    if row.clicked() {
-                        self.select_folder(account.id.clone(), folder, account.protocol);
-                    }
-                }
-                if syncing && folders_were_empty {
-                    ui.add_space(4.0);
-                    ui.add(egui::Spinner::new().color(scheme.accent));
-                }
-                if let Some(err) = error {
-                    ui.add_space(4.0);
-                    ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Wrap);
-                    ui.label(
-                        egui::RichText::new(format!("⚠ {err}"))
-                            .small()
-                            .color(scheme.danger),
-                    );
+                ui.add_space(2.0);
+                for account in &accounts {
+                    self.account_section(ui, scheme, account);
                 }
             });
+    }
+
+    /// One account in the navigation column: a header that collapses it, then
+    /// its folders, indented under it.
+    fn account_section(&mut self, ui: &mut egui::Ui, scheme: ColorScheme, account: &Account) {
+        let collapsed = self.collapsed_accounts.contains(&account.id);
+        let unread = self.account_unread(&account.id);
+        if account_row(ui, scheme, &account.name, unread, collapsed).clicked() {
+            if collapsed {
+                self.collapsed_accounts.remove(&account.id);
+            } else {
+                self.collapsed_accounts.insert(account.id.clone());
+            }
+            return;
+        }
+        if collapsed {
+            ui.add_space(2.0);
+            return;
+        }
+
+        let (folders, syncing, error) = {
+            let state = self.states.entry(account.id.clone()).or_default();
+            (state.folders.clone(), state.syncing, state.error.clone())
+        };
+        let folders_were_empty = folders.is_empty();
+        // Before the first sync there is nothing to list, but INBOX is worth
+        // offering: clicking it is what starts the fetch.
+        let folder_list = if folders.is_empty() {
+            vec!["INBOX".to_string()]
+        } else {
+            folders
+        };
+        ui.indent(("account-folders", &account.id), |ui| {
+            for folder in folder_list {
+                let selected = self.selected_account.as_deref() == Some(account.id.as_str())
+                    && self.selected_folder.as_deref() == Some(folder.as_str());
+                let unread = self.folder_unread(&account.id, &folder);
+                // `folder` is the IMAP wire form (possibly modified UTF-7);
+                // decode it for the label and for the icon lookup, which
+                // matches the readable name.
+                let display = crate::protocol::imap::decode_mailbox_name(folder.as_str());
+                let kind = folders::kind_of(&display);
+                // Only a generic folder has an open variant; the special
+                // mailboxes keep one glyph.
+                let open = selected && kind == FolderKind::Folder;
+                let icon = self.folder_icons.get(&(kind, open)).cloned();
+                let row = folder_row(ui, scheme, icon.as_ref(), &display, unread, selected);
+                if row.clicked() {
+                    self.select_folder(account.id.clone(), folder, account.protocol);
+                }
+            }
+        });
+        if syncing && folders_were_empty {
+            ui.add_space(4.0);
+            ui.add(egui::Spinner::new().color(scheme.accent));
+        }
+        if let Some(err) = error {
+            ui.add_space(4.0);
+            ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Wrap);
+            ui.label(
+                egui::RichText::new(format!("⚠ {err}"))
+                    .small()
+                    .color(scheme.danger),
+            );
+        }
+        ui.add_space(8.0);
     }
 
     /// Middle column: filter bar plus the message list.
@@ -2295,6 +2317,84 @@ fn paint_row_text(
 /// highlight and put the count inside the name. The colors come straight from
 /// the scheme instead of from egui's widget states, which is what lets an
 /// unread folder read brighter than a read one.
+/// Account header in the navigation column: a disclosure triangle, the
+/// account name and its unread total. Clicking the row collapses or expands
+/// the account's folders.
+fn account_row(
+    ui: &mut egui::Ui,
+    scheme: ColorScheme,
+    name: &str,
+    unread: usize,
+    collapsed: bool,
+) -> egui::Response {
+    const ROW_HEIGHT: f32 = 24.0;
+
+    let (rect, response) = ui.allocate_exact_size(
+        egui::vec2(ui.available_width(), ROW_HEIGHT),
+        egui::Sense::click(),
+    );
+    if !ui.is_rect_visible(rect) {
+        return response;
+    }
+    if response.hovered() {
+        ui.painter().rect_filled(rect, 3.0_f32, scheme.hover);
+    }
+
+    // Disclosure triangle: pointing right while collapsed, down while open.
+    let center = egui::pos2(rect.left() + 10.0, rect.center().y);
+    let triangle = if collapsed {
+        vec![
+            egui::pos2(center.x - 3.0, center.y - 5.0),
+            egui::pos2(center.x + 4.0, center.y),
+            egui::pos2(center.x - 3.0, center.y + 5.0),
+        ]
+    } else {
+        vec![
+            egui::pos2(center.x - 5.0, center.y - 3.0),
+            egui::pos2(center.x + 5.0, center.y - 3.0),
+            egui::pos2(center.x, center.y + 4.0),
+        ]
+    };
+    ui.painter().add(egui::Shape::convex_polygon(
+        triangle,
+        scheme.text_weak,
+        egui::Stroke::NONE,
+    ));
+
+    let left = center.x + 10.0;
+    let mut right = rect.right() - 6.0;
+    if unread > 0 {
+        let small = egui::TextStyle::Small.resolve(ui.style());
+        let count = ui
+            .ctx()
+            .fonts(|fonts| fonts.layout_no_wrap(unread.to_string(), small, scheme.text_weak));
+        right -= count.size().x;
+        ui.painter().galley(
+            egui::pos2(right, rect.center().y - count.size().y / 2.0),
+            count,
+            scheme.text_weak,
+        );
+        right -= 6.0;
+    }
+
+    // Always at full strength, unlike a folder row: this is the section's
+    // heading, and it stays readable while the mail under it is all read.
+    let body = egui::TextStyle::Body.resolve(ui.style());
+    let name = truncate_galley(
+        ui.ctx(),
+        name,
+        body.size,
+        scheme.text,
+        (right - left).max(1.0),
+    );
+    ui.painter().galley(
+        egui::pos2(left, rect.center().y - name.size().y / 2.0),
+        name,
+        scheme.text,
+    );
+    response
+}
+
 fn folder_row(
     ui: &mut egui::Ui,
     scheme: ColorScheme,

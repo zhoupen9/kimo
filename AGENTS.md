@@ -256,9 +256,9 @@ Event (mpsc) ──► drain_events() at frame start ──► merge into Accoun
   application icon (the brand, and the leftmost thing in the bar: the same
   embedded PNG the tray serves, downscaled once at startup because egui has
   no mipmaps to filter a 256 px source down to 18 pt), the nav collapse
-  toggle, the account menu (switch only), the icon-only sync button, the
-  preferences cog, drag area, double-click maximize, and the
-  minimize/maximize/close buttons sent as `ViewportCommand`s. Don't
+  toggle, the icon-only sync button, the preferences cog, drag area,
+  double-click maximize, and the minimize/maximize/close buttons sent as
+  `ViewportCommand`s. Don't
   re-enable system decorations.
 - `preferences_modal()` is the one place to configure Kimo: an
   `egui::Modal` (backdrop click or Escape closes it) with a sidebar of
@@ -269,8 +269,8 @@ Event (mpsc) ──► drain_events() at frame start ──► merge into Accoun
   renderer, the interface/fixed-width fonts — all persisted in
   `settings.json` — plus a read-only preview of the palette the theme
   resolves to). Configuration belongs on a page there, not as another
-  title-bar toggle; the title bar keeps only actions (switching accounts,
-  syncing, window controls).
+  title-bar toggle; the title bar keeps only actions (syncing, window
+  controls), and switching accounts is a navigation-column affair.
 - Colors live in one place, `src/theme.rs`. `Theme` (system/light/dark — the
   only part that is persisted) resolves to a `ColorScheme`, and both defaults
   are filled in slot by slot, `ColorScheme::light()` and
@@ -308,12 +308,18 @@ Event (mpsc) ──► drain_events() at frame start ──► merge into Accoun
   the Appearance page previews through. Blitz keeps its own curated font set
   (`blitz_render::load_fonts`); the Preferences choice applies to the egui UI
   and to monospace text in the built-in HTML renderer.
-- The navigation column lists folders as custom rows — kind icon, name
-  (elided with an ellipsis), unread count right-aligned — because the whole
-  row should be the click target and carry the selection highlight, which
-  `selectable_label` cannot do once an icon sits in front of the text. The
-  icon comes from `folders::kind_of`, which classifies the *decoded* mailbox
-  name: an exact keyword first (`INBOX`, `Sent`, `Trash`, `归档`), then
+- The navigation column is where accounts are switched, which is why the
+  title bar has no account menu: every account is a collapsible section
+  (`collapsed_accounts` holds the collapsed ids, in memory only), whose header
+  shows the name and the account's unread total and whose folders are indented
+  under it. An account with no folders yet still offers INBOX, since clicking
+  it is what starts the first fetch. Selecting a folder of another account is
+  what makes it the active one.
+- Folders are custom rows — kind icon, name (elided with an ellipsis), unread
+  count right-aligned — because the whole row should be the click target and
+  carry the selection highlight, which `selectable_label` cannot do once an
+  icon sits in front of the text. The icon comes from `folders::kind_of`,
+  which classifies the *decoded* mailbox name: an exact keyword first (`INBOX`, `Sent`, `Trash`, `归档`), then
   keyword plus a standard ending (`已删除邮件` = 已删除 + 邮件,
   `Sent Items` = Sent + Items), walking path segments from the right so
   `[Gmail]/All Mail` and `项目/已发送/2026` match as well. Only those
