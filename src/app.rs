@@ -1039,9 +1039,14 @@ impl KimoApp {
                             account.protocol,
                         );
                     }
-                    if row.button("Sync").clicked() {
+                    // Sync: icon-only, like the window controls — the tooltip
+                    // carries the label.
+                    let sync = row.add_sized([24.0, 22.0], egui::Button::new(""));
+                    if sync.clicked() {
                         self.sync_all();
                     }
+                    paint_sync_icon(row.painter(), sync.rect, visuals.text_color());
+                    sync.on_hover_text("Sync all accounts");
 
                     // Per-account status: spinner while syncing, warning on error.
                     for account in self.accounts.clone() {
@@ -2062,6 +2067,41 @@ fn font_picker(
             }
         });
     changed
+}
+
+/// Circular-arrow (refresh) glyph for the sync button: an open ring with an
+/// arrow head where it ends, turning the way the ring is drawn.
+fn paint_sync_icon(p: &egui::Painter, rect: egui::Rect, color: egui::Color32) {
+    let c = rect.center();
+    let r = 5.0;
+    let stroke = egui::Stroke::new(1.3_f32, color);
+
+    // Clockwise on screen (y grows downwards) from lower-right to upper-right,
+    // leaving a gap on the right for the arrow head.
+    let start = 0.6_f32;
+    let end = std::f32::consts::TAU - 0.6;
+    const STEPS: usize = 20;
+    let ring: Vec<egui::Pos2> = (0..=STEPS)
+        .map(|i| {
+            let angle = start + (end - start) * i as f32 / STEPS as f32;
+            c + egui::vec2(angle.cos(), angle.sin()) * r
+        })
+        .collect();
+    p.add(egui::Shape::line(ring, stroke));
+
+    // Head at the end of the ring, pointing along the tangent.
+    let dir = egui::vec2(end.cos(), end.sin());
+    let tangent = egui::vec2(-end.sin(), end.cos());
+    let base = c + dir * r;
+    p.add(egui::Shape::convex_polygon(
+        vec![
+            base + tangent * 3.4,
+            base + dir * 2.1 - tangent * 0.3,
+            base - dir * 2.1 - tangent * 0.3,
+        ],
+        color,
+        egui::Stroke::NONE,
+    ));
 }
 
 /// Cog / gear glyph for the preferences button: a hub ring with eight teeth.

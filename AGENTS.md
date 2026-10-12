@@ -188,9 +188,10 @@ Event (mpsc) ──► drain_events() at frame start ──► merge into Accoun
   placeholder.
 - The window is undecorated on purpose (`with_decorations(false)` in
   `main.rs`): `titlebar()` in `app.rs` draws the custom title bar — nav
-  toggle, account menu (switch only), sync button, the preferences cog,
-  drag area, double-click maximize, and the minimize/maximize/close buttons
-  sent as `ViewportCommand`s. Don't re-enable system decorations.
+  toggle, account menu (switch only), the icon-only sync button, the
+  preferences cog, drag area, double-click maximize, and the
+  minimize/maximize/close buttons sent as `ViewportCommand`s. Don't
+  re-enable system decorations.
 - `preferences_modal()` is the one place to configure Kimo: an
   `egui::Modal` (backdrop click or Escape closes it) with a sidebar of
   pages — **Accounts** (account list, use/remove, and the add-account form
