@@ -21,10 +21,12 @@ mod theme;
 mod tray;
 
 fn main() -> eframe::Result {
-    // Pure-Rust TLS: install rustls' `ring` crypto provider process-wide so
-    // ClientConfig::builder() picks it up (the default provider, aws-lc-rs,
-    // is a C library and intentionally not compiled in).
-    let _ = rustls::crypto::ring::default_provider().install_default();
+    // Pure-Rust TLS: install Kimo's crypto provider process-wide so
+    // ClientConfig::builder() picks it up — rustls' `ring` provider plus the
+    // finite-field DH groups and `DHE-RSA` suites of `protocol::ffdhe`, which
+    // servers like Sina's need (the default provider, aws-lc-rs, is a C
+    // library and intentionally not compiled in).
+    let _ = protocol::ffdhe::crypto_provider().install_default();
 
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()

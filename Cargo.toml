@@ -12,6 +12,15 @@ egui = "0.31"
 # TLS: rustls with the pure-Rust `ring` crypto provider (no OpenSSL / aws-lc-rs).
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
 webpki-roots = "0.26"
+# Finite-field DH (the TLS 1.2 `DHE-RSA-*` suites) for mail servers that offer
+# nothing else — rustls implements DHE but ships no FFDHE group in any provider,
+# so `src/protocol/ffdhe.rs` has to do the modular exponentiation itself.
+# crypto-bigint is pure Rust and constant time (hard rule 1); only that module
+# uses it, and only `alloc` is needed — the random helpers stay off.
+crypto-bigint = { version = "0.7", default-features = false, features = [
+    "alloc",
+    "zeroize",
+] }
 
 # RFC 5322 message parsing (pure Rust). `full_encoding` pulls in encoding_rs
 # (also pure Rust) so GBK/GB2312/Big5/Shift-JIS/… bodies decode correctly.

@@ -11,7 +11,11 @@ Kimo is a desktop **email client** GUI written in pure Rust:
 - **Protocols:** IMAP4rev1 and POP3 **only**, implemented by hand in
   `src/protocol/` — no `imap`/`async-imap`/`pop` crates.
 - **TLS:** rustls with the pure-Rust `ring` crypto provider + webpki-roots.
-  The `ring` provider is installed process-wide in `src/main.rs`.
+  `src/protocol/ffdhe.rs` adds the finite-field DH rustls does not ship (an
+  FFDHE group and the two GCM `DHE-RSA` suites, the modular exponentiation
+  coming from `crypto-bigint`), because some mail servers — Sina's, for one —
+  offer TLS 1.2 with nothing but `DHE-RSA` and are otherwise unreachable.
+  That provider is installed process-wide in `src/main.rs`.
 - **HTML mail:** two renderers, switched in Preferences → Appearance and
   remembered in `settings.json` (`html_renderer`).
   *Simple* (the default) parses with html5ever (via `scraper`) and draws
@@ -88,7 +92,7 @@ done. There is no CI yet — that discipline is on you.
 ## Architecture
 
 ```
-src/main.rs             entry point; installs rustls ring provider, launches eframe
+src/main.rs             entry point; installs the rustls provider (ring + FFDHE), launches eframe
 src/app.rs              all UI: KimoApp state, panels, preferences modal, event handling
 src/models.rs           Account / Protocol / TlsMode / MailMessage (serde types)
 src/error.rs            MailError + MailResult
@@ -105,6 +109,7 @@ src/tray.rs             StatusNotifierItem over raw D-Bus (session bus, std::thr
 src/sync.rs             Job/Event enums, worker threads, per-protocol sync logic
 src/protocol/mod.rs     protocol modules
 src/protocol/stream.rs  TcpStream/TLS transport (MailStream, STARTTLS upgrade, buffered Conn)
+src/protocol/ffdhe.rs   FFDHE kx group + DHE-RSA suites, which rustls does not ship
 src/protocol/imap.rs    minimal IMAP4rev1 client (LOGIN, LIST, SELECT, FETCH w/ literals, UID STORE)
 src/protocol/pop3.rs    minimal POP3 client (USER/PASS, STAT, UIDL, RETR w/ de-stuffing, QUIT)
 ```
@@ -195,6 +200,18 @@ Event (mpsc) ──► drain_events() at frame start ──► merge into Accoun
   UI shows them distinctly from protocol bugs.
 - Protocol clients are synchronous and single-purpose; add a method only
   when a sync job actually needs it.
+- Finite-field DH lives in `src/protocol/ffdhe.rs` and is deliberately narrow:
+  2048-bit groups only, and the `DHE-RSA` suites are appended *behind*
+  *ring*'s, so any server offering TLS 1.3 or ECDHE still gets that — DHE is a
+  fallback for Sina-class servers, never a preference. rustls matches the
+  parameters in a server's `ServerKeyExchange` against a provider's
+  `ffdhe_group()` by exact equality, so a group whose prime is not RFC 7919's
+  has to be pinned: Sina's fixed 2048-bit safe prime (verified stable across
+  connections and hosts) is registered under its own code point,
+  `NamedGroup::Unknown(0x01ff)` — `Unknown` is rustls' documented answer for a
+  group the `NamedGroup` enum has no name for, and servers ignore codes they
+  do not know. Supporting another such server means adding its prime to
+  `GROUPS`, not loosening that equality check.
 - IMAP mailbox names stay in their wire form (possibly modified UTF-7) in
   `Event`s, state and caches; `imap::decode_mailbox_name` decodes them for
   display only. SELECT/UID STORE must always use the wire form — do not
@@ -338,6 +355,10 @@ Event (mpsc) ──► drain_events() at frame start ──► merge into Accoun
 Do not "fix" these casually — they are known:
 
 - Attachments are listed by name but cannot be saved or opened yet.
+- TLS finite-field DH covers the 2048-bit groups listed in
+  `src/protocol/ffdhe.rs` and nothing else. A server whose DHE group is
+  another size, or yet another custom prime, still fails the handshake with
+  `SelectedUnofferedKxGroup`; see the FFDHE convention above for what to add.
 - No message deletion/expunge (IMAP `\Deleted` + EXPUNGE, POP3 `DELE`).
 - Credentials in plain text (see above); no OAuth2/XOAUTH2.
 - HTML mail renders through the in-egui subset renderer (`src/html.rs`).
