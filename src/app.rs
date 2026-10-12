@@ -2,16 +2,19 @@
 //! `sync::Event`s drained at the top of every frame; opening a socket happens
 //! only in worker threads.
 //!
-//! Layout: custom title bar on top (nav toggle, sync, preferences cog, window
-//! controls), then three columns — collapsible navigation (every account as a
-//! collapsible section of its folders), message list, reading pane.
+//! Layout: custom title bar on top (nav toggle, sync, search, preferences cog,
+//! window controls), then three columns — collapsible navigation (every account
+//! as a collapsible section of its folders), message list, reading pane.
 //!
-//! Preferences open from the title bar's cog as an `egui::Modal`: the
-//! Accounts page holds the account list and the add/edit account form, the
+//! Two `egui::Modal`s open from the title bar. The magnifier is search: the
+//! free text, the scope and the filters, which used to be a bar above the
+//! message list, plus a one-line strip over the results saying what the query
+//! currently is — the popup is not always on screen. The cog is Preferences:
+//! its Accounts page holds the account list and the add/edit account form, its
 //! Appearance page the theme (which resolves to a `theme::ColorScheme`), the
-//! HTML renderer and the fonts. That renderer draws the
-//! mail either as egui widgets (`crate::html`) or rasterized by Blitz
-//! (`crate::blitz_render`) on a worker thread.
+//! HTML renderer and the fonts. That renderer draws the mail either as egui
+//! widgets (`crate::html`) or rasterized by Blitz (`crate::blitz_render`) on a
+//! worker thread.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::mpsc;
@@ -28,7 +31,7 @@ use crate::theme::{self, ColorScheme, Theme};
 /// Below this window width the navigation bar collapses automatically.
 const NAV_AUTO_COLLAPSE_WIDTH: f32 = 640.0;
 
-/// How long the search bar waits after the last keystroke before asking the
+/// How long the search popup waits after the last keystroke before asking the
 /// database: long enough to swallow a burst of typing, short enough to feel
 /// immediate. Enter skips the wait.
 const SEARCH_SETTLE: Duration = Duration::from_millis(250);
@@ -99,8 +102,8 @@ pub struct KimoApp {
     selected_account: Option<String>,
     selected_folder: Option<String>,
     selected_message: Option<String>,
-    /// What the search bar is asking for. While it is active the middle column
-    /// shows `search_hits` instead of the selected folder.
+    /// What the search popup is asking for. While it is active the middle
+    /// column shows `search_hits` instead of the selected folder.
     search: SearchQuery,
     /// The sequence number of the search whose results are wanted, so a result
     /// that arrives after the query changed can be dropped.
@@ -113,8 +116,11 @@ pub struct KimoApp {
     search_hits: Vec<SearchHit>,
     search_running: bool,
     search_error: Option<String>,
-    /// Whether the filter row under the search bar is expanded.
-    show_filters: bool,
+    /// Whether the search popup is open.
+    show_search: bool,
+    /// Set when the popup opens, so its text field takes the keyboard on the
+    /// next frame instead of waiting for a click.
+    search_focus: bool,
     /// Whether the preferences modal is open.
     show_preferences: bool,
     /// Which preferences page is selected.
@@ -379,7 +385,8 @@ impl KimoApp {
             search_hits: Vec::new(),
             search_running: false,
             search_error: None,
-            show_filters: false,
+            show_search: false,
+            search_focus: false,
             show_preferences: false,
             prefs_tab: PrefsTab::Accounts,
             show_account_form: false,
@@ -1275,6 +1282,27 @@ impl KimoApp {
                     paint_sync_icon(row.painter(), sync.rect, visuals.text_color());
                     sync.on_hover_text("Sync all accounts");
 
+                    // Search: the query and its filters live in the popup this
+                    // opens. The glyph takes the accent while a search is what
+                    // the message list is showing, so the title bar says so
+                    // even when the strip above the results is scrolled away.
+                    let searching = self.search.is_active();
+                    let search = row.add_sized([24.0, 22.0], egui::Button::new(""));
+                    if search.clicked() {
+                        self.open_search();
+                    }
+                    let search_color = if searching {
+                        scheme.accent
+                    } else {
+                        visuals.text_color()
+                    };
+                    paint_search_icon(row.painter(), search.rect, search_color);
+                    search.on_hover_text(if searching {
+                        "Search mail — one is active (Ctrl+F)"
+                    } else {
+                        "Search mail (Ctrl+F)"
+                    });
+
                     // Per-account status: spinner while syncing, warning on error.
                     for account in self.accounts.clone() {
                         let Some(state) = self.states.get(&account.id) else {
@@ -1413,7 +1441,7 @@ impl KimoApp {
         ui.add_space(8.0);
     }
 
-    /// Middle column: the search bar, then the search results or the selected
+    /// Middle column: the search strip, then the search results or the selected
     /// folder's mail.
     fn mail_list(&mut self, ui: &mut egui::Ui) {
         // The database could not be opened: the session works, nothing is
@@ -1433,28 +1461,35 @@ impl KimoApp {
             return;
         }
 
-        let run_now = self.search_bar(ui);
-        ui.separator();
+        // The query itself is edited in the popup; all the column shows is
+        // what it answers and the way back to the folders. Running the search
+        // — and the settle clock — is the frame's business, since the popup
+        // can be open over any of this.
         if self.search.is_active() {
+            self.search_strip(ui);
             self.search_results(ui);
         } else {
             self.folder_messages(ui);
         }
-        self.pump_search(run_now);
-        if self.search_pending.is_some() {
-            // The settle clock is time-based, so a pending search has to keep
-            // the frames coming even when nothing else is moving.
-            ui.ctx().request_repaint_after(SEARCH_SETTLE);
-        }
     }
 
-    /// The search bar: free text, the scope, the filter row and the result
-    /// count. Returns true when Enter asks for a search right away.
-    fn search_bar(&mut self, ui: &mut egui::Ui) -> bool {
+    /// Open the search popup with the keyboard already in its text field.
+    fn open_search(&mut self) {
+        self.show_search = true;
+        self.search_focus = true;
+    }
+
+    /// The search popup, opened from the title-bar magnifier or Ctrl+F: the
+    /// free text, the scope and every filter, which used to be a bar above the
+    /// message list. Searching stays live while it is open — the count under
+    /// the fields follows the query — and Enter (or Search) applies it at once
+    /// and closes, leaving the results on screen. Returns true when the query
+    /// should run without waiting for the settle clock.
+    fn search_modal(&mut self, ctx: &egui::Context) -> bool {
+        let mut open = self.show_search;
         let mut run_now = false;
-        // Read before the closure: the bar edits `self.search`, and mixing
-        // that with a borrow of the whole account list inside one closure is
-        // more trouble than copying two strings.
+        // Read before the closure, which edits the query: mixing that with a
+        // borrow of the account list is more trouble than copying strings.
         let accounts: Vec<(String, String)> = self
             .accounts
             .iter()
@@ -1465,110 +1500,217 @@ impl KimoApp {
             .clone()
             .zip(self.selected_folder.clone());
 
-        ui.horizontal(|ui| {
-            let response = ui.add(
-                egui::TextEdit::singleline(&mut self.search.text)
-                    .hint_text("Search all mail…")
-                    .desired_width(220.0),
-            );
-            if response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
-                run_now = true;
-            }
-
-            let label = match &self.search.scope {
-                Scope::AllMail => "All mail".to_string(),
-                Scope::Account(id) => accounts
-                    .iter()
-                    .find(|(account_id, _)| account_id == id)
-                    .map(|(_, name)| name.clone())
-                    .unwrap_or_else(|| "Account".to_string()),
-                Scope::Folder { .. } => "This folder".to_string(),
-            };
-            egui::ComboBox::from_id_salt("search-scope")
-                .selected_text(label)
-                .width(140.0)
-                .show_ui(ui, |ui| {
-                    ui.selectable_value(&mut self.search.scope, Scope::AllMail, "All mail");
-                    for (id, name) in &accounts {
-                        ui.selectable_value(
-                            &mut self.search.scope,
-                            Scope::Account(id.clone()),
-                            name,
-                        );
-                    }
-                    if let Some((account_id, folder)) = &folder_scope {
-                        ui.selectable_value(
-                            &mut self.search.scope,
-                            Scope::Folder {
-                                account_id: account_id.clone(),
-                                folder: folder.clone(),
-                            },
-                            "This folder",
-                        );
+        let modal = egui::Modal::new(egui::Id::new("search")).show(ctx, |ui| {
+            ui.set_width(430.0);
+            ui.horizontal(|ui| {
+                ui.heading("Search");
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.button("Close").clicked() {
+                        open = false;
                     }
                 });
+            });
+            ui.separator();
 
-            ui.toggle_value(&mut self.show_filters, "Filters");
-            if self.search.is_active() && ui.button("Clear").clicked() {
-                self.search = SearchQuery::default();
+            let text = ui.add(
+                egui::TextEdit::singleline(&mut self.search.text)
+                    .hint_text("Search all mail…")
+                    .desired_width(f32::INFINITY),
+            );
+            if std::mem::take(&mut self.search_focus) {
+                // Just opened: type straight away, no click needed.
+                text.request_focus();
+            }
+            if entered(&text, ui) {
                 run_now = true;
+                open = false;
             }
 
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                let text = if self.search_running {
-                    ui.spinner();
-                    None
-                } else if self.search.is_active() {
-                    let count = self.search_hits.len();
-                    Some(if count >= SEARCH_LIMIT {
-                        format!("{count}+ results")
-                    } else if count == 1 {
-                        "1 result".to_string()
-                    } else {
-                        format!("{count} results")
-                    })
-                } else {
-                    Some(format!("{} messages", self.current_messages().len()))
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                ui.label("Search in");
+                let label = match &self.search.scope {
+                    Scope::AllMail => "All mail".to_string(),
+                    Scope::Account(id) => accounts
+                        .iter()
+                        .find(|(account_id, _)| account_id == id)
+                        .map(|(_, name)| name.clone())
+                        .unwrap_or_else(|| "Account".to_string()),
+                    Scope::Folder { .. } => "This folder".to_string(),
                 };
-                if let Some(text) = text {
-                    ui.label(egui::RichText::new(text).small().weak());
+                egui::ComboBox::from_id_salt("search-scope")
+                    .selected_text(label)
+                    .width(170.0)
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(&mut self.search.scope, Scope::AllMail, "All mail");
+                        for (id, name) in &accounts {
+                            ui.selectable_value(
+                                &mut self.search.scope,
+                                Scope::Account(id.clone()),
+                                name,
+                            );
+                        }
+                        if let Some((account_id, folder)) = &folder_scope {
+                            ui.selectable_value(
+                                &mut self.search.scope,
+                                Scope::Folder {
+                                    account_id: account_id.clone(),
+                                    folder: folder.clone(),
+                                },
+                                "This folder",
+                            );
+                        }
+                    });
+            });
+
+            ui.add_space(4.0);
+            ui.separator();
+            egui::Grid::new("search-filters")
+                .num_columns(2)
+                .spacing([10.0, 8.0])
+                .show(ui, |ui| {
+                    // Enter applies the query from any box, not just the text
+                    // field; a checkbox applies it through the settle clock.
+                    if filter_row(ui, "From", &mut self.search.from, "name or address") {
+                        run_now = true;
+                        open = false;
+                    }
+                    if filter_row(ui, "To", &mut self.search.to, "name or address") {
+                        run_now = true;
+                        open = false;
+                    }
+                    if filter_row(
+                        ui,
+                        "Subject",
+                        &mut self.search.subject,
+                        "words in the subject",
+                    ) {
+                        run_now = true;
+                        open = false;
+                    }
+                    if filter_row(ui, "After", &mut self.search.after, "YYYY-MM-DD") {
+                        run_now = true;
+                        open = false;
+                    }
+                    if filter_row(ui, "Before", &mut self.search.before, "YYYY-MM-DD") {
+                        run_now = true;
+                        open = false;
+                    }
+                    ui.label("Only");
+                    ui.horizontal(|ui| {
+                        ui.checkbox(&mut self.search.unread_only, "Unread");
+                        ui.checkbox(&mut self.search.has_attachment, "Has attachment");
+                    });
+                    ui.end_row();
+                });
+
+            ui.add_space(6.0);
+            ui.separator();
+            ui.horizontal(|ui| {
+                if self.search_running {
+                    ui.spinner();
+                    ui.label(egui::RichText::new("Searching…").small().weak());
+                } else if self.search.is_active() {
+                    ui.label(
+                        egui::RichText::new(results_label(self.search_hits.len()))
+                            .small()
+                            .weak(),
+                    );
+                }
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.button("Search").clicked() {
+                        run_now = true;
+                        open = false;
+                    }
+                    if self.search.is_active() && ui.button("Clear").clicked() {
+                        // Empty the boxes but stay open: clearing one query to
+                        // type the next is the common case, and the list behind
+                        // returns to the folders either way.
+                        self.search = SearchQuery::default();
+                        self.search_focus = true;
+                        run_now = true;
+                    }
+                });
+            });
+        });
+        // Backdrop click or Escape closes the popup. What was typed stays
+        // applied: the search is live, so closing is not a cancel.
+        if modal.should_close() {
+            open = false;
+        }
+        self.show_search = open;
+        run_now
+    }
+
+    /// The line above the results while a search is active: what it answers,
+    /// how many hits, and the two ways out of it. The popup is not always on
+    /// screen, so this is what keeps an active query — and a filter set ten
+    /// minutes ago — from being invisible.
+    fn search_strip(&mut self, ui: &mut egui::Ui) {
+        let scheme = theme::of(ui.ctx());
+        let summary = self.search_summary();
+        let mut edit = false;
+        let mut clear = false;
+        ui.horizontal(|ui| {
+            let (icon, _) = ui.allocate_exact_size(egui::vec2(14.0, 14.0), egui::Sense::hover());
+            paint_search_icon(ui.painter(), icon, scheme.text_weak);
+            ui.label(egui::RichText::new(summary).small().color(scheme.text));
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                // U+00D7, not a fancier cross: the UI font has no glyph for
+                // the typographic one, and a missing glyph is a tofu box.
+                if ui
+                    .small_button("×")
+                    .on_hover_text("Clear the search")
+                    .clicked()
+                {
+                    clear = true;
+                }
+                if ui
+                    .small_button("Edit")
+                    .on_hover_text("Change the query (Ctrl+F)")
+                    .clicked()
+                {
+                    edit = true;
+                }
+                if self.search_running {
+                    ui.spinner();
+                } else {
+                    ui.label(
+                        egui::RichText::new(results_label(self.search_hits.len()))
+                            .small()
+                            .weak(),
+                    );
                 }
             });
         });
-
-        if self.show_filters {
-            ui.horizontal_wrapped(|ui| {
-                ui.label("From");
-                ui.add(
-                    egui::TextEdit::singleline(&mut self.search.from)
-                        .hint_text("name or address")
-                        .desired_width(120.0),
-                );
-                ui.label("To");
-                ui.add(
-                    egui::TextEdit::singleline(&mut self.search.to)
-                        .hint_text("name or address")
-                        .desired_width(120.0),
-                );
-                ui.label("Subject");
-                ui.add(egui::TextEdit::singleline(&mut self.search.subject).desired_width(120.0));
-                ui.label("After");
-                ui.add(
-                    egui::TextEdit::singleline(&mut self.search.after)
-                        .hint_text("YYYY-MM-DD")
-                        .desired_width(90.0),
-                );
-                ui.label("Before");
-                ui.add(
-                    egui::TextEdit::singleline(&mut self.search.before)
-                        .hint_text("YYYY-MM-DD")
-                        .desired_width(90.0),
-                );
-                ui.checkbox(&mut self.search.unread_only, "Unread only");
-                ui.checkbox(&mut self.search.has_attachment, "Has attachment");
-            });
+        ui.separator();
+        if edit {
+            self.open_search();
         }
-        run_now
+        if clear {
+            self.clear_search();
+        }
+    }
+
+    /// End the search: the middle column goes back to the selected folder, and
+    /// the worker is told at once instead of waiting out the settle clock.
+    fn clear_search(&mut self) {
+        self.search = SearchQuery::default();
+        self.search_pending = None;
+        self.spawn_search();
+    }
+
+    /// One line naming what the results on screen answer; see `query_label`.
+    fn search_summary(&self) -> String {
+        let account = match &self.search.scope {
+            Scope::Account(id) => self
+                .accounts
+                .iter()
+                .find(|account| &account.id == id)
+                .map(|account| account.name.as_str()),
+            _ => None,
+        };
+        query_label(&self.search, account)
     }
 
     /// The middle column while no search is active: the selected folder's mail.
@@ -1627,8 +1769,8 @@ impl KimoApp {
         self.search_hits = hits;
     }
 
-    /// Ask for what the search bar is showing, once the query has held still;
-    /// `force` is Enter (or Clear), which skips the wait.
+    /// Ask for what the search popup is showing, once the query has held still;
+    /// `force` is Enter (or Search/Clear), which skips the wait.
     fn pump_search(&mut self, force: bool) {
         if force {
             self.search_pending = None;
@@ -1636,7 +1778,7 @@ impl KimoApp {
             return;
         }
         if self.search_applied.as_ref() == Some(&self.search) {
-            return; // the bar has not changed since the last request
+            return; // the query has not changed since the last request
         }
         let now = Instant::now();
         let pending = self
@@ -2424,8 +2566,32 @@ impl eframe::App for KimoApp {
         }
         egui::CentralPanel::default().show(ctx, |ui| self.mail_list(ui));
 
+        // Ctrl+F opens the search popup, the way every other application's
+        // search does — the title-bar button is the discoverable half of it.
+        if ctx.input_mut(|i| {
+            i.consume_shortcut(&egui::KeyboardShortcut::new(
+                egui::Modifiers::COMMAND,
+                egui::Key::F,
+            ))
+        }) {
+            self.open_search();
+        }
+        // The popup is drawn over whatever the columns just drew. Closing it
+        // is not a cancel: the search ran live while it was open.
+        let mut run_now = false;
+        if self.show_search {
+            run_now = self.search_modal(ctx);
+        }
         if self.show_preferences {
             self.preferences_modal(ctx);
+        }
+        // The query is run from here rather than from the message list: the
+        // popup edits it over any column, and the settle clock is time-based,
+        // so a pending search has to keep the frames coming even when nothing
+        // else is moving.
+        self.pump_search(run_now);
+        if self.search_pending.is_some() {
+            ctx.request_repaint_after(SEARCH_SETTLE);
         }
     }
 }
@@ -2456,7 +2622,64 @@ const BLITZ_SETTLE: Duration = Duration::from_millis(180);
 /// invalidating the very page that made it appear.
 const BLITZ_REUSE_RATIO: f32 = 1.25;
 
-/// What to do about the search bar's current contents.
+/// True when a popup field was left by pressing Enter — the search popup takes
+/// that as "run it now" from any of its boxes, not only the text one.
+fn entered(response: &egui::Response, ui: &egui::Ui) -> bool {
+    response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter))
+}
+
+/// One label + box row of the search popup's filter grid. Returns true when the
+/// box was left by pressing Enter.
+fn filter_row(ui: &mut egui::Ui, label: &str, value: &mut String, hint: &str) -> bool {
+    ui.label(label);
+    let response = ui.add(
+        egui::TextEdit::singleline(value)
+            .hint_text(hint)
+            .desired_width(300.0),
+    );
+    let apply = entered(&response, ui);
+    ui.end_row();
+    apply
+}
+
+/// "1 result" / "12 results" / "200+ results": at `SEARCH_LIMIT` the database
+/// stopped asking, so the count is a floor rather than a total.
+fn results_label(count: usize) -> String {
+    if count >= SEARCH_LIMIT {
+        format!("{count}+ results")
+    } else if count == 1 {
+        "1 result".to_string()
+    } else {
+        format!("{count} results")
+    }
+}
+
+/// One line naming what a query asks for: the free text (or "Filters" when only
+/// the boxes are set) and any scope narrower than all mail. `account` is the
+/// display name for an account scope, when it is known; an inactive query is the
+/// empty string.
+fn query_label(query: &SearchQuery, account: Option<&str>) -> String {
+    if !query.is_active() {
+        return String::new();
+    }
+    let mut parts = Vec::new();
+    let text = query.text.trim();
+    if text.is_empty() {
+        parts.push("Filters".to_string());
+    } else {
+        parts.push(format!("“{text}”"));
+    }
+    match &query.scope {
+        Scope::AllMail => {}
+        Scope::Account(_) => parts.push(account.unwrap_or("one account").to_string()),
+        Scope::Folder { folder, .. } => {
+            parts.push(crate::protocol::imap::decode_mailbox_name(folder))
+        }
+    }
+    parts.join(" · ")
+}
+
+/// What to do about the search popup's current contents.
 #[derive(Debug, PartialEq, Eq)]
 enum SearchWait {
     /// The query changed: start (or restart) the clock.
@@ -2467,7 +2690,7 @@ enum SearchWait {
     Run,
 }
 
-/// The search bar settles the way the Blitz pane does: the database is queried
+/// The search popup settles the way the Blitz pane does: the database is queried
 /// once the user stops typing. `pending` is the query the clock is running for,
 /// and when it started.
 fn search_settle(
@@ -3047,6 +3270,17 @@ fn paint_sync_icon(p: &egui::Painter, rect: egui::Rect, color: egui::Color32) {
     ));
 }
 
+/// Magnifier glyph for the title-bar search button and the results strip: a
+/// ring with a handle towards the lower right.
+fn paint_search_icon(p: &egui::Painter, rect: egui::Rect, color: egui::Color32) {
+    let c = rect.center() - egui::vec2(1.0, 1.0);
+    let r = 4.5;
+    let stroke = egui::Stroke::new(1.4_f32, color);
+    p.circle_stroke(c, r, stroke);
+    let start = c + egui::vec2(r, r) * std::f32::consts::FRAC_1_SQRT_2;
+    p.line_segment([start, start + egui::vec2(3.4, 3.4)], stroke);
+}
+
 /// Cog / gear glyph for the preferences button: a hub ring with eight teeth.
 fn paint_cog_icon(p: &egui::Painter, rect: egui::Rect, color: egui::Color32) {
     let c = rect.center();
@@ -3439,5 +3673,72 @@ mod tests {
         ];
         sort_messages(&mut msgs);
         assert_eq!(msgs[0].uid, "2");
+    }
+
+    #[test]
+    fn the_result_count_says_when_it_is_a_floor() {
+        assert_eq!(results_label(0), "0 results");
+        assert_eq!(results_label(1), "1 result");
+        assert_eq!(results_label(12), "12 results");
+        // At the limit the database stopped asking, so the count is a floor.
+        assert_eq!(results_label(SEARCH_LIMIT), "200+ results");
+    }
+
+    #[test]
+    fn the_strip_names_what_the_results_answer() {
+        // Nothing asked for: no strip at all.
+        assert_eq!(query_label(&SearchQuery::default(), None), "");
+
+        // The free text is the whole story.
+        let typed = SearchQuery {
+            text: "  invoice  ".to_string(),
+            ..SearchQuery::default()
+        };
+        assert_eq!(query_label(&typed, None), "“invoice”");
+
+        // A search with only boxes set says so: the text is not the only way
+        // to ask for something.
+        let unread = SearchQuery {
+            unread_only: true,
+            ..SearchQuery::default()
+        };
+        assert_eq!(query_label(&unread, None), "Filters");
+        let mixed = SearchQuery {
+            text: "report".to_string(),
+            from: "caiwu".to_string(),
+            ..SearchQuery::default()
+        };
+        assert_eq!(
+            query_label(&mixed, None),
+            "“report”",
+            "the boxes are the popup's detail, not the strip's"
+        );
+
+        // A narrower scope is named; an account's name comes from the caller.
+        let scoped = SearchQuery {
+            text: "report".to_string(),
+            scope: Scope::Account("work".to_string()),
+            ..SearchQuery::default()
+        };
+        assert_eq!(query_label(&scoped, Some("Work")), "“report” · Work");
+        assert_eq!(query_label(&scoped, None), "“report” · one account");
+
+        // A folder scope shows the readable name of a wire-form mailbox.
+        let folder = SearchQuery {
+            text: "report".to_string(),
+            scope: Scope::Folder {
+                account_id: "work".to_string(),
+                folder: "&XfJT0ZAB-".to_string(),
+            },
+            ..SearchQuery::default()
+        };
+        assert_eq!(query_label(&folder, None), "“report” · 已发送");
+
+        // All mail narrows nothing, so it adds nothing.
+        let every = SearchQuery {
+            text: "report".to_string(),
+            ..SearchQuery::default()
+        };
+        assert_eq!(query_label(&every, Some("Work")), "“report”");
     }
 }

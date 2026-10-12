@@ -94,7 +94,7 @@ impl Scope {
     }
 }
 
-/// One search: the free text plus every filter the search bar offers.
+/// One search: the free text plus every filter the search popup offers.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct SearchQuery {
     /// Free text: words, `"quoted phrases"`, Chinese runs.
@@ -353,7 +353,7 @@ pub fn run(conn: &rusqlite::Connection, query: &SearchQuery) -> MailResult<Vec<S
 
     // A query that asks for nothing returns nothing: the UI keeps the folder
     // view for these, and an unfiltered dump of the whole database is never
-    // what a search bar means.
+    // what a search box means.
     if !query.is_active() {
         return Ok(Vec::new());
     }
