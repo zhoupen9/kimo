@@ -65,7 +65,7 @@ Kimo is a desktop **email client** GUI written in pure Rust:
 5. **Keep the dependency tree small.** Every new crate needs a concrete
    justification; prefer std where reasonable.
 6. **UI strings are English.** CJK rendering is handled by the best-effort
-   font fallback in `app.rs::install_cjk_font` — do not add an i18n
+   font fallback in `fonts.rs::install` — do not add an i18n
    framework.
 
 ## Commands
@@ -88,6 +88,7 @@ src/main.rs             entry point; installs rustls ring provider, launches efr
 src/app.rs              all UI: KimoApp state, panels, preferences modal, event handling
 src/models.rs           Account / Protocol / TlsMode / MailMessage (serde types)
 src/error.rs            MailError + MailResult
+src/fonts.rs            installed-font discovery (ttf-parser scan) + egui font installation
 src/storage.rs          XDG paths, accounts.json, per-account FolderCache/AccountCache
 src/mail.rs             raw RFC 5322 bytes → MailMessage (mail-parser; HTML kept for rendering)
 src/html.rs             HTML mail → egui widgets (subset: blocks, lists, tables, links, inline styles)
@@ -146,9 +147,13 @@ Event (mpsc) ──► drain_events() at frame start ──► merge into Accoun
   silently change the format, and do not add a secrets daemon (see rule 1).
 - `~/.config/kimo/settings.json` — UI settings: the theme
   (`system`/`light`/`dark`; "system" resolves via GTK/KDE config files, no
-  subprocesses or D-Bus) and `html_renderer` (`egui`/`blitz`, absent means
-  `egui`). Older files may still carry a `render_mode` field from the
-  removed WebKitGTK renderer; it is ignored on load — do not reuse that name.
+  subprocesses or D-Bus), `html_renderer` (`egui`/`blitz`, absent means
+  `egui`), and the font families picked in Preferences → Appearance
+  (`ui_font`, `mono_font`; absent means egui's built-in font plus the CJK
+  fallback). Family *names* are stored, not paths, so the file survives font
+  updates; a name that no longer resolves is simply ignored. Older files may
+  still carry a `render_mode` field from the removed WebKitGTK renderer; it
+  is ignored on load — do not reuse that name.
 - `~/.local/share/kimo/cache/<account-id>.json` — `AccountCache` with one
   `FolderCache` per folder (name, uidvalidity, synced flag, messages).
   Messages carry inline `cid:` images as base64, so caches of image-heavy
@@ -189,10 +194,24 @@ Event (mpsc) ──► drain_events() at frame start ──► merge into Accoun
 - `preferences_modal()` is the one place to configure Kimo: an
   `egui::Modal` (backdrop click or Escape closes it) with a sidebar of
   pages — **Accounts** (account list, use/remove, and the add-account form
-  in place of the list) and **Appearance** (theme and Simple/Blitz HTML
-  renderer, both persisted in `settings.json`). Configuration belongs on a
-  page there, not as another title-bar toggle; the title bar keeps only
-  actions (switching accounts, syncing, window controls).
+  in place of the list) and **Appearance** (theme, Simple/Blitz HTML
+  renderer, and the interface/fixed-width fonts, all persisted in
+  `settings.json`). Configuration belongs on a page there, not as another
+  title-bar toggle; the title bar keeps only actions (switching accounts,
+  syncing, window controls).
+- Fonts are discovered, never fetched through fontconfig (hard rule 1):
+  `fonts::scan()` walks the usual directories and reads each face's `name`
+  table with ttf-parser. That took ~210 ms for the ~1000 installed faces on
+  the development machine, so it runs as `Job::ScanFonts` on a worker thread
+  and arrives as `Event::FontsScanned`; only the single-file read that
+  installs a picked family happens on the UI thread. Families are keyed by
+  their *typographic* family name, and each one keeps its plainest face
+  (regular weight, non-italic) so "DejaVu Sans" does not resolve to the
+  ExtraLight file. `fonts::install` also binds the named families
+  `kimo_ui`/`kimo_mono` — epaint panics on an unbound named family — which
+  the Appearance page previews through. Blitz keeps its own curated font set
+  (`blitz_render::load_fonts`); the Preferences choice applies to the egui UI
+  and to monospace text in the built-in HTML renderer.
 - When touching the UI, actually run `cargo run` and click through it; the
   layout has no golden tests. `blitz_render` has a developer tool for
   eyeballing fidelity without the GUI:

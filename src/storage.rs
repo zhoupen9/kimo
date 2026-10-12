@@ -71,6 +71,14 @@ pub struct Settings {
     /// renderer, the default) or "blitz" (full CSS layout, rasterized).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub html_renderer: Option<String>,
+    /// Family name of the UI (proportional) font, as picked in
+    /// Preferences → Appearance; absent means egui's built-in font.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ui_font: Option<String>,
+    /// Family name of the fixed-width font used for monospace text; absent
+    /// means egui's built-in monospace font.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mono_font: Option<String>,
 }
 
 pub fn load_settings() -> Settings {
@@ -173,15 +181,21 @@ mod tests {
         let s = Settings {
             theme: "dark".into(),
             html_renderer: Some("blitz".into()),
+            ui_font: Some("DejaVu Sans".into()),
+            mono_font: Some("DejaVu Sans Mono".into()),
         };
         let json = serde_json::to_string(&s).unwrap();
         let back: Settings = serde_json::from_str(&json).unwrap();
         assert_eq!(back.theme, "dark");
         assert_eq!(back.html_renderer.as_deref(), Some("blitz"));
+        assert_eq!(back.ui_font.as_deref(), Some("DejaVu Sans"));
+        assert_eq!(back.mono_font.as_deref(), Some("DejaVu Sans Mono"));
         // settings.json with missing keys must still load.
         let missing: Settings = serde_json::from_str("{}").unwrap();
         assert_eq!(missing.theme, "");
         assert_eq!(missing.html_renderer, None);
+        assert_eq!(missing.ui_font, None);
+        assert_eq!(missing.mono_font, None);
         // settings.json written when the web view renderer still existed
         // carries a render_mode field; it is ignored, not an error.
         let legacy: Settings = serde_json::from_str(r#"{"theme":"light","render_mode":"web"}"#)

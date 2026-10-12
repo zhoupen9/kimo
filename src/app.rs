@@ -15,6 +15,7 @@
 use std::collections::HashMap;
 use std::sync::mpsc;
 
+use crate::fonts::FontFamily;
 use crate::models::{Account, MailMessage, Protocol, TlsMode};
 use crate::storage::{self, FolderCache, Settings};
 use crate::sync::{self, Event, Job};
@@ -154,6 +155,13 @@ pub struct KimoApp {
     inline_textures: HashMap<String, Option<egui::TextureHandle>>,
     /// Which renderer the reading pane uses for HTML bodies.
     html_renderer: HtmlRenderer,
+    /// Installed font families for the Appearance pickers; `None` while the
+    /// worker scan (`Job::ScanFonts`) is still running.
+    font_families: Option<Vec<FontFamily>>,
+    /// Picked font family names, as stored in `settings.json`; `None` means
+    /// egui's built-in font (plus the CJK fallback).
+    ui_font: Option<String>,
+    mono_font: Option<String>,
     /// Blitz-rendered pages, keyed by message and geometry; `blitz_order`
     /// holds the insertion order so old pages can be evicted (textures are
     /// megabytes each).
@@ -236,8 +244,12 @@ impl Default for AddAccountForm {
 
 impl KimoApp {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
-        install_cjk_font(&cc.egui_ctx);
+        // egui's built-in fonts only cover Latin/Cyrillic/Greek, so the CJK
+        // fallback goes in immediately; the families picked in Preferences are
+        // applied once the worker scan below has resolved their files.
+        crate::fonts::install(&cc.egui_ctx, None, None);
 
+        let settings = storage::load_settings();
         let accounts = storage::load_accounts();
         let mut states = HashMap::new();
         for account in &accounts {
@@ -266,14 +278,15 @@ impl KimoApp {
             confirm_delete: None,
             nav_collapsed: false,
             was_narrow: false,
-            theme: Theme::parse(&storage::load_settings().theme),
+            theme: Theme::parse(&settings.theme),
             system_dark: system_prefers_dark(),
             images: HashMap::new(),
             stylesheets: HashMap::new(),
             inline_textures: HashMap::new(),
-            html_renderer: HtmlRenderer::parse(
-                &storage::load_settings().html_renderer.unwrap_or_default(),
-            ),
+            html_renderer: HtmlRenderer::parse(settings.html_renderer.as_deref().unwrap_or("")),
+            font_families: None,
+            ui_font: settings.ui_font.clone(),
+            mono_font: settings.mono_font.clone(),
             blitz_pages: HashMap::new(),
             blitz_order: Vec::new(),
             pending_blitz_key: None,
@@ -285,6 +298,11 @@ impl KimoApp {
 
         // System-tray icon (best effort; StatusNotifierItem over D-Bus).
         crate::tray::spawn(app.ctx.clone());
+
+        // Font families for Preferences → Appearance. The scan reads every
+        // installed face's name table, so it runs on a worker thread; the
+        // picked families are applied when the result arrives.
+        sync::spawn(Job::ScanFonts, app.ctx.clone(), app.tx.clone());
 
         for account in app.accounts.clone() {
             sync::spawn(Job::Sync { account }, app.ctx.clone(), app.tx.clone());
@@ -406,6 +424,11 @@ impl KimoApp {
                 if let Some(slot) = self.blitz_pages.get_mut(&key) {
                     *slot = BlitzPage::Failed(error);
                 }
+            }
+            Event::FontsScanned(families) => {
+                self.font_families = Some(families);
+                // settings.json may name families that only now resolve.
+                self.apply_fonts();
             }
         }
     }
@@ -771,7 +794,26 @@ impl KimoApp {
         let _ = storage::save_settings(&Settings {
             theme: self.theme.as_str().to_string(),
             html_renderer: Some(self.html_renderer.as_str().to_string()),
+            ui_font: self.ui_font.clone(),
+            mono_font: self.mono_font.clone(),
         });
+    }
+
+    /// Re-install the egui fonts from the picked family names. Reads one file
+    /// per pick, which is cheap; the directory scan behind
+    /// `font_families` is a worker job.
+    fn apply_fonts(&self) {
+        let families = self.font_families.as_deref().unwrap_or_default();
+        let pick = |name: &Option<String>| {
+            name.as_deref()
+                .and_then(|name| crate::fonts::find(families, name))
+                .cloned()
+        };
+        crate::fonts::install(
+            &self.ctx,
+            pick(&self.ui_font).as_ref(),
+            pick(&self.mono_font).as_ref(),
+        );
     }
 
     /// Apply the selected theme to the context, resolving "system" against
@@ -1662,6 +1704,51 @@ impl KimoApp {
                 .small()
                 .weak(),
         );
+
+        ui.add_space(12.0);
+        ui.separator();
+        ui.add_space(8.0);
+
+        ui.label(egui::RichText::new("Fonts").strong());
+        let mut fonts_changed = false;
+        egui::Grid::new("font-pickers")
+            .num_columns(2)
+            .spacing([10.0, 6.0])
+            .show(ui, |ui| {
+                ui.label("Interface");
+                fonts_changed |= font_picker(ui, "ui-font", &self.font_families, &mut self.ui_font);
+                ui.end_row();
+
+                ui.label("Fixed-width");
+                fonts_changed |=
+                    font_picker(ui, "mono-font", &self.font_families, &mut self.mono_font);
+                ui.end_row();
+            });
+        ui.add_space(4.0);
+        // Previews, rendered through the named families that fonts::install
+        // binds for exactly this purpose.
+        ui.label(
+            egui::RichText::new("The quick brown fox jumps over the lazy dog — 0123456789")
+                .family(egui::FontFamily::Name("kimo_ui".into())),
+        );
+        ui.label(
+            egui::RichText::new("if (mail.is_html()) { render(&body); }  // 0123456789")
+                .family(egui::FontFamily::Name("kimo_mono".into()))
+                .small(),
+        );
+        ui.add_space(4.0);
+        ui.label(
+            egui::RichText::new(
+                "Applies to the app UI and to monospace text in the Simple renderer; \
+                 Blitz mail keeps its own font set.",
+            )
+            .small()
+            .weak(),
+        );
+        if fonts_changed {
+            self.persist_settings();
+            self.apply_fonts();
+        }
     }
 }
 
@@ -1930,6 +2017,53 @@ fn paint_close_icon(p: &egui::Painter, rect: egui::Rect, color: egui::Color32) {
     );
 }
 
+/// A Preferences font picker: "Default" plus every installed family, each
+/// entry drawn in its own shape so fixed-width families stand out. Returns
+/// true when the selection changed.
+fn font_picker(
+    ui: &mut egui::Ui,
+    id: &str,
+    families: &Option<Vec<FontFamily>>,
+    current: &mut Option<String>,
+) -> bool {
+    let mut changed = false;
+    egui::ComboBox::from_id_salt(id)
+        .selected_text(current.clone().unwrap_or_else(|| "Default".to_string()))
+        .width(240.0)
+        .height(320.0)
+        .show_ui(ui, |ui| {
+            ui.set_min_width(260.0);
+            if ui.selectable_label(current.is_none(), "Default").clicked() {
+                *current = None;
+                changed = true;
+            }
+            match families {
+                None => {
+                    ui.label(egui::RichText::new("Scanning installed fonts…").weak());
+                }
+                Some(families) if families.is_empty() => {
+                    ui.label(egui::RichText::new("No fonts found.").weak());
+                }
+                Some(families) => {
+                    for family in families {
+                        let selected = current.as_deref() == Some(family.name.as_str());
+                        let text = egui::RichText::new(&family.name);
+                        let text = if family.monospace {
+                            text.monospace()
+                        } else {
+                            text
+                        };
+                        if ui.selectable_label(selected, text).clicked() {
+                            *current = Some(family.name.clone());
+                            changed = true;
+                        }
+                    }
+                }
+            }
+        });
+    changed
+}
+
 /// Cog / gear glyph for the preferences button: a hub ring with eight teeth.
 fn paint_cog_icon(p: &egui::Painter, rect: egui::Rect, color: egui::Color32) {
     let c = rect.center();
@@ -2041,36 +2175,6 @@ fn civil_from_days(z: i64) -> (i64, u32, u32) {
     let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
     let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
     (if m <= 2 { y + 1 } else { y }, m, d)
-}
-
-/// egui's default fonts only cover Latin/Cyrillic/Greek; mail often needs
-/// more. Best effort: if a system CJK font exists, use it as a fallback for
-/// both proportional and monospace text.
-fn install_cjk_font(ctx: &egui::Context) {
-    const CANDIDATES: &[&str] = &[
-        "/usr/share/fonts/noto-cjk/NotoSansCJK-Regular.ttc",
-        "/usr/share/fonts/google-noto-cjk/NotoSansCJK-Regular.ttc",
-        "/usr/share/fonts/google-noto-sans-cjk/NotoSansCJK-Regular.ttc",
-        "/usr/share/fonts/wenquanyi/wqy-microhei/wqy-microhei.ttc",
-        "/usr/share/fonts/wenquanyi/wqy-zenhei/wqy-zenhei.ttc",
-    ];
-    for path in CANDIDATES {
-        if let Ok(bytes) = std::fs::read(path) {
-            let mut fonts = egui::FontDefinitions::default();
-            fonts
-                .font_data
-                .insert("kimo_cjk".into(), egui::FontData::from_owned(bytes).into());
-            for family in [egui::FontFamily::Proportional, egui::FontFamily::Monospace] {
-                fonts
-                    .families
-                    .entry(family)
-                    .or_default()
-                    .push("kimo_cjk".into());
-            }
-            ctx.set_fonts(fonts);
-            return;
-        }
-    }
 }
 
 #[cfg(test)]

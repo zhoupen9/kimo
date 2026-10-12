@@ -2300,6 +2300,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha1_smol",
+ "ttf-parser",
  "ureq",
  "webpki-roots 0.26.11",
 ]

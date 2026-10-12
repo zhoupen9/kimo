@@ -528,7 +528,7 @@ fn hex_digit(byte: u8) -> Option<u8> {
 /// Blitz's own `system-fonts` feature enumerates fonts through fontconfig — a
 /// C library, which hard rule 1 forbids — so the dependency is built without
 /// it and the font files are registered here with parley/fontique, the same
-/// best-effort approach `app.rs::install_cjk_font` takes for egui.
+/// best-effort approach `crate::fonts` takes for egui.
 fn font_context() -> FontContext {
     static FONTS: OnceLock<FontContext> = OnceLock::new();
     FONTS.get_or_init(load_fonts).clone()
@@ -550,19 +550,6 @@ fn load_fonts() -> FontContext {
     context.collection.make_shared();
     context
 }
-
-/// Font directories worth scanning, in preference order. Missing ones are
-/// skipped, so this needs no configuration on any Unix.
-const FONT_DIRS: &[&str] = &[
-    "/usr/share/fonts",
-    "/usr/local/share/fonts",
-    "/usr/share/X11/fonts",
-    "/System/Library/Fonts",
-    "/Library/Fonts",
-    "/Library/Fonts/Microsoft",
-];
-
-const FONT_EXTENSIONS: &[&str] = &["ttf", "otf", "ttc", "otc"];
 
 /// Font files worth registering, matched on the file name with punctuation
 /// removed ("DejaVu Sans" and "DejaVuSans" both become "dejavusans").
@@ -634,24 +621,7 @@ const PREFERRED_CJK_FONTS: &[&str] = &[
 const FALLBACK_FONT_LIMIT: usize = 48;
 
 fn discover_font_files() -> Vec<PathBuf> {
-    let mut roots: Vec<PathBuf> = FONT_DIRS.iter().map(PathBuf::from).collect();
-    if let Ok(home) = std::env::var("HOME") {
-        let home = PathBuf::from(home);
-        roots.push(home.join(".fonts"));
-        roots.push(home.join(".local/share/fonts"));
-    }
-    if let Ok(data) = std::env::var("XDG_DATA_HOME") {
-        if !data.is_empty() {
-            roots.push(PathBuf::from(data).join("fonts"));
-        }
-    }
-
-    let mut installed = Vec::new();
-    for root in roots {
-        collect_fonts(&root, 4, &mut installed);
-    }
-    installed.sort();
-    installed.dedup();
+    let installed = crate::fonts::font_files();
 
     let preferred: Vec<PathBuf> = installed
         .iter()
@@ -663,6 +633,7 @@ fn discover_font_files() -> Vec<PathBuf> {
     }
     // Nothing familiar installed: fall back to a bounded slice of whatever is
     // there rather than rendering every glyph as tofu.
+    let mut installed = installed;
     installed.truncate(FALLBACK_FONT_LIMIT);
     installed
 }
@@ -684,35 +655,6 @@ fn is_preferred_font(path: &Path) -> bool {
         .iter()
         .any(|family| name.contains(family))
         && (name.contains("regular") || name.contains("bold"))
-}
-
-fn collect_fonts(dir: &Path, depth: usize, out: &mut Vec<PathBuf>) {
-    if depth == 0 {
-        return;
-    }
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        match entry.file_type() {
-            Ok(kind) if kind.is_dir() => collect_fonts(&path, depth - 1, out),
-            Ok(kind) if kind.is_file() => {
-                let is_font = path
-                    .extension()
-                    .and_then(|ext| ext.to_str())
-                    .is_some_and(|ext| {
-                        FONT_EXTENSIONS
-                            .iter()
-                            .any(|known| ext.eq_ignore_ascii_case(known))
-                    });
-                if is_font {
-                    out.push(path);
-                }
-            }
-            _ => {}
-        }
-    }
 }
 
 /// Families tried, in order, for the generic CSS families. Latin faces come

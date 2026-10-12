@@ -47,6 +47,9 @@ pub enum Job {
         key: String,
         request: Box<crate::blitz_render::PageRequest>,
     },
+    /// Enumerate the installed font families for the Preferences pickers
+    /// (see `crate::fonts`). Results come back as `Event::FontsScanned`.
+    ScanFonts,
 }
 
 pub enum Event {
@@ -96,6 +99,8 @@ pub enum Event {
         key: String,
         error: String,
     },
+    /// The installed font families, sorted by name.
+    FontsScanned(Vec<crate::fonts::FontFamily>),
 }
 
 pub fn spawn(job: Job, ctx: egui::Context, tx: Sender<Event>) {
@@ -129,14 +134,19 @@ pub fn spawn(job: Job, ctx: egui::Context, tx: Sender<Event>) {
             let _ = tx.send(event);
             ctx.request_repaint();
         }
+        Job::ScanFonts => {
+            let _ = tx.send(Event::FontsScanned(crate::fonts::scan()));
+            ctx.request_repaint();
+        }
         account_job => {
             let account_id = match &account_job {
                 Job::Sync { account }
                 | Job::SyncFolder { account, .. }
                 | Job::MarkSeen { account, .. } => account.id.clone(),
-                Job::FetchImage { .. } | Job::FetchStylesheet { .. } | Job::RenderHtml { .. } => {
-                    unreachable!()
-                }
+                Job::FetchImage { .. }
+                | Job::FetchStylesheet { .. }
+                | Job::RenderHtml { .. }
+                | Job::ScanFonts => unreachable!(),
             };
             let _ = tx.send(Event::SyncStarted {
                 account_id: account_id.clone(),
@@ -152,9 +162,10 @@ pub fn spawn(job: Job, ctx: egui::Context, tx: Sender<Event>) {
                     folder,
                     uid,
                 } => imap_mark_seen(&account, &folder, uid),
-                Job::FetchImage { .. } | Job::FetchStylesheet { .. } | Job::RenderHtml { .. } => {
-                    unreachable!()
-                }
+                Job::FetchImage { .. }
+                | Job::FetchStylesheet { .. }
+                | Job::RenderHtml { .. }
+                | Job::ScanFonts => unreachable!(),
             };
             let _ = match result {
                 Ok(()) => tx.send(Event::SyncDone { account_id }),
