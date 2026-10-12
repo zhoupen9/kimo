@@ -13,6 +13,11 @@
 //! The choice made in Preferences → Appearance is applied to the egui UI (and
 //! therefore to the built-in HTML renderer, `crate::html`). Blitz keeps its
 //! own curated font set — see `blitz_render::load_fonts`.
+//!
+//! The CJK fallback is a pan-CJK collection (Noto Sans CJK), whose faces share
+//! one glyph repertoire but not the forms they pick from it: the face has to
+//! follow the reader's language, or Chinese mail comes out with Japanese glyph
+//! variants. See `CjkScript`.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -178,15 +183,107 @@ const CJK_CANDIDATES: &[&str] = &[
     "/usr/share/fonts/noto-cjk/NotoSansCJK-Regular.ttc",
     "/usr/share/fonts/google-noto-cjk/NotoSansCJK-Regular.ttc",
     "/usr/share/fonts/google-noto-sans-cjk/NotoSansCJK-Regular.ttc",
+    "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+    "/usr/share/fonts/noto-cjk/NotoSansCJKsc-Regular.otf",
+    "/usr/share/fonts/opentype/noto/NotoSansCJKsc-Regular.otf",
     "/usr/share/fonts/wenquanyi/wqy-microhei/wqy-microhei.ttc",
     "/usr/share/fonts/wenquanyi/wqy-zenhei/wqy-zenhei.ttc",
 ];
 
-/// The first CJK font that is installed, with the face index to use.
-fn cjk_font() -> Option<(Vec<u8>, u32)> {
-    CJK_CANDIDATES
+/// Which CJK glyph variant to fall back to.
+///
+/// Noto Sans CJK (and Source Han Sans) ship one file per weight holding the
+/// Simplified, Traditional, Japanese and Korean faces. They cover the same
+/// characters, but each face picks the *forms* its language writes: the
+/// Japanese face draws 复 the Japanese way, which is what Chinese mail looked
+/// like while this module took the collection's first face — the Japanese one.
+/// So the face follows the locale, the same environment fontconfig reads, and
+/// for the same reason.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum CjkScript {
+    Simplified,
+    Traditional,
+    Japanese,
+    Korean,
+}
+
+impl CjkScript {
+    /// The tag the faces carry in their family name ("Noto Sans CJK SC").
+    fn tag(self) -> &'static str {
+        match self {
+            CjkScript::Simplified => "SC",
+            CjkScript::Traditional => "TC",
+            CjkScript::Japanese => "JP",
+            CjkScript::Korean => "KR",
+        }
+    }
+
+    /// The script the reader's locale asks for. Anything unrecognised — an
+    /// unset locale, `C`, a Latin one — gets Simplified Chinese: it is this
+    /// project's default CJK audience (the folder-name table in `folders.rs`
+    /// is Chinese too), and the other variants stay readable to everyone else.
+    fn from_locale() -> Self {
+        for key in ["LC_ALL", "LC_CTYPE", "LANG", "LANGUAGE"] {
+            let Ok(value) = std::env::var(key) else {
+                continue;
+            };
+            // LANGUAGE is a colon-separated preference list.
+            if let Some(first) = value.split(':').find(|entry| !entry.is_empty()) {
+                return script_of_locale(first);
+            }
+        }
+        CjkScript::Simplified
+    }
+}
+
+/// The CJK variant a locale name asks for: `zh_TW.UTF-8` → Traditional,
+/// `ja_JP` → Japanese, `zh_CN`/`en_US`/`C` → Simplified.
+fn script_of_locale(locale: &str) -> CjkScript {
+    let name = locale.split(['.', '@']).next().unwrap_or_default();
+    let mut parts = name.split(['_', '-']);
+    let language = parts.next().unwrap_or_default().to_ascii_lowercase();
+    let territory = parts.next().unwrap_or_default().to_ascii_lowercase();
+    match language.as_str() {
+        "ja" => CjkScript::Japanese,
+        "ko" => CjkScript::Korean,
+        "zh" if matches!(territory.as_str(), "tw" | "hk" | "mo") => CjkScript::Traditional,
+        _ => CjkScript::Simplified,
+    }
+}
+
+/// The face to use for `script`, given a collection's family names in face
+/// order. The `Mono` faces are skipped: they are for monospace contexts, and
+/// spending a second copy of a ~20 MB face on the rare CJK `<pre>` is not
+/// worth it. `None` means the file carries no face for that script — a
+/// single-language font has exactly one face, which the caller takes as it is.
+fn pick_cjk_face(names: &[Option<String>], script: CjkScript) -> Option<u32> {
+    names
         .iter()
-        .find_map(|path| std::fs::read(path).ok().map(|bytes| (bytes, 0)))
+        .position(|name| {
+            name.as_deref()
+                .is_some_and(|name| !name.contains("Mono") && name.ends_with(script.tag()))
+        })
+        .map(|index| index as u32)
+}
+
+/// The first CJK font that is installed, with the face the locale asks for.
+fn cjk_font() -> Option<(Vec<u8>, u32)> {
+    let script = CjkScript::from_locale();
+    CJK_CANDIDATES.iter().find_map(|path| {
+        let bytes = std::fs::read(path).ok()?;
+        let faces = ttf_parser::fonts_in_collection(&bytes).unwrap_or(1);
+        // One slot per face, unreadable ones included: dropping them would
+        // shift the indexes the faces are chosen by.
+        let names: Vec<Option<String>> = (0..faces)
+            .map(|index| {
+                ttf_parser::Face::parse(&bytes, index)
+                    .ok()
+                    .and_then(|face| face_family_name(&face))
+            })
+            .collect();
+        let index = pick_cjk_face(&names, script).unwrap_or(0);
+        Some((bytes, index))
+    })
 }
 
 fn font_data(bytes: Vec<u8>, index: u32) -> std::sync::Arc<egui::FontData> {
@@ -267,6 +364,60 @@ mod tests {
             index: 0,
             monospace: false,
         }
+    }
+
+    fn names(list: &[&str]) -> Vec<Option<String>> {
+        list.iter().map(|name| Some(name.to_string())).collect()
+    }
+
+    #[test]
+    fn the_locale_selects_the_cjk_variant() {
+        assert_eq!(script_of_locale("zh_CN.UTF-8"), CjkScript::Simplified);
+        assert_eq!(script_of_locale("zh-Hans-CN"), CjkScript::Simplified);
+        assert_eq!(script_of_locale("zh_TW.Big5"), CjkScript::Traditional);
+        assert_eq!(script_of_locale("zh-HK"), CjkScript::Traditional);
+        assert_eq!(script_of_locale("ja_JP.utf8"), CjkScript::Japanese);
+        assert_eq!(script_of_locale("ko_KR"), CjkScript::Korean);
+        assert_eq!(script_of_locale("en_US.UTF-8"), CjkScript::Simplified);
+        assert_eq!(script_of_locale("C"), CjkScript::Simplified);
+        assert_eq!(script_of_locale(""), CjkScript::Simplified);
+    }
+
+    #[test]
+    fn the_cjk_face_follows_the_script_not_the_face_order() {
+        // The order NotoSansCJK-Regular.ttc really ships in. Taking the first
+        // face — which is what this used to do — hands Chinese mail Japanese
+        // glyphs.
+        let faces = names(&[
+            "Noto Sans CJK JP",
+            "Noto Sans CJK KR",
+            "Noto Sans CJK SC",
+            "Noto Sans CJK TC",
+            "Noto Sans CJK HK",
+            "Noto Sans Mono CJK JP",
+            "Noto Sans Mono CJK KR",
+            "Noto Sans Mono CJK SC",
+            "Noto Sans Mono CJK TC",
+            "Noto Sans Mono CJK HK",
+        ]);
+        assert_eq!(pick_cjk_face(&faces, CjkScript::Simplified), Some(2));
+        assert_eq!(pick_cjk_face(&faces, CjkScript::Traditional), Some(3));
+        assert_eq!(pick_cjk_face(&faces, CjkScript::Japanese), Some(0));
+        assert_eq!(pick_cjk_face(&faces, CjkScript::Korean), Some(1));
+        // Monospace faces never win the proportional slot.
+        let mono_only = names(&["Noto Sans Mono CJK SC"]);
+        assert_eq!(pick_cjk_face(&mono_only, CjkScript::Simplified), None);
+        // A single-language face is used whichever tag it carries, and a
+        // script the file does not have leaves the choice to the caller.
+        let simplified_only = names(&["Noto Sans CJK SC"]);
+        assert_eq!(
+            pick_cjk_face(&simplified_only, CjkScript::Simplified),
+            Some(0)
+        );
+        assert_eq!(pick_cjk_face(&simplified_only, CjkScript::Japanese), None);
+        // A face that failed to parse must not shift the ones after it.
+        let gappy = vec![None, Some("Noto Sans CJK SC".to_string())];
+        assert_eq!(pick_cjk_face(&gappy, CjkScript::Simplified), Some(1));
     }
 
     #[test]

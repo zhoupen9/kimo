@@ -307,7 +307,13 @@ Event (mpsc) ──► drain_events() at frame start ──► merge into Accoun
   `kimo_ui`/`kimo_mono` — epaint panics on an unbound named family — which
   the Appearance page previews through. Blitz keeps its own curated font set
   (`blitz_render::load_fonts`); the Preferences choice applies to the egui UI
-  and to monospace text in the built-in HTML renderer.
+  and to monospace text in the built-in HTML renderer. The CJK fallback is a
+  pan-CJK collection (Noto Sans CJK), whose faces cover the same characters
+  but not the same *forms*: the face therefore follows the locale
+  (`CjkScript`: zh-CN → SC, zh-TW/HK → TC, ja → JP, ko → KR, anything else
+  → SC), because taking the collection's first face means the Japanese one —
+  which is how Chinese mail came out with Japanese glyphs for 复 and friends.
+  Do not go back to an index-free `read(path)`.
 - The navigation column is where accounts are switched, which is why the
   title bar has no account menu: every account is a collapsible section
   (`collapsed_accounts` holds the collapsed ids, in memory only), whose header
