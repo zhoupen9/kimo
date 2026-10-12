@@ -310,15 +310,16 @@ Event (mpsc) ──► drain_events() at frame start ──► merge into Accoun
   column. The title-bar field *is* the query — one string, so whatever the
   popup holds is what the field shows, and typing in either searches as you
   stop (`SEARCH_SETTLE`); Enter in the field opens the popup, as does a click
-  on the magnifier beside it or Ctrl+F. `search_modal`, an `egui::Modal`, adds
-  the scope combo and the filter grid the column used to carry, with the live
-  result count along its bottom; Enter in any of its boxes (or the Search
-  button) applies the query and closes it, and Clear empties it without
-  closing, so closing the popup is never a cancel. Nothing else about a search
-  is drawn: the message list starts straight at the rows — the folder's mail or
-  the hits — because a header over them was noise the project owner asked to
-  drop, and the magnifier turning accent-colored is the only sign that a query
-  is what the column shows. Nothing about a query is persisted.
+  on the magnifier drawn inside the box's left edge, or Ctrl+F.
+  `search_modal`, an `egui::Modal`, adds the scope combo and the filter grid
+  the column used to carry, with the live result count along its bottom; Enter
+  in any of its boxes (or the Search button) applies the query and closes it,
+  and Clear empties it without closing, so closing the popup is never a
+  cancel. Nothing else about a search is drawn: the message list starts
+  straight at the rows — the folder's mail or the hits — because a header over
+  them was noise the project owner asked to drop, and the magnifier turning
+  accent-colored is the only sign that a query is what the column shows.
+  Nothing about a query is persisted.
 - A message row (`message_card`; the folder list and the search results share
   it, only the third line differs — the preview, or *account · folder — match*)
   separates unread mail by *weight*, not by color: the sender
@@ -341,8 +342,9 @@ Event (mpsc) ──► drain_events() at frame start ──► merge into Accoun
   application icon (the brand, and the leftmost thing in the bar: the same
   embedded PNG the tray serves, downscaled once at startup because egui has
   no mipmaps to filter a 256 px source down to 18 pt), the nav collapse
-  toggle, the icon-only sync button, the search field with its magnifier, the
-  preferences cog, drag area, double-click maximize, and the
+  toggle, the icon-only sync button, the search box (a field with the
+  magnifier inside it, one widget), the preferences cog, drag area,
+  double-click maximize, and the
   minimize/maximize/close buttons sent as `ViewportCommand`s. Don't re-enable
   system decorations.
 - `preferences_modal()` is the one place to configure Kimo: an

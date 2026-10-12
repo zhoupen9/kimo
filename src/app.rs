@@ -1283,29 +1283,54 @@ impl KimoApp {
                     paint_sync_icon(row.painter(), sync.rect, visuals.text_color());
                     sync.on_hover_text("Sync all accounts");
 
-                    // Search: the magnifier opens the popup (scope, filters and
-                    // the count), and the field beside it is the same query —
-                    // one string, so whatever is searched for anywhere is what
-                    // is written here. Typing in the field searches as you
-                    // stop, like typing in the popup does; the glyph takes the
-                    // accent while a search is what the message list shows.
-                    let searching = self.search.is_active();
-                    let search = row.add_sized([22.0, 22.0], egui::Button::new(""));
-                    if search.clicked() {
+                    // Search, as one box: the field is the query — one
+                    // string, so whatever is searched for anywhere is what is
+                    // written here, and typing in it searches as you stop —
+                    // and the magnifier sits inside its left edge as the way
+                    // into the popup (scope, filters, the count). The glyph
+                    // takes the accent while a search is what the list shows.
+                    let field = row.add(
+                        egui::TextEdit::singleline(&mut self.search.text)
+                            .hint_text("Search mail…")
+                            .desired_width(TITLEBAR_SEARCH_WIDTH)
+                            // Room for the glyph, then the stock TextEdit
+                            // margins, so the text starts after the icon.
+                            .margin(egui::Margin {
+                                left: SEARCH_ICON_INSET,
+                                ..egui::Margin::symmetric(4, 2)
+                            }),
+                    );
+                    // `TextEdit` hands back its *inner* rect — the margin is
+                    // already taken off it — so the box's left edge is that
+                    // minus the inset the text starts at.
+                    let box_left = field.rect.left() - SEARCH_ICON_INSET as f32;
+                    let icon_rect = egui::Rect::from_center_size(
+                        egui::pos2(
+                            box_left + SEARCH_ICON_INSET as f32 / 2.0,
+                            field.rect.center().y,
+                        ),
+                        egui::vec2(SEARCH_ICON_SIZE, SEARCH_ICON_SIZE),
+                    );
+                    // Registered after the field, so the click in that corner
+                    // is the glyph's: it opens the popup instead of dropping a
+                    // cursor under itself.
+                    let icon = row
+                        .interact(
+                            icon_rect,
+                            egui::Id::new("titlebar-search-icon"),
+                            egui::Sense::click(),
+                        )
+                        .on_hover_cursor(egui::CursorIcon::PointingHand);
+                    if icon.clicked() {
                         self.open_search();
                     }
-                    let search_color = if searching {
+                    let search_color = if self.search.is_active() {
                         scheme.accent
                     } else {
                         visuals.text_color()
                     };
-                    paint_search_icon(row.painter(), search.rect, search_color);
-                    search.on_hover_text("Search mail — filters and scope (Ctrl+F)");
-                    let field = row.add(
-                        egui::TextEdit::singleline(&mut self.search.text)
-                            .hint_text("Search mail…")
-                            .desired_width(TITLEBAR_SEARCH_WIDTH),
-                    );
+                    paint_search_icon(row.painter(), icon_rect, search_color);
+                    icon.on_hover_text("Search filters and scope (Ctrl+F)");
                     if entered(&field, row) {
                         // Enter opens the popup, where the query can be
                         // narrowed; the search itself already ran live.
@@ -2538,10 +2563,14 @@ impl eframe::App for KimoApp {
 
 const TITLEBAR_HEIGHT: f32 = 30.0;
 const TITLEBAR_BUTTON_WIDTH: f32 = 42.0;
-/// Width of the title bar's search field. Fixed rather than filling: the bar
-/// also carries the drag surface, and it should not move around with the
-/// length of a query.
-const TITLEBAR_SEARCH_WIDTH: f32 = 190.0;
+/// Width of the title bar's search box (the text part of it). Fixed rather
+/// than filling: the bar also carries the drag surface, and it should not move
+/// around with the length of a query.
+const TITLEBAR_SEARCH_WIDTH: f32 = 175.0;
+/// Room the magnifier takes inside the search box, and the glyph's size. The
+/// inset is the field's left margin, so the text begins after the icon.
+const SEARCH_ICON_INSET: i8 = 22;
+const SEARCH_ICON_SIZE: f32 = 15.0;
 /// Side of the square brand icon at the left of the title bar.
 const BRAND_ICON_SIZE: f32 = 18.0;
 
