@@ -3,7 +3,9 @@
 //! only in worker threads.
 //!
 //! Layout: custom title bar on top (nav toggle, sync in Debug mode, search,
-//! preferences cog, window controls), then three columns — collapsible
+//! then the mail actions — reply, reply all, forward, label, flag, delete — as
+//! one flat group a fixed gap to its right, then the preferences cog and the
+//! window controls), then three columns — collapsible
 //! navigation (every account as a collapsible section of its folders), message
 //! list, reading pane.
 //!
@@ -1212,22 +1214,25 @@ impl KimoApp {
         theme::install(ctx, self.theme.scheme(self.system_dark));
     }
 
+    /// The cached folder the message list is showing, if one is selected and
+    /// its account has been loaded.
+    fn current_folder(&self) -> Option<&storage::Folder> {
+        let account_id = self.selected_account.as_ref()?;
+        let folder = self.selected_folder.as_ref()?;
+        self.states
+            .get(account_id)?
+            .mailbox
+            .folders
+            .iter()
+            .find(|f| f.name == *folder)
+    }
+
     /// Messages of the currently selected folder, newest first — what the
     /// list shows while no search is active.
     fn current_messages(&self) -> Vec<MailMessage> {
-        let Some(account_id) = &self.selected_account else {
-            return Vec::new();
-        };
-        let Some(folder) = &self.selected_folder else {
-            return Vec::new();
-        };
-        let Some(state) = self.states.get(account_id) else {
-            return Vec::new();
-        };
-        let Some(fc) = state.mailbox.folders.iter().find(|f| f.name == *folder) else {
-            return Vec::new();
-        };
-        fc.messages.clone()
+        self.current_folder()
+            .map(|folder| folder.messages.clone())
+            .unwrap_or_default()
     }
 
     fn selected_folder_synced(&self) -> bool {
@@ -1249,17 +1254,35 @@ impl KimoApp {
     }
 
     fn selected_message_view(&self) -> Option<MailMessage> {
-        let uid = self.selected_message.as_ref()?;
-        self.current_messages().into_iter().find(|m| m.uid == *uid)
+        let uid = self.selected_message.as_deref()?;
+        self.current_folder()?
+            .messages
+            .iter()
+            .find(|m| m.uid == uid)
+            .cloned()
+    }
+
+    /// Whether a mail is open in the reading pane — the state the title bar's
+    /// mail actions are enabled by. It asks the pane's own question, so a uid
+    /// left over from a folder or a search the window has moved on from (the
+    /// pane shows its placeholder for it) counts as no mail, and it answers
+    /// without the clone `selected_message_view` makes.
+    fn has_selected_message(&self) -> bool {
+        let Some(uid) = self.selected_message.as_deref() else {
+            return false;
+        };
+        self.current_folder()
+            .is_some_and(|folder| folder.messages.iter().any(|m| m.uid == uid))
     }
 
     // ----- UI ----------------------------------------------------------------
 
     /// Custom window title bar (the window is created undecorated in
-    /// `main.rs`). Left to right: nav collapse toggle, app title, account
-    /// menu, sync button, per-account status. Right edge: theme switch,
-    /// then minimize / maximize / close. The leftover space drags the
-    /// window (double-click toggles maximize).
+    /// `main.rs`). Left to right: nav collapse toggle, the sync button (Debug
+    /// mode only), the search box, the group of mail actions, then the
+    /// per-account status. Right edge: the preferences cog, then minimize /
+    /// maximize / close. The leftover space drags the window (double-click
+    /// toggles maximize).
     fn titlebar(&mut self, ui: &mut egui::Ui) {
         let bar = ui.available_rect_before_wrap();
         let visuals = ui.visuals().clone();
@@ -1495,6 +1518,12 @@ impl KimoApp {
                     paint_search_icon(row.painter(), icon_rect, search_color);
                     search.on_hover_text("Search mail — filters and scope (Ctrl+F)");
 
+                    // Mail actions, set well apart to the right of the search
+                    // box: they act on the mail open in the reading pane, so
+                    // the group is enabled by whether one is open there.
+                    row.add_space((MAIL_ACTION_PADDING - row.spacing().item_spacing.x).max(0.0));
+                    self.titlebar_mail_actions(row, &visuals, bar.height());
+
                     // Per-account status: spinner while syncing, warning on error.
                     for account in self.accounts.clone() {
                         let Some(state) = self.states.get(&account.id) else {
@@ -1536,7 +1565,62 @@ impl KimoApp {
         }
     }
 
-    /// Left column: folders of the selected account.
+    /// The mail actions the title bar carries — reply, reply all, forward,
+    /// label, flag, delete — in one run to the right of the search box. They
+    /// act on the mail open in the reading pane, so that is what enables them
+    /// (`has_selected_message`): with no mail there the six glyphs are dimmed,
+    /// the buttons stop sensing clicks and nothing fills under the pointer.
+    ///
+    /// Every cell is flat, like the rest of the bar's buttons — empty at rest
+    /// and filled under the pointer — which is also what keeps the six of them
+    /// reading as one group rather than as six framed widgets.
+    ///
+    /// UI only so far. The buttons are drawn, hover and enable/disable, but
+    /// nothing is wired to them yet — a click is not even read.
+    fn titlebar_mail_actions(&self, row: &mut egui::Ui, visuals: &egui::Visuals, bar_height: f32) {
+        #[derive(Clone, Copy)]
+        enum Action {
+            Reply,
+            ReplyAll,
+            Forward,
+            Label,
+            Flag,
+            Delete,
+        }
+
+        let enabled = self.has_selected_message();
+        let actions = [
+            (Action::Reply, "Reply"),
+            (Action::ReplyAll, "Reply all"),
+            (Action::Forward, "Forward"),
+            (Action::Label, "Label"),
+            (Action::Flag, "Flag"),
+            (Action::Delete, "Delete"),
+        ];
+        for (action, label) in actions {
+            let response = titlebar_flat_button(row, bar_height, enabled);
+            let color = if enabled {
+                visuals.text_color()
+            } else {
+                visuals.weak_text_color()
+            };
+            let painter = row.painter();
+            match action {
+                Action::Reply => paint_reply_icon(painter, response.rect, color),
+                Action::ReplyAll => paint_reply_all_icon(painter, response.rect, color),
+                Action::Forward => paint_forward_icon(painter, response.rect, color),
+                Action::Label => paint_label_icon(painter, response.rect, color),
+                Action::Flag => paint_flag_icon(painter, response.rect, color),
+                Action::Delete => paint_delete_icon(painter, response.rect, color),
+            }
+            response.on_hover_text(if enabled {
+                label.to_string()
+            } else {
+                format!("{label} — no mail selected")
+            });
+        }
+    }
+
     /// Left column: every account as a collapsible section of its folders.
     /// The selection can be a folder of any of them — switching accounts is
     /// picking a folder here, so the title bar needs no account menu.
@@ -2992,6 +3076,15 @@ const TITLEBAR_SEARCH_HEIGHT: f32 = TITLEBAR_HEIGHT - 16.0;
 /// makes it read as the one field in the bar.
 const SEARCH_BOX_CORNER_RADIUS: u8 = 8;
 
+/// Clear chrome between the title bar's search box and the group of mail
+/// actions to its right. `Ui::add_space` adds to the row's own item spacing
+/// rather than replacing it, so that spacing is taken off here: the two
+/// controls end up exactly this far apart.
+const MAIL_ACTION_PADDING: f32 = 128.0;
+/// How large the mail actions' glyphs are drawn. Their outlines are designed in
+/// a 24×24 box, which `glyph_point` scales to this.
+const MAIL_ACTION_GLYPH: f32 = 18.0;
+
 /// Padding on the sides of the message list's rows: the hairlines `mail_list`
 /// draws down the column's sides sit just outside it. There is none at the top
 /// — the first mail starts at the column's top edge, with no band of surface
@@ -3024,15 +3117,29 @@ const SEARCH_ICON_SIZE: f32 = 15.0;
 /// Side of the square brand icon at the left of the title bar.
 const BRAND_ICON_SIZE: f32 = 18.0;
 
+/// The shape every icon in the title bar is drawn in: as wide as a window
+/// control and the full height of the bar, so they all highlight the same way.
+/// `enabled` is the one thing the mail actions vary — a disabled cell neither
+/// senses clicks nor fills under the pointer.
+fn titlebar_flat_button(ui: &mut egui::Ui, height: f32, enabled: bool) -> egui::Response {
+    let sense = if enabled {
+        egui::Sense::click()
+    } else {
+        egui::Sense::hover()
+    };
+    let (_, response) = ui.allocate_exact_size(egui::vec2(TITLEBAR_BUTTON_WIDTH, height), sense);
+    if enabled {
+        titlebar_hover(ui, response)
+    } else {
+        response
+    }
+}
+
 /// One icon cell in the title bar's left row (the nav collapse toggle and the
-/// sync button): as wide as a window control and the full height of the bar,
-/// so every icon in the bar highlights the same shape.
+/// sync button): `titlebar_flat_button` in the one state those have — always
+/// live.
 fn titlebar_icon_button(ui: &mut egui::Ui, height: f32) -> egui::Response {
-    let (_, response) = ui.allocate_exact_size(
-        egui::vec2(TITLEBAR_BUTTON_WIDTH, height),
-        egui::Sense::click(),
-    );
-    titlebar_hover(ui, response)
+    titlebar_flat_button(ui, height, true)
 }
 
 /// Fill a title-bar icon cell while the pointer is over it. This is the
@@ -3726,6 +3833,140 @@ fn paint_cog_icon(p: &egui::Painter, rect: egui::Rect, color: egui::Color32) {
         let dir = egui::vec2(cos, sin);
         p.line_segment([c + dir * (r * 0.62), c + dir * r], stroke);
     }
+}
+
+// The title bar's mail-action glyphs — reply, reply all, forward, label, flag,
+// delete — painted as vector shapes from their own 24×24 outlines (the box the
+// icon set the folder icons come from is drawn in), so they render identically
+// regardless of which fonts are installed.
+
+/// Map a point of one of those 24×24 outlines onto a title-bar cell, centred
+/// on `center` and drawn at `MAIL_ACTION_GLYPH`.
+fn glyph_point(center: egui::Pos2, x: f32, y: f32) -> egui::Pos2 {
+    center + egui::vec2(x - 12.0, y - 12.0) * (MAIL_ACTION_GLYPH / 24.0)
+}
+
+/// The tail of the reply and forward arrows: a quarter turn rather than a
+/// corner, drawn as the outline does it — a quadratic curve whose control sits
+/// on the corner the two straight parts would have met at.
+fn glyph_tail(
+    p: &egui::Painter,
+    from: egui::Pos2,
+    corner: egui::Pos2,
+    to: egui::Pos2,
+    stroke: egui::Stroke,
+) {
+    p.add(egui::epaint::QuadraticBezierShape::from_points_stroke(
+        [from, corner, to],
+        false,
+        egui::Color32::TRANSPARENT,
+        stroke,
+    ));
+}
+
+/// Reply: an arrow curving back to the left, its shaft turning down at the
+/// tail. Every part is an open path, so the glyph reads as a line drawing like
+/// the rest of the bar's icons.
+fn paint_reply_icon(p: &egui::Painter, rect: egui::Rect, color: egui::Color32) {
+    let g = |x: f32, y: f32| glyph_point(rect.center(), x, y);
+    let stroke = egui::Stroke::new(1.5_f32, color);
+    p.add(egui::Shape::line(
+        vec![g(20.0, 18.0), g(20.0, 16.0)],
+        stroke,
+    ));
+    glyph_tail(p, g(20.0, 16.0), g(20.0, 12.0), g(16.0, 12.0), stroke);
+    p.add(egui::Shape::line(vec![g(16.0, 12.0), g(4.0, 12.0)], stroke));
+    p.add(egui::Shape::line(
+        vec![g(9.0, 17.0), g(4.0, 12.0), g(9.0, 7.0)],
+        stroke,
+    ));
+}
+
+/// Reply all: reply's arrow with a second head behind the first.
+fn paint_reply_all_icon(p: &egui::Painter, rect: egui::Rect, color: egui::Color32) {
+    let g = |x: f32, y: f32| glyph_point(rect.center(), x, y);
+    let stroke = egui::Stroke::new(1.5_f32, color);
+    p.add(egui::Shape::line(
+        vec![g(22.0, 18.0), g(22.0, 16.0)],
+        stroke,
+    ));
+    glyph_tail(p, g(22.0, 16.0), g(22.0, 12.0), g(18.0, 12.0), stroke);
+    p.add(egui::Shape::line(vec![g(18.0, 12.0), g(7.0, 12.0)], stroke));
+    p.add(egui::Shape::line(
+        vec![g(12.0, 17.0), g(7.0, 12.0), g(12.0, 7.0)],
+        stroke,
+    ));
+    p.add(egui::Shape::line(
+        vec![g(7.0, 17.0), g(2.0, 12.0), g(7.0, 7.0)],
+        stroke,
+    ));
+}
+
+/// Forward: reply's arrow mirrored — it leaves to the right instead.
+fn paint_forward_icon(p: &egui::Painter, rect: egui::Rect, color: egui::Color32) {
+    let g = |x: f32, y: f32| glyph_point(rect.center(), x, y);
+    let stroke = egui::Stroke::new(1.5_f32, color);
+    p.add(egui::Shape::line(vec![g(4.0, 18.0), g(4.0, 16.0)], stroke));
+    glyph_tail(p, g(4.0, 16.0), g(4.0, 12.0), g(8.0, 12.0), stroke);
+    p.add(egui::Shape::line(vec![g(8.0, 12.0), g(20.0, 12.0)], stroke));
+    p.add(egui::Shape::line(
+        vec![g(15.0, 17.0), g(20.0, 12.0), g(15.0, 7.0)],
+        stroke,
+    ));
+}
+
+/// Label: a tag — a square turned so that it points right, with the hole near
+/// its flat end.
+fn paint_label_icon(p: &egui::Painter, rect: egui::Rect, color: egui::Color32) {
+    let g = |x: f32, y: f32| glyph_point(rect.center(), x, y);
+    let stroke = egui::Stroke::new(1.5_f32, color);
+    p.add(egui::Shape::line(
+        vec![
+            g(3.0, 3.0),
+            g(12.0, 3.0),
+            g(21.0, 12.0),
+            g(12.0, 21.0),
+            g(3.0, 12.0),
+            g(3.0, 3.0),
+        ],
+        stroke,
+    ));
+    // The hole is a dot rather than a ring: at this size a ring closes up.
+    p.circle_filled(g(7.5, 7.5), MAIL_ACTION_GLYPH * 0.055, color);
+}
+
+/// Flag: a pole with a swallow-tailed pennant on it.
+fn paint_flag_icon(p: &egui::Painter, rect: egui::Rect, color: egui::Color32) {
+    let g = |x: f32, y: f32| glyph_point(rect.center(), x, y);
+    let stroke = egui::Stroke::new(1.5_f32, color);
+    p.add(egui::Shape::line(vec![g(5.0, 21.0), g(5.0, 3.0)], stroke));
+    p.add(egui::Shape::line(
+        vec![
+            g(5.0, 4.0),
+            g(19.0, 4.0),
+            g(15.0, 9.0),
+            g(19.0, 14.0),
+            g(5.0, 14.0),
+        ],
+        stroke,
+    ));
+}
+
+/// Delete: the trash can — lid, handle above it, and the open-topped body. The
+/// two lines the outline draws inside the body are left out: at this size they
+/// close up into a smudge and the can reads better empty.
+fn paint_delete_icon(p: &egui::Painter, rect: egui::Rect, color: egui::Color32) {
+    let g = |x: f32, y: f32| glyph_point(rect.center(), x, y);
+    let stroke = egui::Stroke::new(1.5_f32, color);
+    p.add(egui::Shape::line(vec![g(3.0, 6.0), g(21.0, 6.0)], stroke));
+    p.add(egui::Shape::line(
+        vec![g(8.0, 6.0), g(8.0, 3.0), g(16.0, 3.0), g(16.0, 6.0)],
+        stroke,
+    ));
+    p.add(egui::Shape::line(
+        vec![g(5.0, 6.0), g(5.0, 21.0), g(19.0, 21.0), g(19.0, 6.0)],
+        stroke,
+    ));
 }
 
 /// Best-effort OS dark-mode detection without spawning processes or talking

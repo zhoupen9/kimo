@@ -392,7 +392,11 @@ Event (mpsc) ──► drain_events() at frame start ──► merge into Accoun
   no mipmaps to filter a 256 px source down to 18 pt), the nav collapse
   toggle, the icon-only sync button (Debug mode only: Release syncs on its
   own), the search box (a field with the magnifier inside it, one widget,
-  whose click opens the search popup), the preferences cog, drag area,
+  whose click opens the search popup), the group of mail actions
+  (`titlebar_mail_actions`: reply, reply all, forward, label, flag, delete, one
+  drawing function per glyph, each from a 24×24 outline through `glyph_point`
+  and placed `MAIL_ACTION_PADDING` to the right of the search box), the
+  preferences cog, drag area,
   double-click maximize, and the
   minimize/maximize/close buttons sent as `ViewportCommand`s. The nav toggle,
   the sync button and the cog are one hand-painted icon cell
@@ -402,6 +406,17 @@ Event (mpsc) ──► drain_events() at frame start ──► merge into Accoun
   the pointer. They are not `egui::Button`s for that reason — a stock button
   draws a card-colored frame with a border, which in a title bar reads as a
   widget among window chrome. Don't re-enable system decorations.
+  The mail actions are *flat*, like every other button in the bar — each one is
+  `titlebar_flat_button`, the same window-control-wide, bar-tall cell the nav
+  toggle and the cog use, empty at rest and filled under the pointer. They are
+  deliberately not a framed group: the bar stays chrome plus flat icons, and
+  the run of six is held together by the gap that sets it apart from the search
+  box rather than by a pill. The six enable and disable together, on
+  `has_selected_message` — the reading pane's own lookup, so a uid the pane no
+  longer shows counts as no mail: a disabled cell drops its glyph to
+  `weak_text_color`, stops sensing clicks and never fills. Nothing is wired to
+  the buttons yet: a click runs nothing, so the group is UI only until the
+  actions it names exist.
   The bar is `TITLEBAR_HEIGHT` (48 pt) tall and the search box fills all but
   16 pt of that (`TITLEBAR_SEARCH_HEIGHT`), with a rounder corner than the
   stock widget radius (`SEARCH_BOX_CORNER_RADIUS`); its frame is stock
