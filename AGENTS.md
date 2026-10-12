@@ -29,11 +29,15 @@ Kimo is a desktop **email client** GUI written in pure Rust:
 - **Tray icon:** `src/tray.rs` implements StatusNotifierItem by speaking the
   D-Bus wire protocol directly on a `std::thread` — deliberately not zbus
   (async executor, rule 2) or the GTK tray crates (C, rule 1). The icon is
-  `assets/app.png` (48px, rasterized from the multi-color `assets/app.svg`
-  — regenerate with any svg→png tool, e.g. `rsvg-convert -w 48 -h 48`),
-  embedded with `include_bytes!` and decoded with the image crate, keeping
-  its own colors (the purple circle works on any panel). Left click raises
-  the window; the right-click menu is a minimal `com.canonical.dbusmenu`
+  `assets/app.png` (256px, rasterized from the multi-color `assets/app.svg`
+  — regenerate with any svg→png tool, e.g.
+  `rsvg-convert -w 256 -h 256 -o assets/app.png assets/app.svg`), embedded
+  with `include_bytes!` and decoded with the image crate, keeping its own
+  colors (the purple circle works on any panel). Keep the source large: the
+  host scales the pixmap down to its panel size, so a 48px icon looked
+  blurry on a HiDPI panel. The cost is 256 KB of ARGB per `IconPixmap`
+  reply, which is nothing on the session bus. Left click raises the window;
+  the right-click menu is a minimal `com.canonical.dbusmenu`
   object at `/Menu` (Show / Quit) served by the same thread. Missing
   StatusNotifierWatcher disables the tray silently, and `IconPixmap` must
   stay `a(iiay)` — hosts cannot read a bare byte array. The bus is silent

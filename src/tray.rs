@@ -7,16 +7,18 @@
 //! `org.kde.StatusNotifierItem` and serves the properties/activations that
 //! KDE Plasma and compatible trays query, plus a `com.canonical.dbusmenu`
 //! context menu (Show / Quit) at `MENU_PATH`. The icon is `assets/app.png`
-//! (rasterized from `assets/app.svg`), embedded at compile time, decoded
-//! with the pure-Rust image crate with its colors kept as-is. A missing
+//! (256 px, rasterized from `assets/app.svg`), embedded at compile time,
+//! decoded with the pure-Rust image crate with its colors kept as-is. It is
+//! deliberately large: hosts scale the pixmap down to their panel size, and
+//! the 48 px source this replaced was blurry on a HiDPI panel. A missing
 //! StatusNotifierWatcher (e.g. GNOME without an extension) simply disables
 //! the tray — the app keeps running.
 
 use std::io::{ErrorKind, Read, Write};
 use std::os::unix::net::UnixStream;
 
-/// The application icon (rasterized from `assets/app.svg`), embedded at
-/// compile time.
+/// The application icon (256 px, rasterized from `assets/app.svg`), embedded
+/// at compile time.
 pub(crate) const APP_PNG: &[u8] = include_bytes!("../assets/app.png");
 
 /// D-Bus message types. (Signals, type 4, are received and skipped.)
@@ -1442,8 +1444,10 @@ mod tests {
     #[test]
     fn embedded_png_decodes_with_its_colors() {
         let icon = icon_argb(APP_PNG).expect("decodes");
-        assert_eq!((icon.width, icon.height), (48, 48));
-        assert_eq!(icon.argb.len(), 48 * 48 * 4);
+        // Large on purpose: hosts downscale it, and a small source looked
+        // blurry once the panel asked for more pixels than it had.
+        assert_eq!((icon.width, icon.height), (256, 256));
+        assert_eq!(icon.argb.len(), 256 * 256 * 4);
         // The icon's background circle is #835be1 (131, 91, 225): the
         // pixmap must contain it as straight ARGB — a regression guard
         // against recoloring that once flattened the icon into a blob.
