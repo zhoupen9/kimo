@@ -319,9 +319,9 @@ Event (mpsc) ──► drain_events() at frame start ──► merge into Accoun
   line down the left of the block (`indent_has_left_vline` cleared in
   `nav`): in this column that line reads as a rule through the folder list.
   The chrome — title bar and navigation — is the scheme's `panel`; the message
-  list and the reading pane are the lighter `content`. In the light theme the
-  list column is framed by a hairline down each side (`mail_list`, drawn at the
-  column's own rect), and the reading pane is a card of `content`
+  list and the reading pane are the lighter `content`. The list column is
+  framed by a hairline down each side (`mail_list`, drawn at the column's own
+  rect), and the reading pane is a card of `content`
   (`CONTENT_CARD_CORNER_RADIUS`) inset by `CONTENT_GUTTER` into the chrome,
   whose left side doubles as the splitter; with nothing selected there is no
   card at all. Both highlights in the list are the mail's whole row: a square
@@ -332,9 +332,9 @@ Event (mpsc) ──► drain_events() at frame start ──► merge into Accoun
   (`Frame::inner_margin(LIST_MARGIN)` around the rows, `mail_body` for the
   mail), not on the panel's frame, which is what lets the scroll bars reach the
   column's edge and the card's edge instead of stopping on the padding. egui's
-  panel separators are off in the light theme (they would double those
-  hairlines) and the two boundary pixels are repainted after the panels, so
-  hovering a splitter draws no line at all.
+  panel separators are off in both schemes (they would double those hairlines
+  and the card's gutter) and the two boundary pixels are repainted with the
+  chrome after the panels, so hovering a splitter draws no line at all.
 - Search lives in the title bar and in the popup it opens, never in the
   column. The title-bar box shows the query with the magnifier drawn inside its
   left edge, and the whole box is one click target: a click anywhere in it —
@@ -413,9 +413,11 @@ Event (mpsc) ──► drain_events() at frame start ──► merge into Accoun
   list and the reading pane's card; window, card, hover, input, code, border),
   text and weak text, accent / selection / link, warn / danger / danger_hover,
   and the avatar palette — shared by both themes on purpose, so that a sender
-  keeps its color when the theme changes. In the dark scheme `panel` and
-  `content` are the same color, so the light theme's card, gutter and list
-  hairlines are invisible there and egui's panel separators stay on.
+  keeps its color when the theme changes. `content` is the lighter of the two
+  surfaces in both schemes, and the step between it and `panel` is the *only*
+  thing that draws the card, its gutter and the list's hairlines — the dark
+  scheme used to set both slots to the same color, which is a reading pane with
+  no card in it, so `theme.rs`'s tests pin a minimum ratio between them.
   `ColorScheme::visuals()` maps the scheme onto egui's `Visuals` for every
   stock widget, while `theme::install` also parks the scheme in the context,
   where the hand-painted UI (title bar, folder rows, message cards, avatars,

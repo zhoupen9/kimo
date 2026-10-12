@@ -1617,22 +1617,22 @@ impl KimoApp {
 
     /// Middle column: the search strip, then the search results or the selected
     /// folder's mail — the lighter content surface, framed by a hairline down
-    /// each side in the light theme.
+    /// each side.
     fn mail_list(&mut self, ui: &mut egui::Ui) {
         let scheme = theme::of(ui.ctx());
         // The column's own rect is the whole ui the frame hands over — the
         // padding moved inside the scroll area. The rows' rules span it (see
-        // message_card), and the light theme frames it with a hairline down
-        // each side.
+        // message_card), and a hairline down each side frames it.
         let column = ui.max_rect();
         self.list_column = column;
-        if !scheme.dark {
-            let stroke = egui::Stroke::new(1.0_f32, scheme.border);
-            ui.painter()
-                .vline(column.left() + 0.5, column.y_range(), stroke);
-            ui.painter()
-                .vline(column.right() - 0.5, column.y_range(), stroke);
-        }
+        // A hairline down each side, in both schemes: the chrome is the step
+        // outside the column and the card's gutter the step outside that, and
+        // the hairline is what keeps either from touching the rows.
+        let stroke = egui::Stroke::new(1.0_f32, scheme.border);
+        ui.painter()
+            .vline(column.left() + 0.5, column.y_range(), stroke);
+        ui.painter()
+            .vline(column.right() - 0.5, column.y_range(), stroke);
         // The database could not be opened: the session works, nothing is
         // saved, and this is the only place that says so.
         if let Some(warning) = &self.storage_warning {
@@ -2839,12 +2839,9 @@ impl eframe::App for KimoApp {
         // pane's card floats in — is the scheme's panel color; the message list
         // and the card are the lighter content surface.
         let scheme = theme::of(ctx);
-        // In the light theme the list column draws its own hairlines and the
-        // card's gutter marks the reading pane, so egui's panel separators are
-        // redundant (and would double those hairlines). The dark scheme paints
-        // both surfaces the same color, where egui's separators are the only
-        // thing marking the columns apart.
-        let panel_separators = scheme.dark;
+        // egui's panel separators are off in both schemes: the palette marks
+        // the columns — the list's hairlines, and the card floating in the
+        // chrome's gutter — so a separator would only double them.
 
         egui::TopBottomPanel::top("titlebar")
             .exact_height(TITLEBAR_HEIGHT)
@@ -2857,7 +2854,7 @@ impl eframe::App for KimoApp {
             .resizable(true)
             .min_width(280.0)
             .default_width(460.0)
-            .show_separator_line(panel_separators)
+            .show_separator_line(false)
             // No frame: the gutter and the card are painted in mail_content.
             .frame(egui::Frame::NONE)
             .show(ctx, |ui| self.mail_content(ui));
@@ -2866,7 +2863,7 @@ impl eframe::App for KimoApp {
                 .resizable(true)
                 .min_width(150.0)
                 .default_width(200.0)
-                .show_separator_line(panel_separators)
+                .show_separator_line(false)
                 .show(ctx, |ui| self.nav(ui));
         }
         // What the panels leave over is the message list's column; captured
@@ -2881,17 +2878,12 @@ impl eframe::App for KimoApp {
 
         // egui paints a brighter line along a panel boundary while its splitter
         // is hovered or dragged, and this UI wants the splitters invisible: put
-        // those two pixels back the way they look at rest — nothing in the
-        // light theme, egui's own hairline in the dark one, where it is the
-        // only thing separating two equally dark columns. Painted after the
-        // panels, so it lands on top of whatever they drew there.
-        let boundary = if panel_separators {
-            scheme.border
-        } else {
-            scheme.panel
-        };
+        // those two pixels back to the chrome every frame, so a hovered
+        // splitter looks exactly like a resting one. Painted after the panels,
+        // so it lands on top of whatever they drew there; the list's own
+        // hairlines sit a pixel inside the column and are untouched.
         let splitter = ctx.layer_painter(egui::LayerId::background());
-        let splitter_stroke = egui::Stroke::new(1.0_f32, boundary);
+        let splitter_stroke = egui::Stroke::new(1.0_f32, scheme.panel);
         splitter.vline(
             list_column.left() - 0.5,
             list_column.y_range(),

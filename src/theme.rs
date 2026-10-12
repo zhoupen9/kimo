@@ -91,8 +91,11 @@ pub struct ColorScheme {
     /// Chrome: the title bar and the navigation column.
     pub panel: Color32,
     /// The working surface: the message list column, and the card the reading
-    /// pane floats on inside the chrome's gutter. Near-white in the light
-    /// scheme, so mail reads on paper with a darker chrome around it.
+    /// pane floats on inside the chrome's gutter. The *lighter* of the two
+    /// surfaces in both schemes — near-white paper on gray chrome in the light
+    /// one, a surface lifted off the navigation in the dark one — because the
+    /// card, its gutter and the list's hairlines are all the step between the
+    /// two slots and nothing else.
     pub content: Color32,
     /// Background of modal windows and popups.
     pub window: Color32,
@@ -176,9 +179,11 @@ impl ColorScheme {
             name: "Kimo Dark",
             dark: true,
             panel: Color32::from_rgb(26, 28, 33), // #1A1C21
-            // Same as the chrome: the dark scheme keeps the flat look it had,
-            // so the card and the list column are felt only by their gutter.
-            content: Color32::from_rgb(26, 28, 33), // #1A1C21
+            // Lifted off the chrome, like the light scheme's near-white: the
+            // card, its gutter and the list's hairlines are the step between
+            // these two slots, so a content equal to the panel is a reading
+            // pane with no card in it.
+            content: Color32::from_rgb(32, 35, 41), // #202329
             window: Color32::from_rgb(34, 37, 43),  // #22252B
             card: Color32::from_rgb(36, 39, 46),    // #24272E
             hover: Color32::from_rgb(46, 51, 60),   // #2E333C
@@ -383,10 +388,19 @@ mod tests {
         // Body text goes the other way and so contrasts with its own panel.
         assert!(luminance(LIGHT.text) < luminance(LIGHT.panel));
         assert!(luminance(DARK.text) > luminance(DARK.panel));
-        // The light scheme's working surface is the lighter one: the chrome
-        // around the list and the reading pane's card has to read as a frame.
-        assert!(luminance(LIGHT.content) > luminance(LIGHT.panel));
         assert!(luminance(LIGHT.panel) > luminance(LIGHT.hover));
+    }
+
+    /// The card, its gutter and the list's hairlines are *the step between the
+    /// two surfaces* and nothing else, so the working surface has to stay
+    /// lighter than the chrome in both schemes: the dark scheme once set them
+    /// to the same color, which is a reading pane with no card in it.
+    #[test]
+    fn the_working_surface_is_lighter_than_the_chrome() {
+        for (name, scheme) in [("light", LIGHT), ("dark", DARK)] {
+            let step = luminance(scheme.content) / luminance(scheme.panel);
+            assert!(step >= 1.1, "{name}: content is only {step:.2}x the panel");
+        }
     }
 
     #[test]
