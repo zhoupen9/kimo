@@ -133,10 +133,18 @@ Event (mpsc) ──► drain_events() at frame start ──► merge into Accoun
   through `blitz_render::MailNet` (a blocking `NetProvider` that reuses the
   on-disk resource cache, and understands `data:` and `cid:` URLs). The page
   comes back as `Event::HtmlRendered` with premultiplied RGBA tiles and link
-  boxes, which `app.rs` uploads as textures. Pages are keyed by
-  message + account/folder + quantized geometry, at most two are cached, and
-  a result whose key is no longer pending is dropped. Never render Blitz HTML
-  on the UI thread.
+  boxes, which `app.rs` uploads as textures. Pages are keyed by mail +
+  quantized *width* — never the pane height, which only feeds Blitz's viewport
+  (`vh` and friends): keying on it re-rasterized an identical page on every
+  window resize. At most two pages are cached; a cached page is reused, scaled
+  down and never up, while the pane stays within `BLITZ_REUSE_RATIO` of the
+  width it was laid out for; and a render starts only once the geometry has
+  held still for `BLITZ_SETTLE`, so a splitter drag or an animated window
+  resize queues one render at the end instead of one per frame. Every request
+  takes a fresh `blitz_render::Cancellation` ticket: a render whose ticket is
+  stale gives up mid-layout (and between raster slices) and reports *nothing*,
+  so a superseded render can never be mistaken for a failure of the newer one.
+  Never render Blitz HTML on the UI thread.
 - Remote mutations are limited to `UID STORE +FLAGS.SILENT (\Seen)` (IMAP).
   POP3 never deletes or mutates anything server-side.
 

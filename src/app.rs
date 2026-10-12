@@ -14,6 +14,7 @@
 
 use std::collections::HashMap;
 use std::sync::mpsc;
+use std::time::{Duration, Instant};
 
 use crate::fonts::FontFamily;
 use crate::models::{Account, MailMessage, Protocol, TlsMode};
@@ -167,10 +168,14 @@ pub struct KimoApp {
     /// megabytes each).
     blitz_pages: HashMap<String, BlitzPage>,
     blitz_order: Vec<String>,
-    /// Geometry requested in the previous frame. A render only starts once
-    /// the pane has kept the same size for two frames, so dragging the
-    /// splitter queues one render instead of one per frame.
-    pending_blitz_key: Option<String>,
+    /// Which render is still wanted: every request takes a new ticket and
+    /// older ones stop early, so a superseded render does not keep a core
+    /// busy for a result that will be dropped.
+    blitz_cancel: crate::blitz_render::Cancellation,
+    /// Key waiting for the pane geometry to settle, and since when. Splitter
+    /// drags and compositor resize animations move the geometry every frame;
+    /// see `BLITZ_SETTLE`.
+    pending_blitz_key: Option<(String, Instant)>,
     /// Message the reading pane's scroll offset belongs to, so opening another
     /// mail starts at the top instead of mid-page.
     scrolled_message: Option<String>,
@@ -186,6 +191,10 @@ enum BlitzPage {
 
 /// A finished Blitz page, uploaded as egui textures. Tiles are stacked at
 /// their `offset` from the page origin; both are in points.
+///
+/// Cloning is cheap: `TextureHandle` is a reference to a texture the context
+/// owns, which is what lets a page be adopted under several cache keys.
+#[derive(Clone)]
 struct RasterizedPage {
     tiles: Vec<RasterTile>,
     /// Page size in points.
@@ -196,6 +205,7 @@ struct RasterizedPage {
     truncated: bool,
 }
 
+#[derive(Clone)]
 struct RasterTile {
     texture: egui::TextureHandle,
     /// Offset from the page origin, in points.
@@ -289,6 +299,7 @@ impl KimoApp {
             mono_font: settings.mono_font.clone(),
             blitz_pages: HashMap::new(),
             blitz_order: Vec::new(),
+            blitz_cancel: crate::blitz_render::Cancellation::default(),
             pending_blitz_key: None,
             scrolled_message: None,
         };
@@ -598,18 +609,14 @@ impl KimoApp {
 
     // ----- Blitz pages ------------------------------------------------------
 
-    /// Identity of a rendered page: the message, the account it came from and
-    /// the geometry it was laid out for. Anything else invalidates the cache
-    /// entry and starts a fresh render.
-    fn blitz_key(&self, msg: &MailMessage, width: u32, viewport_height: u32, scale: f32) -> String {
+    /// Identity of a rendered page: the mail it shows. Two pages with the
+    /// same identity are the same document, rendered at different widths.
+    fn blitz_identity(&self, msg: &MailMessage) -> String {
         format!(
-            "{}/{}/{}/{}x{}@{:.2}",
+            "{}/{}/{}/",
             self.selected_account.as_deref().unwrap_or("-"),
             self.selected_folder.as_deref().unwrap_or("-"),
-            msg.uid,
-            width,
-            viewport_height,
-            scale
+            msg.uid
         )
     }
 
@@ -627,9 +634,10 @@ impl KimoApp {
         viewport_height: u32,
         scale: f32,
     ) {
-        // Only one render at a time: resizing the pane invalidates the width
-        // repeatedly, and every superseded render would be wasted work. Their
-        // results are dropped when they arrive, since the keys are gone.
+        // A new request cancels whatever render is still running (its ticket
+        // stops being current, see `blitz_render::Cancellation`), and the
+        // Loading entry it left behind goes with it.
+        let ticket = self.blitz_cancel.issue();
         let stale: Vec<String> = self
             .blitz_pages
             .iter()
@@ -652,7 +660,9 @@ impl KimoApp {
                 .iter()
                 .map(|image| (image.cid.clone(), image.data_base64.clone()))
                 .collect(),
+            ticket,
         };
+        self.pending_blitz_key = None;
         self.blitz_pages.insert(key.clone(), BlitzPage::Loading);
         self.touch_blitz_page(&key);
         self.evict_blitz_pages();
@@ -724,6 +734,38 @@ impl KimoApp {
         self.evict_blitz_pages();
     }
 
+    /// Adopt a page already rendered for this mail when the pane wants a width
+    /// it can simply be scaled down to (see `BLITZ_REUSE_RATIO`). Returns true
+    /// when a page was adopted under `key`.
+    ///
+    /// The adopted entry is another handle on the same textures, not a copy of
+    /// them, so this costs nothing next to a render.
+    fn reuse_blitz_page(&mut self, identity: &str, width: u32, scale: f32, key: &str) -> bool {
+        let wanted = width as f32;
+        let source = self.blitz_pages.iter().find_map(|(candidate, page)| {
+            let BlitzPage::Ready(page) = page else {
+                return None;
+            };
+            // The identity ends in '/', so a shorter uid cannot match a longer.
+            let reusable =
+                candidate.starts_with(identity) && blitz_page_reusable(page.size.x * scale, wanted);
+            reusable.then(|| candidate.clone())
+        });
+        let Some(source) = source else {
+            return false;
+        };
+        let Some(BlitzPage::Ready(page)) = self.blitz_pages.get(&source) else {
+            return false;
+        };
+        let page = page.clone();
+        self.blitz_pages
+            .insert(key.to_string(), BlitzPage::Ready(page));
+        self.pending_blitz_key = None;
+        self.touch_blitz_page(key);
+        self.evict_blitz_pages();
+        true
+    }
+
     /// Move `key` to the back of the cache order, so eviction always drops
     /// the least recently used page.
     fn touch_blitz_page(&mut self, key: &str) {
@@ -746,16 +788,35 @@ impl KimoApp {
         let available = ui.available_width().max(160.0);
         let css_width = (available - BLITZ_PAGE_MARGIN * 2.0).max(160.0);
         let width = quantize(css_width * scale, BLITZ_WIDTH_STEP);
-        let viewport_height = quantize(ui.available_height().max(160.0) * scale, BLITZ_HEIGHT_STEP);
-        let key = self.blitz_key(msg, width, viewport_height, scale);
+        // The pane height reaches Blitz's viewport (`vh` and friends) but not
+        // the text's layout width, so it is sampled when a render starts
+        // instead of being part of the key: a window resize must not make an
+        // otherwise identical page render again.
+        let viewport_height = (ui.available_height().max(160.0) * scale).round() as u32;
+        let identity = self.blitz_identity(msg);
+        let key = blitz_key(&identity, width, scale);
 
-        if !self.blitz_pages.contains_key(&key) {
-            // Wait for the geometry to settle: dragging the pane splitter
-            // would otherwise queue a render on every frame.
-            if self.pending_blitz_key.as_deref() == Some(key.as_str()) {
-                self.start_blitz_render(key.clone(), msg, html, width, viewport_height, scale);
-            } else {
-                self.pending_blitz_key = Some(key.clone());
+        if !self.blitz_pages.contains_key(&key)
+            && !self.reuse_blitz_page(&identity, width, scale, &key)
+        {
+            // Let the geometry settle first: while it keeps changing (splitter
+            // drag, animated window resize) no render is started at all. The
+            // repaint request is what makes the render happen once the pointer
+            // stops moving — egui has no other reason to draw another frame.
+            let now = Instant::now();
+            let held = self.pending_blitz_key.clone();
+            let pending = held.as_ref().map(|(key, since)| (key.as_str(), *since));
+            match blitz_settle(pending, &key, now) {
+                BlitzWait::Start => {
+                    self.start_blitz_render(key.clone(), msg, html, width, viewport_height, scale);
+                }
+                BlitzWait::Wait(remaining) => {
+                    if held.as_ref().map(|(key, _)| key.as_str()) != Some(key.as_str()) {
+                        // First sighting of this geometry: start the clock.
+                        self.pending_blitz_key = Some((key.clone(), now));
+                    }
+                    ui.ctx().request_repaint_after(remaining);
+                }
             }
         }
 
@@ -1798,12 +1859,64 @@ impl eframe::App for KimoApp {
 const TITLEBAR_HEIGHT: f32 = 30.0;
 const TITLEBAR_BUTTON_WIDTH: f32 = 42.0;
 
-/// Blitz reading pane: page margin, geometry quantization for renders, and
-/// how many rendered pages stay in memory (each is megabytes of texture).
+/// Blitz reading pane: page margin, width quantization for renders, and how
+/// many rendered pages stay in memory (each is megabytes of texture).
 const BLITZ_PAGE_MARGIN: f32 = 8.0;
 const BLITZ_WIDTH_STEP: u32 = 32;
-const BLITZ_HEIGHT_STEP: u32 = 128;
 const BLITZ_PAGES_CACHED: usize = 2;
+
+/// How long the pane geometry must hold still before a render starts.
+/// Dragging the splitter, or a compositor animating a window resize, changes
+/// it every frame; rendering each intermediate step would keep a core busy for
+/// results that are all discarded but the last.
+const BLITZ_SETTLE: Duration = Duration::from_millis(180);
+
+/// A finished page may be scaled down instead of re-rendered while the pane
+/// stays within this factor of the width the page was laid out for. Re-flowing
+/// the text for a few percent is not worth a render — and it keeps the
+/// vertical scrollbar, which narrows the pane when it appears, from
+/// invalidating the very page that made it appear.
+const BLITZ_REUSE_RATIO: f32 = 1.25;
+
+/// What to do about a page that is not cached yet.
+#[derive(Debug, PartialEq, Eq)]
+enum BlitzWait {
+    /// The geometry has held still for `BLITZ_SETTLE`: render now.
+    Start,
+    /// Still settling; look again after this long.
+    Wait(Duration),
+}
+
+/// Debounce for the reading pane's geometry. `pending` is the key seen last
+/// time and when it was first seen, `now` the current instant.
+fn blitz_settle(pending: Option<(&str, Instant)>, key: &str, now: Instant) -> BlitzWait {
+    match pending {
+        Some((pending, since)) if pending == key => {
+            let waited = now.saturating_duration_since(since);
+            if waited >= BLITZ_SETTLE {
+                BlitzWait::Start
+            } else {
+                BlitzWait::Wait(BLITZ_SETTLE - waited)
+            }
+        }
+        // Another geometry was pending, or none: this one starts settling now.
+        _ => BlitzWait::Wait(BLITZ_SETTLE),
+    }
+}
+
+/// Cache key of a rendered page: the mail's identity plus the width, in
+/// physical pixels, it was rendered for. Deliberately without the pane height
+/// — see `crate::blitz_render::PageRequest::viewport_height`.
+fn blitz_key(identity: &str, width: u32, scale: f32) -> String {
+    format!("{identity}{width}@{scale:.2}")
+}
+
+/// Whether a page rasterized `rendered` device pixels wide can be scaled down
+/// for a pane wanting `wanted` instead of being rendered again. Only downwards:
+/// a raster is never scaled up, that would blur the text.
+fn blitz_page_reusable(rendered: f32, wanted: f32) -> bool {
+    rendered >= wanted && rendered <= wanted * BLITZ_REUSE_RATIO
+}
 
 /// Round `value` up to the next multiple of `step`, so a pane resize only
 /// re-renders in coarse steps.
@@ -2231,6 +2344,67 @@ mod tests {
         assert_eq!(HtmlRenderer::parse(""), HtmlRenderer::Simple);
         assert_eq!(HtmlRenderer::Blitz.as_str(), "blitz");
         assert_eq!(HtmlRenderer::Simple.as_str(), "egui");
+    }
+
+    #[test]
+    fn blitz_keys_depend_on_width_but_not_pane_height() {
+        let identity = "acct/INBOX/1/";
+        let key = blitz_key(identity, 864, 2.0);
+        // Nothing else feeds the key, so a pane that only grew taller keeps
+        // its page (the height is not part of the key at all).
+        assert_eq!(key, blitz_key(identity, 864, 2.0));
+        // A new width, or a new display scale, is a different raster.
+        assert_ne!(key, blitz_key(identity, 896, 2.0));
+        assert_ne!(key, blitz_key(identity, 864, 1.0));
+        // So is another mail.
+        assert_ne!(key, blitz_key("acct/INBOX/2/", 864, 2.0));
+        assert_ne!(key, blitz_key("acct/INBOX/18/", 864, 2.0));
+    }
+
+    #[test]
+    fn blitz_renders_wait_for_the_geometry_to_settle() {
+        let start = Instant::now();
+        // Never seen before: nothing renders on the first frame.
+        assert_eq!(
+            blitz_settle(None, "page", start),
+            BlitzWait::Wait(BLITZ_SETTLE)
+        );
+        // Still settling: report what is left of the wait.
+        assert_eq!(
+            blitz_settle(
+                Some(("page", start)),
+                "page",
+                start + Duration::from_millis(100)
+            ),
+            BlitzWait::Wait(BLITZ_SETTLE - Duration::from_millis(100))
+        );
+        // Held still long enough: render.
+        assert_eq!(
+            blitz_settle(Some(("page", start)), "page", start + BLITZ_SETTLE),
+            BlitzWait::Start
+        );
+        // A geometry that changed again starts a fresh wait, however long the
+        // previous one had been pending.
+        assert_eq!(
+            blitz_settle(
+                Some(("page", start)),
+                "page-moved",
+                start + BLITZ_SETTLE * 4
+            ),
+            BlitzWait::Wait(BLITZ_SETTLE)
+        );
+    }
+
+    #[test]
+    fn blitz_pages_are_reused_only_for_a_slightly_narrower_pane() {
+        // Within the reuse window: scale the existing raster down.
+        assert!(blitz_page_reusable(864.0, 864.0));
+        assert!(blitz_page_reusable(864.0, 840.0));
+        assert!(blitz_page_reusable(864.0, 700.0));
+        // Much narrower: re-flowing the text is worth a render.
+        assert!(!blitz_page_reusable(864.0, 600.0));
+        // Wider than the raster: a page is never scaled up.
+        assert!(!blitz_page_reusable(864.0, 900.0));
     }
 
     #[test]

@@ -16,7 +16,7 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -119,6 +119,41 @@ table { border-collapse: separate !important; }
 table { border-spacing: 0; }
 ";
 
+/// Which render is still wanted.
+///
+/// Opening another mail, or moving the reading pane, invalidates a render that
+/// is still on a worker thread. The pane issues a fresh ticket for every
+/// request and a render stops as soon as its ticket is no longer the current
+/// one, instead of finishing work whose result would be thrown away.
+#[derive(Clone, Default)]
+pub struct Cancellation {
+    epoch: Arc<AtomicU64>,
+}
+
+impl Cancellation {
+    /// A ticket for a new render; older tickets stop being current.
+    pub fn issue(&self) -> Ticket {
+        Ticket {
+            epoch: self.epoch.clone(),
+            id: self.epoch.fetch_add(1, Ordering::SeqCst) + 1,
+        }
+    }
+}
+
+/// One render's place in the queue; see `Cancellation`.
+#[derive(Clone)]
+pub struct Ticket {
+    epoch: Arc<AtomicU64>,
+    id: u64,
+}
+
+impl Ticket {
+    /// False once a newer render has been requested.
+    pub fn is_current(&self) -> bool {
+        self.epoch.load(Ordering::SeqCst) == self.id
+    }
+}
+
 /// A page to render: the raw HTML body plus the reading pane's geometry and
 /// everything the message carries locally.
 pub struct PageRequest {
@@ -126,12 +161,16 @@ pub struct PageRequest {
     /// Reading-pane width in physical pixels.
     pub width: u32,
     /// Reading-pane height in physical pixels; drives `vh` units and
-    /// percentage heights.
+    /// percentage heights. It is *not* part of the page's cache key: it does
+    /// not affect the text's layout width, so keying on it made every window
+    /// resize re-rasterize an otherwise identical page.
     pub viewport_height: u32,
     /// Device pixels per CSS pixel (`egui::Context::pixels_per_point`).
     pub scale: f32,
     /// Inline `cid:` parts of this message: `(Content-ID, base64 data)`.
     pub inline_images: Vec<(String, String)>,
+    /// This render's place in the queue; see `Cancellation`.
+    pub ticket: Ticket,
 }
 
 /// The finished page, in CSS pixels, cut into texture-sized tiles.
@@ -170,7 +209,14 @@ pub struct LinkBox {
 }
 
 /// Render `request` into a rasterized page. Blocking: call from a worker thread.
-pub fn render(request: &PageRequest) -> Result<Page, String> {
+///
+/// `Ok(None)` means a newer render superseded this one mid-flight (see
+/// `Cancellation`): the result must be dropped silently, never reported as a
+/// failure of the current render.
+pub fn render(request: &PageRequest) -> Result<Option<Page>, String> {
+    if !request.ticket.is_current() {
+        return Ok(None);
+    }
     let width = request.width.clamp(MIN_WIDTH, MAX_WIDTH);
     let scale = if request.scale.is_finite() && request.scale > 0.0 {
         request.scale.clamp(0.5, 4.0)
@@ -198,6 +244,11 @@ pub fn render(request: &PageRequest) -> Result<Page, String> {
         },
     );
     settle(&mut doc, &net);
+    // Parsing and styling are done; give up before the re-layout and
+    // rasterization if the pane has already moved on.
+    if !request.ticket.is_current() {
+        return Ok(None);
+    }
 
     // Mail built on a fixed-width table (the classic 600px newsletter) does
     // not reflow into a narrow reading pane, it overflows — and since the pane
@@ -269,6 +320,11 @@ pub fn render(request: &PageRequest) -> Result<Page, String> {
     let mut tiles = Vec::new();
     let mut y = 0;
     while y < raster_height {
+        // A long page is many slices; check between them so a superseded
+        // render stops after the current slice instead of finishing.
+        if !request.ticket.is_current() {
+            return Ok(None);
+        }
         let slice_height = TILE_HEIGHT.min(raster_height - y);
         let mut renderer = VelloCpuImageRenderer::new(raster_width, slice_height);
         let mut rgba = Vec::new();
@@ -286,7 +342,7 @@ pub fn render(request: &PageRequest) -> Result<Page, String> {
         y += slice_height;
     }
 
-    Ok(Page {
+    Ok(Some(Page {
         // What the reading pane needs: the page's size in points.
         css_width: raster_width as f32 / raster_scale,
         css_height: raster_height as f32 / raster_scale,
@@ -294,7 +350,7 @@ pub fn render(request: &PageRequest) -> Result<Page, String> {
         tiles,
         links: collect_links(&doc, raster_scale),
         truncated,
-    })
+    }))
 }
 
 /// The scale a page of `css_width` × `css_height` CSS pixels is rasterized
@@ -820,8 +876,10 @@ mod tests {
             viewport_height: 300,
             scale: 1.0,
             inline_images: Vec::new(),
+            ticket: Cancellation::default().issue(),
         })
-        .expect("render");
+        .expect("render")
+        .expect("page");
 
         assert!(page.css_width > 0.0 && page.css_height > 0.0);
         let painted = page
@@ -843,6 +901,29 @@ mod tests {
             "links: {:?}",
             page.links.iter().map(|l| &l.href).collect::<Vec<_>>()
         );
+    }
+
+    /// A render whose ticket was superseded must produce nothing at all — the
+    /// pane drops the result, and silently, so it cannot be mistaken for a
+    /// failure of the newer render that replaced it.
+    #[test]
+    fn superseded_renders_produce_nothing() {
+        let cancel = Cancellation::default();
+        let ticket = cancel.issue();
+        // The pane moves on before the worker even starts.
+        let _newer = cancel.issue();
+
+        let page = render(&PageRequest {
+            html: "<body><p>hello</p></body>".to_string(),
+            width: 600,
+            viewport_height: 400,
+            scale: 1.0,
+            inline_images: Vec::new(),
+            ticket,
+        })
+        .expect("cancellation is not a failure");
+
+        assert!(page.is_none(), "a superseded render must not return a page");
     }
 
     /// How the raster scale reacts to the pixel budget.
@@ -881,8 +962,10 @@ mod tests {
             viewport_height: 600,
             scale: 2.0,
             inline_images: Vec::new(),
+            ticket: Cancellation::default().issue(),
         })
-        .expect("render");
+        .expect("render")
+        .expect("page");
 
         assert!(!page.truncated, "the tail must survive the pixel budget");
         assert_eq!(page.scale, 2.0, "no downscaling was needed");
@@ -942,8 +1025,10 @@ mod tests {
             viewport_height: 800,
             scale,
             inline_images: Vec::new(),
+            ticket: Cancellation::default().issue(),
         })
-        .expect("render");
+        .expect("render")
+        .expect("page");
         println!(
             "page: css {:.0}x{:.0}, raster {}x{}, tiles {}, truncated {}",
             page.css_width,

@@ -127,11 +127,18 @@ pub fn spawn(job: Job, ctx: egui::Context, tx: Sender<Event>) {
             ctx.request_repaint();
         }
         Job::RenderHtml { key, request } => {
-            let event = match crate::blitz_render::render(&request) {
-                Ok(page) => Event::HtmlRendered { key, page },
-                Err(error) => Event::HtmlRenderFailed { key, error },
-            };
-            let _ = tx.send(event);
+            match crate::blitz_render::render(&request) {
+                Ok(Some(page)) => {
+                    let _ = tx.send(Event::HtmlRendered { key, page });
+                }
+                // Superseded by a newer render while this one was running:
+                // stay silent. The key may already belong to that newer
+                // render, so reporting a failure would mislabel it.
+                Ok(None) => return,
+                Err(error) => {
+                    let _ = tx.send(Event::HtmlRenderFailed { key, error });
+                }
+            }
             ctx.request_repaint();
         }
         Job::ScanFonts => {
