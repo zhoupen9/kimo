@@ -7,7 +7,7 @@
 //! navigation, message list, reading pane.
 //!
 //! Preferences open from the title bar's cog as an `egui::Modal`: the
-//! Accounts page holds the account list and the add-account form, the
+//! Accounts page holds the account list and the add/edit account form, the
 //! Appearance page the theme (which resolves to a `theme::ColorScheme`), the
 //! HTML renderer and the fonts. That renderer draws the
 //! mail either as egui widgets (`crate::html`) or rasterized by Blitz
@@ -98,10 +98,10 @@ pub struct KimoApp {
     show_preferences: bool,
     /// Which preferences page is selected.
     prefs_tab: PrefsTab,
-    /// Accounts page: the add-account form replaces the account list while
-    /// this is set.
+    /// Accounts page: the add/edit account form replaces the account list
+    /// while this is set.
     show_account_form: bool,
-    add_form: AddAccountForm,
+    account_form: AccountForm,
     confirm_delete: Option<String>,
     nav_collapsed: bool,
     /// Whether the window was narrow last frame, so auto-collapse only
@@ -202,8 +202,14 @@ pub struct AccountUiState {
     pub error: Option<String>,
 }
 
+/// The fields of the add/edit account form, plus the account it is
+/// editing: `editing` is `None` while the form is filling in a new one.
 #[derive(Clone, Debug)]
-struct AddAccountForm {
+struct AccountForm {
+    /// The account being edited, by id. The id is the account's identity —
+    /// minted once from its name, and the name of its cache file — so
+    /// renaming an account does not move its cached mail.
+    editing: Option<String>,
     name: String,
     protocol: Protocol,
     host: String,
@@ -213,9 +219,12 @@ struct AddAccountForm {
     tls: TlsMode,
 }
 
-impl Default for AddAccountForm {
+impl Default for AccountForm {
+    /// An empty form for a new account: IMAP over implicit TLS, the setup
+    /// most providers use.
     fn default() -> Self {
         Self {
+            editing: None,
             name: String::new(),
             protocol: Protocol::Imap,
             host: String::new(),
@@ -224,6 +233,67 @@ impl Default for AddAccountForm {
             password: String::new(),
             tls: TlsMode::Implicit,
         }
+    }
+}
+
+impl AccountForm {
+    /// The same form, pre-filled from a configured account and remembering
+    /// its id so that saving updates it instead of adding another one.
+    fn edit(account: &Account) -> Self {
+        Self {
+            editing: Some(account.id.clone()),
+            name: account.name.clone(),
+            protocol: account.protocol,
+            host: account.host.clone(),
+            port_str: account.port.to_string(),
+            username: account.username.clone(),
+            password: account.password.clone(),
+            tls: account.tls,
+        }
+    }
+
+    /// Every required field is filled in (and the port is a port).
+    fn is_valid(&self) -> bool {
+        !self.name.trim().is_empty()
+            && !self.host.trim().is_empty()
+            && !self.username.trim().is_empty()
+            && self.port_str.trim().parse::<u16>().is_ok()
+    }
+
+    /// The port to save: what was typed, or the protocol/TLS default when
+    /// that text is not a number.
+    fn port(&self) -> u16 {
+        self.port_str
+            .trim()
+            .parse()
+            .unwrap_or_else(|_| self.protocol.default_port(self.tls))
+    }
+
+    /// The account this form describes, under an id the caller picks — the
+    /// edited account's own, or a fresh one for a new account.
+    fn to_account(&self, id: String) -> Account {
+        Account {
+            id,
+            name: self.name.trim().to_string(),
+            protocol: self.protocol,
+            host: self.host.trim().to_string(),
+            port: self.port(),
+            username: self.username.trim().to_string(),
+            password: self.password.clone(),
+            tls: self.tls,
+        }
+    }
+
+    /// Whether saving this form reaches a different mailbox than `account`
+    /// does. The endpoint — protocol, host, port, username — steers which
+    /// mailbox is logged into, so a change there throws the cached mail
+    /// away; the name is only a label and the password is a credential, so
+    /// neither disturbs the cache.
+    fn points_elsewhere(&self, account: &Account) -> bool {
+        account.protocol != self.protocol
+            || account.host != self.host.trim()
+            || account.port != self.port()
+            || account.username != self.username.trim()
     }
 }
 
@@ -263,7 +333,7 @@ impl KimoApp {
             show_preferences: false,
             prefs_tab: PrefsTab::Accounts,
             show_account_form: false,
-            add_form: AddAccountForm::default(),
+            account_form: AccountForm::default(),
             confirm_delete: None,
             nav_collapsed: false,
             was_narrow: false,
@@ -516,44 +586,91 @@ impl KimoApp {
         }
         let _ = storage::save_accounts(&self.accounts);
         storage::delete_cache(account_id);
+        self.forget_blitz_pages(account_id);
     }
 
-    fn save_new_account(&mut self) {
-        let form = self.add_form.clone();
-        let port: u16 = form
-            .port_str
-            .trim()
-            .parse()
-            .unwrap_or_else(|_| form.protocol.default_port(form.tls));
+    /// Save the add/edit form: mint an account (and a fresh id) for a new
+    /// one, or replace the edited account in place, then sync it so the
+    /// window shows what the credentials actually reach.
+    fn save_account_form(&mut self) {
+        let form = self.account_form.clone();
+        let edited = form
+            .editing
+            .clone()
+            .and_then(|id| self.accounts.iter().position(|a| a.id == id));
+        let account = match edited {
+            Some(index) => form.to_account(self.accounts[index].id.clone()),
+            None => form.to_account(self.unique_account_id(&slug(&form.name))),
+        };
+        let account_id = account.id.clone();
 
-        let base = slug(&form.name);
-        let mut id = base.clone();
+        let switches_mailbox = match edited {
+            Some(index) => {
+                let previous = std::mem::replace(&mut self.accounts[index], account.clone());
+                form.points_elsewhere(&previous)
+            }
+            // A new account has no cached mail yet; treat it as a switch so
+            // the (empty) state below is built the same way.
+            None => {
+                self.accounts.push(account.clone());
+                true
+            }
+        };
+
+        if switches_mailbox {
+            // The cache describes the mailbox the old settings reached, and
+            // the new ones may be a different server entirely: drop it
+            // rather than show mail from an account that is gone. The
+            // in-flight renders of its pages have to go too.
+            self.states
+                .insert(account_id.clone(), AccountUiState::default());
+            storage::delete_cache(&account_id);
+            self.forget_blitz_pages(&account_id);
+        }
+
+        let _ = storage::save_accounts(&self.accounts);
+        sync::spawn(Job::Sync { account }, self.ctx.clone(), self.tx.clone());
+
+        if edited.is_none() {
+            // Adding an account takes the window, like it always did.
+            self.selected_account = Some(account_id.clone());
+            self.selected_folder = Some("INBOX".to_string());
+            self.selected_message = None;
+        } else if switches_mailbox && self.selected_account.as_deref() == Some(account_id.as_str())
+        {
+            // The folder list and its mail are about to be replaced.
+            self.selected_folder = Some("INBOX".to_string());
+            self.selected_message = None;
+        }
+        self.show_account_form = false;
+    }
+
+    /// An id for a new account: the slug of its name, numbered if that is
+    /// taken. Ids name the cache files, so they are never reused.
+    fn unique_account_id(&self, base: &str) -> String {
+        let mut id = base.to_string();
         let mut n = 1;
         while self.accounts.iter().any(|a| a.id == id) {
             n += 1;
             id = format!("{base}-{n}");
         }
+        id
+    }
 
-        let account = Account {
-            id,
-            name: form.name.trim().to_string(),
-            protocol: form.protocol,
-            host: form.host.trim().to_string(),
-            port,
-            username: form.username.trim().to_string(),
-            password: form.password.clone(),
-            tls: form.tls,
-        };
-        let account_id = account.id.clone();
-        self.accounts.push(account.clone());
-        self.states.entry(account_id.clone()).or_default();
-        let _ = storage::save_accounts(&self.accounts);
-
-        sync::spawn(Job::Sync { account }, self.ctx.clone(), self.tx.clone());
-        self.selected_account = Some(account_id);
-        self.selected_folder = Some("INBOX".to_string());
-        self.selected_message = None;
-        self.show_account_form = false;
+    /// Drop every cached Blitz page belonging to an account (keys start
+    /// with its id and a `/`, so `work` cannot match `work-2`).
+    fn forget_blitz_pages(&mut self, account_id: &str) {
+        let prefix = format!("{account_id}/");
+        self.blitz_pages.retain(|key, _| !key.starts_with(&prefix));
+        self.blitz_order
+            .retain(|key| self.blitz_pages.contains_key(key));
+        if self
+            .pending_blitz_key
+            .as_ref()
+            .is_some_and(|(key, _)| key.starts_with(&prefix))
+        {
+            self.pending_blitz_key = None;
+        }
     }
 
     // ----- queries ----------------------------------------------------------
@@ -1533,15 +1650,16 @@ impl KimoApp {
         self.show_preferences = open;
     }
 
-    /// Preferences → Accounts: the configured accounts, with the add-account
-    /// form taking over the page while it is open.
+    /// Preferences → Accounts: the configured accounts, with the add/edit
+    /// account form taking over the page while it is open.
     fn accounts_page(&mut self, ui: &mut egui::Ui) {
         if self.show_account_form {
-            self.account_form(ui);
+            self.account_form_page(ui);
             return;
         }
 
         let mut switch_to: Option<Account> = None;
+        let mut edit: Option<String> = None;
         let mut remove: Option<String> = None;
 
         ui.label(
@@ -1584,6 +1702,9 @@ impl KimoApp {
                         if !in_use && ui.button("Use").clicked() {
                             switch_to = Some(account.clone());
                         }
+                        if ui.button("Edit").clicked() {
+                            edit = Some(account.id.clone());
+                        }
                     });
                 });
                 ui.label(
@@ -1603,12 +1724,16 @@ impl KimoApp {
 
         ui.add_space(6.0);
         if ui.button("+ Add account").clicked() {
-            self.add_form = AddAccountForm::default();
+            self.account_form = AccountForm::default();
             self.show_account_form = true;
+            self.confirm_delete = None;
         }
 
         if let Some(account) = switch_to {
             self.select_folder(account.id.clone(), "INBOX".to_string(), account.protocol);
+        }
+        if let Some(id) = edit {
+            self.open_edit_account_form(&id);
         }
         if let Some(id) = remove {
             self.delete_account(&id);
@@ -1616,13 +1741,33 @@ impl KimoApp {
         }
     }
 
-    /// Preferences → Accounts → new account: the form the standalone
-    /// "Add account" window used to show.
-    fn account_form(&mut self, ui: &mut egui::Ui) {
-        ui.label(egui::RichText::new("New account").strong());
+    /// Open the account form on a configured account, pre-filled, so the
+    /// dialog edits it instead of adding another one.
+    fn open_edit_account_form(&mut self, account_id: &str) {
+        let Some(account) = self.accounts.iter().find(|a| a.id == account_id) else {
+            return;
+        };
+        self.account_form = AccountForm::edit(account);
+        self.show_account_form = true;
+        self.confirm_delete = None;
+    }
+
+    /// Preferences → Accounts → form: fill in a new account, or edit the
+    /// one the form was opened on. The standalone "Add account" window used
+    /// to show this.
+    fn account_form_page(&mut self, ui: &mut egui::Ui) {
+        let editing = self.account_form.editing.is_some();
+        ui.label(
+            egui::RichText::new(if editing {
+                "Edit account"
+            } else {
+                "New account"
+            })
+            .strong(),
+        );
         ui.add_space(4.0);
 
-        let f = &mut self.add_form;
+        let f = &mut self.account_form;
         egui::Grid::new("account_form_grid")
             .num_columns(2)
             .spacing([10.0, 6.0])
@@ -1701,22 +1846,18 @@ impl KimoApp {
         );
         ui.add_space(4.0);
 
-        let valid = {
-            let f = &self.add_form;
-            !f.name.trim().is_empty()
-                && !f.host.trim().is_empty()
-                && !f.username.trim().is_empty()
-                && f.port_str.trim().parse::<u16>().is_ok()
-        };
+        let valid = self.account_form.is_valid();
         ui.horizontal(|ui| {
             if ui.button("Cancel").clicked() {
                 self.show_account_form = false;
             }
-            if ui
-                .add_enabled(valid, egui::Button::new("Save & connect"))
-                .clicked()
-            {
-                self.save_new_account();
+            let save = if editing {
+                "Save & sync"
+            } else {
+                "Save & connect"
+            };
+            if ui.add_enabled(valid, egui::Button::new(save)).clicked() {
+                self.save_account_form();
             }
         });
     }
@@ -2623,6 +2764,61 @@ mod tests {
         assert!(kde_scheme_is_dark("[General]\nColorScheme=BreezeDark\n"));
         assert!(!kde_scheme_is_dark("[General]\nColorScheme=BreezeLight\n"));
         assert!(!kde_scheme_is_dark("[General]\n"));
+    }
+
+    #[test]
+    fn edit_form_round_trips_and_keeps_the_account_id() {
+        let account = test_account("imap.example.com");
+        let form = AccountForm::edit(&account);
+        assert_eq!(form.editing.as_deref(), Some("work"));
+        assert_eq!(form.to_account(account.id.clone()), account);
+    }
+
+    #[test]
+    fn renaming_or_retyping_a_password_keeps_the_cached_mail() {
+        let account = test_account("imap.example.com");
+        let mut form = AccountForm::edit(&account);
+        form.name = "Home mail".to_string();
+        form.password = "a new secret".to_string();
+        assert!(!form.points_elsewhere(&account));
+    }
+
+    #[test]
+    fn another_endpoint_is_another_mailbox() {
+        let account = test_account("imap.example.com");
+        let mut form = AccountForm::edit(&account);
+        form.host = "imap.other.example".to_string();
+        assert!(form.points_elsewhere(&account));
+
+        let mut form = AccountForm::edit(&account);
+        form.port_str = "143".to_string();
+        assert!(form.points_elsewhere(&account));
+
+        let mut form = AccountForm::edit(&account);
+        form.username = "someone@example.com".to_string();
+        assert!(form.points_elsewhere(&account));
+
+        let mut form = AccountForm::edit(&account);
+        form.protocol = Protocol::Pop3;
+        assert!(form.points_elsewhere(&account));
+
+        // Trailing space is trimmed, not a different server.
+        let mut form = AccountForm::edit(&account);
+        form.host = "  imap.example.com  ".to_string();
+        assert!(!form.points_elsewhere(&account));
+    }
+
+    fn test_account(host: &str) -> Account {
+        Account {
+            id: "work".to_string(),
+            name: "Work".to_string(),
+            protocol: Protocol::Imap,
+            host: host.to_string(),
+            port: 993,
+            username: "me@example.com".to_string(),
+            password: "hunter2".to_string(),
+            tls: TlsMode::Implicit,
+        }
     }
 
     #[test]

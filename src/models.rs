@@ -41,7 +41,7 @@ pub enum TlsMode {
 }
 
 /// A user-configured mail account.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Account {
     pub id: String,
     pub name: String,

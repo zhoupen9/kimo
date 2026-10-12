@@ -160,6 +160,13 @@ Event (mpsc) ──► drain_events() at frame start ──► merge into Accoun
 - `~/.config/kimo/accounts.json` — the account list, **including passwords,
   in plain text**. This is a documented, accepted limitation for now; do not
   silently change the format, and do not add a secrets daemon (see rule 1).
+  An account's `id` is minted once (the slug of its name, numbered if taken)
+  and is never reused: it names the account's cache file, so renaming an
+  account in Preferences keeps its cached mail on disk. Editing an account is
+  an in-place update of the same id; the cached mail is thrown away only when
+  the form's endpoint (protocol, host, port, username) changed, because only
+  then can the old cache describe somebody else's mailbox
+  (`AccountForm::points_elsewhere`).
 - `~/.config/kimo/settings.json` — UI settings: the theme
   (`system`/`light`/`dark`; "system" resolves via GTK/KDE config files, no
   subprocesses or D-Bus), `html_renderer` (`egui`/`blitz`, absent means
@@ -229,8 +236,10 @@ Event (mpsc) ──► drain_events() at frame start ──► merge into Accoun
   re-enable system decorations.
 - `preferences_modal()` is the one place to configure Kimo: an
   `egui::Modal` (backdrop click or Escape closes it) with a sidebar of
-  pages — **Accounts** (account list, use/remove, and the add-account form
-  in place of the list) and **Appearance** (theme, Simple/Blitz HTML
+  pages — **Accounts** (account list with use/edit/remove, and the
+  add/edit account form in place of the list: it is pre-filled from the
+  account it was opened on, and `Save & sync` updates that account and
+  syncs it) and **Appearance** (theme, Simple/Blitz HTML
   renderer, the interface/fixed-width fonts — all persisted in
   `settings.json` — plus a read-only preview of the palette the theme
   resolves to). Configuration belongs on a page there, not as another
