@@ -7,11 +7,12 @@
 //! navigation (every account as a collapsible section of its folders), message
 //! list, reading pane.
 //!
-//! Two `egui::Modal`s open from the title bar. The magnifier is search: the
-//! free text lives in the field beside it, the scope and the filters in the
-//! popup, all of it once a bar above the message list. The column carries no
-//! search chrome of its own — the magnifier turning accent-colored is what says
-//! a search is what it is showing. The cog is Preferences:
+//! Two `egui::Modal`s open from the title bar. Search is the box with the
+//! magnifier in it: clicking it opens the popup, which holds the free text, the
+//! scope and the filters, all of it once a bar above the message list. The
+//! column carries no search chrome of its own — the magnifier turning
+//! accent-colored is what says a search is what it is showing. The cog is
+//! Preferences:
 //! its Accounts page holds the account list and the add/edit account form, its
 //! Appearance page the theme (which resolves to a `theme::ColorScheme`), the
 //! HTML renderer and the fonts. That renderer draws the mail either as egui
@@ -1386,45 +1387,50 @@ impl KimoApp {
                         );
                     }
 
-                    // Search, as one box: the field is the query — one
-                    // string, so whatever is searched for anywhere is what is
-                    // written here, and typing in it searches as you stop —
-                    // and the magnifier sits inside its left edge as the way
-                    // into the popup (scope, filters, the count). The glyph
-                    // takes the accent while a search is what the list shows.
+                    // Search, as one box: the query with the magnifier inside
+                    // its left edge, and the whole box is one click target —
+                    // the glyph and the text open the same popup, which is
+                    // where a query is typed (the scope, the filters and the
+                    // count live there too). The field is non-interactive for
+                    // that reason: a caret here would only fight the popup's
+                    // own field for the keyboard, and would leave focus behind
+                    // when the popup closes. The glyph takes the accent while a
+                    // search is what the message list shows.
+                    let margin = egui::Margin {
+                        left: SEARCH_ICON_INSET,
+                        ..egui::Margin::symmetric(4, 2)
+                    };
                     let field = row.add(
                         egui::TextEdit::singleline(&mut self.search.text)
                             .hint_text("Search mail…")
+                            .interactive(false)
                             .desired_width(TITLEBAR_SEARCH_WIDTH)
-                            // Room for the glyph, then the stock TextEdit
-                            // margins, so the text starts after the icon.
-                            .margin(egui::Margin {
-                                left: SEARCH_ICON_INSET,
-                                ..egui::Margin::symmetric(4, 2)
-                            }),
+                            .margin(margin),
                     );
-                    // `TextEdit` hands back its *inner* rect — the margin is
-                    // already taken off it — so the box's left edge is that
-                    // minus the inset the text starts at.
-                    let box_left = field.rect.left() - SEARCH_ICON_INSET as f32;
-                    let icon_rect = egui::Rect::from_center_size(
+                    // `TextEdit` hands back its *inner* rect — the margins are
+                    // already taken off it — so the box is that, grown back by
+                    // the margins it was given.
+                    let box_rect = egui::Rect::from_min_max(
                         egui::pos2(
-                            box_left + SEARCH_ICON_INSET as f32 / 2.0,
-                            field.rect.center().y,
+                            field.rect.left() - margin.left as f32,
+                            field.rect.top() - margin.top as f32,
                         ),
-                        egui::vec2(SEARCH_ICON_SIZE, SEARCH_ICON_SIZE),
+                        egui::pos2(
+                            field.rect.right() + margin.right as f32,
+                            field.rect.bottom() + margin.bottom as f32,
+                        ),
                     );
-                    // Registered after the field, so the click in that corner
-                    // is the glyph's: it opens the popup instead of dropping a
-                    // cursor under itself.
-                    let icon = row
+                    // Registered after the field, which is why the click is
+                    // the box's: it opens the popup wherever in the box it
+                    // lands, the magnifier included.
+                    let search = row
                         .interact(
-                            icon_rect,
-                            egui::Id::new("titlebar-search-icon"),
+                            box_rect,
+                            egui::Id::new("titlebar-search"),
                             egui::Sense::click(),
                         )
                         .on_hover_cursor(egui::CursorIcon::PointingHand);
-                    if icon.clicked() {
+                    if search.clicked() {
                         self.open_search();
                     }
                     let search_color = if self.search.is_active() {
@@ -1432,13 +1438,15 @@ impl KimoApp {
                     } else {
                         visuals.text_color()
                     };
+                    let icon_rect = egui::Rect::from_center_size(
+                        egui::pos2(
+                            box_rect.left() + SEARCH_ICON_INSET as f32 / 2.0,
+                            box_rect.center().y,
+                        ),
+                        egui::vec2(SEARCH_ICON_SIZE, SEARCH_ICON_SIZE),
+                    );
                     paint_search_icon(row.painter(), icon_rect, search_color);
-                    icon.on_hover_text("Search filters and scope (Ctrl+F)");
-                    if entered(&field, row) {
-                        // Enter opens the popup, where the query can be
-                        // narrowed; the search itself already ran live.
-                        self.open_search();
-                    }
+                    search.on_hover_text("Search mail — filters and scope (Ctrl+F)");
 
                     // Per-account status: spinner while syncing, warning on error.
                     for account in self.accounts.clone() {

@@ -210,12 +210,12 @@ Event (mpsc) ──► drain_events() at frame start ──► merge into Accoun
   `search::run` on a worker and answers `Event::SearchResults { seq, hits }`.
   Every request takes a new `seq`, and the UI drops an answer whose `seq` is not
   the current one, so a query typed over never shows the previous mail. The
-  title-bar field and the popup both wait for the typing to stop
-  (`SEARCH_SETTLE`, `search_settle`) and Enter skips the wait;
+  popup waits for the typing to stop (`SEARCH_SETTLE`, `search_settle`) — the
+  title-bar box only displays the query — and Enter skips the wait;
   `search_applied` is the query the results on screen already answer, which is
   what keeps an unchanged query from searching again every frame. The request
-  is pumped from `KimoApp::update`, not from the message list: the field and
-  the popup that edit the query sit outside every column.
+  is pumped from `KimoApp::update`, not from the message list: the popup that
+  edits the query sits outside every column.
 - Remote mutations are limited to `UID STORE +FLAGS.SILENT (\Seen)` (IMAP).
   POP3 never deletes or mutates anything server-side.
 
@@ -316,11 +316,14 @@ Event (mpsc) ──► drain_events() at frame start ──► merge into Accoun
   `message_card` paints both kinds of row), and the reading pane on the right
   with a "No mail selected" placeholder.
 - Search lives in the title bar and in the popup it opens, never in the
-  column. The title-bar field *is* the query — one string, so whatever the
-  popup holds is what the field shows, and typing in either searches as you
-  stop (`SEARCH_SETTLE`); Enter in the field opens the popup, as does a click
-  on the magnifier drawn inside the box's left edge, or Ctrl+F.
-  `search_modal`, an `egui::Modal`, adds the scope combo and the filter grid
+  column. The title-bar box shows the query with the magnifier drawn inside its
+  left edge, and the whole box is one click target: a click anywhere in it —
+  glyph or text — opens the popup, as does Ctrl+F. The field in it is
+  deliberately *not* interactive (it displays the query; the popup is the
+  editor): a caret there would fight the popup's own field for the keyboard and
+  leave focus behind when the popup closes, and one string backs both, so
+  whatever is typed in the popup is what the box shows. `search_modal`, an
+  `egui::Modal`, holds the free text, the scope combo and the filter grid
   the column used to carry, with the live result count along its bottom; Enter
   in any of its boxes (or the Search button) applies the query and closes it,
   and Clear empties it without closing, so closing the popup is never a
@@ -352,8 +355,8 @@ Event (mpsc) ──► drain_events() at frame start ──► merge into Accoun
   embedded PNG the tray serves, downscaled once at startup because egui has
   no mipmaps to filter a 256 px source down to 18 pt), the nav collapse
   toggle, the icon-only sync button (Debug mode only: Release syncs on its
-  own), the search box (a field with the magnifier inside it, one widget), the
-  preferences cog, drag area,
+  own), the search box (a field with the magnifier inside it, one widget,
+  whose click opens the search popup), the preferences cog, drag area,
   double-click maximize, and the
   minimize/maximize/close buttons sent as `ViewportCommand`s. Don't re-enable
   system decorations.
