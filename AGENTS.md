@@ -201,8 +201,11 @@ Event (mpsc) ──► drain_events() at frame start ──► merge into Accoun
   `message_row`), right reading pane with a "No mail selected"
   placeholder.
 - The window is undecorated on purpose (`with_decorations(false)` in
-  `main.rs`): `titlebar()` in `app.rs` draws the custom title bar — nav
-  toggle, account menu (switch only), the icon-only sync button, the
+  `main.rs`): `titlebar()` in `app.rs` draws the custom title bar — the
+  application icon (the brand, and the leftmost thing in the bar: the same
+  embedded PNG the tray serves, downscaled once at startup because egui has
+  no mipmaps to filter a 256 px source down to 18 pt), the nav collapse
+  toggle, the account menu (switch only), the icon-only sync button, the
   preferences cog, drag area, double-click maximize, and the
   minimize/maximize/close buttons sent as `ViewportCommand`s. Don't
   re-enable system decorations.

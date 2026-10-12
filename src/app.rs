@@ -144,6 +144,9 @@ pub struct KimoApp {
     /// second, open glyph. Uploaded once at startup from the embedded PNGs
     /// in `folders::FolderKind::ICONS`.
     folder_icons: HashMap<(FolderKind, bool), egui::TextureHandle>,
+    /// The application icon, drawn at the left of the title bar. `None` only
+    /// if the embedded PNG fails to decode.
+    brand_icon: Option<egui::TextureHandle>,
     theme: Theme,
     /// Cached OS dark-mode preference, so "system" resolution does not hit
     /// the filesystem every frame. Refreshed on startup and whenever the
@@ -277,6 +280,7 @@ impl KimoApp {
 
         // Folder-list icons: white PNGs (see `folders`), tinted per row.
         let folder_icons = load_folder_icons(&cc.egui_ctx);
+        let brand_icon = load_brand_icon(&cc.egui_ctx);
 
         let (tx, rx) = mpsc::channel();
         let mut app = Self {
@@ -297,6 +301,7 @@ impl KimoApp {
             nav_collapsed: false,
             was_narrow: false,
             folder_icons,
+            brand_icon,
             theme: Theme::parse(&settings.theme),
             system_dark: system_prefers_dark(),
             images: HashMap::new(),
@@ -1052,6 +1057,15 @@ impl KimoApp {
                 row_size,
                 egui::Layout::left_to_right(egui::Align::Center),
                 |row| {
+                    // Brand first: the application icon is the leftmost
+                    // thing in the bar (the tray embeds the same PNG).
+                    if let Some(icon) = self.brand_icon.clone() {
+                        row.add(
+                            egui::Image::from_texture(&icon)
+                                .fit_to_exact_size(egui::vec2(BRAND_ICON_SIZE, BRAND_ICON_SIZE)),
+                        );
+                    }
+
                     // Nav collapse toggle (hamburger, painted as lines).
                     let toggle = row.add_sized([26.0, 22.0], egui::Button::new(""));
                     if toggle.clicked() {
@@ -1073,9 +1087,6 @@ impl KimoApp {
                     } else {
                         "Hide folders"
                     });
-
-                    row.label(egui::RichText::new("Kimo").small().strong());
-                    row.separator();
 
                     // Account menu: switch the active account. Adding and
                     // removing accounts lives in Preferences → Accounts.
@@ -1869,6 +1880,8 @@ impl eframe::App for KimoApp {
 
 const TITLEBAR_HEIGHT: f32 = 30.0;
 const TITLEBAR_BUTTON_WIDTH: f32 = 42.0;
+/// Side of the square brand icon at the left of the title bar.
+const BRAND_ICON_SIZE: f32 = 18.0;
 
 /// Blitz reading pane: page margin, width quantization for renders, and how
 /// many rendered pages stay in memory (each is megabytes of texture).
@@ -2161,6 +2174,18 @@ fn folder_row(
         color,
     );
     response
+}
+
+/// The application icon for the title bar: the same embedded 256 px PNG the
+/// tray serves, downscaled once here — painting it at 18 pt straight from the
+/// 256 px texture would alias badly, since egui has no mipmaps.
+fn load_brand_icon(ctx: &egui::Context) -> Option<egui::TextureHandle> {
+    let decoded = image::load_from_memory(crate::tray::APP_PNG)
+        .ok()?
+        .to_rgba8();
+    let small = image::imageops::resize(&decoded, 64, 64, image::imageops::FilterType::Lanczos3);
+    let pixels = egui::ColorImage::from_rgba_unmultiplied([64, 64], small.as_raw());
+    Some(ctx.load_texture("brand-icon", pixels, Default::default()))
 }
 
 /// Decode the embedded folder icons (see `folders::FolderKind::ICONS`) into
