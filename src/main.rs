@@ -49,7 +49,9 @@ struct Kimo {
     state: Option<egui_winit::State>,
     gpu: Option<gpu::Gpu>,
     app: Option<app::KimoApp>,
-    /// What egui knows about the window, for `process_viewport_commands`.
+    /// What the loop knows about the window: `egui_winit` fills it in every
+    /// frame, reads commands back into it, and egui gets it as this frame's
+    /// viewport input.
     viewport: egui::ViewportInfo,
     /// Clipboard actions egui asked for, which go back to it as input events.
     actions: Vec<egui_winit::ActionRequested>,
@@ -200,6 +202,19 @@ impl Kimo {
         ) else {
             return;
         };
+        // What egui's own input says about the window — `i.viewport().maximized`,
+        // which the title bar's maximize/restore glyph is drawn from — is
+        // something `egui-winit` leaves for the caller to fill in: its
+        // `take_egui_input` writes nothing into `viewports` but the scale
+        // factor, and its doc says to call `update_viewport_info` first. That is
+        // what eframe does every frame, and the info is also where a close is
+        // recorded, so the same struct is fed to egui as this frame's input.
+        egui_winit::update_viewport_info(&mut self.viewport, &self.egui_ctx, &window, false);
+        state
+            .egui_input_mut()
+            .viewports
+            .insert(egui::ViewportId::ROOT, self.viewport.clone());
+
         let viewports = gpu.render(&window, state, app, event_loop);
 
         let mut actions = std::mem::take(&mut self.actions);
@@ -211,6 +226,19 @@ impl Kimo {
                 &window,
                 &mut actions,
             );
+        }
+        // The one window command `egui_winit` leaves to the caller is the
+        // close: it records a `ViewportEvent::Close` in the info it is handed
+        // rather than ending anything, because in eframe that recording is the
+        // app's chance to refuse the close (`CancelClose`). Kimo has no such
+        // chance to offer, and only the loop can end itself, so the recording is
+        // read here — this is the path the title bar's close button and the
+        // tray's Quit take, while the compositor's own close arrives as
+        // `WindowEvent::CloseRequested`.
+        let close_requested = self.viewport.close_requested();
+        self.viewport.events.clear();
+        if close_requested {
+            event_loop.exit();
         }
         // Cut, copy and paste are egui's way of asking for the clipboard: this
         // side does the OS part and feeds the result back in as events.

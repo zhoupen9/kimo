@@ -348,7 +348,16 @@ Event (mpsc) ──► drain_events() at frame start ──► merge into Accoun
   not come round yet must be *left in place*: a loop that consumes it sleeps
   through the frame egui asked for), and
   `egui_winit::process_viewport_commands` for the commands the title bar sends
-  (drag, minimize, maximize, close). The renderer is wgpu, and its 0.36-era API
+  (drag, minimize, maximize), with two catches that are the loop's own to
+  handle: a close is only *recorded* by it, as a `ViewportEvent::Close` in the
+  `ViewportInfo` it is handed (in eframe that recording is the app's chance to
+  refuse the close, via `CancelClose`), so the loop reads it and ends itself —
+  the tray's Quit takes the same path — and that info has to be refreshed from
+  the window every frame (`egui_winit::update_viewport_info`) and handed to
+  egui as `RawInput::viewports`, because `egui-winit` itself fills in nothing
+  but the scale factor: without it `i.viewport().maximized`, which draws the
+  title bar's maximize/restore glyph, is always `None` and the maximize button
+  can never restore. The renderer is wgpu, and its 0.36-era API
   is young: `InstanceDescriptor` is built by `new_with_display_handle`,
   presenting is `Queue::present`, pipeline layouts take
   `bind_group_layouts: &[Some(&layout)]` and `immediate_size`, passes and
