@@ -337,14 +337,19 @@ Event (mpsc) ──► drain_events() at frame start ──► merge into Accoun
   The chrome — title bar and navigation — is the scheme's `panel`; the message
   list and the reading pane are the lighter `content`. The columns run from the
   window's own top edge, and the title bar floats over them (see the title-bar
-  bullet below): the list keeps clear of it with padding *inside* its scroll
-  area, which scrolls away with the rows, while the navigation and the reading
-  pane are inset by the bar's height and never go under it. The list column is
+  bullet below): the navigation is inset by the bar's height and never goes
+  under it, while the two content columns keep clear of the bar with padding
+  *inside* their scroll areas, which scrolls away with what they hold — the
+  list's rows, and the reading pane's entire card, its headers included, which
+  is why mail passes under the glass there too. The list column is
   framed by a hairline down each side (`mail_list`, drawn at the column's own
   rect), and the reading pane is a card of `content`
   (`CONTENT_CARD_CORNER_RADIUS`) inset by `CONTENT_GUTTER` into the chrome,
   whose left side doubles as the splitter; with nothing selected there is no
-  card at all. Both highlights in the list are the mail's whole row: a square
+  card at all. The card is the pane's own scroll container — headers, rule and
+  body scroll together, and the scroll bar runs down the card's edge rather
+  than down the body's — and it still hugs a short mail: it is exactly as tall
+  as the mail until the mail outgrows the pane. Both highlights in the list are the mail's whole row: a square
   block spanning the column edge to edge. A mail draws its own edges instead of
   sharing a rule with its neighbour — left, right and bottom in `row_edge`, the
   top in the fainter `row_edge_top`, each a pixel inside its own rect — so what
@@ -361,7 +366,8 @@ Event (mpsc) ──► drain_events() at frame start ──► merge into Accoun
   each scroll area
   (`Frame::inner_margin(LIST_PADDING)` around the rows — sides, bottom, and
   the bar's height at the top, which is what the rows scroll under — and
-  `mail_body` for the mail), not on the panel's frame, which is what lets the scroll bars
+  `mail_card` for the mail, whose top margin is the bar's height on top of the
+  card's own), not on the panel's frame, which is what lets the scroll bars
   reach the column's edge and the card's edge instead of stopping on the
   padding. egui's
   panel separators are off in both schemes (they would double those hairlines
@@ -412,10 +418,11 @@ Event (mpsc) ──► drain_events() at frame start ──► merge into Accoun
   has always been; once the list is scrolled it turns to glass — the fill keeps
   `GLASS_ALPHA` of the scheme's `panel`, the backdrop behind it is blurred
   (`src/glass.rs`) and a hairline appears along its bottom edge. One animated
-  value (`TITLEBAR_FLOAT_TIME`) drives all three from the list's own scroll
-  offset (`KimoApp::list_scroll`, captured where its scroll area is built), so
-  scrolling back to the top docks the bar again rather than snapping it, and a
-  list with nothing to scroll — or no list at all — leaves it docked. Inside
+  value (`TITLEBAR_FLOAT_TIME`) drives all three from the two content columns'
+  scroll offsets (`KimoApp::list_scroll` and `mail_scroll`, each captured where
+  its scroll area is built), so scrolling either of them back to the top docks
+  the bar again rather than snapping it, and a column with nothing to scroll —
+  or no list and no mail at all — leaves it docked. Inside
   the bar, left to right: the application icon (the brand, and the leftmost
   thing in the bar: the same
   embedded PNG the tray serves, downscaled once at startup because egui has

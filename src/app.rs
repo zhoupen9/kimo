@@ -386,6 +386,10 @@ pub struct KimoApp {
     /// scroll area at all. The title bar floats over the column once this
     /// leaves the top, and docks again when it comes back.
     list_scroll: f32,
+    /// The same for the reading pane's card, which scrolls the whole mail:
+    /// either column scrolled is content under the floating bar. Zero while
+    /// no mail is open.
+    mail_scroll: f32,
 }
 
 /// A Blitz page: rendering, rendered, or failed.
@@ -615,6 +619,7 @@ impl KimoApp {
             scrolled_message: None,
             list_column: egui::Rect::ZERO,
             list_scroll: 0.0,
+            mail_scroll: 0.0,
         };
 
         app.selected_account = app.accounts.first().map(|a| a.id.clone());
@@ -1475,12 +1480,14 @@ impl KimoApp {
             egui::Pos2::ZERO,
             egui::vec2(ctx.screen_rect().width(), TITLEBAR_HEIGHT),
         );
-        // The list's scroll offset is the whole trigger: any scroll at all is
-        // mail under the bar, and the first row is back under it only at the
-        // top.
+        // Either column scrolling is the trigger: the message list's offset,
+        // or the reading pane's card, which scrolls the whole mail. Any scroll
+        // at all is content under the bar, and the top is the only place where
+        // nothing is.
+        let scrolled = self.list_scroll.max(self.mail_scroll) > 0.5;
         let floating = ctx.animate_bool_with_time(
             egui::Id::new("titlebar-floating"),
-            self.list_scroll > 0.5,
+            scrolled,
             TITLEBAR_FLOAT_TIME,
         );
 
@@ -2755,6 +2762,13 @@ impl KimoApp {
     /// CONTENT_GUTTER, whose left side is also the splitter. With nothing
     /// selected there is no card at all: the pane is bare chrome and the
     /// placeholder sits directly on it.
+    ///
+    /// The card is the pane's scroll container: the headers, the rule and the
+    /// body are one column inside the card's own scroll area, so the scroll bar
+    /// runs down the card's edge rather than down the body's. The card reaches
+    /// the window's top edge — the floating title bar lies over it — and its
+    /// top padding is the bar's height (see `mail_card`), so the mail scrolls
+    /// under the glass exactly like the message list's rows do.
     fn mail_content(&mut self, ui: &mut egui::Ui) {
         let scheme = theme::of(ui.ctx());
         // The chrome is painted here rather than by the panel's frame: a frame
@@ -2768,50 +2782,74 @@ impl KimoApp {
         ui.set_min_size(panel.size());
         ui.painter().rect_filled(panel, 0.0, scheme.panel);
 
-        // The title bar floats over the pane's top edge, so everything in it
-        // starts below the bar: the card, and the placeholder that centres in
-        // what the bar leaves rather than in the whole panel.
+        // The title bar floats over the pane's top edge; with nothing open the
+        // placeholder centres in what the bar leaves, and there is no scroll
+        // left to float for.
         let below_bar = egui::Rect::from_min_max(
             egui::pos2(panel.left(), panel.top() + TITLEBAR_HEIGHT),
             panel.max,
         );
         let Some(msg) = self.selected_message_view() else {
+            self.mail_scroll = 0.0;
             let _ = ui.allocate_new_ui(egui::UiBuilder::new().max_rect(below_bar), |ui| {
-                self.mail_content_body(ui, None);
+                ui.centered_and_justified(|ui| {
+                    ui.label(egui::RichText::new("No mail selected").weak().heading());
+                });
             });
             return;
         };
 
+        // A newly opened message starts at the top. The scroll offset is per
+        // pane, not per message, so without this the next mail opens wherever
+        // the previous one was left — for a Blitz page that means the top of
+        // the page is simply not on screen.
+        let message_key = format!(
+            "{}/{}",
+            self.selected_folder.as_deref().unwrap_or("-"),
+            msg.uid
+        );
+        let new_message = self.scrolled_message.as_deref() != Some(message_key.as_str());
+        if new_message {
+            self.scrolled_message = Some(message_key);
+        }
+
         // The card hugs the mail instead of always filling the pane, so its
         // height is only known once the mail has been laid out: the painter
-        // reserves the shape here and it is filled in below, which is also what
-        // puts the card *behind* the text. An egui Frame cannot do this — it
-        // sizes itself to the content rect, which only works out when the
-        // content fills the pane.
+        // reserves the shape here and it is filled in below. Painting the card
+        // rather than framing the content is also what keeps the scroll bar *on*
+        // the card: a frame would be inset by the bar's own strip, leaving the
+        // bar over the chrome beside it.
         let where_to_put_card = ui.painter().add(egui::Shape::Noop);
         let card_left = panel.left() + CONTENT_GUTTER;
         let card_right = panel.right() - CONTENT_GUTTER;
-        let card_top = below_bar.top() + CONTENT_GUTTER;
+        let card_top = panel.top() + CONTENT_GUTTER;
         let card_bottom = panel.bottom() - CONTENT_GUTTER;
-        // The body gets the card's whole rect: its padding lives inside the
-        // scroll area (see mail_body), which is what lets the scroll bar sit on
-        // the card's edge rather than on the padding.
         let inner = egui::Rect::from_min_max(
             egui::pos2(card_left, card_top),
             egui::pos2(card_right, card_bottom),
         );
-        let content = ui
+        let used = ui
             .allocate_new_ui(egui::UiBuilder::new().max_rect(inner), |ui| {
-                self.mail_content_body(ui, Some(msg))
+                let mut scroll = egui::ScrollArea::vertical()
+                    // Full width, but only as tall as the mail: the card around
+                    // a short message hugs it instead of running to the pane's
+                    // floor, while a long one takes the pane and scrolls.
+                    .auto_shrink([false, true])
+                    // Switching renderers swaps the whole card; a scroll offset
+                    // from the other renderer would land in empty space.
+                    .id_salt(("mail-card", self.html_renderer.as_str()));
+                if new_message {
+                    scroll = scroll.vertical_scroll_offset(0.0);
+                }
+                let output = scroll.show(ui, |ui| self.mail_card(ui, &msg));
+                // Scrolled away from the top, the bar floats over this card.
+                self.mail_scroll = output.state.offset.y;
             })
             .response
             .rect;
         let card = egui::Rect::from_min_max(
             egui::pos2(card_left, card_top),
-            egui::pos2(
-                card_right,
-                (content.bottom() + CONTENT_PADDING.y).min(card_bottom),
-            ),
+            egui::pos2(card_right, used.bottom().min(card_bottom)),
         );
         ui.painter().set(
             where_to_put_card,
@@ -2819,100 +2857,59 @@ impl KimoApp {
         );
     }
 
-    /// What the pane holds: the selected message, or the empty-pane
-    /// placeholder. The message is passed in already resolved — resolving it
-    /// here would clone it a second time every frame.
-    fn mail_content_body(&mut self, ui: &mut egui::Ui, msg: Option<MailMessage>) {
-        let Some(msg) = msg else {
-            ui.centered_and_justified(|ui| {
-                ui.label(egui::RichText::new("No mail selected").weak().heading());
-            });
-            return;
-        };
-        ui.vertical(|ui| {
-            ui.set_min_width(ui.available_width());
-            // The headers carry the card's padding themselves; the body below
-            // is padded inside its own scroll area.
-            egui::Frame::new()
-                .inner_margin(egui::Margin {
-                    left: CONTENT_PADDING.x as i8,
-                    right: CONTENT_PADDING.x as i8,
-                    top: CONTENT_PADDING.y as i8,
-                    bottom: 0,
-                })
-                .show(ui, |ui| {
-                    ui.heading(msg.subject.as_str());
+    /// The mail on its card: the headers, the rule under them and the body in
+    /// one padded column, which the card's scroll area scrolls as a whole.
+    ///
+    /// The padding is inside the scroll area, so the scroll bar sits on the
+    /// card's edge and not on the text. Its top is the title bar's height on
+    /// top of the card's own: the bar floats over the card, and that is what
+    /// keeps the subject below it at rest — scrolling takes the padding away
+    /// with the headers, which is what lets them pass under the glass.
+    fn mail_card(&mut self, ui: &mut egui::Ui, msg: &MailMessage) {
+        egui::Frame::new()
+            .inner_margin(egui::Margin {
+                left: CONTENT_PADDING_I8,
+                right: CONTENT_PADDING_I8,
+                top: TITLEBAR_HEIGHT_I8 + CONTENT_PADDING_I8,
+                bottom: CONTENT_PADDING_I8,
+            })
+            .show(ui, |ui| {
+                ui.set_min_width(ui.available_width());
+                ui.heading(msg.subject.as_str());
+                ui.label(
+                    egui::RichText::new(format!("From: {}", msg.from))
+                        .small()
+                        .weak(),
+                );
+                if !msg.to.is_empty() {
                     ui.label(
-                        egui::RichText::new(format!("From: {}", msg.from))
+                        egui::RichText::new(format!("To: {}", msg.to))
                             .small()
                             .weak(),
                     );
-                    if !msg.to.is_empty() {
-                        ui.label(
-                            egui::RichText::new(format!("To: {}", msg.to))
-                                .small()
-                                .weak(),
-                        );
-                    }
-                    if !msg.date.is_empty() {
-                        ui.label(
-                            egui::RichText::new(format!("Date: {}", msg.date))
-                                .small()
-                                .weak(),
-                        );
-                    }
-                    if !msg.attachment_names.is_empty() {
-                        ui.label(
-                            egui::RichText::new(format!("📎 {}", msg.attachment_names.join(", ")))
-                                .small(),
-                        );
-                    }
-                    // The rule between the headers and the body spans the card, not
-                    // just the mail's text column.
-                    ui.add(egui::Separator::default().grow(CONTENT_PADDING.x));
-                });
-            // A newly opened message starts at the top. The scroll offset is
-            // per pane, not per message, so without this the next mail opens
-            // wherever the previous one was left — for a Blitz page that means
-            // the top of the page is simply not on screen.
-            let message_key = format!(
-                "{}/{}",
-                self.selected_folder.as_deref().unwrap_or("-"),
-                msg.uid
-            );
-            let new_message = self.scrolled_message.as_deref() != Some(message_key.as_str());
-            if new_message {
-                self.scrolled_message = Some(message_key);
-            }
-            let mut scroll = egui::ScrollArea::vertical()
-                // Full width, but only as tall as the mail: the card around it
-                // hugs a short message instead of running to the pane's floor,
-                // while a long one still takes the pane and scrolls.
-                .auto_shrink([false, true])
-                // Switching renderers swaps the whole pane; a scroll offset
-                // from the other renderer would land in empty space.
-                .id_salt(("mail-content", self.html_renderer.as_str()));
-            if new_message {
-                scroll = scroll.vertical_scroll_offset(0.0);
-            }
-            scroll.show(ui, |ui| {
-                // The mail is padded inside the scroll area: the bar has to
-                // reach the card's edge, so the pane's own rect is unpadded.
-                egui::Frame::new()
-                    .inner_margin(egui::Margin {
-                        left: CONTENT_PADDING.x as i8,
-                        right: CONTENT_PADDING.x as i8,
-                        top: 0,
-                        bottom: 0,
-                    })
-                    .show(ui, |ui| self.mail_body(ui, &msg));
+                }
+                if !msg.date.is_empty() {
+                    ui.label(
+                        egui::RichText::new(format!("Date: {}", msg.date))
+                            .small()
+                            .weak(),
+                    );
+                }
+                if !msg.attachment_names.is_empty() {
+                    ui.label(
+                        egui::RichText::new(format!("📎 {}", msg.attachment_names.join(", ")))
+                            .small(),
+                    );
+                }
+                // The rule between the headers and the body spans the card, not
+                // just the mail's text column.
+                ui.add(egui::Separator::default().grow(CONTENT_PADDING.x));
+                self.mail_body(ui, msg);
             });
-        });
     }
 
-    /// The mail itself, laid out inside the pane's scroll area. Its padding
-    /// lives here instead of on the pane so the scroll bar can sit on the
-    /// card's edge.
+    /// The mail itself, laid out inside the card's scroll area (`mail_card`),
+    /// which owns the padding around it.
     fn mail_body(&mut self, ui: &mut egui::Ui, msg: &MailMessage) {
         ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Wrap);
         let html = msg.body_html.as_deref();
@@ -3582,8 +3579,11 @@ const LIST_PADDING: egui::Margin = egui::Margin {
 /// boundary covers it, and no line is drawn in it.
 const CONTENT_GUTTER: f32 = 4.0;
 /// Padding between the card's edge and the mail on it — all four sides, so the
-/// subject and the body do not sit against the card's corners.
-const CONTENT_PADDING: egui::Vec2 = egui::vec2(12.0, 12.0);
+/// subject and the body do not sit against the card's corners. The integer
+/// form is the one `egui::Margin` wants.
+const CONTENT_PADDING_I8: i8 = 12;
+const CONTENT_PADDING: egui::Vec2 =
+    egui::vec2(CONTENT_PADDING_I8 as f32, CONTENT_PADDING_I8 as f32);
 /// Corner radius of the reading pane's card.
 const CONTENT_CARD_CORNER_RADIUS: u8 = 8;
 /// Room the magnifier takes inside the search box, and the glyph's size. The
