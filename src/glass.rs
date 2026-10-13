@@ -8,40 +8,50 @@
 //! smudge of its colors instead of unreadable text.
 //!
 //! wgpu cannot do what the glow build did, though. There the copy was
-//! `glCopyTexSubImage2D` *inside* the pass that draws the bar: OpenGL will read
+//! glCopyTexSubImage2D *inside* the pass that draws the bar: OpenGL will read
 //! the framebuffer it is currently drawing into. wgpu will not — a texture
 //! cannot be sampled while it is a pass's attachment, and the attachment here
-//! is the window's surface, which is not even created with `COPY_SRC`. So the
-//! frame is split around this pass instead (see `crate::gpu`): everything
-//! behind the bar is drawn into an offscreen *scene* texture, this module
-//! copies the bar's strip of it (a plain texture-to-texture copy, the one
-//! thing wgpu does allow), blurs it in two separable passes, and the rest of
-//! the frame — the bar's fill, its icons, its text — is drawn onto the window
-//! with the blurred strip under it. The callback is the seam between the two
-//! halves of the frame and, in the second half, the thing that draws the strip.
+//! is the window's surface, which is not even created with COPY_SRC. So the
+//! frame is split around this pass instead (see crate::gpu): everything behind
+//! the bar is drawn into an offscreen *scene* texture, this module copies the
+//! bar's strip of it (a plain texture-to-texture copy, the one thing wgpu does
+//! allow), blurs it in two separable passes, and the rest of the frame — the
+//! bar's fill, its icons, its text — is drawn onto the window with the blurred
+//! strip under it. The callback is the seam between the two halves of the frame
+//! and, in the second half, the thing that draws the strip.
 //!
-//! The blur is separable — a horizontal pass into an offscreen texture of the
-//! bar's size, then a vertical one — because a single two-dimensional kernel
-//! cheap enough to run per frame is sampled too sparsely to hide the detail it
-//! is meant to destroy: nine taps four pixels apart left a visible comb over
-//! the text. Seventeen taps a pixel and a half apart, twice, cost less and
-//! leave nothing readable. Both passes draw one full-viewport triangle (the
-//! strip *is* the viewport), and the same pipeline draws the result: with a
-//! step of zero the blur is a plain copy.
+//! The blur is a **Gaussian**, one axis per pass: a horizontal pass into an
+//! offscreen texture of the bar's size, then a vertical one. SIGMA_PX is the
+//! standard deviation, in physical pixels, and the kernel stops a little short
+//! of three of them — past that a Gaussian contributes nothing the eight-bit
+//! strip could show. It is normalised, so the weights always sum to one and the
+//! frost never brightens or darkens what is behind it. Each axis walks TAPS
+//! *pairs* of taps either side of the fragment plus a centre one, and each pair
+//! is placed half a texel past an even boundary, between two texels, exactly
+//! where the sampler's linear filter averages them: one fetch stands in for two
+//! taps, so a 17-tap Gaussian costs 9 fetches rather than 17. (Its precursor was
+//! a box: 17 taps two pixels apart, which skipped every other texel and left a
+//! faint comb over the text.)
+//!
+//! Both passes draw one full-viewport triangle (the strip *is* the viewport),
+//! and the callback's half of the frame copies the result texel for texel.
 //!
 //! Every failure here is soft. A device that will not take the pipeline or the
-//! textures — for want of a format, say — reports once, sets `failed`, and
-//! leaves the bar translucent over the crisp content instead of frosted.
+//! textures — for want of a format, say — reports once, sets failed, and leaves
+//! the bar translucent over the crisp content instead of frosted.
 
 use std::sync::{Arc, Mutex};
 
 use egui_wgpu::CallbackTrait;
 
-/// The width of one blur step, in physical pixels: the shader takes its taps
-/// this far apart (see [`SHADER`], which carries the tap count and the loop
-/// that reads them). Sampling inside the pixel grid is what keeps text from
-/// aliasing into a pattern instead of dissolving.
-const STEP_PX: f32 = 2.0;
+/// The Gaussian's standard deviation, in physical pixels: what "how frosted"
+/// means. Raise it for a heavier smear; TAPS has to come with it.
+const SIGMA_PX: f32 = 6.0;
+
+/// Tap pairs either side of the fragment: eight reaches 16 px, which is a shade
+/// under three standard deviations at the sigma above — far enough out that
+/// what is left over is below what the eight-bit strip could show.
+const TAPS: usize = 8;
 
 /// The glass pass, shared with the paint callback it hands to egui. Cloning it
 /// clones a handle: the GPU objects are made once, on the first floating frame.
@@ -52,9 +62,9 @@ pub struct Glass {
 
 #[derive(Default)]
 struct Shared {
-    /// The bar's rect this frame, in points, recorded by `Glass::backdrop`.
-    /// It is what tells the integration where the frame splits and what to
-    /// blur; `None` means the bar is docked and the frame needs none of it.
+    /// The bar's rect this frame, in points, recorded by Glass::backdrop. It is
+    /// what tells the integration where the frame splits and what to blur;
+    /// None means the bar is docked and the frame needs none of it.
     rect: Option<egui::Rect>,
     /// The GPU objects, made on the first frame that needs them.
     gpu: Option<Gpu>,
@@ -64,7 +74,7 @@ struct Shared {
 }
 
 impl Glass {
-    /// Blur whatever has already been drawn behind `rect`.
+    /// Blur whatever has already been drawn behind rect.
     ///
     /// This belongs *before* the fill and the glyphs that sit on the glass,
     /// which is also where the frame is split: everything added before it is
@@ -85,15 +95,15 @@ impl Glass {
         ));
     }
 
-    /// Forget last frame's bar: `backdrop` records this frame's.
+    /// Forget last frame's bar: backdrop records this frame's.
     pub(crate) fn begin_frame(&self) {
         if let Ok(mut shared) = self.shared.lock() {
             shared.rect = None;
         }
     }
 
-    /// The bar's rect in physical pixels, clamped to the window, or `None`
-    /// when the bar is docked (or the pass has failed).
+    /// The bar's rect in physical pixels, clamped to the window, or None when
+    /// the bar is docked (or the pass has failed).
     pub(crate) fn rect_px(&self, pixels_per_point: f32, size: [u32; 2]) -> Option<[u32; 4]> {
         let shared = self.shared.lock().ok()?;
         if shared.failed {
@@ -170,7 +180,7 @@ impl Glass {
         }
     }
 
-    /// Copy the bar's strip out of `scene` and blur it, into the texture the
+    /// Copy the bar's strip out of the scene and blur it, into the texture the
     /// callback draws. This runs between the frame's two halves, so the scene
     /// holds everything *behind* the bar and nothing of the bar itself.
     pub(crate) fn blur(
@@ -208,19 +218,21 @@ impl Glass {
                 depth_or_array_layers: 1,
             },
         );
-        // One pass per axis: the bind group carries that axis's step, and each
-        // pass draws the one triangle over its whole viewport.
+        // One axis per pass: the bind group carries that axis's kernel — its
+        // offsets along the axis, in uv — and each pass draws the one triangle
+        // over its whole viewport.
         gpu.blur_pass(encoder, &gpu.first.view, &gpu.strip.bind_group);
         gpu.blur_pass(encoder, &gpu.second.view, &gpu.first.bind_group);
     }
 }
 
 /// The GPU objects of the pass, made on the first floating frame and kept until
-/// the window — or the bar — changes size.
+/// the window — or the bar — changes size, which changes the kernels with it.
 struct Gpu {
-    /// One pipeline for all three draws: the two blur axes, and the copy the
-    /// callback does with a step of zero.
-    pipeline: wgpu::RenderPipeline,
+    /// The Gaussian, one axis per pass.
+    blur: wgpu::RenderPipeline,
+    /// The callback's draw: the finished strip, texel for texel.
+    copy: wgpu::RenderPipeline,
     /// The pixels behind the bar, copied out of the scene.
     strip: Target,
     /// The horizontal pass's result.
@@ -272,42 +284,47 @@ impl Gpu {
 
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("kimo_glass"),
-            source: wgpu::ShaderSource::Wgsl(SHADER.into()),
+            source: wgpu::ShaderSource::Wgsl(shader().into()),
         });
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("kimo_glass"),
             bind_group_layouts: &[Some(&layout)],
             immediate_size: 0,
         });
-        let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("kimo_glass"),
-            layout: Some(&pipeline_layout),
-            vertex: wgpu::VertexState {
-                module: &shader,
-                entry_point: Some("vs_main"),
-                compilation_options: Default::default(),
-                buffers: &[],
-            },
-            fragment: Some(wgpu::FragmentState {
-                module: &shader,
-                entry_point: Some("fs_main"),
-                compilation_options: Default::default(),
-                targets: &[Some(wgpu::ColorTargetState {
-                    format,
-                    blend: None,
-                    write_mask: wgpu::ColorWrites::ALL,
-                })],
-            }),
-            primitive: wgpu::PrimitiveState::default(),
-            depth_stencil: None,
-            multisample: wgpu::MultisampleState::default(),
-            multiview_mask: None,
-            cache: None,
-        });
+        let pipeline = |entry: &str| {
+            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some("kimo_glass"),
+                layout: Some(&pipeline_layout),
+                vertex: wgpu::VertexState {
+                    module: &shader,
+                    entry_point: Some("vs_main"),
+                    compilation_options: Default::default(),
+                    buffers: &[],
+                },
+                fragment: Some(wgpu::FragmentState {
+                    module: &shader,
+                    entry_point: Some(entry),
+                    compilation_options: Default::default(),
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format,
+                        blend: None,
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                }),
+                primitive: wgpu::PrimitiveState::default(),
+                depth_stencil: None,
+                multisample: wgpu::MultisampleState::default(),
+                multiview_mask: None,
+                cache: None,
+            })
+        };
+        let blur = pipeline("fs_blur");
+        let copy = pipeline("fs_copy");
 
         let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             label: Some("kimo_glass"),
-            // Clamped: the strip's edge samples its own edge, not the far side.
+            // Clamped: a strip that runs out of texels at its own edge samples
+            // that edge rather than the far side of the bar.
             address_mode_u: wgpu::AddressMode::ClampToEdge,
             address_mode_v: wgpu::AddressMode::ClampToEdge,
             address_mode_w: wgpu::AddressMode::ClampToEdge,
@@ -316,25 +333,20 @@ impl Gpu {
             ..Default::default()
         });
 
-        // The step of each pass, which is what makes one shader do all three:
-        // a pixel and a half either side per axis, none at all for the copy.
-        // Written once — they only change when the bar is resized.
-        let step = |x: f32, y: f32| {
+        // The kernels, written once: their uv offsets depend only on the
+        // strip's size, which is one of the things that makes the pass be made
+        // again at all.
+        let kernel = |extent: u32, horizontal: bool| {
             let buffer = device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("kimo_glass_step"),
-                size: 8,
+                label: Some("kimo_glass_kernel"),
+                size: (4 * (TAPS + 1) * 4) as u64,
                 usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
                 mapped_at_creation: false,
             });
-            queue.write_buffer(&buffer, 0, &floats(x, y));
+            queue.write_buffer(&buffer, 0, &kernel_bytes(extent as f32, horizontal));
             buffer
         };
-        let (width, height) = (size[0] as f32, size[1] as f32);
-        let steps = [
-            step(STEP_PX / width, 0.0),
-            step(0.0, STEP_PX / height),
-            step(0.0, 0.0),
-        ];
+        let kernels = [kernel(size[0], true), kernel(size[1], false)];
 
         let mut textures = Vec::new();
         for label in ["kimo_glass_strip", "kimo_glass_first", "kimo_glass_second"] {
@@ -355,7 +367,7 @@ impl Gpu {
                 view_formats: &[],
             }));
         }
-        let mut target = |index: usize| {
+        let mut target = |kernel: usize| {
             let texture = textures.remove(0);
             let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
             let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -372,7 +384,7 @@ impl Gpu {
                     },
                     wgpu::BindGroupEntry {
                         binding: 2,
-                        resource: steps[index].as_entire_binding(),
+                        resource: kernels[kernel].as_entire_binding(),
                     },
                 ],
             });
@@ -382,10 +394,13 @@ impl Gpu {
                 bind_group,
             }
         };
-        let (strip, first, second) = (target(0), target(1), target(2));
+        // The strip is blurred horizontally, that result vertically, and the
+        // second result is what the callback copies — its kernel goes unused.
+        let (strip, first, second) = (target(0), target(1), target(1));
 
         Some(Self {
-            pipeline,
+            blur,
+            copy,
             strip,
             first,
             second,
@@ -398,8 +413,8 @@ impl Gpu {
         self.format == format && self.size == size
     }
 
-    /// One axis of the blur, or the copy: a triangle over the whole target,
-    /// sampling `sources` through its own bind group.
+    /// One axis of the blur: a triangle over the whole target, sampling the
+    /// source texture through its own bind group and that axis's kernel.
     fn blur_pass(
         &self,
         encoder: &mut wgpu::CommandEncoder,
@@ -422,7 +437,7 @@ impl Gpu {
             occlusion_query_set: None,
             multiview_mask: None,
         });
-        pass.set_pipeline(&self.pipeline);
+        pass.set_pipeline(&self.blur);
         pass.set_bind_group(0, source, &[]);
         pass.draw(0..3, 0..1);
     }
@@ -457,34 +472,38 @@ impl CallbackTrait for GlassCallback {
         if shared.failed {
             return;
         }
-        pass.set_pipeline(&gpu.pipeline);
+        pass.set_pipeline(&gpu.copy);
         pass.set_bind_group(0, &gpu.second.bind_group, &[]);
         pass.draw(0..3, 0..1);
     }
 }
 
-/// The pass's shader. One triangle covers the viewport — the strip (or the bar)
-/// *is* the viewport, so there is no projection to set up, only the uv of the
-/// corner that says which way the texture reads.
-const SHADER: &str = r#"
-struct Uniforms {
-    step: vec2<f32>,
-};
-
+/// The pass's shader, with the tap count baked in so the two cannot drift: one
+/// triangle covers the viewport — the strip *is* the viewport, so there is no
+/// projection to set up — and the fragment walks the kernel's pairs.
+fn shader() -> String {
+    let taps = TAPS;
+    format!(
+        r#"
 @group(0) @binding(0) var source: texture_2d<f32>;
 @group(0) @binding(1) var source_sampler: sampler;
-@group(0) @binding(2) var<uniform> uniforms: Uniforms;
 
-struct VertexOut {
+struct Kernel {{
+    // One entry per tap pair: the offset along the axis being blurred, in uv,
+    // and the weight of the pair. Written by kernel_bytes.
+    pairs: array<vec4<f32>, {taps}>,
+    centre: vec4<f32>,
+}};
+
+@group(0) @binding(2) var<uniform> kernel: Kernel;
+
+struct VertexOut {{
     @builtin(position) position: vec4<f32>,
     @location(0) uv: vec2<f32>,
-};
-
-const TAPS: i32 = 8;
-const SAMPLES: f32 = 17.0;
+}};
 
 @vertex
-fn vs_main(@builtin(vertex_index) index: u32) -> VertexOut {
+fn vs_main(@builtin(vertex_index) index: u32) -> VertexOut {{
     // (0,0), (2,0), (0,2): one triangle over the whole clip square, whose uv
     // runs 0..1 with v = 0 at the top, as the texture does.
     let corner = vec2<f32>(f32((index << 1u) & 2u), f32(index & 2u));
@@ -492,23 +511,128 @@ fn vs_main(@builtin(vertex_index) index: u32) -> VertexOut {
     out.position = vec4<f32>(corner.x * 2.0 - 1.0, 1.0 - corner.y * 2.0, 0.0, 1.0);
     out.uv = corner;
     return out;
-}
+}}
 
+// The Gaussian itself: the centre tap, then each pair either side of it. A
+// pair's offset sits between two texels, so the sampler's linear filter
+// averages them and one fetch covers two taps.
 @fragment
-fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
-    var sum = vec4<f32>(0.0);
-    for (var i: i32 = -TAPS; i <= TAPS; i = i + 1) {
-        sum = sum + textureSample(source, source_sampler, in.uv + vec2<f32>(f32(i), 0.0) * uniforms.step);
-    }
-    return sum / SAMPLES;
-}
-"#;
+fn fs_blur(in: VertexOut) -> @location(0) vec4<f32> {{
+    var sum = kernel.centre.x * textureSample(source, source_sampler, in.uv);
+    for (var i = 0; i < {taps}; i = i + 1) {{
+        let pair = kernel.pairs[i];
+        sum = sum
+            + pair.z * (textureSample(source, source_sampler, in.uv + pair.xy)
+                      + textureSample(source, source_sampler, in.uv - pair.xy));
+    }}
+    return sum;
+}}
 
-/// Two little-endian floats for a uniform buffer. (wgpu's own bytemuck is not
-/// a dependency of this crate.)
-fn floats(x: f32, y: f32) -> [u8; 8] {
-    let mut bytes = [0u8; 8];
-    bytes[0..4].copy_from_slice(&x.to_le_bytes());
-    bytes[4..8].copy_from_slice(&y.to_le_bytes());
-    bytes
+// Texel for texel, for the half of the frame that draws the bar.
+@fragment
+fn fs_copy(in: VertexOut) -> @location(0) vec4<f32> {{
+    return textureSample(source, source_sampler, in.uv);
+}}
+"#
+    )
+}
+
+/// One weight of the Gaussian, before normalisation.
+fn weight(distance_px: f32) -> f32 {
+    (-(distance_px * distance_px) / (2.0 * SIGMA_PX * SIGMA_PX)).exp()
+}
+
+/// One axis's kernel, as the uniform buffer wants it: TAPS pairs of
+/// (offset.x, offset.y, weight, 0) — the offset along the axis being blurred,
+/// in uv — then the centre tap's weight.
+///
+/// The pairs are the Gaussian's taps folded two at a time: the taps 1 and 2 px
+/// out share one fetch, placed at 1.5 px, because the sampler averages them
+/// there, and the pair's weight is the two weights added up. The whole set is
+/// then divided by its sum, so blurring a flat colour returns that colour.
+fn kernel_bytes(extent_px: f32, horizontal: bool) -> Vec<u8> {
+    let mut pairs = Vec::with_capacity(TAPS);
+    let mut total = weight(0.0);
+    for tap in 1..=TAPS {
+        let near = (2 * tap - 1) as f32;
+        let far = (2 * tap) as f32;
+        let pair = weight(near) + weight(far);
+        // Half a texel past the even boundary: between the two taps' texels.
+        let offset = (near + far) / 2.0 / extent_px;
+        pairs.push((offset, pair));
+        total += 2.0 * pair;
+    }
+
+    let mut words = Vec::with_capacity(4 * (TAPS + 1));
+    for (offset, pair) in pairs {
+        let x = if horizontal { offset } else { 0.0 };
+        let y = if horizontal { 0.0 } else { offset };
+        words.extend_from_slice(&[x, y, pair / total, 0.0]);
+    }
+    words.extend_from_slice(&[weight(0.0) / total, 0.0, 0.0, 0.0]);
+    words.iter().flat_map(|word| word.to_le_bytes()).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The kernel as Rust sees it: each pair's offset in pixels and its
+    /// normalised weight, plus the centre tap's weight.
+    fn taps(extent_px: f32) -> (Vec<(f32, f32)>, f32) {
+        let bytes = kernel_bytes(extent_px, true);
+        let word = |entry: &[u8], index: usize| {
+            f32::from_le_bytes(entry[index * 4..index * 4 + 4].try_into().unwrap())
+        };
+        let pairs = bytes
+            .as_chunks::<16>()
+            .0
+            .iter()
+            .take(TAPS)
+            .map(|entry| (word(entry, 0) * extent_px, word(entry, 2)))
+            .collect();
+        let centre = word(&bytes[16 * TAPS..], 0);
+        (pairs, centre)
+    }
+
+    #[test]
+    fn the_gaussian_adds_up_to_one_and_falls_off() {
+        let (pairs, centre) = taps(100.0);
+        let total = centre + 2.0 * pairs.iter().map(|(_, weight)| weight).sum::<f32>();
+        assert!((total - 1.0).abs() < 1e-4, "the weights sum to {total}");
+
+        // A pair outweighs the centre tap because it stands for two of them,
+        // so what falls off is the pairs — and, per texel, the middle of the
+        // kernel is still the heaviest, which is what `centre > pair / 2` says.
+        let weights: Vec<f32> = pairs.iter().map(|(_, weight)| *weight).collect();
+        assert!(centre > weights[0] / 2.0, "the centre tap is the heaviest");
+        assert!(
+            weights.windows(2).all(|pair| pair[0] > pair[1]),
+            "the weights fall off with distance: {weights:?}"
+        );
+    }
+
+    #[test]
+    fn the_pairs_sit_between_two_texels() {
+        // 1.5, 3.5, ...: half a texel past each even boundary, which is where
+        // the sampler averages the two taps the pair stands for.
+        for (index, (offset_px, _)) in taps(100.0).0.into_iter().enumerate() {
+            let expected = 2.0 * (index + 1) as f32 - 0.5;
+            assert!(
+                (offset_px - expected).abs() < 1e-3,
+                "pair {index} is at {offset_px} px, not {expected}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_axis_only_blurs_along_itself() {
+        let bytes = kernel_bytes(96.0, false);
+        for (index, entry) in bytes.as_chunks::<16>().0.iter().take(TAPS).enumerate() {
+            let word =
+                |at: usize| f32::from_le_bytes(entry[at * 4..at * 4 + 4].try_into().unwrap());
+            assert_eq!(word(0), 0.0, "pair {index} has an x offset on the y axis");
+            assert!(word(1) > 0.0, "pair {index} has no y offset");
+        }
+    }
 }
