@@ -9,17 +9,17 @@
 //! navigation (every account as a collapsible section of its folders), message
 //! list, reading pane.
 //!
-//! Two `egui::Modal`s open from the title bar. Search is the box with the
-//! magnifier in it: clicking it opens the popup, which holds the free text, the
-//! scope and the filters, all of it once a bar above the message list. The
-//! column carries no search chrome of its own — the magnifier turning
-//! accent-colored is what says a search is what it is showing. The cog is
-//! Preferences:
-//! its Accounts page holds the account list and the add/edit account form, its
+//! Three `egui::Modal`s open from the title bar, each dimming the columns
+//! behind it. Search is the box with the magnifier in it: clicking it opens the
+//! popup, which holds the free text, the scope and the filters. The column
+//! carries no search chrome of its own — the magnifier turning accent-colored
+//! is what says a search is what it is showing. The cog is Preferences: its
+//! Accounts page holds the account list and the add/edit account form, its
 //! Appearance page the theme (which resolves to a `theme::ColorScheme`), the
 //! HTML renderer and the fonts. That renderer draws the mail either as egui
 //! widgets (`crate::html`) or rasterized by Blitz (`crate::blitz_render`) on a
-//! worker thread.
+//! worker thread. The pencil is the compose card, which holds a draft and
+//! nothing else — Kimo has no SMTP, so there is nowhere for it to go.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::mpsc;
@@ -2249,16 +2249,21 @@ impl KimoApp {
         run_now
     }
 
-    /// The compose window, opened from the title bar: an `egui::Window` rather
-    /// than a modal, because writing a mail is not a decision the rest of the
-    /// app has to wait on — the columns stay usable behind it.
+    /// The compose window, opened from the title bar: an `egui::Modal`, so the
+    /// columns behind it are covered by a backdrop and cannot be used while a
+    /// mail is being written.
     ///
     /// It edits a draft and nothing else. Kimo speaks IMAP and POP3, with no
-    /// SMTP, so Send is drawn disabled and says why; the draft lives in the
-    /// window, and closing it — the ✕ or Discard — drops it.
+    /// SMTP, so Send is drawn disabled and says why; the draft lives in this
+    /// card, and Discard drops it.
+    ///
+    /// The backdrop click and Escape deliberately do not close it: the draft is
+    /// the only copy of the mail, and a click beside the card must not be what
+    /// throws it away, so `ModalResponse::should_close` is ignored and Discard
+    /// is the way out.
     fn compose_window(&mut self, ctx: &egui::Context) {
         // Taken out for the closure, which edits the draft while reading the
-        // account list, and put back only while the window is still open.
+        // account list, and put back unless the draft was discarded.
         let Some(mut draft) = self.compose.take() else {
             return;
         };
@@ -2274,135 +2279,118 @@ impl KimoApp {
             })
             .collect();
 
-        // Two ways out of the window, and both drop the draft: the ✕ egui draws
-        // from `open`, and the Discard button. They cannot share a flag —
-        // `open` is borrowed by the builder for as long as the window is on
-        // screen — so the two meet again below.
-        let mut open = true;
         let mut discard = false;
-        egui::Window::new("New mail")
-            .open(&mut open)
-            .collapsible(false)
-            .resizable(true)
-            .default_size(egui::vec2(COMPOSE_WIDTH, 520.0))
-            .default_pos(ctx.screen_rect().center() - egui::vec2(COMPOSE_WIDTH, 520.0) / 2.0)
-            .show(ctx, |ui| {
-                // The window is about to be laid out for the first time when
-                // this runs, so the available width can still be the screen's:
-                // what the boxes are given is clamped to the width they are
-                // designed for rather than believing it.
-                let field_width =
-                    (ui.available_width() - COMPOSE_LABEL_WIDTH - ui.spacing().item_spacing.x)
-                        .min(COMPOSE_WIDTH - COMPOSE_LABEL_WIDTH);
-                let field = |ui: &mut egui::Ui, label: &str, value: &mut String, hint: &str| {
-                    ui.horizontal(|ui| {
-                        ui.add_sized(
-                            [COMPOSE_LABEL_WIDTH, COMPOSE_FIELD_HEIGHT],
-                            egui::Label::new(label).halign(egui::Align::RIGHT),
-                        );
-                        ui.add(
-                            egui::TextEdit::singleline(value)
-                                .hint_text(hint)
-                                .desired_width(field_width),
-                        )
-                    })
-                    .inner
-                };
+        let _ = egui::Modal::new(egui::Id::new("compose")).show(ctx, |ui| {
+            ui.set_width(COMPOSE_WIDTH);
+            ui.heading("New mail");
+            ui.separator();
 
-                let from_label = draft
-                    .from
-                    .as_ref()
-                    .and_then(|id| accounts.iter().find(|(account_id, ..)| account_id == id))
-                    .map(|(_, name, address)| format!("{name} <{address}>"));
+            // The card is a fixed width, so the boxes get a constant: what the
+            // label column and the gap beside it leave.
+            let field_width = COMPOSE_WIDTH - COMPOSE_LABEL_WIDTH - ui.spacing().item_spacing.x;
+            let field = |ui: &mut egui::Ui, label: &str, value: &mut String, hint: &str| {
                 ui.horizontal(|ui| {
                     ui.add_sized(
                         [COMPOSE_LABEL_WIDTH, COMPOSE_FIELD_HEIGHT],
-                        egui::Label::new("From").halign(egui::Align::RIGHT),
+                        egui::Label::new(label).halign(egui::Align::RIGHT),
                     );
-                    match (accounts.is_empty(), from_label) {
-                        (true, _) => {
-                            ui.label(
-                                egui::RichText::new(
-                                    "No account yet — add one in Preferences → Accounts.",
-                                )
-                                .weak(),
-                            );
-                        }
-                        (false, Some(label)) => {
-                            egui::ComboBox::from_id_salt("compose-from")
-                                .selected_text(label)
-                                .width(field_width)
-                                .show_ui(ui, |ui| {
-                                    for (id, name, address) in &accounts {
-                                        ui.selectable_value(
-                                            &mut draft.from,
-                                            Some(id.clone()),
-                                            format!("{name} <{address}>"),
-                                        );
-                                    }
-                                });
-                        }
-                        // Only reachable if the From account vanished between
-                        // two frames; pick the fallback rather than showing a
-                        // list with nothing selected.
-                        (false, None) => {
-                            draft.from =
-                                compose_from(&self.accounts, self.selected_account.as_deref());
-                        }
-                    }
-                });
+                    ui.add(
+                        egui::TextEdit::singleline(value)
+                            .hint_text(hint)
+                            .desired_width(field_width),
+                    )
+                })
+                .inner
+            };
 
-                let to = field(ui, "To", &mut draft.to, "name@example.com");
-                if std::mem::take(&mut draft.focus) {
-                    to.request_focus();
-                }
-                field(ui, "Cc", &mut draft.cc, "name@example.com");
-                field(ui, "Subject", &mut draft.subject, "Subject");
-
-                ui.add_space(6.0);
-                // The body takes what the header and the footer leave, and
-                // scrolls on its own once the mail outgrows that — the window
-                // itself never scrolls.
-                let body_height =
-                    (ui.available_height() - COMPOSE_FOOTER_HEIGHT).clamp(120.0, 640.0);
-                egui::ScrollArea::vertical()
-                    .id_salt("compose-body")
-                    .max_height(body_height)
-                    .auto_shrink([false, false])
-                    .show(ui, |ui| {
-                        ui.add(
-                            egui::TextEdit::multiline(&mut draft.body)
-                                .hint_text("Write your message…")
-                                .desired_width(field_width)
-                                .desired_rows(12),
+            let from_label = draft
+                .from
+                .as_ref()
+                .and_then(|id| accounts.iter().find(|(account_id, ..)| account_id == id))
+                .map(|(_, name, address)| format!("{name} <{address}>"));
+            ui.horizontal(|ui| {
+                ui.add_sized(
+                    [COMPOSE_LABEL_WIDTH, COMPOSE_FIELD_HEIGHT],
+                    egui::Label::new("From").halign(egui::Align::RIGHT),
+                );
+                match (accounts.is_empty(), from_label) {
+                    (true, _) => {
+                        ui.label(
+                            egui::RichText::new(
+                                "No account yet — add one in Preferences → Accounts.",
+                            )
+                            .weak(),
                         );
-                    });
-
-                ui.add_space(6.0);
-                ui.separator();
-                ui.horizontal(|ui| {
-                    ui.label(
-                        egui::RichText::new(
-                            "Kimo cannot send mail: it speaks IMAP and POP3 only, with no SMTP.",
-                        )
-                        .small()
-                        .weak(),
-                    );
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        ui.add_enabled(false, egui::Button::new("Send"))
-                            .on_disabled_hover_text(
-                                "Sending is not implemented — Kimo has no SMTP.",
-                            );
-                        if ui.button("Discard").clicked() {
-                            discard = true;
-                        }
-                    });
-                });
+                    }
+                    (false, Some(label)) => {
+                        egui::ComboBox::from_id_salt("compose-from")
+                            .selected_text(label)
+                            .width(field_width)
+                            .show_ui(ui, |ui| {
+                                for (id, name, address) in &accounts {
+                                    ui.selectable_value(
+                                        &mut draft.from,
+                                        Some(id.clone()),
+                                        format!("{name} <{address}>"),
+                                    );
+                                }
+                            });
+                    }
+                    // Only reachable if the From account vanished between
+                    // two frames; pick the fallback rather than showing a
+                    // list with nothing selected.
+                    (false, None) => {
+                        draft.from = compose_from(&self.accounts, self.selected_account.as_deref());
+                    }
+                }
             });
 
-        // Closed: the draft goes with the window. There is no other copy of it
+            let to = field(ui, "To", &mut draft.to, "name@example.com");
+            if std::mem::take(&mut draft.focus) {
+                to.request_focus();
+            }
+            field(ui, "Cc", &mut draft.cc, "name@example.com");
+            field(ui, "Subject", &mut draft.subject, "Subject");
+
+            ui.add_space(6.0);
+            // The body is a fixed height and scrolls on its own once the
+            // mail outgrows it: the card never grows with the draft.
+            egui::ScrollArea::vertical()
+                .id_salt("compose-body")
+                .max_height(COMPOSE_BODY_HEIGHT)
+                .auto_shrink([false, false])
+                .show(ui, |ui| {
+                    ui.add(
+                        egui::TextEdit::multiline(&mut draft.body)
+                            .hint_text("Write your message…")
+                            .desired_width(field_width)
+                            .desired_rows(12),
+                    );
+                });
+
+            ui.add_space(6.0);
+            ui.separator();
+            ui.horizontal(|ui| {
+                ui.label(
+                    egui::RichText::new(
+                        "Kimo cannot send mail: it speaks IMAP and POP3 only, with no SMTP.",
+                    )
+                    .small()
+                    .weak(),
+                );
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.add_enabled(false, egui::Button::new("Send"))
+                        .on_disabled_hover_text("Sending is not implemented — Kimo has no SMTP.");
+                    if ui.button("Discard").clicked() {
+                        discard = true;
+                    }
+                });
+            });
+        });
+
+        // Discarded: the draft goes with the card. There is no other copy of it
         // and nowhere it could have been saved to.
-        if open && !discard {
+        if !discard {
             self.compose = Some(draft);
         }
     }
@@ -3499,9 +3487,9 @@ impl eframe::App for KimoApp {
         // the modals, which egui keeps in the foreground layer.
         self.titlebar_area(ctx);
 
-        // The compose window sits over the columns but under the popups: egui
-        // keeps modals in the foreground layer, so it needs no ordering of its
-        // own — a draft is not a decision the rest of the app waits on.
+        // The compose modal: over the columns and the bar, and under any modal
+        // opened after it (egui stacks the foreground layer in the order its
+        // areas are shown).
         if self.compose.is_some() {
             self.compose_window(ctx);
         }
@@ -3621,14 +3609,14 @@ const BRAND_ICON_SIZE: f32 = 18.0;
 /// item.
 const BRAND_ICON_MARGIN: f32 = 10.0;
 
-/// The compose window: the width its boxes are laid out for (also the width it
-/// opens at), the label column of its header fields, the height of one of those
-/// one-line fields, and what its footer — the note and the buttons — is
-/// reserved out of the body's height.
+/// The compose modal: the width of its card (what the boxes are laid out for),
+/// the label column of its header fields, the height of one of those one-line
+/// fields, and the height of the body box, which scrolls rather than growing
+/// the card.
 const COMPOSE_WIDTH: f32 = 560.0;
 const COMPOSE_LABEL_WIDTH: f32 = 56.0;
 const COMPOSE_FIELD_HEIGHT: f32 = 22.0;
-const COMPOSE_FOOTER_HEIGHT: f32 = 96.0;
+const COMPOSE_BODY_HEIGHT: f32 = 320.0;
 
 /// The shape every icon in the title bar is drawn in: as wide as a window
 /// control and the full height of the bar, so they all highlight the same way.

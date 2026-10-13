@@ -30,8 +30,9 @@ Kimo is a desktop **email client** GUI written in pure Rust:
   (pulling in `encoding_rs`, pure Rust) so GB2312/GBK/GB18030/Big5/
   Shift-JIS/… mail decodes to proper UTF-8 instead of Latin-1 mojibake.
 - **Receive-only by design.** There is no SMTP and nothing is ever sent:
-  composing exists as a window that holds a draft in memory (`ComposeDraft`),
-  with its Send button disabled — see the compose-window convention below.
+  composing exists as a modal card that holds a draft in memory
+  (`ComposeDraft`), with its Send button disabled — see the compose-window
+  convention below.
 - **Tray icon:** `src/tray.rs` implements StatusNotifierItem by speaking the
   D-Bus wire protocol directly on a `std::thread` — deliberately not zbus
   (async executor, rule 2) or the GTK tray crates (C, rule 1). The icon is
@@ -523,23 +524,28 @@ Event (mpsc) ──► drain_events() at frame start ──► merge into Accoun
   for the project owner, not a fix to slip in. The folder's sync mark is
   deliberately not moved back: the mail is gone from the server too, and a mark
   that walked back to it would only make the next sync fetch it again.
-- The compose window (`compose_window`, opened by the title bar's pencil) is
-  the app's one `egui::Window`: an `egui::Modal` would block the columns, and
-  writing a mail is not a decision the rest of the app waits on. It floats over
-  the columns and under the modals (egui paints modals in the foreground
-  layer), and there is one of it — `KimoApp::compose` holds the draft, and the
-  button leaves an open window alone rather than resetting what has been typed
-  into it. From is the configured accounts, defaulting to the one whose mail is
-  open and falling back to the first (`compose_from`); To, Cc, Subject and the
-  body are plain strings in `ComposeDraft`, deliberately not widget state: a
-  window opened again must start empty. The boxes are a fixed label column plus
-  what the window's width leaves (`COMPOSE_WIDTH` and friends), the body takes
-  the height the header and footer leave and scrolls inside that, and the first
-  frame puts the keyboard in To.
+- The compose window (`compose_window`, opened by the title bar's pencil) is an
+  `egui::Modal`, like the search popup and Preferences: a card `COMPOSE_WIDTH`
+  wide in the foreground layer, whose backdrop dims the columns and the bar and
+  takes their clicks, so a mail is written with the rest of the app out of the
+  way. There is one of it — `KimoApp::compose` holds the draft, and the button
+  leaves an open card alone rather than resetting what has been typed into it.
+  From is the configured accounts, defaulting to the one whose mail is open and
+  falling back to the first (`compose_from`); To, Cc, Subject and the body are
+  plain strings in `ComposeDraft`, deliberately not widget state: a card opened
+  again must start empty. The boxes are a fixed label column plus what
+  `COMPOSE_WIDTH` leaves, the body is `COMPOSE_BODY_HEIGHT` tall and scrolls
+  inside that rather than growing the card, and the first frame puts the
+  keyboard in To.
+  **The backdrop does not close it.** `ModalResponse::should_close` — a click
+  beside the card, or Escape — is deliberately ignored: the draft is the only
+  copy of the mail, and neither should be what throws it away. Discard is the
+  way out. The app's other two modals do close on the backdrop; the difference
+  here is the draft.
   **Nothing is sent and nothing is persisted.** Kimo speaks IMAP and POP3 only
   (hard rule 4), so Send is drawn disabled with the reason on its tooltip and
-  the footer says so in words; there is no drafts folder, so closing the window
-  — its ✕ or Discard — is the end of the mail, which is the only copy of it.
+  the footer says so in words; there is no drafts folder, so Discard is the end
+  of the mail, which is the only copy of it.
   Wiring any of that up is a decision for the project owner, not an oversight
   to fix in passing.
 - `preferences_modal()` is the one place to configure Kimo: an
