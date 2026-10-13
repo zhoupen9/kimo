@@ -462,7 +462,15 @@ Event (mpsc) ──► drain_events() at frame start ──► merge into Accoun
   stock widget radius (`SEARCH_BOX_CORNER_RADIUS`); its frame is stock
   `TextEdit` chrome, so the radius is set on the widget visuals in a scope —
   and because the field is deliberately non-interactive, the slot that matters
-  is `noninteractive` (egui picks the visuals by `Sense`, not by hover).
+  is `noninteractive` (egui picks the visuals by `Sense`, not by hover). Its
+  *fill* goes to glass with the bar (`GLASS_FIELD_ALPHA`, animated by the same
+  value): the one control in the bar with a background of its own would
+  otherwise sit on the glass as a solid sticker, so it keeps only part of the
+  scheme's `input` and the blurred mail shows through the box the way it
+  shows through the bar, with the stroke left to say where the field is. That
+  fill has to be set per widget (`TextEdit::background_color`) rather than on
+  a widget slot, because the stock frame is drawn from
+  `Visuals::extreme_bg_color`.
 - The frosted backdrop is the one piece of hand-written OpenGL in the app
   (`src/glass.rs`), because egui has no blur: nothing in the painter can sample
   what has already been drawn. It is an `egui::PaintCallback`

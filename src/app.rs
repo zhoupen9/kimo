@@ -1526,7 +1526,7 @@ impl KimoApp {
                 // of the bar, so everything in `titlebar` lays out from the
                 // window's top edge exactly as it did in the panel.
                 ui.scope_builder(egui::UiBuilder::new().max_rect(rect), |ui| {
-                    self.titlebar(ui);
+                    self.titlebar(ui, floating);
                 });
             });
     }
@@ -1537,7 +1537,11 @@ impl KimoApp {
     /// per-account status. Right edge: the preferences cog, then minimize /
     /// maximize / close. The leftover space drags the window (double-click
     /// toggles maximize).
-    fn titlebar(&mut self, ui: &mut egui::Ui) {
+    ///
+    /// `floating` is how far the bar has gone to glass (see `titlebar_area`),
+    /// which the search box follows: it is the one control in the bar with a
+    /// fill of its own, and it would sit on the glass as a solid sticker.
+    fn titlebar(&mut self, ui: &mut egui::Ui, floating: f32) {
         let bar = ui.available_rect_before_wrap();
         let visuals = ui.visuals().clone();
         let scheme = theme::of(ui.ctx());
@@ -1712,6 +1716,13 @@ impl KimoApp {
                     // rather than by hover, so `noninteractive` is the slot it
                     // actually draws with; the rest are rounded as well, so that
                     // making the field live again would not square the corners.
+                    //
+                    // Its fill goes to glass with the bar: the fill keeps only
+                    // part of the input color, so the blurred mail behind the
+                    // bar shows through the box the way it shows through the
+                    // bar itself. The stock frame is drawn from
+                    // `Visuals::extreme_bg_color`, which is why this is
+                    // `background_color` and not another widget slot.
                     let field = row
                         .scope(|ui| {
                             let radius = egui::CornerRadius::same(SEARCH_BOX_CORNER_RADIUS);
@@ -1725,10 +1736,14 @@ impl KimoApp {
                             ] {
                                 widget.corner_radius = radius;
                             }
+                            let fill = scheme
+                                .input
+                                .gamma_multiply(1.0 - floating * (1.0 - GLASS_FIELD_ALPHA));
                             ui.add(
                                 egui::TextEdit::singleline(&mut self.search.text)
                                     .hint_text("Search mail…")
                                     .interactive(false)
+                                    .background_color(fill)
                                     .desired_width(TITLEBAR_SEARCH_WIDTH)
                                     // The bar is taller than a text row, so the
                                     // field is grown to a fixed height and the
@@ -3535,6 +3550,11 @@ const TITLEBAR_FLOAT_TIME: f32 = 0.16;
 /// query stay crisp, low enough that the smudge behind them reads as mail
 /// rather than as a smeared background.
 const GLASS_ALPHA: f32 = 0.62;
+/// The same for the search box's own fill, which is lighter than the bar's to
+/// begin with: it keeps a little less of it, so the box is glass too and the
+/// mail still shows through it. The stroke is what keeps it reading as a
+/// field once the fill has gone.
+const GLASS_FIELD_ALPHA: f32 = 0.45;
 /// Width of the title bar's search box (the text part of it). Fixed rather
 /// than filling: the bar also carries the drag surface, and it should not move
 /// around with the length of a query.
