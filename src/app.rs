@@ -956,6 +956,26 @@ impl KimoApp {
                     }
                 }
             }
+            Event::OlderMail {
+                account_id,
+                folder,
+                available,
+            } => {
+                // What the server said about older mail — the one thing the
+                // list's button is drawn from. Nothing else on screen depends
+                // on it (the column counts mail, not marks), so no rows are
+                // derived again for it.
+                if let Some(state) = self.states.get_mut(&account_id) {
+                    if let Some(folder) = state
+                        .mailbox
+                        .folders
+                        .iter_mut()
+                        .find(|candidate| candidate.name == folder)
+                    {
+                        folder.can_load_older = available;
+                    }
+                }
+            }
             Event::Messages {
                 account_id,
                 folder,
@@ -975,6 +995,10 @@ impl KimoApp {
                             // is one of the folders the column lists rather
                             // than one kept for its cached mail.
                             listed: true,
+                            // The job that fetched the mail reports what the
+                            // server said about older mail in `OlderMail`,
+                            // which is what sets this for real.
+                            can_load_older: false,
                             messages: Vec::new(),
                         });
                     }
@@ -2830,6 +2854,9 @@ impl KimoApp {
                 };
                 ui.label(egui::RichText::new(text).weak().heading());
             });
+            // Nothing to scroll: whatever the folder holds, this *is* the
+            // bottom of the list.
+            self.load_older_button(ui);
             return;
         }
         let mut clicked: Option<MailMessage> = None;
@@ -2862,8 +2889,102 @@ impl KimoApp {
             });
         // Scrolled away from the top, the bar floats over this list.
         self.list_scroll = list.state.offset.y;
+        // The bottom of the list is the one place where "older" is what the eye
+        // is on, so it is where the button belongs. A list shorter than its
+        // viewport is at its bottom by definition.
+        let end = (list.content_size.y - list.inner_rect.height()).max(0.0);
+        if list.state.offset.y >= end - 1.0 {
+            self.load_older_button(ui);
+        }
         if let Some(msg) = clicked {
             self.open_message(&msg);
+        }
+    }
+
+    /// `Load older mail`, floating over the bottom of the message list: the
+    /// folder's marks say the server has mail below everything this machine
+    /// holds, and the list has nothing left below the fold. A click hands the
+    /// folder to `Job::LoadOlder`, which asks the server how far down it goes
+    /// before it fetches anything — so a click that finds nothing clears the
+    /// button instead of failing.
+    ///
+    /// Drawn after the rows, in the column's own rect, so it reads as floating
+    /// over them rather than as the last row: it belongs to the foot of the
+    /// column, and scrolling never carries it away. While the account is busy
+    /// with the server the button says so and stops taking clicks — the
+    /// title bar's spinner is the other half of that.
+    fn load_older_button(&mut self, ui: &mut egui::Ui) {
+        let (Some(account_id), Some(folder)) = (&self.selected_account, &self.selected_folder)
+        else {
+            return;
+        };
+        let (account_id, folder) = (account_id.clone(), folder.clone());
+        let Some(state) = self.states.get(&account_id) else {
+            return;
+        };
+        let available = state
+            .mailbox
+            .folders
+            .iter()
+            .find(|candidate| candidate.name == folder)
+            .is_some_and(|folder| folder.can_load_older);
+        if !available {
+            return;
+        }
+        let busy = state.syncing;
+
+        let scheme = theme::of(ui.ctx());
+        let column = ui.max_rect();
+        let size = egui::vec2(LOAD_OLDER_WIDTH, LOAD_OLDER_HEIGHT);
+        let rect = egui::Rect::from_center_size(
+            egui::pos2(
+                column.center().x,
+                column.bottom() - LOAD_OLDER_MARGIN - size.y / 2.0,
+            ),
+            size,
+        );
+        let label = if busy {
+            "Loading…"
+        } else {
+            "Load older mail"
+        };
+        let clicked = ui
+            .scope_builder(
+                egui::UiBuilder::new()
+                    .max_rect(rect)
+                    .layout(egui::Layout::centered_and_justified(
+                        egui::Direction::LeftToRight,
+                    )),
+                |ui| {
+                    // A shadow, so the button reads as floating over the rows
+                    // rather than as a row of its own.
+                    egui::Frame::new()
+                        .shadow(ui.visuals().window_shadow)
+                        .show(ui, |ui| {
+                            ui.add_enabled(
+                                !busy,
+                                egui::Button::new(label)
+                                    .min_size(size)
+                                    .fill(scheme.input)
+                                    .corner_radius(LOAD_OLDER_CORNER_RADIUS),
+                            )
+                        })
+                        .inner
+                },
+            )
+            .inner;
+        let clicked = clicked.on_hover_text(format!(
+            "There is older mail on the server — fetch the next {} messages",
+            sync::OLDER_BATCH
+        ));
+        if clicked.clicked() {
+            if let Some(account) = self.accounts.iter().find(|a| a.id == account_id).cloned() {
+                sync::spawn(
+                    Job::LoadOlder { account, folder },
+                    self.ctx.clone(),
+                    self.tx.clone(),
+                );
+            }
         }
     }
 
@@ -4105,6 +4226,15 @@ const MAIL_ACTION_GLYPH: f32 = 18.0;
 /// Padding on the sides of the message list's rows: the hairlines `mail_list`
 /// draws down the column's sides sit just outside it.
 const LIST_MARGIN: i8 = 8;
+
+/// The floating `Load older mail` button: its size, how far its bottom edge
+/// stays clear of the column's, and its corner (the same roundness as the
+/// search box, so the two controls the bar and the list float read as one
+/// family rather than as two widgets that happen to be on top).
+const LOAD_OLDER_WIDTH: f32 = 150.0;
+const LOAD_OLDER_HEIGHT: f32 = 26.0;
+const LOAD_OLDER_MARGIN: f32 = 12.0;
+const LOAD_OLDER_CORNER_RADIUS: u8 = SEARCH_BOX_CORNER_RADIUS;
 
 /// The rows' padding inside the list's scroll area. The top is the title
 /// bar's height and it is *inside* the scroll area on purpose: the first mail
@@ -5630,6 +5760,7 @@ mod tests {
             uidvalidity: Some(1),
             synced: true,
             listed: true,
+            can_load_older: false,
             messages,
         };
         let mut mailboxes = HashMap::new();
@@ -5662,6 +5793,7 @@ mod tests {
                 uidvalidity: Some(1),
                 synced: *count > 0,
                 listed: *listed,
+                can_load_older: false,
                 messages: (0..*count)
                     .map(|index| test_message(&format!("{name}-{index}"), false))
                     .collect(),
@@ -5987,6 +6119,114 @@ mod tests {
             app.selected_message.as_deref(),
             Some(expected.to_string().as_str())
         );
+    }
+
+    /// The floating `Load older mail` button: drawn only while the folder's
+    /// marks say the server has mail below everything this machine holds, and
+    /// only at the bottom of the list — the one place where "older" is what the
+    /// eye is on. A list shorter than its viewport is at its bottom by
+    /// definition, which is how the first two frames below are drawn.
+    #[test]
+    fn the_load_older_button_is_offered_at_the_bottom_of_the_list() {
+        let ctx = egui::Context::default();
+        crate::fonts::install(&ctx, None, None);
+        let mut app = app_with_messages(&ctx, 3);
+
+        // The marks have not been asked yet: nothing to load, nothing drawn.
+        assert!(!frame_texts(&ctx, &mut app)
+            .iter()
+            .any(|text| text == "Load older mail"));
+
+        // The server said there is older mail (as a sync would).
+        let folder = app
+            .states
+            .get_mut("acct")
+            .unwrap()
+            .mailbox
+            .folders
+            .iter_mut()
+            .find(|folder| folder.name == "INBOX")
+            .unwrap();
+        folder.can_load_older = true;
+        assert!(frame_texts(&ctx, &mut app)
+            .iter()
+            .any(|text| text == "Load older mail"));
+
+        // A long list starts at its top, which is not the bottom.
+        let mut long = app_with_messages(&ctx, 60);
+        long.states
+            .get_mut("acct")
+            .unwrap()
+            .mailbox
+            .folders
+            .iter_mut()
+            .find(|folder| folder.name == "INBOX")
+            .unwrap()
+            .can_load_older = true;
+        run_app_frame(&ctx, &mut long, Vec::new());
+        assert!(
+            !frame_texts(&ctx, &mut long)
+                .iter()
+                .any(|text| text == "Load older mail"),
+            "the button belongs to the bottom of the list, not to its top"
+        );
+
+        // Scrolled all the way down, it is there. The wheel only reaches a
+        // scroll area the pointer is over.
+        run_app_frame(
+            &ctx,
+            &mut long,
+            vec![egui::Event::PointerMoved(egui::pos2(300.0, 400.0))],
+        );
+        run_app_frame(
+            &ctx,
+            &mut long,
+            vec![egui::Event::MouseWheel {
+                unit: egui::MouseWheelUnit::Point,
+                delta: egui::vec2(0.0, -100_000.0),
+                phase: egui::TouchPhase::Move,
+                modifiers: egui::Modifiers::default(),
+            }],
+        );
+        for _ in 0..30 {
+            run_app_frame(&ctx, &mut long, Vec::new());
+        }
+        assert!(long.list_scroll > 0.0, "the list did not scroll");
+        assert!(
+            frame_texts(&ctx, &mut long)
+                .iter()
+                .any(|text| text == "Load older mail"),
+            "the end of the list is where the button is offered"
+        );
+    }
+
+    /// A click on the button asks the server, and the answer is what the button
+    /// is drawn from: the event a job sends when it finds nothing below the
+    /// floor takes it away again. (The job itself needs a server; this is the
+    /// half of it that is the app's.)
+    #[test]
+    fn the_answer_about_older_mail_is_what_draws_the_button() {
+        let ctx = egui::Context::default();
+        crate::fonts::install(&ctx, None, None);
+        let mut app = app_with_messages(&ctx, 3);
+
+        app.apply_event(Event::OlderMail {
+            account_id: "acct".to_string(),
+            folder: "INBOX".to_string(),
+            available: true,
+        });
+        assert!(frame_texts(&ctx, &mut app)
+            .iter()
+            .any(|text| text == "Load older mail"));
+
+        app.apply_event(Event::OlderMail {
+            account_id: "acct".to_string(),
+            folder: "INBOX".to_string(),
+            available: false,
+        });
+        assert!(!frame_texts(&ctx, &mut app)
+            .iter()
+            .any(|text| text == "Load older mail"));
     }
 
     /// One headless frame of an app under test at a given window width, with

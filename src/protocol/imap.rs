@@ -124,6 +124,16 @@ impl ImapClient {
         Ok(info)
     }
 
+    /// The oldest message the selected mailbox holds: `FETCH 1 (UID)` asks for
+    /// the *first* message by sequence number, and sequence numbers run in UID
+    /// order, so the first one is the oldest — one line of answer instead of a
+    /// UID set the size of the mailbox. `None` is an empty mailbox, which is an
+    /// answer too.
+    pub fn oldest_uid(&mut self) -> MailResult<Option<u32>> {
+        let (_, untagged) = self.run("FETCH 1 (UID)")?;
+        Ok(untagged.iter().find_map(|line| extract_uid(line)))
+    }
+
     /// FETCH `set` (UID FLAGS BODY.PEEK[]) and return each message with its raw
     /// RFC 5322 bytes. `set` is a sequence set, or a UID set when `by_uid` —
     /// the caller knows which range it asked for. Handles `{n}` literal
@@ -611,6 +621,53 @@ mod tests {
 
         client.delete_message("INBOX", 45).unwrap();
         assert_eq!(server.join().unwrap().len(), 5);
+    }
+
+    /// The oldest message is asked for by *sequence* number — `FETCH 1 (UID)`,
+    /// not a UID set — because a sequence number is what is ordered by UID and
+    /// can name the oldest message in one line. An empty mailbox answers with
+    /// no FETCH line at all, which is not an error.
+    #[test]
+    fn the_oldest_uid_is_the_first_message_by_sequence_number() {
+        let (account, server) = one_shot_server(vec![
+            (
+                "LIST \"\" \"*\"",
+                "* LIST (\\HasNoChildren) \"/\" \"INBOX\"\r\n{tag} OK LIST completed\r\n"
+                    .to_string(),
+            ),
+            (
+                "SELECT \"INBOX\"",
+                "* 3 EXISTS\r\n{tag} OK [READ-WRITE] SELECT completed\r\n".to_string(),
+            ),
+            (
+                "FETCH 1 (UID)",
+                "* 1 FETCH (UID 480)\r\n{tag} OK FETCH completed\r\n".to_string(),
+            ),
+        ]);
+        let mut client = ImapClient::connect(&account).unwrap();
+        client.list_folders().unwrap();
+        client.select("INBOX").unwrap();
+        assert_eq!(client.oldest_uid().unwrap(), Some(480));
+        server.join().unwrap();
+
+        // The same mailbox, empty: the server answers the FETCH with nothing.
+        let (account, server) = one_shot_server(vec![
+            (
+                "LIST \"\" \"*\"",
+                "* LIST (\\HasNoChildren) \"/\" \"INBOX\"\r\n{tag} OK LIST completed\r\n"
+                    .to_string(),
+            ),
+            (
+                "SELECT \"INBOX\"",
+                "* 0 EXISTS\r\n{tag} OK [READ-WRITE] SELECT completed\r\n".to_string(),
+            ),
+            ("FETCH 1 (UID)", "{tag} OK FETCH completed\r\n".to_string()),
+        ]);
+        let mut client = ImapClient::connect(&account).unwrap();
+        client.list_folders().unwrap();
+        client.select("INBOX").unwrap();
+        assert_eq!(client.oldest_uid().unwrap(), None);
+        server.join().unwrap();
     }
 
     /// A server without UIDPLUS rejects `UID EXPUNGE`; the message has just

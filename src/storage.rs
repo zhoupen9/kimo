@@ -130,6 +130,12 @@ pub struct Folder {
     /// this machine has — so the column keeps the row too, and this is what
     /// lets it say that the server no longer has it.
     pub listed: bool,
+    /// Whether the folder's marks say the server has mail below the oldest this
+    /// machine holds — what the message list's `Load older mail` button is
+    /// drawn from. A fact about the server as of the last time it was asked,
+    /// like `listed`: `db::load_mailboxes` derives it at startup, and the jobs
+    /// that ask the server report it as they learn it.
+    pub can_load_older: bool,
     pub messages: Vec<MailMessage>,
 }
 

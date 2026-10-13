@@ -23,10 +23,38 @@ use crate::storage;
 pub const BACKFILL_LIMIT: u32 = 50;
 
 /// The lowest 1-based position a first sync reaches: the newest
-/// `BACKFILL_LIMIT` messages of `total`. Everything older is out of scope, and
-/// the mark the sync stores is what says so.
+/// `BACKFILL_LIMIT` messages of `total`. Everything older waits for a
+/// `Load older mail` click — see `OLDER_BATCH`.
 fn backfill_start(total: usize) -> usize {
     total.saturating_sub(BACKFILL_LIMIT as usize) + 1
+}
+
+/// How many older messages one `Load older mail` click fetches. The same size
+/// as a folder's first fetch, so the list grows in the steps it started in.
+pub const OLDER_BATCH: u32 = 50;
+
+/// The UID range one click takes out of an IMAP folder: the batch below the
+/// floor the folder has been fetched down to, or the server's oldest message,
+/// whichever is closer — and `None` when there is nothing below the floor at
+/// all, either because the floor is the first UID there is or because the
+/// server's oldest message is one we already hold.
+fn older_uids(floor: u32, oldest: u32, batch: u32) -> Option<(u32, u32)> {
+    if floor <= 1 || oldest >= floor {
+        return None;
+    }
+    Some((oldest.max(floor.saturating_sub(batch)), floor - 1))
+}
+
+/// The same for a POP3 drop, whose numbering always starts at 1: the only
+/// question is how far above it the floor is. A floor below one batch's worth
+/// takes the whole of what is left, which is why the subtraction saturates —
+/// the first click of a folder that was backfilled from number 21 asks for
+/// 1..20, not for an underflow.
+fn older_numbers(floor: u32, batch: u32) -> Option<(u32, u32)> {
+    if floor <= 1 {
+        return None;
+    }
+    Some((floor.saturating_sub(batch).max(1), floor - 1))
 }
 
 /// The UID a fetch resumes from, or `None` when the folder has to be fetched
@@ -65,6 +93,11 @@ pub enum Job {
     },
     /// Fetch one specific IMAP folder.
     SyncFolder { account: Account, folder: String },
+    /// Fetch the mail below the floor one folder has been fetched down to —
+    /// the `Load older mail` button at the bottom of the list. The folder is
+    /// asked how far down it goes first, so a click that finds nothing is one
+    /// that reports it rather than one that fails.
+    LoadOlder { account: Account, folder: String },
     /// Push `\Seen` back to the server (IMAP only) and store the flag in the
     /// database (both protocols; POP3 has no server-side flags).
     MarkSeen {
@@ -126,6 +159,15 @@ pub enum Event {
     SyncFailed {
         account_id: String,
         error: String,
+    },
+    /// Whether the server has older mail below what one folder holds — the
+    /// answer the list's `Load older mail` button is drawn from. Sent by every
+    /// job that asks: a sync probes as it fetches, and a click answers as it
+    /// loads, so the button is never stale for longer than one round trip.
+    OlderMail {
+        account_id: String,
+        folder: String,
+        available: bool,
     },
     /// One message is out of the server and out of the database, so the UI
     /// can drop its in-memory copy of it.
@@ -251,6 +293,26 @@ pub fn spawn(job: Job, ctx: egui::Context, tx: Sender<Event>) {
             }
             ctx.request_repaint();
         }
+        Job::LoadOlder { account, folder } => {
+            // A round trip like any other: the account's spinner says the
+            // server is being asked while it happens.
+            let account_id = account.id.clone();
+            let _ = tx.send(Event::SyncStarted {
+                account_id: account_id.clone(),
+            });
+            match load_older(&account, &folder, &tx) {
+                Ok(()) => {
+                    let _ = tx.send(Event::SyncDone { account_id });
+                }
+                Err(error) => {
+                    let _ = tx.send(Event::SyncFailed {
+                        account_id,
+                        error: format!("older mail: {error}"),
+                    });
+                }
+            }
+            ctx.request_repaint();
+        }
         Job::DeleteMessage {
             account,
             folder,
@@ -294,6 +356,7 @@ pub fn spawn(job: Job, ctx: egui::Context, tx: Sender<Event>) {
                 | Job::Search { .. }
                 | Job::MarkSeen { .. }
                 | Job::DeleteMessage { .. }
+                | Job::LoadOlder { .. }
                 | Job::DeleteAccount { .. } => unreachable!(),
             };
             let _ = tx.send(Event::SyncStarted {
@@ -327,6 +390,7 @@ pub fn spawn(job: Job, ctx: egui::Context, tx: Sender<Event>) {
                 | Job::Search { .. }
                 | Job::MarkSeen { .. }
                 | Job::DeleteMessage { .. }
+                | Job::LoadOlder { .. }
                 | Job::DeleteAccount { .. } => unreachable!(),
             };
             let _ = match result {
@@ -508,13 +572,21 @@ fn fetch_folder_into(
 ) -> MailResult<()> {
     let info = client.select(folder)?;
     let resume = resume_uid(&db::folder_sync(&account.id, folder)?, info.uidvalidity);
+    // How far down the mailbox goes is the server's own answer, and this is
+    // where it is asked for: one `FETCH 1 (UID)` per folder, kept in the
+    // database so the list knows about older mail without a round trip of its
+    // own (see `Job::LoadOlder`).
+    let oldest = client.oldest_uid()?;
+    let mut floor: Option<u32> = None;
     let mut messages = Vec::new();
     if info.exists > 0 {
         // A folder that was fetched before is asked for the UIDs it does not
         // have yet: `<next>:*` is everything from the mark on. A server may
         // answer that with the last message when the mark is already past the
         // end, which the filter drops. A folder that was never fetched takes
-        // the newest `BACKFILL_LIMIT` messages, by sequence number.
+        // the newest `BACKFILL_LIMIT` messages, by sequence number — and the
+        // lowest UID of that window is the floor a `Load older mail` click
+        // starts below.
         let fetched = match resume {
             Some(next) => client
                 .fetch_bodies(&format!("{next}:*"), true)?
@@ -523,7 +595,9 @@ fn fetch_folder_into(
                 .collect(),
             None => {
                 let start = backfill_start(info.exists as usize) as u32;
-                client.fetch_bodies(&format!("{start}:{}", info.exists), false)?
+                let fetched = client.fetch_bodies(&format!("{start}:{}", info.exists), false)?;
+                floor = fetched.iter().map(|message| message.uid).min();
+                fetched
             }
         };
         for fetched in fetched {
@@ -547,7 +621,93 @@ fn fetch_folder_into(
             messages,
         });
     }
+    // The two marks the button is drawn from, written after the batch and its
+    // rotation: a window that was just fetched is the floor, and the answer is
+    // what the server said. Nothing is reported from a generation the store
+    // did not keep — a rotation clears both, and this puts the new ones back.
+    if let Some(floor) = floor {
+        db::set_first_num(&account.id, folder, floor)?;
+    }
+    db::set_oldest_uid(&account.id, folder, oldest)?;
+    let mark = db::folder_sync(&account.id, folder)?;
+    let _ = tx.send(Event::OlderMail {
+        account_id: account.id.clone(),
+        folder: folder.to_string(),
+        available: db::older_available(mark.first_num, mark.oldest_uid),
+    });
     Ok(())
+}
+
+/// Fetch the older mail of one folder: the batch below the floor it has been
+/// fetched down to. IMAP names the range by UID, POP3 by message number.
+fn load_older(account: &Account, folder: &str, tx: &Sender<Event>) -> MailResult<()> {
+    match account.protocol {
+        Protocol::Imap => load_older_imap(account, folder, tx),
+        Protocol::Pop3 => load_older_pop3(account, tx),
+    }
+}
+
+fn load_older_imap(account: &Account, folder: &str, tx: &Sender<Event>) -> MailResult<()> {
+    with_imap(account, |client| {
+        client.login(&account.username, &account.password)?;
+        let info = client.select(folder)?;
+        let oldest = client.oldest_uid()?;
+        let mark = db::folder_sync(&account.id, folder)?;
+        // The stored UIDs are the address of the mail this folder holds. Under
+        // another UIDVALIDITY they address different mail, and a batch fetched
+        // now would replace them with a slice out of the middle of the mailbox:
+        // the sync is what rotates a folder, so this only says what it found.
+        let same_generation = matches!(
+            (mark.uidvalidity, info.uidvalidity),
+            (Some(stored), Some(selected)) if stored == selected
+        );
+        if !same_generation {
+            return Err(MailError::Protocol(
+                "the folder changed on the server — sync it before loading older mail".to_string(),
+            ));
+        }
+        // The answer is recorded either way: the button is drawn from it, and
+        // "this mailbox is empty" is an answer.
+        db::set_oldest_uid(&account.id, folder, oldest)?;
+        let mut more = false;
+        let range = match (mark.first_num, oldest) {
+            (Some(floor), Some(oldest)) => {
+                older_uids(floor, oldest, OLDER_BATCH).map(|range| (range, oldest))
+            }
+            _ => None,
+        };
+        if let Some(((low, high), oldest)) = range {
+            let fetched = client.fetch_bodies(&format!("{low}:{high}"), true)?;
+            let mut messages = Vec::new();
+            for fetched in fetched {
+                let seen = fetched
+                    .flags
+                    .iter()
+                    .any(|f| f.eq_ignore_ascii_case("\\Seen"));
+                messages.push(mail::parse(&fetched.raw, &fetched.uid.to_string(), seen));
+            }
+            // The floor moves whether or not the range held anything: it is
+            // where this folder has been asked from, and a mailbox with gaps in
+            // it would otherwise be asked for the same empty range forever.
+            db::set_first_num(&account.id, folder, low)?;
+            if !messages.is_empty() {
+                db::save_messages(&account.id, folder, info.uidvalidity, &messages)?;
+                let _ = tx.send(Event::Messages {
+                    account_id: account.id.clone(),
+                    folder: folder.to_string(),
+                    uidvalidity: info.uidvalidity,
+                    messages,
+                });
+            }
+            more = low > oldest;
+        }
+        let _ = tx.send(Event::OlderMail {
+            account_id: account.id.clone(),
+            folder: folder.to_string(),
+            available: more,
+        });
+        Ok(())
+    })
 }
 
 /// Store the flag locally and, for IMAP, push it to the server. The local
@@ -608,6 +768,52 @@ fn pop3_delete(account: &Account, uid: &str) -> MailResult<()> {
     result
 }
 
+fn load_older_pop3(account: &Account, tx: &Sender<Event>) -> MailResult<()> {
+    let mut client = Pop3Client::connect(account)?;
+    let result = (|| -> MailResult<()> {
+        client.login(&account.username, &account.password)?;
+        let uidls = client.uidl()?;
+        let mark = db::folder_sync(&account.id, "INBOX")?;
+        let mut more = false;
+        if let Some((low, high)) = mark
+            .first_num
+            .and_then(|floor| older_numbers(floor, OLDER_BATCH))
+        {
+            let known = db::stored_uids(&account.id, "INBOX")?;
+            let mut messages = Vec::new();
+            for (num, uid) in uidls {
+                let num = num as u32;
+                if num < low || num > high || known.contains(&uid) {
+                    continue;
+                }
+                let raw = client.retr(num as usize)?;
+                messages.push(mail::parse(&raw, &uid, false));
+            }
+            // As on the IMAP side: the floor moves even when the range held
+            // nothing, or the next click would ask for the same numbers again.
+            db::set_first_num(&account.id, "INBOX", low)?;
+            if !messages.is_empty() {
+                db::save_messages(&account.id, "INBOX", None, &messages)?;
+                let _ = tx.send(Event::Messages {
+                    account_id: account.id.clone(),
+                    folder: "INBOX".to_string(),
+                    uidvalidity: None,
+                    messages,
+                });
+            }
+            more = low > 1;
+        }
+        let _ = tx.send(Event::OlderMail {
+            account_id: account.id.clone(),
+            folder: "INBOX".to_string(),
+            available: more,
+        });
+        Ok(())
+    })();
+    client.quit();
+    result
+}
+
 fn sync_pop3(account: &Account, tx: &Sender<Event>) -> MailResult<()> {
     let mut client = Pop3Client::connect(account)?;
     let result = (|| -> MailResult<()> {
@@ -638,9 +844,13 @@ fn sync_pop3(account: &Account, tx: &Sender<Event>) -> MailResult<()> {
         }
         // The floor goes first: a folder with a floor and no mail is fetched
         // from that floor next time, so this order can cost a repeated pass but
-        // never a message.
+        // never a message. A drop's numbering starts at 1, so it is also where
+        // the server's oldest message is — the answer the `Load older mail`
+        // button is drawn from, and the one thing about a drop nobody has to
+        // ask for.
         if cold {
             db::set_first_num(&account.id, "INBOX", window as u32)?;
+            db::set_oldest_uid(&account.id, "INBOX", (count > 0).then_some(1))?;
         }
         if cold || !messages.is_empty() {
             db::save_messages(&account.id, "INBOX", None, &messages)?;
@@ -651,6 +861,12 @@ fn sync_pop3(account: &Account, tx: &Sender<Event>) -> MailResult<()> {
                 messages,
             });
         }
+        let mark = db::folder_sync(&account.id, "INBOX")?;
+        let _ = tx.send(Event::OlderMail {
+            account_id: account.id.clone(),
+            folder: "INBOX".to_string(),
+            available: db::older_available(mark.first_num, mark.oldest_uid),
+        });
         Ok(())
     })();
     client.quit();
@@ -668,6 +884,44 @@ mod tests {
         assert_eq!(backfill_start(BACKFILL_LIMIT as usize), 1);
         assert_eq!(backfill_start(BACKFILL_LIMIT as usize + 1), 2);
         assert_eq!(backfill_start(5000), 5000 - BACKFILL_LIMIT as usize + 1);
+    }
+
+    /// What one `Load older mail` click asks an IMAP folder for: the batch
+    /// below the floor, the floor being the oldest UID ever fetched. The
+    /// server's own oldest message is where the walk stops — asking below it
+    /// would be asking for mail that is not there — and a mailbox whose oldest
+    /// message is one already held has nothing to load at all.
+    #[test]
+    fn a_click_asks_for_the_batch_below_the_floor() {
+        // A floor in the middle of a mailbox: one batch, and no further.
+        assert_eq!(older_uids(5000, 1, 50), Some((4950, 4999)));
+        // A mailbox whose mail starts just below the floor: only what there is.
+        assert_eq!(older_uids(5000, 4975, 50), Some((4975, 4999)));
+        // And then the bottom, which is the end of the walk.
+        assert_eq!(older_uids(4975, 4975, 50), None);
+        assert_eq!(older_uids(4975, 4976, 50), None, "deleted elsewhere");
+        assert_eq!(older_uids(1, 1, 50), None, "the floor is the first UID");
+        // A floor of 2 asks for UID 1 alone, whatever the batch size.
+        assert_eq!(older_uids(2, 1, 50), Some((1, 1)));
+        // `older_uids` never proposes UID 0: the range starts at the first UID
+        // the protocol has, whatever the arithmetic below the batch says.
+        assert_eq!(older_uids(2, 1, 500), Some((1, 1)));
+    }
+
+    /// The same walk for a POP3 drop, whose numbering starts at 1 — so the
+    /// floor alone says how much is left below it, and the walk ends there.
+    #[test]
+    fn a_drop_is_walked_down_to_its_first_message() {
+        assert_eq!(older_numbers(4951, 50), Some((4901, 4950)));
+        assert_eq!(older_numbers(60, 50), Some((10, 59)));
+        assert_eq!(older_numbers(51, 50), Some((1, 50)));
+        assert_eq!(older_numbers(50, 50), Some((1, 49)));
+        // A floor *below* one batch — a drop that was backfilled from number
+        // 21, say — takes what is left instead of underflowing.
+        assert_eq!(older_numbers(21, 50), Some((1, 20)));
+        assert_eq!(older_numbers(2, 50), Some((1, 1)));
+        assert_eq!(older_numbers(1, 50), None, "the drop starts at number 1");
+        assert_eq!(older_numbers(0, 50), None);
     }
 
     /// The order a sync sweeps folders in: what the user asked for, INBOX, then
@@ -717,6 +971,7 @@ mod tests {
             uidvalidity: Some(7),
             uid_next: Some(13),
             first_num: None,
+            oldest_uid: None,
         };
         assert_eq!(resume_uid(&mark, Some(7)), Some(13));
         // Another generation: the stored UIDs describe mail that is gone.

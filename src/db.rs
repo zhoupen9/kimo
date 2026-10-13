@@ -50,7 +50,7 @@ use crate::models::{Account, InlineImage, MailMessage, Protocol, TlsMode};
 use crate::storage::{self, Folder, Mailbox};
 
 /// The schema version this build writes and understands.
-pub const SCHEMA_VERSION: i64 = 3;
+pub const SCHEMA_VERSION: i64 = 4;
 
 /// How long a statement waits for another writer before giving up. Jobs hold
 /// the connection only around their SQL, so this is a backstop, not a plan.
@@ -80,12 +80,19 @@ CREATE TABLE IF NOT EXISTS folders (
     account_id  TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
     name        TEXT NOT NULL,          -- IMAP wire form (modified UTF-7)
     uidvalidity INTEGER,                -- NULL for POP3
-    -- How far this folder has been fetched; NULL until it has been synced once.
-    -- IMAP: one past the highest UID stored, so every UID below it is here.
-    -- POP3: the lowest message number this drop is fetched from — the first
-    -- sync takes the newest messages and the older ones stay out of scope.
+    -- The ends of the window this folder has been fetched for, NULL until it
+    -- has been synced once. IMAP: `uid_next` is one past the highest UID
+    -- stored, and `first_num` the lowest one — the floor a `Load older mail`
+    -- click walks down. POP3: `first_num` is the lowest message number this
+    -- drop is fetched from and `uid_next` is unused; the first sync takes the
+    -- newest messages.
     uid_next    INTEGER,
     first_num   INTEGER,
+    -- The oldest message the server had when this folder was last opened:
+    -- IMAP, what `FETCH 1 (UID)` answered; POP3, 1 — the first number of a
+    -- drop's numbering, which is where its mail starts by definition. With
+    -- `first_num` it is what says whether there is older mail to load.
+    oldest_uid  INTEGER,
     synced      INTEGER NOT NULL DEFAULT 0,
     -- 1 when the last `LIST` named this mailbox, 0 when the row is kept only
     -- for the mail cached for it — a mailbox deleted on the server keeps its
@@ -182,6 +189,40 @@ ALTER TABLE folders ADD COLUMN first_num INTEGER;
 /// which is also what the column drew before. The next sync records the truth.
 const MIGRATE_V3_SQL: &str = r#"
 ALTER TABLE folders ADD COLUMN listed INTEGER NOT NULL DEFAULT 1;
+"#;
+
+/// The step from `user_version` 3 to 4: how far down a folder has been fetched
+/// and how far down the server goes — the two marks the list's `Load older
+/// mail` button is drawn from.
+///
+/// Nothing in the database says what the *server's* oldest message is: only the
+/// server can answer that, and it answers on the next sync, so a folder from
+/// before this step has no button until one runs. A POP3 folder is the
+/// exception, and gets its answer here: the first number of a drop's numbering
+/// is always 1.
+const MIGRATE_V4_SQL: &str = r#"
+ALTER TABLE folders ADD COLUMN oldest_uid INTEGER;
+
+UPDATE folders SET oldest_uid = 1
+ WHERE (SELECT protocol FROM accounts WHERE id = folders.account_id) = 'pop3';
+"#;
+
+/// IMAP's floor as the mail a database from before version 4 already implies:
+/// the lowest UID it holds, which is also the lowest it was ever fetched down
+/// to. This is the version-3 step's guess, not the rule — a live folder's floor
+/// is written by the fetch that moved it (`db::set_first_num`), because a
+/// mailbox whose older messages have gaps in them is walked through one *asked
+/// for* range at a time, and a range that came back empty still has to move the
+/// mark. The protocol test inside it is what keeps a POP3 folder's `first_num`
+/// (the message number its sync chose) out of it.
+const DERIVE_FIRST_NUM_SQL: &str = r#"
+UPDATE folders SET first_num = (
+        SELECT MIN(CAST(m.uid AS INTEGER))
+          FROM messages m
+         WHERE m.account_id = ?1 AND m.folder = ?2
+    )
+  WHERE account_id = ?1 AND name = ?2
+    AND (SELECT protocol FROM accounts WHERE id = ?1) = 'imap'
 "#;
 
 /// IMAP's sync mark as a function of what is stored: one past the highest UID
@@ -427,6 +468,16 @@ fn migrate(conn: &mut Connection, legacy: Option<(&Path, &Path)>) -> MailResult<
         tx.pragma_update(None, "user_version", 3)?;
         tx.commit()?;
     }
+    if start < 4 {
+        let tx = conn.transaction()?;
+        tx.execute_batch(MIGRATE_V4_SQL)?;
+        // The floor the stored mail already implies — a database from before
+        // this step holds whatever a first sync chose to keep, and the lowest
+        // of it is exactly what the button has to start below.
+        derive_imap_folders(&tx, DERIVE_FIRST_NUM_SQL)?;
+        tx.pragma_update(None, "user_version", 4)?;
+        tx.commit()?;
+    }
     Ok(())
 }
 
@@ -434,6 +485,13 @@ fn migrate(conn: &mut Connection, legacy: Option<(&Path, &Path)>) -> MailResult<
 /// before version 2 has the UIDs but not the mark; deriving one is what keeps
 /// the upgrade from refetching a batch it already holds.
 fn derive_imap_marks(conn: &Connection) -> MailResult<()> {
+    derive_imap_folders(conn, DERIVE_UID_NEXT_SQL)
+}
+
+/// Run one of the derivations above for every IMAP folder. They are all
+/// "recompute this folder's mark from the rows it holds", so they all walk the
+/// folders the same way.
+fn derive_imap_folders(conn: &Connection, sql: &str) -> MailResult<()> {
     let folders: Vec<(String, String)> = {
         let mut stmt = conn.prepare(
             "SELECT account_id, name FROM folders
@@ -446,7 +504,7 @@ fn derive_imap_marks(conn: &Connection) -> MailResult<()> {
         }
         folders
     };
-    let mut derive = conn.prepare(DERIVE_UID_NEXT_SQL)?;
+    let mut derive = conn.prepare(sql)?;
     for (account_id, folder) in &folders {
         derive.execute(params![account_id, folder])?;
     }
@@ -577,10 +635,26 @@ pub struct FolderSync {
     /// IMAP: one past the highest UID stored, and therefore the first UID a
     /// sync asks for. `save_messages` keeps it in step with the rows.
     pub uid_next: Option<u32>,
-    /// POP3: the lowest message number this drop is synced from. The first sync
-    /// of a drop picks it (`sync::BACKFILL_LIMIT` newest messages); the mail
-    /// below it is deliberately out of scope.
+    /// IMAP: the lowest UID ever fetched for this folder — the floor a
+    /// `Load older mail` click walks down. `save_messages` keeps it in step
+    /// with the rows, like `uid_next`. POP3: the lowest message number this
+    /// drop is synced from, which the first sync picks
+    /// (`sync::BACKFILL_LIMIT` newest messages).
     pub first_num: Option<u32>,
+    /// The oldest message the server had when the folder was last opened:
+    /// IMAP, the UID `FETCH 1 (UID)` answered with, POP3 always 1. `None` means
+    /// nobody has asked yet — or asked and been told the mailbox is empty.
+    pub oldest_uid: Option<u32>,
+}
+
+/// Whether a folder's marks say the server has mail below the oldest this
+/// database holds — the one question the list's `Load older mail` button asks.
+/// `None` on either side is "not known": nothing has been fetched from the
+/// folder downwards yet, or the server has never said how far down it goes.
+/// Both marks are per UIDVALIDITY generation, so a folder whose generation
+/// moved answers `false` until a sync has been through it again.
+pub fn older_available(first_num: Option<u32>, oldest_uid: Option<u32>) -> bool {
+    matches!((first_num, oldest_uid), (Some(floor), Some(oldest)) if oldest < floor)
 }
 
 /// What one folder remembers. A folder the database does not know, or one that
@@ -594,7 +668,7 @@ pub fn folder_sync(account_id: &str, folder: &str) -> MailResult<FolderSync> {
 fn folder_sync_on(conn: &Connection, account_id: &str, folder: &str) -> MailResult<FolderSync> {
     let mark = conn
         .query_row(
-            "SELECT uidvalidity, uid_next, first_num FROM folders
+            "SELECT uidvalidity, uid_next, first_num, oldest_uid FROM folders
               WHERE account_id = ?1 AND name = ?2",
             params![account_id, folder],
             |row| {
@@ -602,6 +676,7 @@ fn folder_sync_on(conn: &Connection, account_id: &str, folder: &str) -> MailResu
                     uidvalidity: row.get(0)?,
                     uid_next: row.get(1)?,
                     first_num: row.get(2)?,
+                    oldest_uid: row.get(3)?,
                 })
             },
         )
@@ -609,10 +684,15 @@ fn folder_sync_on(conn: &Connection, account_id: &str, folder: &str) -> MailResu
     Ok(mark.unwrap_or_default())
 }
 
-/// POP3 only: remember the message number the drop is synced from. Written
-/// *before* the batch it belongs to, so the window is never lost: a folder with
-/// a floor and no mail is simply fetched from that floor next time, which can
-/// cost a repeated pass but never a message.
+/// Remember how far down a folder has been fetched: IMAP's floor is the lowest
+/// UID a fetch was sent for, POP3's the lowest message number of the window its
+/// drop is synced from. It is a mark about *what was asked*, not about what is
+/// stored — a `Load older mail` range that came back empty still moves it, or
+/// the next click would ask for the same gaps forever.
+///
+/// Written *before* the batch it belongs to, so the window is never lost: a
+/// folder with a floor and no mail is simply fetched from that floor next time,
+/// which can cost a repeated pass but never a message.
 pub fn set_first_num(account_id: &str, folder: &str, first_num: u32) -> MailResult<()> {
     let db = db()?;
     set_first_num_on(db.conn(), account_id, folder, first_num)
@@ -631,6 +711,35 @@ fn set_first_num_on(
          VALUES (?1, ?2, NULL, 0, ?3, 1)
          ON CONFLICT(account_id, name) DO UPDATE SET first_num = excluded.first_num",
         params![account_id, folder, first_num],
+    )?;
+    Ok(())
+}
+
+/// Remember the oldest message the server had, which is what a `Load older
+/// mail` click is drawn from together with `first_num`. Written after a
+/// successful `SELECT`, so a folder this creates is one the server has: it is
+/// the write that says a mailbox with no mail in it — or none we kept — has
+/// been looked at.
+///
+/// `None` is an answer too: the mailbox is empty, and nothing is below a floor
+/// in an empty mailbox. It is also what the record of a folder whose generation
+/// moved has to fall back to (see `save_messages`).
+pub fn set_oldest_uid(account_id: &str, folder: &str, oldest_uid: Option<u32>) -> MailResult<()> {
+    let db = db()?;
+    set_oldest_uid_on(db.conn(), account_id, folder, oldest_uid)
+}
+
+fn set_oldest_uid_on(
+    conn: &Connection,
+    account_id: &str,
+    folder: &str,
+    oldest_uid: Option<u32>,
+) -> MailResult<()> {
+    conn.execute(
+        "INSERT INTO folders (account_id, name, uidvalidity, synced, oldest_uid, listed)
+         VALUES (?1, ?2, NULL, 1, ?3, 1)
+         ON CONFLICT(account_id, name) DO UPDATE SET oldest_uid = excluded.oldest_uid",
+        params![account_id, folder, oldest_uid],
     )?;
     Ok(())
 }
@@ -700,7 +809,8 @@ fn load_mailboxes_on(
 
     {
         let mut stmt = conn.prepare(
-            "SELECT account_id, name, uidvalidity, synced, listed FROM folders ORDER BY name",
+            "SELECT account_id, name, uidvalidity, synced, listed, first_num, oldest_uid
+               FROM folders ORDER BY name",
         )?;
         let rows = stmt.query_map([], |row| {
             Ok((
@@ -709,16 +819,21 @@ fn load_mailboxes_on(
                 row.get::<_, Option<u32>>(2)?,
                 row.get::<_, i64>(3)?,
                 row.get::<_, i64>(4)?,
+                row.get::<_, Option<u32>>(5)?,
+                row.get::<_, Option<u32>>(6)?,
             ))
         })?;
         for row in rows {
-            let (account_id, name, uidvalidity, synced, listed) = row?;
+            let (account_id, name, uidvalidity, synced, listed, first_num, oldest_uid) = row?;
             if let Some(mailbox) = mailboxes.get_mut(&account_id) {
                 mailbox.folders.push(Folder {
                     name,
                     uidvalidity,
                     synced: synced != 0,
                     listed: listed != 0,
+                    // The button is drawn from the marks alone, so a start
+                    // knows about older mail without asking anybody.
+                    can_load_older: older_available(first_num, oldest_uid),
                     messages: Vec::new(),
                 });
             }
@@ -907,6 +1022,15 @@ fn save_messages_on(
             "DELETE FROM messages WHERE account_id = ?1 AND folder = ?2",
             params![account_id, folder],
         )?;
+        // Both marks describe the generation that just went — one is the UID
+        // space it was fetched in, the other the server's answer about it — so
+        // they go with the rows. The sync that read the new generation writes
+        // them again as it fetches.
+        tx.execute(
+            "UPDATE folders SET first_num = NULL, oldest_uid = NULL
+              WHERE account_id = ?1 AND name = ?2",
+            params![account_id, folder],
+        )?;
     }
 
     tx.execute(
@@ -969,10 +1093,13 @@ fn save_messages_on(
         }
     }
 
-    // The mark is a function of what is stored, not of the batch: a batch that
-    // changed nothing (the server answered a UID set with a message already
-    // held) cannot move it, and a UIDVALIDITY rotation — whose rows were
-    // deleted above — starts the folder over from the new batch.
+    // The resume mark is a function of what is stored, not of the batch: a
+    // batch that changed nothing (the server answered a UID set with a message
+    // already held) cannot move it, and a UIDVALIDITY rotation — whose rows
+    // were deleted above — starts the folder over from the new batch. The two
+    // marks below are deliberately *not* derived here: the floor is where a
+    // fetch was sent, and `oldest_uid` is the server's own answer, and only the
+    // job that asked knows either.
     tx.execute(DERIVE_UID_NEXT_SQL, params![account_id, folder])?;
 
     tx.commit()?;
@@ -1015,6 +1142,10 @@ fn delete_message_on(
         "DELETE FROM messages WHERE account_id = ?1 AND folder = ?2 AND uid = ?3",
         params![account_id, folder, uid],
     )?;
+    // Both marks are deliberately left where they are: see this function's
+    // caller. The floor is where the folder was last asked from, which deleting
+    // a message does not change — the range below it is asked for again and
+    // answers with whatever still exists there.
     Ok(())
 }
 
@@ -1346,6 +1477,19 @@ mod tests {
 
     fn count(conn: &Connection, sql: &str) -> i64 {
         conn.query_row(sql, [], |row| row.get(0)).unwrap()
+    }
+
+    /// The one folder model `load_mailboxes` hands the app, for the tests that
+    /// care what the marks say about it.
+    fn loaded_folder(conn: &Connection, account_id: &str, folder: &str) -> super::Folder {
+        load_mailboxes_on(conn, &[account_id.to_string()])
+            .unwrap()
+            .remove(account_id)
+            .unwrap()
+            .folders
+            .into_iter()
+            .find(|candidate| candidate.name == folder)
+            .unwrap()
     }
 
     /// The folders of one account the server is recorded as listing.
@@ -1830,6 +1974,136 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
+    /// A folder's floor is a mark about what its fetches *asked for*, not
+    /// something derived from the mail it holds — a `Load older mail` range
+    /// that comes back empty (the mailbox has gaps in it) still has to move it,
+    /// or the next click would ask for the same gap forever. What a UIDVALIDITY
+    /// rotation does is clear it, together with the server's answer: both
+    /// describe a generation that is gone.
+    #[test]
+    fn a_folders_floor_is_the_mark_its_fetches_write() {
+        let (mut conn, dir) = test_db("fetch-floor");
+        save_account_on(&conn, &account("work")).unwrap();
+        save_messages_on(
+            &mut conn,
+            "work",
+            "INBOX",
+            Some(4),
+            &[message("500", "a", "a"), message("501", "b", "b")],
+        )
+        .unwrap();
+        // The sync that fetched the window writes where it reached.
+        set_first_num_on(&conn, "work", "INBOX", 500).unwrap();
+        set_oldest_uid_on(&conn, "work", "INBOX", Some(1)).unwrap();
+        let mark = folder_sync_on(&conn, "work", "INBOX").unwrap();
+        assert_eq!(mark.first_num, Some(500));
+        assert_eq!(mark.uid_next, Some(502), "the other end of the window");
+        assert!(loaded_folder(&conn, "work", "INBOX").can_load_older);
+
+        // A second click reaches lower and moves the floor with it.
+        set_first_num_on(&conn, "work", "INBOX", 450).unwrap();
+        save_messages_on(
+            &mut conn,
+            "work",
+            "INBOX",
+            Some(4),
+            &[message("450", "c", "c")],
+        )
+        .unwrap();
+        let mark = folder_sync_on(&conn, "work", "INBOX").unwrap();
+        assert_eq!(mark.first_num, Some(450));
+        assert_eq!(mark.uid_next, Some(502), "and the newest end did not move");
+
+        // Deleting the oldest messages leaves both marks alone: the range below
+        // the floor is simply asked for again.
+        delete_message_on(&conn, "work", "INBOX", "450").unwrap();
+        let mark = folder_sync_on(&conn, "work", "INBOX").unwrap();
+        assert_eq!(mark.first_num, Some(450));
+        assert_eq!(mark.oldest_uid, Some(1));
+
+        // A new generation is a new folder: the UIDs, the floor and the
+        // server's answer all described mail that is not this mail.
+        save_messages_on(
+            &mut conn,
+            "work",
+            "INBOX",
+            Some(9),
+            &[message("7", "d", "d")],
+        )
+        .unwrap();
+        let mark = folder_sync_on(&conn, "work", "INBOX").unwrap();
+        assert_eq!(mark.first_num, None);
+        assert_eq!(mark.oldest_uid, None);
+        assert_eq!(
+            count(
+                &conn,
+                "SELECT COUNT(*) FROM messages WHERE account_id = 'work'"
+            ),
+            1,
+            "the old generation's rows went with them"
+        );
+        assert!(!older_available(mark.first_num, mark.oldest_uid));
+        integrity_check_on(&conn).unwrap();
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// What the server says about its oldest mail is POP3's one number away
+    /// from a floor: the drop's numbering starts at 1, so every message below
+    /// the floor is one a click can fetch. Its own record is written by its
+    /// sync (and by the version-3 step of `migrate`), and an answer of "the
+    /// mailbox is empty" clears it.
+    #[test]
+    fn a_folder_with_a_floor_and_an_answer_has_older_mail_to_load() {
+        let (conn, dir) = test_db("older-available");
+        let mut pop = account("pop");
+        pop.protocol = Protocol::Pop3;
+        save_account_on(&conn, &pop).unwrap();
+        set_first_num_on(&conn, "pop", "INBOX", 4951).unwrap();
+        assert!(
+            !loaded_folder(&conn, "pop", "INBOX").can_load_older,
+            "the floor alone is not an answer: nobody has asked the server"
+        );
+
+        set_oldest_uid_on(&conn, "pop", "INBOX", Some(1)).unwrap();
+        assert!(loaded_folder(&conn, "pop", "INBOX").can_load_older);
+
+        // The floor reaching the bottom of the numbering is the same as the
+        // answer meeting it: nothing below either of them.
+        set_first_num_on(&conn, "pop", "INBOX", 1).unwrap();
+        assert!(!loaded_folder(&conn, "pop", "INBOX").can_load_older);
+
+        // An empty mailbox is an answer too, and it takes the button away.
+        set_first_num_on(&conn, "pop", "INBOX", 4951).unwrap();
+        set_oldest_uid_on(&conn, "pop", "INBOX", None).unwrap();
+        let mark = folder_sync_on(&conn, "pop", "INBOX").unwrap();
+        assert_eq!(mark.oldest_uid, None);
+        assert!(!older_available(mark.first_num, mark.oldest_uid));
+        integrity_check_on(&conn).unwrap();
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The rule itself, apart from the database: `None` on either side is not
+    /// an answer, and the answer is the comparison.
+    #[test]
+    fn older_mail_is_the_servers_oldest_below_the_floor() {
+        assert!(older_available(Some(500), Some(1)));
+        assert!(older_available(Some(2), Some(1)));
+        assert!(
+            !older_available(Some(1), Some(1)),
+            "the floor is the bottom"
+        );
+        assert!(
+            !older_available(Some(500), Some(500)),
+            "the server's oldest is the oldest we hold"
+        );
+        assert!(
+            !older_available(Some(500), Some(600)),
+            "mail deleted elsewhere is not older mail to load"
+        );
+        assert!(!older_available(None, Some(1)), "nothing fetched downwards");
+        assert!(!older_available(Some(500), None), "nobody has asked");
+    }
+
     /// What a `LIST` answer decides: which folders count as ones the server
     /// still has. A folder it leaves out is not deleted — the mail cached for
     /// it is the only copy of it here — but it stops being listed, which is
@@ -1921,7 +2195,8 @@ mod tests {
         conn.execute_batch(
             "ALTER TABLE folders DROP COLUMN uid_next;
              ALTER TABLE folders DROP COLUMN first_num;
-             ALTER TABLE folders DROP COLUMN listed;",
+             ALTER TABLE folders DROP COLUMN listed;
+             ALTER TABLE folders DROP COLUMN oldest_uid;",
         )
         .unwrap();
         conn.pragma_update(None, "user_version", 1).unwrap();
@@ -1940,6 +2215,74 @@ mod tests {
             folder_sync_on(&conn, "pop", "INBOX").unwrap().uid_next,
             None,
             "a POP3 UIDL is not a UID, however numeric it looks"
+        );
+        assert_eq!(
+            folder_sync_on(&conn, "work", "INBOX").unwrap().first_num,
+            Some(10),
+            "the floor is the lowest UID the folder holds"
+        );
+        assert_eq!(
+            folder_sync_on(&conn, "pop", "INBOX").unwrap().first_num,
+            None,
+            "a POP3 floor is a message number its sync chose, not a UID"
+        );
+        assert_eq!(
+            folder_sync_on(&conn, "pop", "INBOX").unwrap().oldest_uid,
+            Some(1),
+            "a drop's numbering starts at 1, so that is its oldest message"
+        );
+        assert_eq!(
+            folder_sync_on(&conn, "work", "INBOX").unwrap().oldest_uid,
+            None,
+            "only the server can say how far down an IMAP mailbox goes"
+        );
+        integrity_check_on(&conn).unwrap();
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A database from version 3 gains the two marks the `Load older mail`
+    /// button is drawn from: the floor the mail it already holds implies, and —
+    /// for a POP3 drop, whose numbering starts at 1 — the server's oldest
+    /// number. An IMAP folder's `oldest_uid` stays unknown until a sync asks,
+    /// which is the point: nothing local can say what the server has.
+    #[test]
+    fn a_version_3_database_learns_its_fetch_floor() {
+        let (mut conn, dir) = test_db("migrate-v4");
+        save_account_on(&conn, &account("work")).unwrap();
+        save_messages_on(
+            &mut conn,
+            "work",
+            "INBOX",
+            Some(4),
+            &[message("10", "a", "a"), message("12", "b", "b")],
+        )
+        .unwrap();
+        let mut pop = account("pop");
+        pop.protocol = Protocol::Pop3;
+        save_account_on(&conn, &pop).unwrap();
+        save_messages_on(&mut conn, "pop", "INBOX", None, &[message("9", "a", "a")]).unwrap();
+        set_first_num_on(&conn, "pop", "INBOX", 4951).unwrap();
+
+        conn.execute_batch("ALTER TABLE folders DROP COLUMN oldest_uid;")
+            .unwrap();
+        conn.pragma_update(None, "user_version", 3).unwrap();
+
+        migrate(&mut conn, None).unwrap();
+        assert_eq!(
+            count(&conn, "SELECT * FROM pragma_user_version"),
+            SCHEMA_VERSION
+        );
+        let work = folder_sync_on(&conn, "work", "INBOX").unwrap();
+        assert_eq!(work.first_num, Some(10));
+        assert!(
+            !older_available(work.first_num, work.oldest_uid),
+            "an unasked IMAP folder has no button"
+        );
+        let pop = folder_sync_on(&conn, "pop", "INBOX").unwrap();
+        assert_eq!(pop.first_num, Some(4951), "POP3's own floor is left alone");
+        assert!(
+            older_available(pop.first_num, pop.oldest_uid),
+            "4950 messages below the floor, and 1 is where they start"
         );
         integrity_check_on(&conn).unwrap();
         let _ = fs::remove_dir_all(&dir);

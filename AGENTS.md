@@ -185,8 +185,8 @@ Event (mpsc) ──► drain_events() at frame start ──► merge into Accoun
   an IMAP folder's mark to one past the highest UID it holds, in the same
   transaction as the batch, so a crash can never advance past mail that did not
   reach the disk. `BACKFILL_LIMIT` (in `sync.rs`) is the size of a folder's
-  *first* fetch: the newest messages only, because everything older is
-  deliberately out of scope — the mark is what says so. `Job::Sync` (startup
+  *first* fetch: the newest messages only, and the rest waits for the button in
+  the bullet below. `Job::Sync` (startup
   and the title-bar button) fetches the folder list, INBOX and every folder that
   has been fetched before, and a folder that fails does not cost the others
   theirs (the first error is reported at the end). A folder the user never
@@ -204,6 +204,20 @@ Event (mpsc) ──► drain_events() at frame start ──► merge into Accoun
   it first, so the message is not a lie in the one mode that shows the button. It is a per-installation setting rather than a
   build flag so that a development build can be pointed at a real account
   without a sync on every start.
+- Older mail is fetched on demand: the message list floats a `Load older mail`
+  button over its foot when the list is at its end and the folder's marks say
+  the server has mail below everything here, and one click is a `Job::LoadOlder`
+  of `OLDER_BATCH` (50) messages. Two marks answer that without asking the
+  server on every scroll: `folders.first_num`, the floor a folder has been
+  fetched *down to* (IMAP: the lowest UID a fetch was sent for; POP3: the lowest
+  message number), and `folders.oldest_uid`, how far down the server goes — what
+  `FETCH 1 (UID)` answered, which every IMAP sync records, and 1 for POP3, whose
+  numbering starts there. `db::older_available` is the whole rule,
+  `db::load_mailboxes` derives it at startup and `Event::OlderMail` carries a
+  fresher answer. A click re-asks before fetching, so an emptied mailbox clears
+  the button rather than failing on it; the floor moves even when the batch came
+  back empty (the mailbox has gaps), which is why it is a mark about what was
+  *asked for* — deletes leave it alone, and a UIDVALIDITY rotation clears it.
 - The folder list is cached like the mail is, and the `LIST` is only what
   updates it. `folders.listed` records which mailboxes the last answer named;
   `db::save_folder_list` writes it in one transaction with the folders
@@ -275,8 +289,8 @@ Event (mpsc) ──► drain_events() at frame start ──► merge into Accoun
 - `~/.local/share/kimo/mail.db` — the one database (SQLite, WAL, mode 0600
   because it holds the passwords). `accounts` (id, name, protocol, host,
   port, username, password, tls, position), `folders` (account_id, name,
-  uidvalidity, uid_next, first_num, synced, listed — the middle two are the sync
-  marks of the bullet above, and `listed` is what the last `LIST` named),
+  uidvalidity, uid_next, first_num, oldest_uid, synced, listed — the fetch
+  marks of the bullets above, then `listed`, what the last `LIST` named),
   `messages` keyed by `(account_id, folder, uid)` with
   the subject, addresses, both bodies, the preview and the bigram column,
   `attachments` and `inline_images` (raw bytes, not base64) as children of a
@@ -912,8 +926,8 @@ Do not "fix" these casually — they are known:
   and a sync does not notice deletions either: mail removed in another client stays in the database
   and in the list forever. What a sync does is incremental by UIDL — a message
   already stored is never downloaded again — and bounded below by the
-  `first_num` floor the first sync chose, so the messages a first sync skipped
-  are never fetched, on purpose.
+  `first_num` floor, so the messages a first sync skipped arrive only when
+  `Load older mail` asks for them.
 - Flags of mail that is already stored are not read back from the server. IMAP
   `\Seen` is taken for a message as it is fetched, and from then on the local
   flag is the only truth (`seen` only ever grows). Sync used to refresh the
