@@ -5,12 +5,13 @@
 //!         cargo test --release -- --ignored --nocapture bench_render
 //!
 //! The built-in renderer draws a message on *every* frame the reading pane is
-//! visible: app.rs calls html::render straight from update, and it re-parses
-//! and re-lays out the body each time. It is therefore timed the way the app
-//! calls it (inside the pane's ScrollArea) and reported as parse+layout, as
-//! the tessellation that follows, and as the frame total. Blitz runs once per
-//! (message, pane width) on a worker thread, so it is timed as a single
-//! blitz_render::render call and reported with what that produced.
+//! visible: app.rs lays the body out again each time. It parses it only once
+//! per mail, though, and keeps the width it settled at (`app.rs`'s
+//! `BodyCache`), so this bench measures both the way the pane does: the parse
+//! once, and then the layout inside the pane's ScrollArea per frame —
+//! reported with the tessellation that follows and the frame total. Blitz runs
+//! once per (message, pane width) on a worker thread, so it is timed as a
+//! single blitz_render::render call and reported with what that produced.
 //!
 //! A developer tool, not a test: nothing here asserts.
 
@@ -294,6 +295,9 @@ fn inline_images(conn: &rusqlite::Connection, message_id: i64) -> Vec<(String, V
 
 #[derive(Default)]
 struct SimpleStats {
+    /// Parsing the body, which the pane pays once per mail.
+    parse: Duration,
+    /// Laying the parsed body out again, which the pane pays every frame.
     layout: Vec<Duration>,
     tessellate: Vec<Duration>,
     frame: Vec<Duration>,
@@ -321,6 +325,9 @@ fn bench_simple(ctx: &egui::Context, case: &Case) -> SimpleStats {
     let images = HashMap::new();
     let sheets = HashMap::new();
     let mut stats = SimpleStats::default();
+    let parse_start = Instant::now();
+    let document = html::Document::parse(&case.html);
+    stats.parse = parse_start.elapsed();
     for rep in 0..=REPS {
         let input = || egui::RawInput {
             screen_rect: Some(egui::Rect::from_min_size(
@@ -347,7 +354,7 @@ fn bench_simple(ctx: &egui::Context, case: &Case) -> SimpleStats {
                                 missing_stylesheets: Vec::new(),
                             };
                             let start = Instant::now();
-                            html::render(ui, &case.html, &mut html_ctx);
+                            html::render_document(ui, &document, &mut html_ctx);
                             layout += start.elapsed();
                         });
                 });
@@ -535,6 +542,7 @@ fn bench_render() {
         simple_rows.push(vec![
             case.name.clone(),
             format!("{:.1} KB", case.kb()),
+            format!("{:.2}", simple.parse.as_secs_f64() * 1000.0),
             cell(&simple.layout),
             cell(&simple.tessellate),
             cell(&simple.frame),
@@ -559,12 +567,15 @@ fn bench_render() {
         ]);
     }
 
-    println!("built-in (egui) renderer, per frame - it re-renders every frame the pane is visible");
+    println!(
+        "built-in (egui) renderer - parsed once per mail, laid out every frame the pane is visible"
+    );
     print_table(
         &[
             "case",
             "html",
-            "parse+layout ms",
+            "parse ms (once)",
+            "layout ms (per frame)",
             "tessellate ms",
             "frame total ms",
             "vertices",
@@ -592,9 +603,10 @@ fn bench_render() {
     println!(
         "notes: the first Blitz render of this process was the {} case and took {:.0} ms, \
          which includes building Blitz's font context from the curated on-disk set; every \
-         later render in the table above is steady state. The built-in renderer pays its \
-         parse+layout on every painted frame (size-dependent, ~1.3 ms for the 100 KB mail), \
-         Blitz once per (message, pane width) and then only the texture memory listed.",
+         later render in the table above is steady state. The built-in renderer parses a \
+         body once (size-dependent: ~1.4 ms for the 100 KB mail) and lays the parsed body \
+         out on every painted frame (~0.5 ms for it), Blitz once per (message, pane width) \
+         and then only the texture memory listed.",
         blitz_first_case, blitz_first_ms,
     );
 }

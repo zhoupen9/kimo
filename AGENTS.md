@@ -215,12 +215,27 @@ Event (mpsc) ──► drain_events() at frame start ──► merge into Accoun
   window resize. At most two pages are cached; a cached page is reused, scaled
   down and never up, while the pane stays within `BLITZ_REUSE_RATIO` of the
   width it was laid out for; and a render starts only once the geometry has
-  held still for `BLITZ_SETTLE`, so a splitter drag or an animated window
-  resize queues one render at the end instead of one per frame. Every request
-  takes a fresh `blitz_render::Cancellation` ticket: a render whose ticket is
-  stale gives up mid-layout (and between raster slices) and reports *nothing*,
-  so a superseded render can never be mistaken for a failure of the newer one.
-  Never render Blitz HTML on the UI thread.
+  held still for `GEOMETRY_SETTLE`, so a splitter drag or an animated window
+  resize queues one render at the end instead of one per frame (the built-in
+  renderer waits the same time, see the next bullet). Every
+  request takes a fresh `blitz_render::Cancellation` ticket: a render whose
+  ticket is stale gives up mid-layout (and between raster slices) and reports
+  *nothing*, so a superseded render can never be mistaken for a failure of the
+  newer one. Never render Blitz HTML on the UI thread.
+- The built-in renderer keeps two things between frames in `KimoApp::body`
+  (`BodyCache`), because a splitter drag moves the reading pane's width on every
+  frame and the whole body is otherwise re-derived on each one: the *parsed
+  body* (`html::Document`, since html5ever's parse is the larger half of what a
+  frame costs and the tree does not change while the mail is open) and the
+  *width it settled at*. The body is laid out at that width while the pane is
+  moving — in a scope of its own, because a ui never gets narrower than what it
+  has already drawn (`set_max_width` widens the max back to the min rect) — so a
+  drag clips the mail instead of re-shaping every run of text in it; once the
+  geometry has held still for `GEOMETRY_SETTLE` it reflows once, for the width
+  the pane came to rest at. A new mail, or a body re-fetched under the same uid
+  (`body_fingerprint`), drops the document and is laid out at the pane's own
+  width at once. Do not draw the body outside that scope, and do not "fix" the
+  hold by narrowing the card's own ui.
 - Searching is a job like any other: `Job::Search { seq, query }` runs
   `search::run` on a worker and answers `Event::SearchResults { seq, hits }`.
   Every request takes a new `seq`, and the UI drops an answer whose `seq` is not
@@ -399,7 +414,15 @@ Event (mpsc) ──► drain_events() at frame start ──► merge into Accoun
   release, and since egui's `Grid` keeps its column widths between frames the
   pane could never be dragged narrower than the widest it had ever been for
   that mail. The horizontal bar appears only when the mail really is wider than
-  the pane, and a newly opened mail resets both offsets. Both highlights in the list are the mail's whole row: a square
+  the pane, and a newly opened mail resets both offsets. The list lays out only
+  the rows its viewport shows (`virtual_rows`, which is
+  `ScrollArea::show_rows` with this column's arithmetic: the first row starts
+  below the title bar's padding, inside the scroll area, so a row range counted
+  from the content's own origin would be off by it — and the row a partly
+  scrolled viewport starts in could be skipped), and it draws them straight out
+  of the account state: mail is never copied to be listed, so a click is
+  remembered as the mail it landed on and opened once the list has stopped
+  borrowing that state. Both highlights in the list are the mail's whole row: a square
   block spanning the column edge to edge. A mail draws its own edges instead of
   sharing a rule with its neighbour — left, right and bottom in `row_edge`, the
   top in the fainter `row_edge_top`, each a pixel inside its own rect — so what
@@ -521,7 +544,7 @@ Event (mpsc) ──► drain_events() at frame start ──► merge into Accoun
   `weak_text_color`, stops sensing clicks and never fills. Delete is wired —
   it is the one action whose job exists so far — and the other five still run
   nothing, so a click on one of them is not even read.
-  The bar is `TITLEBAR_HEIGHT` (48 pt) tall and the search box fills all but
+  The bar is `TITLEBAR_HEIGHT` (40 pt) tall and the search box fills all but
   16 pt of that (`TITLEBAR_SEARCH_HEIGHT`), with a rounder corner than the
   stock widget radius (`SEARCH_BOX_CORNER_RADIUS`); its frame is stock
   `TextEdit` chrome, so the radius is set on the widget visuals in a scope —
@@ -727,10 +750,16 @@ Event (mpsc) ──► drain_events() at frame start ──► merge into Accoun
   `cargo test --release -- --ignored --nocapture bench_render` times both
   renderers on a short mail, a newsletter-shaped fixture and — with
   `KIMO_BENCH_DB=~/.local/share/kimo/mail.db` — the median-sized and largest
-  HTML bodies in the database. Note what the two numbers mean: the built-in
-  renderer re-parses and re-lays out the body on *every* frame the reading
-  pane is visible (there is no cache of the widget tree), while Blitz pays
-  once per (message, pane width) on a worker thread.
+  HTML bodies in the database. Note what the numbers mean: the built-in
+  renderer lays the body out on *every* frame the reading pane is visible —
+  there is no cache of the widget tree — but it parses it once and keeps the
+  width it settled at (`BodyCache`), so a frame costs the layout, not the parse
+  and not a reflow per pixel of a splitter drag. Blitz pays parse, layout and
+  rasterization once per (message, pane width), on a worker thread. For whole
+  frames rather than bodies — including what a splitter drag costs — `app.rs`
+  has `bench_frame_cost`, which drives the real app headlessly at a fixed
+  splitter position and while it is being dragged:
+  `cargo test --release -- --ignored --nocapture bench_frame_cost`.
 - Blitz is built with `blitz-dom`'s default features **off**: its
   `system-fonts` feature would link fontconfig (a C library, hard rule 1).
   `blitz_render` therefore registers fonts from disk itself (a curated set —
