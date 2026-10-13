@@ -134,8 +134,9 @@ src/sync.rs             Job/Event enums, worker threads, per-protocol sync logic
 src/protocol/mod.rs     protocol modules
 src/protocol/stream.rs  TcpStream/TLS transport (MailStream, STARTTLS upgrade, buffered Conn)
 src/protocol/ffdhe.rs   FFDHE kx group + DHE-RSA suites, which rustls does not ship
-src/protocol/imap.rs    minimal IMAP4rev1 client (LOGIN, LIST, SELECT, FETCH w/ literals, UID STORE)
-src/protocol/pop3.rs    minimal POP3 client (USER/PASS, STAT, UIDL, RETR w/ de-stuffing, QUIT)
+src/protocol/imap.rs    minimal IMAP4rev1 client (LOGIN, LIST, SELECT, FETCH w/ literals,
+                        UID STORE, delete: UID FETCH probe + UID EXPUNGE)
+src/protocol/pop3.rs    minimal POP3 client (USER/PASS, STAT, UIDL, RETR w/ de-stuffing, DELE, QUIT)
 ```
 
 ### Data flow
@@ -224,8 +225,11 @@ Event (mpsc) ──► drain_events() at frame start ──► merge into Accoun
   what keeps an unchanged query from searching again every frame. The request
   is pumped from `KimoApp::update`, not from the message list: the popup that
   edits the query sits outside every column.
-- Remote mutations are limited to `UID STORE +FLAGS.SILENT (\Seen)` (IMAP).
-  POP3 never deletes or mutates anything server-side.
+- Remote mutations are `UID STORE +FLAGS.SILENT (\Seen)` (IMAP) and, behind
+  the title bar's Delete button, `\Deleted` + `UID EXPUNGE` (IMAP) or `DELE`
+  (POP3). A delete tells the server first and deletes locally after; a message
+  the server no longer has is deleted locally only. See the deletion bullet
+  under Conventions for the whole rule.
 
 ### Storage layout
 
@@ -293,7 +297,10 @@ Event (mpsc) ──► drain_events() at frame start ──► merge into Accoun
   io/rustls/serde_json/rusqlite). `MailError::Db` is SQLite's own error and
   `MailError::Storage` everything else the storage layer can fail at. Map
   server auth refusals to `MailError::Auth` so the UI shows them distinctly
-  from protocol bugs.
+  from protocol bugs. `MailError::Refused` is a server that read a command and
+  said no (IMAP NO / BAD), kept apart from `Protocol` — a broken connection or
+  a reply we cannot parse — so a command with a fallback (the mailbox-wide
+  `EXPUNGE` for a server without UIDPLUS) can tell the two apart.
 - Protocol clients are synchronous and single-purpose; add a method only
   when a sync job actually needs it.
 - Finite-field DH lives in `src/protocol/ffdhe.rs` and is deliberately narrow:
@@ -421,15 +428,48 @@ Event (mpsc) ──► drain_events() at frame start ──► merge into Accoun
   box rather than by a pill. The six enable and disable together, on
   `has_selected_message` — the reading pane's own lookup, so a uid the pane no
   longer shows counts as no mail: a disabled cell drops its glyph to
-  `weak_text_color`, stops sensing clicks and never fills. Nothing is wired to
-  the buttons yet: a click runs nothing, so the group is UI only until the
-  actions it names exist.
+  `weak_text_color`, stops sensing clicks and never fills. Delete is wired —
+  it is the one action whose job exists so far — and the other five still run
+  nothing, so a click on one of them is not even read.
   The bar is `TITLEBAR_HEIGHT` (48 pt) tall and the search box fills all but
   16 pt of that (`TITLEBAR_SEARCH_HEIGHT`), with a rounder corner than the
   stock widget radius (`SEARCH_BOX_CORNER_RADIUS`); its frame is stock
   `TextEdit` chrome, so the radius is set on the widget visuals in a scope —
   and because the field is deliberately non-interactive, the slot that matters
   is `noninteractive` (egui picks the visuals by `Sense`, not by hover).
+- Deleting a mail (the title bar's Delete → `KimoApp::delete_selected_message` →
+  `Job::DeleteMessage`) is **remote first, local after**: the worker asks the
+  server to drop the message and only then deletes the database row
+  (`db::delete_message`), so mail that is still on the server never disappears
+  from here and a deletion that fails — no connection, a read-only mailbox —
+  leaves both copies alone and reports why on the account (`Event::SyncFailed`,
+  prefixed "delete:"). The reverse case is the other half of the rule: a mail
+  the server no longer has is deleted **locally only**, without a command that
+  could touch anything else. IMAP asks before it flags — the mailbox has to
+  still be in LIST (a mailbox that *is* listed but refuses SELECT is an error,
+  not a licence to drop the local copy) and then `UID FETCH <uid> (UID)` has to
+  answer for the UID — and only then is it flagged `\Deleted` and expunged,
+  with `UID EXPUNGE` naming the one message and the mailbox-wide `EXPUNGE`
+  only as the fallback for a server without UIDPLUS (which answers BAD). POP3
+  has no folders and no flags: the UIDL is the whole address of the message,
+  `DELE <number>` goes out for it when the drop still answers for it, and the
+  `QUIT` that `pop3_delete` always sends is what commits the deletion.
+  The row leaves the list only when the job reports success
+  (`Event::MessageDeleted`) — the job brackets its round trip with
+  `SyncStarted`/`SyncDone`, so the account's spinner is what says the mail is
+  on its way out — and that event is also where the reading pane is cleared if
+  it was showing that mail, its cached Blitz pages go (`forget_blitz_message`)
+  and an active search is asked again, since the hit list is a snapshot of the
+  database. A half-finished delete is harmless: a mail whose remote copy went
+  but whose local row survived is deleted again by the same button, which then
+  finds nothing on the server and stops at the local half.
+  **Deleting is permanent.** There is no Trash: IMAP expunges and POP3's `DELE`
+  is the server's own hard delete, so the button does not ask first — the
+  tooltip says what it does — and nothing in the app can undo it. Deleting to
+  a Trash folder instead (IMAP `UID COPY` + expunge; POP3 cannot) is a decision
+  for the project owner, not a fix to slip in. The folder's sync mark is
+  deliberately not moved back: the mail is gone from the server too, and a mark
+  that walked back to it would only make the next sync fetch it again.
 - The compose window (`compose_window`, opened by the title bar's pencil) is
   the app's one `egui::Window`: an `egui::Modal` would block the columns, and
   writing a mail is not a decision the rest of the app waits on. It floats over
@@ -592,11 +632,15 @@ Do not "fix" these casually — they are known:
   `src/protocol/ffdhe.rs` and nothing else. A server whose DHE group is
   another size, or yet another custom prime, still fails the handshake with
   `SelectedUnofferedKxGroup`; see the FFDHE convention above for what to add.
-- No message deletion/expunge (IMAP `\Deleted` + EXPUNGE, POP3 `DELE`).
+- Deleting is permanent: there is no Trash folder and no undo, a click on the
+  title bar's Delete expunges the mail on the server without asking first, and
+  it acts on the one mail the reading pane shows — no multi-select, no
+  Delete-key shortcut.
 - Nothing a mail is written into can leave the machine: the compose window's
   draft cannot be sent (no SMTP), saved, or reopened once its window is
-  closed, and the title bar's reply / reply all / forward / label / flag /
-  delete buttons are drawn but not wired to anything yet.
+  closed, and the title bar's reply / reply all / forward / label / flag
+  buttons are drawn but not wired to anything yet (delete is wired; see the
+  deletion bullet above).
 - Credentials in plain text in `mail.db` (mode 0600, see above); no
   OAuth2/XOAUTH2. The database is not encrypted, and the app never renames or
   deletes it on its own: a corrupt file is the user's to move aside.
@@ -631,8 +675,8 @@ Do not "fix" these casually — they are known:
   resources are fetched during the render, so the first view of an
   image-heavy mail can take a few seconds (the disk cache makes the second
   one fast). Fonts are the curated disk set, not fontconfig's.
-- POP3 never deletes or mutates anything server-side, and a sync does not
-  notice deletions either: mail removed in another client stays in the database
+- POP3 changes one thing server-side — the `DELE` behind the Delete button —
+  and a sync does not notice deletions either: mail removed in another client stays in the database
   and in the list forever. What a sync does is incremental by UIDL — a message
   already stored is never downloaded again — and bounded below by the
   `first_num` floor the first sync chose, so the messages a first sync skipped

@@ -936,6 +936,30 @@ fn set_seen_on(conn: &Connection, account_id: &str, folder: &str, uid: &str) -> 
     Ok(())
 }
 
+/// Delete one message: its row, and through the cascades and the FTS trigger
+/// its attachments, its inline images and its index entry.
+///
+/// The folder's sync mark is deliberately left where it is. The mail is gone
+/// from the server as well — the caller deletes it there first — so a mark
+/// that walked back to it would only make the next sync fetch it again.
+pub fn delete_message(account_id: &str, folder: &str, uid: &str) -> MailResult<()> {
+    let db = db()?;
+    delete_message_on(db.conn(), account_id, folder, uid)
+}
+
+fn delete_message_on(
+    conn: &Connection,
+    account_id: &str,
+    folder: &str,
+    uid: &str,
+) -> MailResult<()> {
+    conn.execute(
+        "DELETE FROM messages WHERE account_id = ?1 AND folder = ?2 AND uid = ?3",
+        params![account_id, folder, uid],
+    )?;
+    Ok(())
+}
+
 /// Check the database file and the FTS index. Every mutation test ends with
 /// this, so a trigger that stopped firing or a missed `cascade` cannot go
 /// unnoticed.
@@ -1409,6 +1433,47 @@ mod tests {
         );
         assert_eq!(count(&conn, "SELECT COUNT(*) FROM inline_images"), 1);
         assert_eq!(hits(&conn, "hello"), 1, "the deleted mail left the index");
+        integrity_check_on(&conn).unwrap();
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn deleting_a_message_takes_its_children_and_its_index_row() {
+        let (mut conn, dir) = test_db("delete-message");
+        save_account_on(&conn, &account("work")).unwrap();
+        let mut mail = message("1", "Hello", "body of the mail");
+        mail.attachment_names = vec!["report.pdf".to_string()];
+        mail.inline_images = vec![InlineImage {
+            cid: "logo".to_string(),
+            content_type: "image/png".to_string(),
+            data: b"png bytes".to_vec(),
+        }];
+        save_messages_on(
+            &mut conn,
+            "work",
+            "INBOX",
+            Some(1),
+            &[mail, message("2", "Other", "other body")],
+        )
+        .unwrap();
+        assert_eq!(
+            folder_sync_on(&conn, "work", "INBOX").unwrap().uid_next,
+            Some(3),
+            "the batch moves the folder's mark"
+        );
+
+        delete_message_on(&conn, "work", "INBOX", "1").unwrap();
+
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM messages"), 1);
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM attachments"), 0);
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM inline_images"), 0);
+        assert_eq!(hits(&conn, "hello"), 0, "the deleted mail left the index");
+        assert_eq!(hits(&conn, "other"), 1);
+        assert_eq!(
+            folder_sync_on(&conn, "work", "INBOX").unwrap().uid_next,
+            Some(3),
+            "the mark does not walk back to a message that is gone"
+        );
         integrity_check_on(&conn).unwrap();
         let _ = fs::remove_dir_all(&dir);
     }

@@ -72,6 +72,14 @@ pub enum Job {
         folder: String,
         uid: String,
     },
+    /// Delete one message. The server is told first and the database row goes
+    /// only once it has agreed (see `delete_message`), so nothing is ever
+    /// dropped here while the server still has it.
+    DeleteMessage {
+        account: Account,
+        folder: String,
+        uid: String,
+    },
     /// Remove an account: its row, its folders and, through the cascades, every
     /// message cached for it.
     DeleteAccount { account_id: String },
@@ -118,6 +126,13 @@ pub enum Event {
     SyncFailed {
         account_id: String,
         error: String,
+    },
+    /// One message is out of the server and out of the database, so the UI
+    /// can drop its in-memory copy of it.
+    MessageDeleted {
+        account_id: String,
+        folder: String,
+        uid: String,
     },
     ImageLoaded {
         url: String,
@@ -236,6 +251,39 @@ pub fn spawn(job: Job, ctx: egui::Context, tx: Sender<Event>) {
             }
             ctx.request_repaint();
         }
+        Job::DeleteMessage {
+            account,
+            folder,
+            uid,
+        } => {
+            // Not a sync, but it is a round trip: the account's spinner is
+            // what says the mail is on its way out while the server is asked.
+            let account_id = account.id.clone();
+            let _ = tx.send(Event::SyncStarted {
+                account_id: account_id.clone(),
+            });
+            match delete_message(&account, &folder, &uid) {
+                Ok(()) => {
+                    // The row leaves the list only now, with the database
+                    // already short of it.
+                    let _ = tx.send(Event::MessageDeleted {
+                        account_id: account_id.clone(),
+                        folder,
+                        uid,
+                    });
+                    let _ = tx.send(Event::SyncDone { account_id });
+                }
+                // The local copy is still there — that is the point of the
+                // order above — and the account carries the reason.
+                Err(error) => {
+                    let _ = tx.send(Event::SyncFailed {
+                        account_id,
+                        error: format!("delete: {error}"),
+                    });
+                }
+            }
+            ctx.request_repaint();
+        }
         account_job => {
             let account_id = match &account_job {
                 Job::Sync { account, .. } | Job::SyncFolder { account, .. } => account.id.clone(),
@@ -245,6 +293,7 @@ pub fn spawn(job: Job, ctx: egui::Context, tx: Sender<Event>) {
                 | Job::ScanFonts
                 | Job::Search { .. }
                 | Job::MarkSeen { .. }
+                | Job::DeleteMessage { .. }
                 | Job::DeleteAccount { .. } => unreachable!(),
             };
             let _ = tx.send(Event::SyncStarted {
@@ -277,6 +326,7 @@ pub fn spawn(job: Job, ctx: egui::Context, tx: Sender<Event>) {
                 | Job::ScanFonts
                 | Job::Search { .. }
                 | Job::MarkSeen { .. }
+                | Job::DeleteMessage { .. }
                 | Job::DeleteAccount { .. } => unreachable!(),
             };
             let _ = match result {
@@ -505,6 +555,42 @@ fn imap_mark_seen(account: &Account, folder: &str, uid: u32) -> MailResult<()> {
         client.select(folder)?;
         client.uid_store_flags_silent(uid, "+FLAGS.SILENT (\\Seen)")
     })
+}
+
+/// Delete one message. The remote half goes first and the database row only
+/// after it: mail that is still on the server must not vanish from here, or
+/// the next sync would bring it back and the deletion would look like it
+/// never happened. Mail the server no longer has is dropped locally — there
+/// is nothing remote to delete, and the local copy is the only one left.
+fn delete_message(account: &Account, folder: &str, uid: &str) -> MailResult<()> {
+    match account.protocol {
+        Protocol::Imap => imap_delete(account, folder, uid)?,
+        Protocol::Pop3 => pop3_delete(account, uid)?,
+    }
+    db::delete_message(&account.id, folder, uid)
+}
+
+fn imap_delete(account: &Account, folder: &str, uid: &str) -> MailResult<()> {
+    let number = uid
+        .parse::<u32>()
+        .map_err(|_| MailError::Protocol(format!("not an IMAP UID: {uid}")))?;
+    with_imap(account, |client| {
+        client.login(&account.username, &account.password)?;
+        client.delete_message(folder, number)
+    })
+}
+
+/// POP3 has no folders, so the UIDL is the whole address of the message. The
+/// deletion is committed by `QUIT`, which `quit` sends whatever happened above
+/// it — a session that ends any other way leaves the mail on the server.
+fn pop3_delete(account: &Account, uid: &str) -> MailResult<()> {
+    let mut client = Pop3Client::connect(account)?;
+    let result = (|| -> MailResult<()> {
+        client.login(&account.username, &account.password)?;
+        client.delete_by_uidl(uid)
+    })();
+    client.quit();
+    result
 }
 
 fn sync_pop3(account: &Account, tx: &Sender<Event>) -> MailResult<()> {

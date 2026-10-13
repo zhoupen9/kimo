@@ -6,8 +6,16 @@ use std::fmt;
 pub enum MailError {
     Io(std::io::Error),
     Tls(rustls::Error),
-    /// The server replied with something we could not accept (NO / BAD / -ERR).
+    /// The server replied with something we could not make sense of, or could
+    /// not accept (POP3's -ERR, an unexpected line). IMAP's own NO / BAD are
+    /// `Refused` instead: a caller may have a fallback for those.
     Protocol(String),
+    /// The server understood a command and refused it (IMAP NO / BAD). Kept
+    /// apart from `Protocol`, which also covers a server answering something
+    /// we cannot make sense of: a caller with a fallback for a command the
+    /// server does not implement (an extension only some servers have) must
+    /// not take a broken connection for a refusal.
+    Refused(String),
     /// Login or authentication was rejected.
     Auth(String),
     /// A settings file could not be read or written.
@@ -25,6 +33,7 @@ impl fmt::Display for MailError {
             MailError::Io(e) => write!(f, "I/O error: {e}"),
             MailError::Tls(e) => write!(f, "TLS error: {e}"),
             MailError::Protocol(msg) => write!(f, "protocol error: {msg}"),
+            MailError::Refused(msg) => write!(f, "server refused: {msg}"),
             MailError::Auth(msg) => write!(f, "authentication failed: {msg}"),
             MailError::Json(e) => write!(f, "settings error: {e}"),
             MailError::Db(e) => write!(f, "storage error: {e}"),
@@ -40,7 +49,10 @@ impl std::error::Error for MailError {
             MailError::Tls(e) => Some(e),
             MailError::Json(e) => Some(e),
             MailError::Db(e) => Some(e),
-            MailError::Storage(_) | MailError::Protocol(_) | MailError::Auth(_) => None,
+            MailError::Storage(_)
+            | MailError::Protocol(_)
+            | MailError::Refused(_)
+            | MailError::Auth(_) => None,
         }
     }
 }

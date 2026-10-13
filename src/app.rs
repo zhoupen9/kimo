@@ -180,6 +180,53 @@ enum PrefsTab {
     Appearance,
 }
 
+/// One of the mail actions in the title bar. All of them act on the mail open
+/// in the reading pane; Delete is the one that does something so far.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum MailAction {
+    Reply,
+    ReplyAll,
+    Forward,
+    Label,
+    Flag,
+    Delete,
+}
+
+impl MailAction {
+    /// The buttons, in the order the bar draws them.
+    const ALL: [MailAction; 6] = [
+        MailAction::Reply,
+        MailAction::ReplyAll,
+        MailAction::Forward,
+        MailAction::Label,
+        MailAction::Flag,
+        MailAction::Delete,
+    ];
+
+    /// The action's name. The bar carries glyphs rather than words, so this
+    /// is the hover text, and the "no mail selected" note beside it.
+    fn label(self) -> &'static str {
+        match self {
+            MailAction::Reply => "Reply",
+            MailAction::ReplyAll => "Reply all",
+            MailAction::Forward => "Forward",
+            MailAction::Label => "Label",
+            MailAction::Flag => "Flag",
+            MailAction::Delete => "Delete",
+        }
+    }
+
+    /// The hover text while there is mail to act on. Delete says what it
+    /// does: it is the one action here that cannot be undone, because it
+    /// expunges the mail on the server as well.
+    fn tooltip(self) -> &'static str {
+        match self {
+            MailAction::Delete => "Delete — removes this mail from the server too",
+            other => other.label(),
+        }
+    }
+}
+
 /// A mail being written in the compose window.
 ///
 /// Nothing about it is persisted and nothing is sent: Kimo speaks IMAP and
@@ -670,6 +717,32 @@ impl KimoApp {
                     state.error = Some(error);
                 }
             }
+            Event::MessageDeleted {
+                account_id,
+                folder,
+                uid,
+            } => {
+                // The worker has already taken the mail off the server and
+                // out of the database; what is left is this in-memory copy.
+                if let Some(state) = self.states.get_mut(&account_id) {
+                    if let Some(fc) = state.mailbox.folders.iter_mut().find(|f| f.name == folder) {
+                        fc.messages.retain(|m| m.uid != uid);
+                    }
+                }
+                if self.selected_account.as_deref() == Some(account_id.as_str())
+                    && self.selected_folder.as_deref() == Some(folder.as_str())
+                    && self.selected_message.as_deref() == Some(uid.as_str())
+                {
+                    self.selected_message = None;
+                }
+                self.forget_blitz_message(&account_id, &folder, &uid);
+                // The results are a snapshot of the database from when the
+                // query ran, so they have to be asked for again for the
+                // deleted mail to leave them too.
+                if self.search.is_active() {
+                    self.spawn_search();
+                }
+            }
             Event::ImageLoaded {
                 url,
                 width,
@@ -863,6 +936,42 @@ impl KimoApp {
         self.forget_blitz_pages(account_id);
     }
 
+    /// Delete the mail the reading pane shows, by way of a worker thread: the
+    /// server is told first and the database row goes only once it has agreed
+    /// (`Job::DeleteMessage`), so mail that is still on the server is never
+    /// dropped here. The row leaves the list when the deletion comes back
+    /// (`Event::MessageDeleted`), which is also where the reading pane is
+    /// cleared if it was showing it.
+    ///
+    /// Nothing asks first: the button is the confirmation, and a deletion that
+    /// cannot be undone is what the tooltip says it is.
+    fn delete_selected_message(&mut self) {
+        // The reading pane's own question, so a uid it no longer shows is no
+        // mail to delete — the same test the buttons' enabled state makes.
+        if !self.has_selected_message() {
+            return;
+        }
+        let (Some(account_id), Some(folder), Some(uid)) = (
+            self.selected_account.clone(),
+            self.selected_folder.clone(),
+            self.selected_message.clone(),
+        ) else {
+            return;
+        };
+        let Some(account) = self.accounts.iter().find(|a| a.id == account_id).cloned() else {
+            return;
+        };
+        sync::spawn(
+            Job::DeleteMessage {
+                account,
+                folder,
+                uid,
+            },
+            self.ctx.clone(),
+            self.tx.clone(),
+        );
+    }
+
     /// Save the add/edit form: mint an account (and a fresh id) for a new
     /// one, or replace the edited account in place, then sync it so the
     /// window shows what the credentials actually reach.
@@ -942,14 +1051,27 @@ impl KimoApp {
     /// Drop every cached Blitz page belonging to an account (keys start
     /// with its id and a `/`, so `work` cannot match `work-2`).
     fn forget_blitz_pages(&mut self, account_id: &str) {
-        let prefix = format!("{account_id}/");
-        self.blitz_pages.retain(|key, _| !key.starts_with(&prefix));
+        self.forget_blitz_prefix(&format!("{account_id}/"));
+    }
+
+    /// Drop the cached pages of one message. The key a page is stored under is
+    /// the message's identity — account, folder and uid, each followed by a
+    /// `/` (`blitz_identity`) — with the geometry after it, so the identity is
+    /// the prefix.
+    fn forget_blitz_message(&mut self, account_id: &str, folder: &str, uid: &str) {
+        self.forget_blitz_prefix(&format!("{account_id}/{folder}/{uid}/"));
+    }
+
+    /// Drop every cached page whose key starts with `prefix`, and give up the
+    /// one waiting for the geometry to settle if it is one of them.
+    fn forget_blitz_prefix(&mut self, prefix: &str) {
+        self.blitz_pages.retain(|key, _| !key.starts_with(prefix));
         self.blitz_order
             .retain(|key| self.blitz_pages.contains_key(key));
         if self
             .pending_blitz_key
             .as_ref()
-            .is_some_and(|(key, _)| key.starts_with(&prefix))
+            .is_some_and(|(key, _)| key.starts_with(prefix))
         {
             self.pending_blitz_key = None;
         }
@@ -1638,29 +1760,18 @@ impl KimoApp {
     /// and filled under the pointer — which is also what keeps the six of them
     /// reading as one group rather than as six framed widgets.
     ///
-    /// UI only so far. The buttons are drawn, hover and enable/disable, but
-    /// nothing is wired to them yet — a click is not even read.
-    fn titlebar_mail_actions(&self, row: &mut egui::Ui, visuals: &egui::Visuals, bar_height: f32) {
-        #[derive(Clone, Copy)]
-        enum Action {
-            Reply,
-            ReplyAll,
-            Forward,
-            Label,
-            Flag,
-            Delete,
-        }
-
+    /// Delete is wired: it hands the mail to `delete_selected_message`, which
+    /// has a worker take it off the server before it leaves the database. The
+    /// other five are still drawn only — a click on one runs nothing, so they
+    /// stay UI until the actions they name exist.
+    fn titlebar_mail_actions(
+        &mut self,
+        row: &mut egui::Ui,
+        visuals: &egui::Visuals,
+        bar_height: f32,
+    ) {
         let enabled = self.has_selected_message();
-        let actions = [
-            (Action::Reply, "Reply"),
-            (Action::ReplyAll, "Reply all"),
-            (Action::Forward, "Forward"),
-            (Action::Label, "Label"),
-            (Action::Flag, "Flag"),
-            (Action::Delete, "Delete"),
-        ];
-        for (action, label) in actions {
+        for action in MailAction::ALL {
             let response = titlebar_flat_button(row, bar_height, enabled);
             let color = if enabled {
                 visuals.text_color()
@@ -1669,18 +1780,28 @@ impl KimoApp {
             };
             let painter = row.painter();
             match action {
-                Action::Reply => paint_reply_icon(painter, response.rect, color),
-                Action::ReplyAll => paint_reply_all_icon(painter, response.rect, color),
-                Action::Forward => paint_forward_icon(painter, response.rect, color),
-                Action::Label => paint_label_icon(painter, response.rect, color),
-                Action::Flag => paint_flag_icon(painter, response.rect, color),
-                Action::Delete => paint_delete_icon(painter, response.rect, color),
+                MailAction::Reply => paint_reply_icon(painter, response.rect, color),
+                MailAction::ReplyAll => paint_reply_all_icon(painter, response.rect, color),
+                MailAction::Forward => paint_forward_icon(painter, response.rect, color),
+                MailAction::Label => paint_label_icon(painter, response.rect, color),
+                MailAction::Flag => paint_flag_icon(painter, response.rect, color),
+                MailAction::Delete => paint_delete_icon(painter, response.rect, color),
             }
-            response.on_hover_text(if enabled {
-                label.to_string()
+            let response = response.on_hover_text(if enabled {
+                action.tooltip().to_string()
             } else {
-                format!("{label} — no mail selected")
+                format!("{} — no mail selected", action.label())
             });
+            if enabled && response.clicked() {
+                match action {
+                    MailAction::Delete => self.delete_selected_message(),
+                    MailAction::Reply
+                    | MailAction::ReplyAll
+                    | MailAction::Forward
+                    | MailAction::Label
+                    | MailAction::Flag => {}
+                }
+            }
         }
     }
 

@@ -81,6 +81,31 @@ impl Pop3Client {
         Ok(out)
     }
 
+    /// Delete the message with this UIDL, if the drop still has it. A UIDL the
+    /// server no longer answers for is a message that is already gone, which is
+    /// not an error.
+    ///
+    /// POP3 commits a deletion at QUIT and at nothing else, so the caller has
+    /// to end the session with `quit` for this to reach the server: a
+    /// connection that drops in between leaves the mail alone, which is the
+    /// safe direction.
+    pub fn delete_by_uidl(&mut self, uid: &str) -> MailResult<()> {
+        let number = self
+            .uidl()?
+            .into_iter()
+            .find(|(_, id)| id == uid)
+            .map(|(number, _)| number);
+        match number {
+            Some(number) => self.dele(number),
+            None => Ok(()),
+        }
+    }
+
+    /// Mark one message deleted (`DELE`).
+    fn dele(&mut self, num: usize) -> MailResult<()> {
+        self.command(&format!("DELE {num}")).map(|_| ())
+    }
+
     pub fn quit(&mut self) {
         let _ = self.conn.write_line("QUIT");
         let _ = self.read_status();
@@ -115,7 +140,83 @@ impl Pop3Client {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
     use crate::error::MailError;
+    use crate::models::{Protocol, TlsMode};
+    use std::io::{BufRead, Write};
+
+    /// A canned POP3 server on a loopback port: greet, then answer each
+    /// (command, response) pair, asserting the command is exactly what the
+    /// test expected — a UIDL mistaken for a message number would delete the
+    /// wrong mail, and POP3 has no way back from that.
+    fn one_shot_server(
+        script: Vec<(&'static str, &'static str)>,
+    ) -> (Account, std::thread::JoinHandle<Vec<String>>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            socket.write_all(b"+OK ready\r\n").unwrap();
+            let mut reader = std::io::BufReader::new(socket.try_clone().unwrap());
+            let mut commands = Vec::new();
+            for (expected, response) in script {
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                let line = line.trim_end().to_string();
+                assert_eq!(line, expected, "the client sent a different command");
+                socket.write_all(response.as_bytes()).unwrap();
+                commands.push(line);
+            }
+            commands
+        });
+        let account = Account {
+            id: "local".to_string(),
+            name: "Local".to_string(),
+            protocol: Protocol::Pop3,
+            host: "127.0.0.1".to_string(),
+            port,
+            username: "me".to_string(),
+            password: "secret".to_string(),
+            tls: TlsMode::Plain,
+        };
+        (account, server)
+    }
+
+    #[test]
+    fn deleting_a_message_sends_the_number_its_uidl_names() {
+        let (account, server) = one_shot_server(vec![
+            ("USER me", "+OK\r\n"),
+            ("PASS secret", "+OK\r\n"),
+            ("UIDL", "+OK\r\n1 aaa\r\n2 bbb\r\n.\r\n"),
+            ("DELE 2", "+OK message 2 deleted\r\n"),
+            ("QUIT", "+OK bye\r\n"),
+        ]);
+        let mut client = Pop3Client::connect(&account).unwrap();
+        client.login("me", "secret").unwrap();
+
+        client.delete_by_uidl("bbb").unwrap();
+        client.quit();
+        assert_eq!(server.join().unwrap().len(), 5);
+    }
+
+    /// The message is not in the drop any more: nothing is sent for it, and
+    /// the caller drops its own copy without a command that could touch
+    /// another message.
+    #[test]
+    fn a_uidl_the_drop_no_longer_has_sends_no_dele() {
+        let (account, server) = one_shot_server(vec![
+            ("USER me", "+OK\r\n"),
+            ("PASS secret", "+OK\r\n"),
+            ("UIDL", "+OK\r\n1 aaa\r\n.\r\n"),
+            ("QUIT", "+OK bye\r\n"),
+        ]);
+        let mut client = Pop3Client::connect(&account).unwrap();
+        client.login("me", "secret").unwrap();
+
+        client.delete_by_uidl("bbb").unwrap();
+        client.quit();
+        assert_eq!(server.join().unwrap().len(), 4);
+    }
 
     #[test]
     fn error_mapping_is_by_display_text() {

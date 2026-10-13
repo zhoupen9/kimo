@@ -53,7 +53,7 @@ impl ImapClient {
             quote_string(pass)
         ))
         .map_err(|e| match e {
-            MailError::Protocol(msg) => MailError::Auth(msg),
+            MailError::Protocol(msg) | MailError::Refused(msg) => MailError::Auth(msg),
             other => other,
         })
         .map(|_| ())
@@ -173,6 +173,54 @@ impl ImapClient {
             .map(|_| ())
     }
 
+    /// Delete one message from `folder`, if the server still has it.
+    ///
+    /// The mailbox is checked against LIST first: one the server no longer
+    /// lists is gone, and its mail with it — there is nothing remote left to
+    /// delete, and the caller is free to drop its local copy. A mailbox that
+    /// *is* listed but refuses SELECT is an error instead: the server may
+    /// simply be unwilling to open it right now, and mail that is still on
+    /// the server must not disappear here.
+    ///
+    /// The UID is then probed before anything is flagged, so a message
+    /// another client has already removed takes the same local-only path.
+    /// Only a message the server still answers for is flagged `\Deleted`
+    /// and expunged, which is what keeps the two copies from disagreeing.
+    pub fn delete_message(&mut self, folder: &str, uid: u32) -> MailResult<()> {
+        if !self.list_folders()?.iter().any(|listed| listed == folder) {
+            return Ok(());
+        }
+        self.select(folder)?;
+        if !self.uid_exists(uid)? {
+            return Ok(());
+        }
+        self.uid_store_flags_silent(uid, "+FLAGS.SILENT (\\Deleted)")?;
+        self.uid_expunge(uid)
+    }
+
+    /// Whether `uid` is still in the selected mailbox: `UID FETCH <uid>
+    /// (UID)` answers with one untagged FETCH line when it is, and with none
+    /// when it is not.
+    fn uid_exists(&mut self, uid: u32) -> MailResult<bool> {
+        let (_, untagged) = self.run(&format!("UID FETCH {uid} (UID)"))?;
+        Ok(untagged
+            .iter()
+            .any(|line| line.contains(" FETCH ") && extract_uid(line) == Some(uid)))
+    }
+
+    /// Expunge exactly one message: `UID EXPUNGE` (RFC 4315, the UIDPLUS
+    /// extension) names the UID, so nothing another client left flagged goes
+    /// with it. A server without UIDPLUS answers BAD, and the mailbox-wide
+    /// `EXPUNGE` is then the only way — the message was flagged `\Deleted`
+    /// right before, so it is what that command is aimed at.
+    fn uid_expunge(&mut self, uid: u32) -> MailResult<()> {
+        match self.run(&format!("UID EXPUNGE {uid}")) {
+            Ok(_) => Ok(()),
+            Err(MailError::Refused(_)) => self.run("EXPUNGE").map(|_| ()),
+            Err(error) => Err(error),
+        }
+    }
+
     pub fn logout(&mut self) {
         let _ = self.run("LOGOUT");
     }
@@ -199,12 +247,10 @@ impl ImapClient {
                 if rest.starts_with("OK") {
                     return Ok((rest.to_string(), untagged));
                 }
-                let msg = rest.to_string();
-                return Err(if rest.starts_with("NO") {
-                    MailError::Protocol(format!("server rejected command: {msg}"))
-                } else {
-                    MailError::Protocol(format!("BAD: {msg}"))
-                });
+                // NO and BAD are the server's own answers — it read the
+                // command and said no — which a caller with a fallback has to
+                // be able to tell apart from a connection that went wrong.
+                return Err(MailError::Refused(rest.to_string()));
             }
             untagged.push(line);
         }
@@ -479,6 +525,120 @@ mod tests {
             tls: TlsMode::Plain,
         };
         (account, server)
+    }
+
+    /// A canned mailbox: LIST knows INBOX, SELECT opens it, and one message
+    /// (UID 45) is in it. Each test scripts what its server answers after
+    /// that, so the commands a delete sends are pinned.
+    fn incipit() -> Vec<(&'static str, String)> {
+        vec![
+            (
+                "LIST \"\" \"*\"",
+                "* LIST (\\HasNoChildren) \"/\" \"INBOX\"\r\n{tag} OK LIST completed\r\n"
+                    .to_string(),
+            ),
+            (
+                "SELECT \"INBOX\"",
+                "* 3 EXISTS\r\n{tag} OK [READ-WRITE] SELECT completed\r\n".to_string(),
+            ),
+            (
+                "UID FETCH 45 (UID)",
+                "* 3 FETCH (UID 45)\r\n{tag} OK FETCH completed\r\n".to_string(),
+            ),
+        ]
+    }
+
+    #[test]
+    fn deleting_a_message_flags_the_uid_and_expunges_it() {
+        let mut script = incipit();
+        script.push((
+            "UID STORE 45 +FLAGS.SILENT (\\Deleted)",
+            "{tag} OK STORE completed\r\n".to_string(),
+        ));
+        script.push((
+            "UID EXPUNGE 45",
+            "{tag} OK EXPUNGE completed\r\n".to_string(),
+        ));
+        let (account, server) = one_shot_server(script);
+        let mut client = ImapClient::connect(&account).unwrap();
+
+        client.delete_message("INBOX", 45).unwrap();
+        assert_eq!(server.join().unwrap().len(), 5);
+    }
+
+    /// A server without UIDPLUS rejects `UID EXPUNGE`; the message has just
+    /// been flagged, so the mailbox-wide EXPUNGE is the way to finish.
+    #[test]
+    fn a_server_without_uidplus_falls_back_to_the_plain_expunge() {
+        let mut script = incipit();
+        script.push((
+            "UID STORE 45 +FLAGS.SILENT (\\Deleted)",
+            "{tag} OK STORE completed\r\n".to_string(),
+        ));
+        script.push((
+            "UID EXPUNGE 45",
+            "{tag} BAD Unknown command\r\n".to_string(),
+        ));
+        script.push((
+            "EXPUNGE",
+            "* 3 EXPUNGE\r\n{tag} OK EXPUNGE completed\r\n".to_string(),
+        ));
+        let (account, server) = one_shot_server(script);
+        let mut client = ImapClient::connect(&account).unwrap();
+
+        client.delete_message("INBOX", 45).unwrap();
+        assert_eq!(server.join().unwrap().len(), 6);
+    }
+
+    /// The mail is not on the server any more, so there is nothing to flag or
+    /// expunge: the commands stop at the probe, and the caller drops its own
+    /// copy. `UID FETCH` answers a UID it does not have with no FETCH line.
+    #[test]
+    fn a_uid_the_server_no_longer_has_is_never_stored_or_expunged() {
+        let mut script = vec![incipit()[0].clone(), incipit()[1].clone()];
+        script.push((
+            "UID FETCH 45 (UID)",
+            "{tag} OK FETCH completed\r\n".to_string(),
+        ));
+        let (account, server) = one_shot_server(script);
+        let mut client = ImapClient::connect(&account).unwrap();
+
+        client.delete_message("INBOX", 45).unwrap();
+        assert_eq!(server.join().unwrap().len(), 3);
+    }
+
+    /// A mailbox the server no longer lists is gone with its mail: no SELECT,
+    /// no STORE — nothing remote is left to delete.
+    #[test]
+    fn a_mailbox_the_server_no_longer_lists_is_never_selected() {
+        let script = vec![incipit()[0].clone()];
+        let (account, server) = one_shot_server(script);
+        let mut client = ImapClient::connect(&account).unwrap();
+
+        // The server lists INBOX alone: a mail cached under Archive has no
+        // mailbox left to be deleted from.
+        client.delete_message("Archive", 45).unwrap();
+        assert_eq!(server.join().unwrap().len(), 1);
+    }
+
+    /// A mailbox that is listed but refuses SELECT is not a mailbox whose mail
+    /// may be dropped: the refusal travels back to the caller, which keeps its
+    /// copy.
+    #[test]
+    fn a_refused_select_keeps_the_callers_copy() {
+        let script = vec![
+            incipit()[0].clone(),
+            (
+                "SELECT \"INBOX\"",
+                "{tag} NO mailbox is locked\r\n".to_string(),
+            ),
+        ];
+        let (account, server) = one_shot_server(script);
+        let mut client = ImapClient::connect(&account).unwrap();
+
+        let error = client.delete_message("INBOX", 45).unwrap_err();
+        assert!(matches!(error, MailError::Refused(_)), "{error}");
+        assert_eq!(server.join().unwrap().len(), 2);
     }
 
     #[test]
