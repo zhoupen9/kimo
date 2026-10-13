@@ -3548,10 +3548,10 @@ const TITLEBAR_BUTTON_WIDTH: f32 = 42.0;
 /// Short enough to feel like a state change rather than an animation.
 const TITLEBAR_FLOAT_TIME: f32 = 0.16;
 /// What the bar's fill keeps of its alpha while it floats: the rest is the
-/// blurred mail showing through. High enough that the bar's own icons and
-/// query stay crisp, low enough that the smudge behind them reads as mail
-/// rather than as a smeared background.
-const GLASS_ALPHA: f32 = 0.62;
+/// blurred mail showing through. At 0.25 the blurred mail *is* the bar's body
+/// and the fill is a tint over it; the bar's own icons and query stay crisp
+/// because they are painted over that fill at full strength.
+const GLASS_ALPHA: f32 = 0.25;
 /// The same for the search box's own fill, which is lighter than the bar's to
 /// begin with: it keeps a little less of it, so the box is glass too and the
 /// mail still shows through it. The stroke is what keeps it reading as a
