@@ -424,7 +424,8 @@ Event (mpsc) ──► drain_events() at frame start ──► merge into Accoun
   the bar again rather than snapping it, and a column with nothing to scroll —
   or no list and no mail at all — leaves it docked. Inside
   the bar, left to right: the application icon (the brand, and the leftmost
-  thing in the bar: the same
+  thing in the bar, kept `BRAND_ICON_MARGIN` clear of the window's edge rather
+  than flush against it: the same
   embedded PNG the tray serves, downscaled once at startup because egui has
   no mipmaps to filter a 256 px source down to 18 pt), the nav collapse
   toggle, the compose button (the one mail action that needs no mail open, so

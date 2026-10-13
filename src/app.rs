@@ -1638,7 +1638,9 @@ impl KimoApp {
                 egui::Layout::left_to_right(egui::Align::Center),
                 |row| {
                     // Brand first: the application icon is the leftmost
-                    // thing in the bar (the tray embeds the same PNG).
+                    // thing in the bar (the tray embeds the same PNG), a
+                    // little clear of the window's edge.
+                    row.add_space(BRAND_ICON_MARGIN);
                     if let Some(icon) = self.brand_icon.clone() {
                         row.add(
                             egui::Image::from_texture(&icon)
@@ -3612,6 +3614,12 @@ const SEARCH_ICON_INSET: i8 = 22;
 const SEARCH_ICON_SIZE: f32 = 15.0;
 /// Side of the square brand icon at the left of the title bar.
 const BRAND_ICON_SIZE: f32 = 18.0;
+/// Clear space between the window's left edge and the brand icon: the mark is
+/// the first thing in the bar, and flush against the frame it reads as cropped
+/// rather than placed. It is the whole gap — the row's item spacing separates
+/// items that follow one another, and the space added here is the row's first
+/// item.
+const BRAND_ICON_MARGIN: f32 = 10.0;
 
 /// The compose window: the width its boxes are laid out for (also the width it
 /// opens at), the label column of its header fields, the height of one of those
