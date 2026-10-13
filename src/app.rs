@@ -4082,14 +4082,29 @@ impl KimoApp {
             // No frame: the gutter and the card are painted in mail_content.
             .frame(egui::Frame::NONE)
             .show(ui, |ui| self.mail_content(ui));
-        if !self.nav_collapsed {
-            egui::Panel::left("nav")
-                .resizable(true)
-                .min_size(150.0)
-                .default_size(200.0)
-                .show_separator_line(false)
-                .show(ui, |ui| self.nav(ui));
-        }
+        // The navigation slides out instead of vanishing: `show_collapsible`
+        // lays the column out at its full width and slides it off toward the
+        // window's edge, clipped, so the folder rows keep their layout as it
+        // goes and the list takes the room over frame by frame. The slide runs
+        // on egui's own animation time (`Style::animation_time`, 0.2 s), and
+        // the panel's stored width survives it — a collapsed column reopens at
+        // the width the splitter left it at, not at the width it slid to.
+        //
+        // Collapsing is the title-bar toggle's business (and the narrow-window
+        // rule's, above): `drag_to_open(false)` keeps a collapsed column
+        // from leaving an invisible grab strip — and a hover line — across the
+        // message list's left edge, and the expanded flag the panel is handed
+        // is a copy, so that a splitter drag past the minimum keeps clamping
+        // there the way it always has instead of shutting the column by
+        // itself.
+        let mut expanded = !self.nav_collapsed;
+        egui::Panel::left("nav")
+            .resizable(true)
+            .min_size(150.0)
+            .default_size(200.0)
+            .show_separator_line(false)
+            .drag_to_open(false)
+            .show_collapsible(ui, &mut expanded, |ui| self.nav(ui));
         // No padding on the frame: the column's padding lives inside its scroll
         // area (see folder_messages), so the scroll bar can sit on the column's
         // edge instead of on the padding. The column's own rect — what the two
@@ -4746,8 +4761,19 @@ fn sender_initial(from: &str) -> String {
         .unwrap_or_else(|| "?".to_string())
 }
 
-/// Lay out a single line of text, cut with an ellipsis (by binary search on
-/// characters) to fit `max_width` pixels.
+/// Lay out a single line of text, cut with an ellipsis to fit `max_width`
+/// pixels.
+///
+/// The cut is epaint's own — one layout job whose `TextWrapping` ends the row
+/// at `max_width` and puts the ellipsis there (`max_rows: 1`,
+/// `overflow_character`) — rather than a binary search over cut prefixes. A
+/// search lays a galley out per probe to measure it: up to `log2(chars)`
+/// shapings for one line, every probe left in the galley cache, and its cost at
+/// its worst exactly when the width has moved far enough that all of the probes
+/// are new — the first frames of a slide or a splitter drag. Here a line costs
+/// one shaping whatever the width did, which is what the callers need: the
+/// message list lays out every visible row on every frame the column's width
+/// moves.
 fn truncate_galley(
     ctx: &egui::Context,
     text: &str,
@@ -4755,30 +4781,17 @@ fn truncate_galley(
     color: egui::Color32,
     max_width: f32,
 ) -> std::sync::Arc<egui::Galley> {
-    let font = egui::FontId::proportional(size);
-    let full = ctx.fonts_mut(|f| f.layout_no_wrap(text.to_owned(), font.clone(), color));
-    if full.size().x <= max_width {
-        return full;
-    }
-    let chars: Vec<char> = text.chars().collect();
-    // Find the longest prefix + "…" that fits (lo fits, hi never does).
-    let (mut lo, mut hi) = (0usize, chars.len());
-    while lo + 1 < hi {
-        let mid = (lo + hi) / 2;
-        let cut: String = chars[..mid].iter().collect::<String>() + "…";
-        let fits = ctx
-            .fonts_mut(|f| f.layout_no_wrap(cut, font.clone(), color))
-            .size()
-            .x
-            <= max_width;
-        if fits {
-            lo = mid;
-        } else {
-            hi = mid;
-        }
-    }
-    let cut: String = chars[..lo].iter().collect::<String>() + "…";
-    ctx.fonts_mut(|f| f.layout_no_wrap(cut, font, color))
+    let mut job = egui::text::LayoutJob::simple_format(
+        text.to_owned(),
+        egui::text::TextFormat::simple(egui::FontId::proportional(size), color),
+    );
+    job.wrap.max_width = max_width;
+    job.wrap.max_rows = 1;
+    // What `TextWrapping` asks for when `max_rows` is 1: without it a
+    // run with no break in it (an address, a CJK subject) would not be cut where
+    // the row ends.
+    job.wrap.break_anywhere = true;
+    ctx.fonts_mut(|f| f.layout_job(job))
 }
 
 /// How far the second strike of bold text sits from the first, in points.
@@ -5597,6 +5610,79 @@ mod tests {
         }
     }
 
+    /// The same question for the navigation column's slide: every frame of the
+    /// collapse moves the message column's width, so its visible rows are laid
+    /// out for a new width on each one. What it measures, on this machine and
+    /// the developer's own mail: with the built-in renderer and the mail open,
+    /// a slide frame costs about a millisecond more than a resting one in
+    /// release (2.1 ms against 1.2 ms) and about 26 ms more in a debug build,
+    /// where shaping is what is slow. All of that is the message list's rows —
+    /// with the rows not painted at all, a slide frame and a resting frame are
+    /// the same, so the navigation column itself is never re-laid out:
+    /// `Panel::show_collapsible` keeps its content at its full width and only
+    /// slides and clips it.
+    ///
+    ///     cargo test --release -- --ignored --nocapture bench_nav_slide
+    #[test]
+    #[ignore = "developer tool; prints frame times for a nav slide and asserts nothing"]
+    fn bench_nav_slide() {
+        let ctx = egui::Context::default();
+        let scale = 2.0;
+        let Some(mut app) = probe_app(&ctx) else {
+            println!("no mail database: nothing to measure");
+            return;
+        };
+        const PANE: f32 = 520.0;
+        // 60 frames/s, so the slide is done inside the first 12 frames.
+        const MOVING: usize = 12;
+        let settle = |app: &mut KimoApp| {
+            for _ in 0..24 {
+                probe_frame(&ctx, app, PANE, scale);
+            }
+        };
+        let run = |app: &mut KimoApp, count: usize| -> Vec<Duration> {
+            (0..count)
+                .map(|_| probe_frame(&ctx, app, PANE, scale))
+                .collect()
+        };
+        let report = |label: &str, times: &[Duration]| {
+            let mut moving = times[..MOVING.min(times.len())].to_vec();
+            let median = probe_median(&mut moving);
+            let peak = times.iter().copied().max().unwrap_or_default();
+            println!(
+                "  {label:12}  moving median {:7.2} ms  peak {:7.2} ms",
+                probe_ms(median),
+                probe_ms(peak),
+            );
+        };
+
+        println!(
+            "nav slide: {} / {}",
+            app.selected_account.as_deref().unwrap_or("-"),
+            app.selected_folder.as_deref().unwrap_or("-"),
+        );
+        for open in [true, false] {
+            if !open {
+                app.selected_message = None;
+            }
+            let mail = if open { "mail open" } else { "no mail" };
+
+            app.nav_collapsed = false;
+            settle(&mut app);
+            let rest = run(&mut app, 16);
+            report(&format!("{mail} rest"), &rest);
+
+            app.nav_collapsed = true;
+            let out = run(&mut app, 16);
+            report(&format!("{mail} slide out"), &out);
+
+            settle(&mut app);
+            app.nav_collapsed = false;
+            let back = run(&mut app, 16);
+            report(&format!("{mail} slide in"), &back);
+        }
+    }
+
     #[test]
     fn html_renderer_round_trips_through_settings() {
         assert_eq!(HtmlRenderer::parse("blitz"), HtmlRenderer::Blitz);
@@ -6016,6 +6102,51 @@ mod tests {
             app.folder_messages_of("acct", "Archive")
                 .map(<[MailMessage]>::len),
             Some(2)
+        );
+    }
+
+    /// Collapsing the navigation slides the column out over the frames that
+    /// follow rather than making it vanish: the list takes its room a step at a
+    /// time (`Panel::show_collapsible`). The slide leaves the width the
+    /// splitter gave the column alone, so reopening brings that column back —
+    /// not the sliver the slide ended on.
+    #[test]
+    fn collapsing_the_navigation_slides_it_out() {
+        let ctx = egui::Context::default();
+        crate::fonts::install(&ctx, None, None);
+        let mut app = app_with_messages(&ctx, 3);
+
+        run_app_frame(&ctx, &mut app, Vec::new());
+        let open = app.list_column.left();
+        assert!(open > 0.0, "the navigation should be open to begin with");
+
+        // The first frame of the collapse has the column on its way out: it has
+        // moved, and it has not arrived.
+        app.nav_collapsed = true;
+        run_app_frame(&ctx, &mut app, Vec::new());
+        let sliding = app.list_column.left();
+        assert!(
+            sliding > 0.0 && sliding < open,
+            "the column should be part-way out, not at {sliding} pt (from {open} pt)"
+        );
+
+        // A few frames later the slide has run its course and the list reaches
+        // the window's edge.
+        for _ in 0..20 {
+            run_app_frame(&ctx, &mut app, Vec::new());
+        }
+        assert_eq!(app.list_column.left(), 0.0, "the slide never finished");
+
+        // Reopening runs the same slide backwards, and lands on the column's
+        // own width rather than the width the slide was last seen at.
+        app.nav_collapsed = false;
+        for _ in 0..20 {
+            run_app_frame(&ctx, &mut app, Vec::new());
+        }
+        assert_eq!(
+            app.list_column.left(),
+            open,
+            "the column reopened at a width of its own"
         );
     }
 
@@ -6949,7 +7080,13 @@ mod tests {
                 100.0,
             );
             assert!(long.size().x <= 100.0);
-            assert!(long.text().ends_with('…'));
+            assert!(long.elided, "the text should say it was cut");
+            assert_eq!(long.rows.len(), 1, "the row should stay a single line");
+            assert_eq!(
+                long.rows[0].glyphs.last().map(|glyph| glyph.chr),
+                Some('…'),
+                "the row should end in the ellipsis"
+            );
         });
         frame.textures_delta.clear();
     }

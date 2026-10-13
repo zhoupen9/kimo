@@ -419,7 +419,18 @@ Event (mpsc) ──► drain_events() at frame start ──► merge into Accoun
   640px — see `NAV_AUTO_COLLAPSE_WIDTH`), the central column (while a search is
   active the list shows `search_results` instead of the selected folder, and
   `message_card` paints both kinds of row), and the reading pane on the right
-  with a "No mail selected" placeholder.
+  with a "No mail selected" placeholder. Collapsing the navigation — by the
+  toggle or by the narrow-window rule — slides the column out rather than
+  dropping it: `Panel::show_collapsible` keeps the rows at the layout they had
+  at the column's full width and slides the whole column off toward the
+  window's edge, clipped, so the list takes its room over the frames of egui's
+  animation time (`Style::animation_time`, 0.2 s), and the width the splitter
+  gave the column survives the slide — a collapsed column reopens as wide as it
+  was. The splitter is not a second way to collapse (`drag_to_open(false)`,
+  and the expanded flag `show_collapsible` writes back is dropped): the toggle
+  stays the one control, the splitter keeps clamping at `min_size` the way it
+  always has, and a collapsed column leaves no invisible grab strip — or resize
+  cursor — over the message list's left edge.
   Folders indent under their account (`Ui::indent`) without egui's faint guide
   line down the left of the block (`indent_has_left_vline` cleared in
   `nav`): in this column that line reads as a rule through the folder list.
@@ -515,7 +526,16 @@ Event (mpsc) ──► drain_events() at frame start ──► merge into Accoun
   font sizes are the `ROW_DATE_FONT_SIZE` / `ROW_TITLE_FONT_SIZE` /
   `ROW_PREVIEW_FONT_SIZE` constants next to `MESSAGE_ROW_HEIGHT` (a 68 pt
   row whose three lines are centred at y = 20 / 40 / 57), so retuning the list
-  is one edit instead of a hunt for literals.
+  is one edit instead of a hunt for literals. The three lines are elided by
+  epaint itself (`truncate_galley`: one `LayoutJob` whose `max_rows` is 1 and
+  whose overflow character is the ellipsis), never by a search that lays a
+  galley out per probe to measure it: the list re-lays out every visible row on
+  every frame the column's width moves — a splitter drag, the navigation
+  column's slide — and one shaping pass per line per frame is the whole of what
+  that costs (`bench_nav_slide` measures it). A search's probes are largely
+  cache-warm from the width of the frame before, but the frames where they are
+  not pay `log2(chars)` shapings apiece — its worst frames cost about three
+  times what the elision's do.
 - The window is undecorated on purpose (`with_decorations(false)` in
   `main.rs`): `titlebar_area()` in `app.rs` draws the custom title bar — an
   `egui::Area` fixed to the window's top edge and shown *after* the panels, not
@@ -850,7 +870,11 @@ Event (mpsc) ──► drain_events() at frame start ──► merge into Accoun
   frames rather than bodies — including what a splitter drag costs — `app.rs`
   has `bench_frame_cost`, which drives the real app headlessly at a fixed
   splitter position and while it is being dragged:
-  `cargo test --release -- --ignored --nocapture bench_frame_cost`.
+  `cargo test --release -- --ignored --nocapture bench_frame_cost`. Its
+  companion `bench_nav_slide` measures those frames through the navigation
+  column's collapse and its slide back open, which moves the message column's
+  width the way a drag does
+  (`cargo test --release -- --ignored --nocapture bench_nav_slide`).
 - Blitz is built with `blitz-dom`'s default features **off**: its
   `system-fonts` feature would link fontconfig (a C library, hard rule 1).
   `blitz_render` therefore registers fonts from disk itself (a curated set —
