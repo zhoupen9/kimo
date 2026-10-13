@@ -275,6 +275,11 @@ fn window_attributes() -> winit::window::WindowAttributes {
     let mut attributes = Window::default_attributes()
         .with_title("Kimo")
         .with_decorations(false) // the custom title bar is drawn in app.rs
+        // The window's corners are cut out of the frame (see
+        // `gpu::CornerMask`), so the surface has to carry an alpha channel: on
+        // Wayland this flag is also what stops winit from marking the whole
+        // surface opaque, and on X11 it is what picks a 32-bit visual.
+        .with_transparent(true)
         .with_inner_size(winit::dpi::LogicalSize::new(1280.0, 800.0));
     #[cfg(target_os = "linux")]
     {

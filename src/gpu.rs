@@ -25,6 +25,13 @@ use winit::window::Window;
 
 use crate::app::KimoApp;
 
+/// The window's own corner radius, in logical points. The window is a card: its
+/// four corners are cut out of the surface so the compositor shows what is
+/// behind them (see `CornerMask`). A compositor-side window rule of its own has
+/// to agree with it — niri's `geometry-corner-radius`, for one — or the shadow
+/// it draws will still assume a square window.
+const WINDOW_CORNER_RADIUS: f32 = 8.0;
+
 /// The window's GPU context: device, surface, egui's renderer, and the offscreen
 /// scene a frame with a floating title bar is drawn into first.
 pub struct Gpu {
@@ -38,6 +45,8 @@ pub struct Gpu {
     scene: Option<Scene>,
     /// Draws the scene onto the surface, one to one.
     composite: Composite,
+    /// The last draw of a frame: the window's rounded corners.
+    corners: CornerMask,
 }
 
 /// The offscreen frame: the texture, and the bind group that samples it.
@@ -53,6 +62,25 @@ struct Composite {
     pipeline: wgpu::RenderPipeline,
     layout: wgpu::BindGroupLayout,
     sampler: wgpu::Sampler,
+}
+
+/// Cuts the window's rounded corners out of the frame.
+///
+/// The last draw of a frame paints the four corner squares of the surface with
+/// the corner's *coverage* as alpha, and a blend that keeps nothing of the
+/// source colour but scales the destination by `1 - src.a` — for the alpha
+/// channel as well as the colour, which is what keeps the result premultiplied.
+/// A pixel outside the radius is therefore scaled to zero and the compositor
+/// shows what is behind the window there; the rim, a pixel wide, fades out
+/// instead of stair-stepping.
+struct CornerMask {
+    pipeline: wgpu::RenderPipeline,
+    /// `size.x, size.y, radius`, in physical pixels (see `mask_bytes`).
+    uniform: wgpu::Buffer,
+    bind_group: wgpu::BindGroup,
+    /// Whether the surface can carry the transparency this needs. Without an
+    /// alpha mode the corners stay square rather than turn black.
+    enabled: bool,
 }
 
 impl Gpu {
@@ -89,6 +117,22 @@ impl Gpu {
         // attachment would not allow.
         config.present_mode = wgpu::PresentMode::Fifo;
         config.usage = wgpu::TextureUsages::RENDER_ATTACHMENT;
+        // The corner mask cuts pixels out of the frame, so the surface has to
+        // carry their alpha to the compositor: `Auto` resolves to `Opaque`,
+        // which would leave the cut corners black. Premultiplied is also the
+        // space egui-wgpu's own blending is in. A surface with no alpha mode at
+        // all keeps its square corners instead of growing black ones.
+        let alpha = surface
+            .get_capabilities(&adapter)
+            .alpha_modes
+            .contains(&wgpu::CompositeAlphaMode::PreMultiplied);
+        if alpha {
+            config.alpha_mode = wgpu::CompositeAlphaMode::PreMultiplied;
+        } else {
+            eprintln!(
+                "kimo: this surface has no premultiplied alpha mode; the window keeps square corners"
+            );
+        }
         surface.configure(&device, &config);
 
         let renderer = egui_wgpu::Renderer::new(
@@ -97,6 +141,7 @@ impl Gpu {
             egui_wgpu::RendererOptions::default(),
         );
         let composite = Composite::new(&device, config.format);
+        let corners = CornerMask::new(&device, config.format, alpha);
 
         Self {
             surface,
@@ -106,6 +151,7 @@ impl Gpu {
             renderer,
             scene: None,
             composite,
+            corners,
         }
     }
 
@@ -160,6 +206,10 @@ impl Gpu {
             pixels_per_point,
         };
         let size = [self.config.width, self.config.height];
+        // The mask's corner radius is a UI measurement, so it follows the scale
+        // factor; both it and the size are physical pixels in the shader.
+        self.corners
+            .set(&self.queue, size, corner_radius(size, pixels_per_point));
         // The scheme is installed by the app's frame, so the clear color — what
         // shows in the moment before the panels cover the window — is read here.
         let clear = clear_color(crate::theme::of(&egui_ctx));
@@ -245,6 +295,8 @@ impl Gpu {
                         .forget_lifetime();
                     self.composite.draw(&mut pass, self.scene.as_ref());
                     self.renderer.render(&mut pass, over, &descriptor);
+                    // Last, over everything: the window's own corners.
+                    self.corners.round(&mut pass);
                     drop(pass);
                 }
                 self.queue.submit(
@@ -264,24 +316,27 @@ impl Gpu {
                     &descriptor,
                 );
                 {
-                    let pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                        label: Some("kimo"),
-                        color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                            view: &view,
-                            resolve_target: None,
-                            depth_slice: None,
-                            ops: wgpu::Operations {
-                                load: wgpu::LoadOp::Clear(clear),
-                                store: wgpu::StoreOp::Store,
-                            },
-                        })],
-                        depth_stencil_attachment: None,
-                        timestamp_writes: None,
-                        occlusion_query_set: None,
-                        multiview_mask: None,
-                    });
-                    self.renderer
-                        .render(&mut pass.forget_lifetime(), &primitives, &descriptor);
+                    let mut pass = encoder
+                        .begin_render_pass(&wgpu::RenderPassDescriptor {
+                            label: Some("kimo"),
+                            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                                view: &view,
+                                resolve_target: None,
+                                depth_slice: None,
+                                ops: wgpu::Operations {
+                                    load: wgpu::LoadOp::Clear(clear),
+                                    store: wgpu::StoreOp::Store,
+                                },
+                            })],
+                            depth_stencil_attachment: None,
+                            timestamp_writes: None,
+                            occlusion_query_set: None,
+                            multiview_mask: None,
+                        })
+                        .forget_lifetime();
+                    self.renderer.render(&mut pass, &primitives, &descriptor);
+                    // Last, over everything: the window's own corners.
+                    self.corners.round(&mut pass);
                 }
                 self.queue.submit(
                     callbacks
@@ -476,6 +531,128 @@ impl Composite {
     }
 }
 
+impl CornerMask {
+    fn new(device: &wgpu::Device, format: wgpu::TextureFormat, enabled: bool) -> Self {
+        let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("kimo_corners"),
+            entries: &[wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            }],
+        });
+        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("kimo_corners"),
+            source: wgpu::ShaderSource::Wgsl(MASK_SHADER.into()),
+        });
+        let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("kimo_corners"),
+            bind_group_layouts: &[Some(&layout)],
+            immediate_size: 0,
+        });
+        let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("kimo_corners"),
+            layout: Some(&pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &shader,
+                entry_point: Some("vs_main"),
+                compilation_options: Default::default(),
+                buffers: &[],
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &shader,
+                entry_point: Some("fs_main"),
+                compilation_options: Default::default(),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format,
+                    // Not a colour but a coverage: what the frame already holds
+                    // is scaled by what the coverage leaves of it.
+                    blend: Some(wgpu::BlendState {
+                        color: wgpu::BlendComponent {
+                            src_factor: wgpu::BlendFactor::Zero,
+                            dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
+                            operation: wgpu::BlendOperation::Add,
+                        },
+                        alpha: wgpu::BlendComponent {
+                            src_factor: wgpu::BlendFactor::Zero,
+                            dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
+                            operation: wgpu::BlendOperation::Add,
+                        },
+                    }),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+            }),
+            primitive: wgpu::PrimitiveState::default(),
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState::default(),
+            multiview_mask: None,
+            cache: None,
+        });
+        let uniform = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("kimo_corners"),
+            size: 16,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("kimo_corners"),
+            layout: &layout,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: uniform.as_entire_binding(),
+            }],
+        });
+        Self {
+            pipeline,
+            uniform,
+            bind_group,
+            enabled,
+        }
+    }
+
+    /// This frame's surface size and corner radius, both in physical pixels.
+    fn set(&self, queue: &wgpu::Queue, size: [u32; 2], radius: f32) {
+        if self.enabled {
+            queue.write_buffer(&self.uniform, 0, &mask_bytes(size, radius));
+        }
+    }
+
+    /// Draw the four corners over whatever the frame has drawn so far.
+    fn round(&self, pass: &mut wgpu::RenderPass<'static>) {
+        if !self.enabled {
+            return;
+        }
+        pass.set_pipeline(&self.pipeline);
+        pass.set_bind_group(0, &self.bind_group, &[]);
+        // Four corner quads, two triangles each.
+        pass.draw(0..24, 0..1);
+    }
+}
+
+/// The window's corner radius in physical pixels: [`WINDOW_CORNER_RADIUS`] in
+/// points, and never more than half the window, which would fold the corner
+/// quads inside out.
+fn corner_radius(size: [u32; 2], pixels_per_point: f32) -> f32 {
+    let half = (size[0] as f32 / 2.0).min(size[1] as f32 / 2.0);
+    (WINDOW_CORNER_RADIUS * pixels_per_point)
+        .round()
+        .clamp(0.0, half)
+}
+
+/// The mask's uniform: the surface size and the corner radius, both in physical
+/// pixels, then the padding the uniform's `vec2` alignment asks for.
+fn mask_bytes(size: [u32; 2], radius: f32) -> Vec<u8> {
+    [size[0] as f32, size[1] as f32, radius, 0.0]
+        .iter()
+        .flat_map(|word| word.to_le_bytes())
+        .collect()
+}
+
 /// The window's background, which egui's panels cover but a resize can show for
 /// a frame.
 fn clear_color(scheme: crate::theme::ColorScheme) -> wgpu::Color {
@@ -512,3 +689,100 @@ fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
     return textureSample(source, source_sampler, in.uv);
 }
 "#;
+
+/// Draws the four corner squares of the window, each carrying the coverage of
+/// the rounded corner that falls in it: 0 where the frame stays, 1 where it is
+/// cut away, and the ramp between the two.
+const MASK_SHADER: &str = r#"
+struct Mask {
+    // The surface, in physical pixels.
+    size: vec2<f32>,
+    // The corner radius, in physical pixels.
+    radius: f32,
+    _padding: f32,
+};
+
+@group(0) @binding(0) var<uniform> mask: Mask;
+
+struct VertexOut {
+    @builtin(position) position: vec4<f32>,
+    // The centre of this corner's circle, in physical pixels.
+    @location(0) centre: vec2<f32>,
+};
+
+@vertex
+fn vs_main(@builtin(vertex_index) index: u32) -> VertexOut {
+    // Four quads of six vertices: `corner` picks one (bit 0 is the right edge,
+    // bit 1 the bottom one) and `vertex` the point inside it.
+    let corner = index / 6u;
+    let vertex = index % 6u;
+    let right = (corner & 1u) == 1u;
+    let bottom = (corner & 2u) == 2u;
+    // The two triangles of a unit quad: (0,0) (1,0) (0,1) and (1,0) (1,1) (0,1).
+    let u = select(0.0, 1.0, vertex == 1u || vertex == 3u || vertex == 4u);
+    let v = select(0.0, 1.0, vertex == 2u || vertex == 4u || vertex == 5u);
+
+    let radius = mask.radius;
+    let centre = vec2<f32>(
+        select(radius, mask.size.x - radius, right),
+        select(radius, mask.size.y - radius, bottom),
+    );
+    let origin = vec2<f32>(
+        select(0.0, mask.size.x - radius, right),
+        select(0.0, mask.size.y - radius, bottom),
+    );
+    let pixel = origin + vec2<f32>(u, v) * radius;
+
+    var out: VertexOut;
+    out.position = vec4<f32>(
+        pixel.x / mask.size.x * 2.0 - 1.0,
+        1.0 - pixel.y / mask.size.y * 2.0,
+        0.0,
+        1.0,
+    );
+    out.centre = centre;
+    return out;
+}
+
+@fragment
+fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
+    // `position` is the pixel's centre in framebuffer coordinates, which is the
+    // space the radius is in.
+    let d = distance(in.position.xy, in.centre);
+    // Nothing inside the corner, everything outside it, and a pixel of ramp
+    // between the two, which the blend turns into the antialiased rim.
+    let cut = smoothstep(mask.radius - 0.5, mask.radius + 0.5, d);
+    return vec4<f32>(0.0, 0.0, 0.0, cut);
+}
+"#;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The uniform as the shader sees it: size.x, size.y, radius.
+    fn uniform(size: [u32; 2], radius: f32) -> [f32; 4] {
+        let bytes = mask_bytes(size, radius);
+        let word = |index: usize| {
+            let mut four = [0u8; 4];
+            four.copy_from_slice(&bytes[index * 4..index * 4 + 4]);
+            f32::from_le_bytes(four)
+        };
+        [word(0), word(1), word(2), word(3)]
+    }
+
+    #[test]
+    fn the_mask_uniform_is_the_size_and_the_radius() {
+        assert_eq!(mask_bytes([1920, 1080], 32.0).len(), 16);
+        assert_eq!(uniform([1920, 1080], 32.0), [1920.0, 1080.0, 32.0, 0.0]);
+    }
+
+    #[test]
+    fn the_corner_radius_follows_the_scale_factor_and_the_window() {
+        assert_eq!(corner_radius([1920, 1080], 1.0), 8.0);
+        assert_eq!(corner_radius([1920, 1080], 2.0), 16.0);
+        // Never more than half the window: the quads would fold inside out.
+        assert_eq!(corner_radius([20, 1080], 2.0), 10.0);
+        assert_eq!(corner_radius([0, 0], 1.0), 0.0);
+    }
+}

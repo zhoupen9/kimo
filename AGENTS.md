@@ -488,6 +488,19 @@ Event (mpsc) ──► drain_events() at frame start ──► merge into Accoun
   the pointer. They are not `egui::Button`s for that reason — a stock button
   draws a card-colored frame with a border, which in a title bar reads as a
   widget among window chrome. Don't re-enable system decorations.
+  The window is transparent (`with_transparent(true)` in `main.rs`) and its
+  four corners are cut out of the frame by `gpu::CornerMask`: the last draw of
+  a frame scales the four corner squares of the surface by the corner's
+  coverage, through a `Zero`/`OneMinusSrcAlpha` blend on the colour *and* the
+  alpha so that what is cut stays premultiplied, and the compositor shows what
+  is behind the window there. That is why the surface is configured with
+  `CompositeAlphaMode::PreMultiplied` — `Auto` resolves to `Opaque`, which
+  would cut black corners instead — and why a surface with no alpha mode at all
+  keeps its square corners rather than gaining black ones.
+  `WINDOW_CORNER_RADIUS` (8 pt) is also the radius a compositor-side window
+  rule has to agree with (niri's `geometry-corner-radius`): without it the
+  compositor still assumes a square window and its shadow shows through the
+  cut corners.
   The mail actions are *flat*, like every other button in the bar — each one is
   `titlebar_flat_button`, the same window-control-wide, bar-tall cell the nav
   toggle and the cog use, empty at rest and filled under the pointer. They are
