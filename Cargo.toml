@@ -6,8 +6,20 @@ description = "Kimo — a pure-Rust email client (IMAP & POP3) with an egui inte
 license = "MIT"
 
 [dependencies]
-eframe = "0.31"
-egui = "0.31"
+# egui and eframe move in lockstep (see AGENTS.md). eframe's own default is the
+# wgpu renderer now; Kimo keeps the glow one, which is what `src/glass.rs` draws
+# the floating title bar's blur with (`egui_glow` paint callbacks), and leaves
+# out the features it has no use for: `links` would pull a browser opener, and
+# `web_screen_reader` is web-only. The clipboard comes with eframe's own
+# `egui-winit` dependency.
+eframe = { version = "0.36", default-features = false, features = [
+    "accesskit",
+    "default_fonts",
+    "glow",
+    "wayland",
+    "x11",
+] }
+egui = "0.36"
 
 # TLS: rustls with the pure-Rust `ring` crypto provider (no OpenSSL / aws-lc-rs).
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }

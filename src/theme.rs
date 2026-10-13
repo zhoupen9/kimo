@@ -234,7 +234,7 @@ impl ColorScheme {
         visuals.window_fill = self.window;
         visuals.window_stroke = border;
         visuals.faint_bg_color = self.card;
-        visuals.extreme_bg_color = self.input;
+        visuals.text_edit_bg_color = Some(self.input);
         visuals.code_bg_color = self.code;
         visuals.hyperlink_color = self.link;
         visuals.warn_fg_color = self.warn;
@@ -307,8 +307,24 @@ fn scheme_id() -> egui::Id {
 
 /// Apply a scheme to the context: egui's visuals for the stock widgets, and
 /// the scheme itself for everything the app paints by hand ([`of`]).
+///
+/// egui 0.36 keeps one style per theme and picks between them by a preference,
+/// so *both* styles are filled in — a stock widget must never come out in
+/// egui's own palette, whichever theme egui thinks it is in — and the
+/// preference follows this module's scheme, which resolves "system" against
+/// the desktop itself rather than letting egui ask a second time (`set_theme`
+/// is only called when it would change, so this stays cheap per frame).
 pub fn install(ctx: &egui::Context, scheme: ColorScheme) {
-    ctx.set_visuals(scheme.visuals());
+    ctx.set_visuals_of(egui::Theme::Light, LIGHT.visuals());
+    ctx.set_visuals_of(egui::Theme::Dark, DARK.visuals());
+    let wanted = if scheme.dark {
+        egui::ThemePreference::Dark
+    } else {
+        egui::ThemePreference::Light
+    };
+    if ctx.options(|options| options.theme_preference) != wanted {
+        ctx.set_theme(wanted);
+    }
     ctx.data_mut(|data| data.insert_temp(scheme_id(), scheme));
 }
 
@@ -503,7 +519,7 @@ mod tests {
             assert_eq!(visuals.panel_fill, scheme.panel);
             assert_eq!(visuals.window_fill, scheme.window);
             assert_eq!(visuals.faint_bg_color, scheme.card);
-            assert_eq!(visuals.extreme_bg_color, scheme.input);
+            assert_eq!(visuals.text_edit_bg_color, Some(scheme.input));
             assert_eq!(visuals.code_bg_color, scheme.code);
             assert_eq!(visuals.hyperlink_color, scheme.link);
             assert_eq!(visuals.warn_fg_color, scheme.warn);
@@ -533,7 +549,7 @@ mod tests {
         );
         install(&ctx, LIGHT);
         assert_eq!(of(&ctx), LIGHT);
-        assert_eq!(ctx.style().visuals.panel_fill, LIGHT.panel);
+        assert_eq!(ctx.style_of(ctx.theme()).visuals.panel_fill, LIGHT.panel);
     }
 
     #[test]

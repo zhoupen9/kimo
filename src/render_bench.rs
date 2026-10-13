@@ -331,10 +331,10 @@ fn bench_simple(ctx: &egui::Context, case: &Case) -> SimpleStats {
         };
         let mut layout = Duration::ZERO;
         let frame_start = Instant::now();
-        let output = ctx.run(input(), |ctx| {
+        let mut output = ctx.run_ui(input(), |ui| {
             egui::CentralPanel::default()
                 .frame(egui::Frame::NONE)
-                .show(ctx, |ui| {
+                .show(ui, |ui| {
                     egui::ScrollArea::vertical()
                         .auto_shrink([false, false])
                         .show(ui, |ui| {
@@ -352,6 +352,9 @@ fn bench_simple(ctx: &egui::Context, case: &Case) -> SimpleStats {
                         });
                 });
         });
+        // epaint panics on a dropped `TexturesDelta` (egui 0.36), and this
+        // bench only wants the shapes.
+        output.textures_delta.clear();
         let frame = frame_start.elapsed();
         let tessellate_start = Instant::now();
         let primitives = ctx.tessellate(output.shapes, SCALE);

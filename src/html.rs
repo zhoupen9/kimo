@@ -648,6 +648,14 @@ fn table_rows(table: NodeRef<'_, Node>) -> Vec<Vec<NodeRef<'_, Node>>> {
 mod tests {
     use super::*;
 
+    /// One frame of a layout test. epaint panics on a dropped
+    /// `TexturesDelta` (egui 0.36) and these tests only lay widgets out, so
+    /// the frame's texture updates are thrown away here.
+    fn run_frame(ctx: &egui::Context, input: egui::RawInput, frame: impl FnMut(&mut egui::Ui)) {
+        let mut output = ctx.run_ui(input, frame);
+        output.textures_delta.clear();
+    }
+
     /// `parse_fragment` wraps content in an `<html>` element, so tests
     /// search the whole tree for the element they need.
     fn find_element<'a>(frag: &'a Html, name: &str) -> NodeRef<'a, Node> {
@@ -791,12 +799,12 @@ mod tests {
             ..Default::default()
         };
         let ctx = egui::Context::default();
-        let _ = ctx.run(raw, |ctx| {
+        run_frame(&ctx, raw, |ui| {
             let images = HashMap::new();
             let inline = HashMap::new();
             let sheets = HashMap::new();
             let mut hctx = empty_ctx(&images, &inline, &sheets);
-            egui::CentralPanel::default().show(ctx, |ui| {
+            egui::CentralPanel::default().show(ui, |ui| {
                 render(ui, &html, &mut hctx);
                 assert!(
                     ui.min_rect().width() > 800.0,
@@ -821,12 +829,12 @@ mod tests {
             ..Default::default()
         };
         let ctx = egui::Context::default();
-        let _ = ctx.run(raw, |ctx| {
+        run_frame(&ctx, raw, |ui| {
             let images = HashMap::new();
             let inline = HashMap::new();
             let sheets = HashMap::new();
             let mut hctx = empty_ctx(&images, &inline, &sheets);
-            egui::CentralPanel::default().show(ctx, |ui| {
+            egui::CentralPanel::default().show(ui, |ui| {
                 render(ui, html, &mut hctx);
                 assert!(
                     ui.min_rect().width() > 800.0,
@@ -844,12 +852,12 @@ mod tests {
         // the cursor when in a grid layout". Run the real egui layout to
         // exercise it.
         let ctx = egui::Context::default();
-        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+        run_frame(&ctx, egui::RawInput::default(), |ui| {
             let images = HashMap::new();
             let inline = HashMap::new();
             let sheets = HashMap::new();
             let mut hctx = empty_ctx(&images, &inline, &sheets);
-            egui::CentralPanel::default().show(ctx, |ui| {
+            egui::CentralPanel::default().show(ui, |ui| {
                 render(
                     ui,
                     "<table>\
@@ -867,12 +875,12 @@ mod tests {
     #[test]
     fn remote_resources_are_collected_for_fetching() {
         let ctx = egui::Context::default();
-        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+        run_frame(&ctx, egui::RawInput::default(), |ui| {
             let images = HashMap::new();
             let inline = HashMap::new();
             let sheets = HashMap::new();
             let mut hctx = empty_ctx(&images, &inline, &sheets);
-            egui::CentralPanel::default().show(ctx, |ui| {
+            egui::CentralPanel::default().show(ui, |ui| {
                 render(
                     ui,
                     "<link rel=\"stylesheet\" href=\"https://example.com/s.css\">\
@@ -890,7 +898,7 @@ mod tests {
     #[test]
     fn cid_images_render_from_the_inline_map() {
         let ctx = egui::Context::default();
-        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+        run_frame(&ctx, egui::RawInput::default(), |ui| {
             let images = HashMap::new();
             let sheets = HashMap::new();
             let pixels =
@@ -898,7 +906,7 @@ mod tests {
             let texture = ctx.load_texture("cid-test", pixels, Default::default());
             let inline = HashMap::from([("logo@example.com".to_string(), texture)]);
             let mut hctx = empty_ctx(&images, &inline, &sheets);
-            egui::CentralPanel::default().show(ctx, |ui| {
+            egui::CentralPanel::default().show(ui, |ui| {
                 render(
                     ui,
                     "<p>x <img src=\"cid:logo@example.com\"> y</p>",
@@ -914,12 +922,12 @@ mod tests {
     #[test]
     fn inline_styles_and_style_blocks_apply_without_panic() {
         let ctx = egui::Context::default();
-        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+        run_frame(&ctx, egui::RawInput::default(), |ui| {
             let images = HashMap::new();
             let inline = HashMap::new();
             let sheets = HashMap::new();
             let mut hctx = empty_ctx(&images, &inline, &sheets);
-            egui::CentralPanel::default().show(ctx, |ui| {
+            egui::CentralPanel::default().show(ui, |ui| {
                 render(
                     ui,
                     "<head><style>.warn { color: #ff0000; font-weight: bold }</style></head>\

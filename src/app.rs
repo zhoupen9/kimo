@@ -1478,7 +1478,7 @@ impl KimoApp {
         let scheme = theme::of(ctx);
         let rect = egui::Rect::from_min_size(
             egui::Pos2::ZERO,
-            egui::vec2(ctx.screen_rect().width(), TITLEBAR_HEIGHT),
+            egui::vec2(ctx.viewport_rect().width(), TITLEBAR_HEIGHT),
         );
         // Either column scrolling is the trigger: the message list's offset,
         // or the reading pane's card, which scrolls the whole mail. Any scroll
@@ -1723,7 +1723,7 @@ impl KimoApp {
                     // part of the input color, so the blurred mail behind the
                     // bar shows through the box the way it shows through the
                     // bar itself. The stock frame is drawn from
-                    // `Visuals::extreme_bg_color`, which is why this is
+                    // `Visuals::text_edit_bg_color`, which is why this is
                     // `background_color` and not another widget slot.
                     let field = row
                         .scope(|ui| {
@@ -2700,7 +2700,7 @@ impl KimoApp {
         let title_color = scheme.text;
 
         // First row: timestamp right-aligned, sender truncated before it.
-        let date_galley = ui.ctx().fonts(|f| {
+        let date_galley = ui.ctx().fonts_mut(|f| {
             f.layout_no_wrap(
                 card.date.to_string(),
                 egui::FontId::proportional(ROW_DATE_FONT_SIZE),
@@ -2796,7 +2796,7 @@ impl KimoApp {
         );
         let Some(msg) = self.selected_message_view() else {
             self.mail_scroll = 0.0;
-            let _ = ui.allocate_new_ui(egui::UiBuilder::new().max_rect(below_bar), |ui| {
+            let _ = ui.scope_builder(egui::UiBuilder::new().max_rect(below_bar), |ui| {
                 ui.centered_and_justified(|ui| {
                     ui.label(egui::RichText::new("No mail selected").weak().heading());
                 });
@@ -2834,7 +2834,7 @@ impl KimoApp {
             egui::pos2(card_right, card_bottom),
         );
         let used = ui
-            .allocate_new_ui(egui::UiBuilder::new().max_rect(inner), |ui| {
+            .scope_builder(egui::UiBuilder::new().max_rect(inner), |ui| {
                 let mut scroll = egui::ScrollArea::vertical()
                     // Full width, but only as tall as the mail: the card around
                     // a short message hugs it instead of running to the pane's
@@ -3410,13 +3410,18 @@ fn swatch(ui: &mut egui::Ui, color: egui::Color32) {
 }
 
 impl eframe::App for KimoApp {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+    /// One frame. egui 0.36 hands the app a root `Ui` to draw into rather than
+    /// a `Context`; the context is cloned out of it because the areas, modals,
+    /// animations and layer painting below are all context-level.
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+        let ctx = ui.ctx().clone();
+        let ctx = &ctx;
         self.drain_events();
         self.apply_theme(ctx);
 
         // Collapse the nav bar automatically when the window becomes narrow;
         // re-expanding is a manual choice and stays until the next crossing.
-        let narrow = ctx.screen_rect().width() < NAV_AUTO_COLLAPSE_WIDTH;
+        let narrow = ctx.viewport_rect().width() < NAV_AUTO_COLLAPSE_WIDTH;
         if narrow && !self.was_narrow {
             self.nav_collapsed = true;
         }
@@ -3436,31 +3441,31 @@ impl eframe::App for KimoApp {
         // own business — the list's top padding scrolls away with its rows
         // (`LIST_PADDING`), the navigation and the reading pane are inset by
         // the bar's height.
-        egui::SidePanel::right("mail_content")
+        egui::Panel::right("mail_content")
             .resizable(true)
-            .min_width(280.0)
-            .default_width(460.0)
+            .min_size(280.0)
+            .default_size(460.0)
             .show_separator_line(false)
             // No frame: the gutter and the card are painted in mail_content.
             .frame(egui::Frame::NONE)
-            .show(ctx, |ui| self.mail_content(ui));
+            .show(ui, |ui| self.mail_content(ui));
         if !self.nav_collapsed {
-            egui::SidePanel::left("nav")
+            egui::Panel::left("nav")
                 .resizable(true)
-                .min_width(150.0)
-                .default_width(200.0)
+                .min_size(150.0)
+                .default_size(200.0)
                 .show_separator_line(false)
-                .show(ctx, |ui| self.nav(ui));
+                .show(ui, |ui| self.nav(ui));
         }
-        // What the panels leave over is the message list's column; captured
-        // before the central panel takes it, for the splitter repaint below.
-        let list_column = ctx.available_rect();
         // No padding on the frame: the column's padding lives inside its scroll
         // area (see folder_messages), so the scroll bar can sit on the column's
-        // edge instead of on the padding.
+        // edge instead of on the padding. The column's own rect — what the two
+        // side panels leave — is recorded by `mail_list` for the splitter
+        // repaint below.
         egui::CentralPanel::default()
             .frame(egui::Frame::new().fill(scheme.content))
-            .show(ctx, |ui| self.mail_list(ui));
+            .show(ui, |ui| self.mail_list(ui));
+        let list_column = self.list_column;
 
         // egui paints a brighter line along a panel boundary while its splitter
         // is hovered or dragged, and this UI wants the splitters invisible: put
@@ -3921,7 +3926,7 @@ fn truncate_galley(
     max_width: f32,
 ) -> std::sync::Arc<egui::Galley> {
     let font = egui::FontId::proportional(size);
-    let full = ctx.fonts(|f| f.layout_no_wrap(text.to_owned(), font.clone(), color));
+    let full = ctx.fonts_mut(|f| f.layout_no_wrap(text.to_owned(), font.clone(), color));
     if full.size().x <= max_width {
         return full;
     }
@@ -3932,7 +3937,7 @@ fn truncate_galley(
         let mid = (lo + hi) / 2;
         let cut: String = chars[..mid].iter().collect::<String>() + "…";
         let fits = ctx
-            .fonts(|f| f.layout_no_wrap(cut, font.clone(), color))
+            .fonts_mut(|f| f.layout_no_wrap(cut, font.clone(), color))
             .size()
             .x
             <= max_width;
@@ -3943,7 +3948,7 @@ fn truncate_galley(
         }
     }
     let cut: String = chars[..lo].iter().collect::<String>() + "…";
-    ctx.fonts(|f| f.layout_no_wrap(cut, font, color))
+    ctx.fonts_mut(|f| f.layout_no_wrap(cut, font, color))
 }
 
 /// How far the second strike of bold text sits from the first, in points.
@@ -4026,7 +4031,7 @@ fn account_row(
         let small = egui::TextStyle::Small.resolve(ui.style());
         let count = ui
             .ctx()
-            .fonts(|fonts| fonts.layout_no_wrap(unread.to_string(), small, scheme.text_weak));
+            .fonts_mut(|fonts| fonts.layout_no_wrap(unread.to_string(), small, scheme.text_weak));
         right -= count.size().x;
         ui.painter().galley(
             egui::pos2(right, rect.center().y - count.size().y / 2.0),
@@ -4107,7 +4112,7 @@ fn folder_row(
         let small = egui::TextStyle::Small.resolve(ui.style());
         let count = ui
             .ctx()
-            .fonts(|fonts| fonts.layout_no_wrap(unread.to_string(), small, color));
+            .fonts_mut(|fonts| fonts.layout_no_wrap(unread.to_string(), small, color));
         right -= count.size().x;
         ui.painter().galley(
             egui::pos2(right, rect.center().y - count.size().y / 2.0),
@@ -4884,15 +4889,23 @@ mod tests {
     #[test]
     fn truncate_galley_cuts_to_fit_and_appends_ellipsis() {
         let ctx = egui::Context::default();
-        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+        // epaint panics on a dropped `TexturesDelta` (egui 0.36).
+        let mut frame = ctx.run_ui(egui::RawInput::default(), |ui| {
             let color = egui::Color32::WHITE;
-            let short = truncate_galley(ctx, "hi", 14.0, color, 500.0);
+            let short = truncate_galley(ui.ctx(), "hi", 14.0, color, 500.0);
             assert_eq!(short.text(), "hi");
 
-            let long = truncate_galley(ctx, &"很长的一段中文内容。".repeat(10), 14.0, color, 100.0);
+            let long = truncate_galley(
+                ui.ctx(),
+                &"很长的一段中文内容。".repeat(10),
+                14.0,
+                color,
+                100.0,
+            );
             assert!(long.size().x <= 100.0);
             assert!(long.text().ends_with('…'));
         });
+        frame.textures_delta.clear();
     }
 
     #[test]

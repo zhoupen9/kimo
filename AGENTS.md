@@ -7,7 +7,7 @@ Read this before changing anything.
 
 Kimo is a desktop **email client** GUI written in pure Rust:
 
-- **GUI:** eframe/egui (immediate mode, pinned to the 0.31 line for now).
+- **GUI:** eframe/egui (immediate mode, pinned to the 0.36 line).
 - **Protocols:** IMAP4rev1 and POP3 **only**, implemented by hand in
   `src/protocol/` — no `imap`/`async-imap`/`pop` crates.
 - **TLS:** rustls with the pure-Rust `ring` crypto provider + webpki-roots.
@@ -85,7 +85,7 @@ Kimo is a desktop **email client** GUI written in pure Rust:
 2. **No async runtime.** Networking runs on short-lived `std::thread` jobs
    (see `src/sync.rs`); results come back over `std::sync::mpsc`. Do not
    introduce tokio, async-std, or an executor.
-3. **Never block the UI thread.** `eframe::App::update` only drains the
+3. **Never block the UI thread.** `eframe::App::ui` only drains the
    event channel and draws. Any socket I/O, file scan or other potentially
    slow work must be a `sync::Job` on a worker thread. Workers call
    `ctx.request_repaint()` when they emit.
@@ -144,7 +144,7 @@ src/protocol/pop3.rs    minimal POP3 client (USER/PASS, STAT, UIDL, RETR w/ de-s
 ### Data flow
 
 ```
-UI (app.rs update)
+UI (app.rs ui)
    │  spawn(Job)                                   UI thread — no sockets, no DB writes
    ▼
 worker thread (sync.rs)
@@ -324,8 +324,24 @@ Event (mpsc) ──► drain_events() at frame start ──► merge into Accoun
 - Pure parsing helpers (e.g. `extract_uid`, `literal_size`, `html_to_text`)
   live next to their users and get `#[cfg(test)]` unit tests — that is where
   tests go in this codebase; no `tests/` directory yet.
-- egui is pinned to 0.31.x along with eframe. Keep both in lockstep when
-  bumping, and expect API churn on upgrade (check the egui CHANGELOG).
+- egui and eframe are pinned in lockstep (`0.36`), and the step from 0.31 was
+  not a version bump but a change of shape: 0.36 draws the whole app into one
+  root `Ui` (`eframe::App::ui` — there is no `Context`-level `update` any
+  more), the side panels are `egui::Panel::left`/`right` shown *onto* that `Ui`
+  (with `min_size`/`default_size`, not `min_width`/`default_width`), the
+  context's `screen_rect`/`available_rect` are `viewport_rect`/`content_rect`
+  (the message list's own rect is taken from `mail_list`, which records it),
+  `Ui::allocate_new_ui` is `Ui::scope_builder`, a galley needs
+  `Context::fonts_mut`, and the styles are *per theme*: `theme::install` fills
+  in both of them and sets the preference from Kimo's own system detection, so
+  a stock widget is never drawn in egui's palette. The layout tests run their
+  frame through `run_frame`, because epaint panics on a dropped
+  `TexturesDelta`. eframe's *default* renderer is wgpu now; Kimo asks for
+  `default-features = false` plus `glow` (with `accesskit`, `default_fonts`,
+  `wayland`, `x11`) because the floating title bar's blur is an `egui_glow`
+  paint callback — the one place the backend shows — and wgpu would be a large
+  dependency for an app that draws no 3D. Read the egui CHANGELOG before
+  bumping again.
 - Layout is a three-column mail client: left navigation (collapsible via
   the title-bar toggle; auto-collapses when the window is narrower than
   640px — see `NAV_AUTO_COLLAPSE_WIDTH`), the central column (while a search is
@@ -472,7 +488,8 @@ Event (mpsc) ──► drain_events() at frame start ──► merge into Accoun
   shows through the bar, with the stroke left to say where the field is. That
   fill has to be set per widget (`TextEdit::background_color`) rather than on
   a widget slot, because the stock frame is drawn from
-  `Visuals::extreme_bg_color`.
+  `Visuals::text_edit_bg_color` (0.36's name for the slot; it is an `Option`
+  now).
 - The frosted backdrop is the one piece of hand-written OpenGL in the app
   (`src/glass.rs`), because egui has no blur: nothing in the painter can sample
   what has already been drawn. It is an `egui::PaintCallback`
