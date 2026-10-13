@@ -9,6 +9,7 @@ mod db;
 mod error;
 mod folders;
 mod fonts;
+mod glass;
 mod html;
 mod mail;
 mod models;
@@ -40,6 +41,9 @@ fn main() -> eframe::Result {
             .with_app_id("kimo")
             .with_decorations(false) // custom titlebar drawn in app.rs
             .with_inner_size([1280.0, 800.0]),
+        // `multisampling` is deliberately left at eframe's default of 0: the
+        // floating title bar copies its backdrop out of the framebuffer
+        // (`src/glass.rs`), which a multisampled one does not allow.
         ..Default::default()
     };
 

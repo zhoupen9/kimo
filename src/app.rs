@@ -27,6 +27,7 @@ use std::time::{Duration, Instant};
 
 use crate::folders::{self, FolderKind};
 use crate::fonts::FontFamily;
+use crate::glass::Glass;
 use crate::models::{Account, MailMessage, Protocol, TlsMode};
 use crate::search::{Scope, SearchHit, SearchQuery, SEARCH_LIMIT};
 use crate::storage::{self, Settings};
@@ -329,6 +330,9 @@ pub struct KimoApp {
     /// The application icon, drawn at the left of the title bar. `None` only
     /// if the embedded PNG fails to decode.
     brand_icon: Option<egui::TextureHandle>,
+    /// The frosted backdrop of a floating title bar (see `crate::glass`): the
+    /// GL pass is made once, on the first frame the bar floats.
+    glass: Glass,
     theme: Theme,
     /// Cached OS dark-mode preference, so "system" resolution does not hit
     /// the filesystem every frame. Refreshed on startup and whenever the
@@ -378,6 +382,10 @@ pub struct KimoApp {
     /// rules span it so they reach the column's hairlines; nothing else reads
     /// it.
     list_column: egui::Rect,
+    /// How far the message list is scrolled, in points — zero when it has no
+    /// scroll area at all. The title bar floats over the column once this
+    /// leaves the top, and docks again when it comes back.
+    list_scroll: f32,
 }
 
 /// A Blitz page: rendering, rendered, or failed.
@@ -588,6 +596,7 @@ impl KimoApp {
             was_narrow: false,
             folder_icons,
             brand_icon,
+            glass: Glass::default(),
             theme: Theme::parse(&settings.theme),
             system_dark: system_prefers_dark(),
             storage_warning: crate::db::warning(),
@@ -605,6 +614,7 @@ impl KimoApp {
             pending_blitz_key: None,
             scrolled_message: None,
             list_column: egui::Rect::ZERO,
+            list_scroll: 0.0,
         };
 
         app.selected_account = app.accounts.first().map(|a| a.id.clone());
@@ -1450,6 +1460,70 @@ impl KimoApp {
 
     // ----- UI ----------------------------------------------------------------
 
+    /// The title bar itself, floating over the columns rather than docked
+    /// above them: one `egui::Area` fixed to the window's top edge and drawn
+    /// after the panels, which is what lets the message list scroll under it.
+    ///
+    /// While the list is at its top the bar is the solid chrome band it has
+    /// always been; once the list is scrolled it turns to glass — its backdrop
+    /// blurred (`crate::glass`) and its fill translucent — with a line under
+    /// it to say where it ends. Both follow one animated value, so scrolling
+    /// back to the top docks the bar again instead of snapping it.
+    fn titlebar_area(&mut self, ctx: &egui::Context) {
+        let scheme = theme::of(ctx);
+        let rect = egui::Rect::from_min_size(
+            egui::Pos2::ZERO,
+            egui::vec2(ctx.screen_rect().width(), TITLEBAR_HEIGHT),
+        );
+        // The list's scroll offset is the whole trigger: any scroll at all is
+        // mail under the bar, and the first row is back under it only at the
+        // top.
+        let floating = ctx.animate_bool_with_time(
+            egui::Id::new("titlebar-floating"),
+            self.list_scroll > 0.5,
+            TITLEBAR_FLOAT_TIME,
+        );
+
+        egui::Area::new(egui::Id::new("titlebar"))
+            .order(egui::Order::Middle)
+            .fixed_pos(egui::Pos2::ZERO)
+            .movable(false)
+            .show(ctx, |ui| {
+                let painter = ui.painter().clone();
+                // The blurred backdrop goes in first: a callback runs in the
+                // order the shape was added, so it has to be under the fill
+                // and the glyphs that sit on the glass.
+                if floating > 0.0 {
+                    self.glass.backdrop(&painter, rect);
+                }
+                // Opaque chrome at rest, glass while floating — the scheme's
+                // `panel` either way, only its alpha moves, so the bar never
+                // changes color, just solidity.
+                painter.rect_filled(
+                    rect,
+                    0.0,
+                    scheme
+                        .panel
+                        .gamma_multiply(1.0 - floating * (1.0 - GLASS_ALPHA)),
+                );
+                if floating > 0.0 {
+                    // The line under a floating bar: the one thing that says
+                    // where the bar ends and the content continues.
+                    painter.hline(
+                        rect.x_range(),
+                        rect.bottom() - 0.5,
+                        egui::Stroke::new(1.0_f32, scheme.row_edge.gamma_multiply(floating)),
+                    );
+                }
+                // The bar's own widgets: the `Area` hands them a Ui the size
+                // of the bar, so everything in `titlebar` lays out from the
+                // window's top edge exactly as it did in the panel.
+                ui.scope_builder(egui::UiBuilder::new().max_rect(rect), |ui| {
+                    self.titlebar(ui);
+                });
+            });
+    }
+
     /// Custom window title bar (the window is created undecorated in
     /// `main.rs`). Left to right: nav collapse toggle, the sync button (Debug
     /// mode only), the search box, the group of mail actions, then the
@@ -1816,6 +1890,9 @@ impl KimoApp {
         // The HTML renderer's lists, the only other users of `indent`, keep
         // theirs.
         ui.visuals_mut().indent_has_left_vline = false;
+        // The title bar floats over the columns, so this one's content starts
+        // below it: what the glass shows here is the panel fill, not folders.
+        ui.add_space(TITLEBAR_HEIGHT);
         if self.accounts.is_empty() {
             ui.label("No accounts yet.");
             ui.label(
@@ -1931,7 +2008,9 @@ impl KimoApp {
                 .inner_margin(egui::Margin {
                     left: LIST_MARGIN,
                     right: LIST_MARGIN,
-                    top: LIST_MARGIN,
+                    // Below the bar like the rows are, since this stands where
+                    // the first of them would.
+                    top: TITLEBAR_HEIGHT_I8 + LIST_MARGIN,
                     bottom: 0,
                 })
                 .show(ui, |ui| {
@@ -1944,6 +2023,9 @@ impl KimoApp {
                 });
         }
         if self.accounts.is_empty() || self.selected_account.is_none() {
+            // Nothing to scroll, so the bar is docked: whatever the last list
+            // left behind is not this frame's offset.
+            self.list_scroll = 0.0;
             ui.centered_and_justified(|ui| {
                 ui.heading("Kimo");
             });
@@ -2305,6 +2387,7 @@ impl KimoApp {
     fn folder_messages(&mut self, ui: &mut egui::Ui) {
         let messages = self.current_messages();
         if messages.is_empty() {
+            self.list_scroll = 0.0;
             ui.centered_and_justified(|ui| {
                 let text = if self.selected_folder_synced() {
                     "This folder is empty."
@@ -2315,7 +2398,7 @@ impl KimoApp {
             });
             return;
         }
-        egui::ScrollArea::vertical()
+        let list = egui::ScrollArea::vertical()
             .auto_shrink([false, false])
             .show(ui, |ui| {
                 egui::Frame::new()
@@ -2325,11 +2408,13 @@ impl KimoApp {
                         // mails are the rows' own edges, so the layout must not
                         // add space of its own between them.
                         ui.spacing_mut().item_spacing.y = 0.0;
-                        for msg in &messages {
-                            self.message_row(ui, msg);
+                        for (index, msg) in messages.iter().enumerate() {
+                            self.message_row(ui, msg, index == 0);
                         }
                     });
             });
+        // Scrolled away from the top, the bar floats over this list.
+        self.list_scroll = list.state.offset.y;
     }
 
     /// The middle column while a search is active: one card per hit.
@@ -2355,19 +2440,21 @@ impl KimoApp {
         // Taken out for the duration so the rows can be painted while `self` is
         // borrowed mutably (a click opens a mail); put back below.
         let hits = std::mem::take(&mut self.search_hits);
-        egui::ScrollArea::vertical()
+        let list = egui::ScrollArea::vertical()
             .auto_shrink([false, false])
             .show(ui, |ui| {
                 egui::Frame::new()
                     .inner_margin(LIST_PADDING)
                     .show(ui, |ui| {
                         ui.spacing_mut().item_spacing.y = 0.0;
-                        for hit in &hits {
-                            self.search_row(ui, hit);
+                        for (index, hit) in hits.iter().enumerate() {
+                            self.search_row(ui, hit, index == 0);
                         }
                     });
             });
         self.search_hits = hits;
+        // A scrolled result list floats the bar exactly like the folder's does.
+        self.list_scroll = list.state.offset.y;
     }
 
     /// Ask for what the search popup is showing, once the query has held still;
@@ -2454,8 +2541,9 @@ impl KimoApp {
         }
     }
 
-    /// One message card in the folder list.
-    fn message_row(&mut self, ui: &mut egui::Ui, msg: &MailMessage) {
+    /// One message card in the folder list. `first` is the list's own first
+    /// card, which is the one that draws no line above itself.
+    fn message_row(&mut self, ui: &mut egui::Ui, msg: &MailMessage, first: bool) {
         let selected = self.selected_message.as_deref() == Some(msg.uid.as_str());
         let preview = if msg.preview.is_empty() {
             " ".to_string()
@@ -2470,7 +2558,7 @@ impl KimoApp {
             unread: !msg.seen,
             selected,
         };
-        let response = self.message_card(ui, &card);
+        let response = self.message_card(ui, &card, first);
         if response.clicked() {
             self.open_message(msg);
         }
@@ -2478,7 +2566,7 @@ impl KimoApp {
 
     /// One search result: the same card, with where the mail lives and the line
     /// the query matched as its third line.
-    fn search_row(&mut self, ui: &mut egui::Ui, hit: &SearchHit) {
+    fn search_row(&mut self, ui: &mut egui::Ui, hit: &SearchHit, first: bool) {
         let selected = self.selected_message.as_deref() == Some(hit.uid.as_str())
             && self.selected_folder.as_deref() == Some(hit.folder.as_str());
         let account = self
@@ -2499,7 +2587,7 @@ impl KimoApp {
             unread: !hit.seen,
             selected,
         };
-        let response = self.message_card(ui, &card);
+        let response = self.message_card(ui, &card, first);
         if response.clicked() {
             self.open_hit(hit);
         }
@@ -2507,8 +2595,9 @@ impl KimoApp {
 
     /// One card in the middle column: avatar on the left; sender + timestamp,
     /// title and a muted third line stacked on the right. The folder list and
-    /// the search results share it — only what the three lines say differs.
-    fn message_card(&self, ui: &mut egui::Ui, card: &CardText) -> egui::Response {
+    /// the search results share it — only what the three lines say differs —
+    /// and `first` marks the card the list starts with.
+    fn message_card(&self, ui: &mut egui::Ui, card: &CardText, first: bool) -> egui::Response {
         let scheme = theme::of(ui.ctx());
         let (rect, resp) = ui.allocate_exact_size(
             egui::vec2(ui.available_width(), MESSAGE_ROW_HEIGHT),
@@ -2542,10 +2631,9 @@ impl KimoApp {
         let top_edge = egui::Stroke::new(1.0_f32, scheme.row_edge_top);
         let edges = painter.with_clip_rect(column);
         // The top edge is what separates this mail from the one above, so the
-        // first mail of the list has none: it starts at the column's top edge,
-        // where an edge would draw a line under the title bar — and the bar has
-        // no bottom line by design.
-        if rect.top() >= column.top() + 1.0 {
+        // first mail of the list has none: an edge there would draw a line
+        // under the title bar, whose bottom is deliberately bare.
+        if !first {
             edges.line_segment(
                 [
                     egui::pos2(column.left(), rect.top() + 0.5),
@@ -2680,8 +2768,17 @@ impl KimoApp {
         ui.set_min_size(panel.size());
         ui.painter().rect_filled(panel, 0.0, scheme.panel);
 
+        // The title bar floats over the pane's top edge, so everything in it
+        // starts below the bar: the card, and the placeholder that centres in
+        // what the bar leaves rather than in the whole panel.
+        let below_bar = egui::Rect::from_min_max(
+            egui::pos2(panel.left(), panel.top() + TITLEBAR_HEIGHT),
+            panel.max,
+        );
         let Some(msg) = self.selected_message_view() else {
-            self.mail_content_body(ui, None);
+            let _ = ui.allocate_new_ui(egui::UiBuilder::new().max_rect(below_bar), |ui| {
+                self.mail_content_body(ui, None);
+            });
             return;
         };
 
@@ -2694,7 +2791,7 @@ impl KimoApp {
         let where_to_put_card = ui.painter().add(egui::Shape::Noop);
         let card_left = panel.left() + CONTENT_GUTTER;
         let card_right = panel.right() - CONTENT_GUTTER;
-        let card_top = panel.top() + CONTENT_GUTTER;
+        let card_top = below_bar.top() + CONTENT_GUTTER;
         let card_bottom = panel.bottom() - CONTENT_GUTTER;
         // The body gets the card's whole rect: its padding lives inside the
         // scroll area (see mail_body), which is what lets the scroll bar sit on
@@ -3331,13 +3428,12 @@ impl eframe::App for KimoApp {
         // the columns — the list's hairlines, and the card floating in the
         // chrome's gutter — so a separator would only double them.
 
-        egui::TopBottomPanel::top("titlebar")
-            .exact_height(TITLEBAR_HEIGHT)
-            // egui draws a dim separator line along a panel's inner edge by
-            // default, which here reads as a rule under the bar; the bar runs
-            // into the columns below it instead.
-            .show_separator_line(false)
-            .show(ctx, |ui| self.titlebar(ui));
+        // No top panel: the title bar is an overlay (`titlebar_area`), so the
+        // columns run from the window's top edge and the message list can
+        // scroll under the bar. What each column keeps clear of the bar is its
+        // own business — the list's top padding scrolls away with its rows
+        // (`LIST_PADDING`), the navigation and the reading pane are inset by
+        // the bar's height.
         egui::SidePanel::right("mail_content")
             .resizable(true)
             .min_width(280.0)
@@ -3383,6 +3479,12 @@ impl eframe::App for KimoApp {
             splitter_stroke,
         );
 
+        // The title bar, over the columns it belongs to: the list scrolls
+        // under it and it is glass while it does (`titlebar_area`). Drawn
+        // before the compose window, so a draft floats over it, and before
+        // the modals, which egui keeps in the foreground layer.
+        self.titlebar_area(ctx);
+
         // The compose window sits over the columns but under the popups: egui
         // keeps modals in the foreground layer, so it needs no ordering of its
         // own — a draft is not a decision the rest of the app waits on.
@@ -3422,8 +3524,20 @@ impl eframe::App for KimoApp {
 
 // ----- helpers --------------------------------------------------------------
 
-const TITLEBAR_HEIGHT: f32 = 48.0;
+/// The title bar's height. The integer form is the one the message list's
+/// top padding wants (`egui::Margin` is in whole points), and the only place
+/// the two could drift apart.
+const TITLEBAR_HEIGHT_I8: i8 = 48;
+const TITLEBAR_HEIGHT: f32 = TITLEBAR_HEIGHT_I8 as f32;
 const TITLEBAR_BUTTON_WIDTH: f32 = 42.0;
+/// How long the bar takes to turn from docked chrome into glass and back.
+/// Short enough to feel like a state change rather than an animation.
+const TITLEBAR_FLOAT_TIME: f32 = 0.16;
+/// What the bar's fill keeps of its alpha while it floats: the rest is the
+/// blurred mail showing through. High enough that the bar's own icons and
+/// query stay crisp, low enough that the smudge behind them reads as mail
+/// rather than as a smeared background.
+const GLASS_ALPHA: f32 = 0.62;
 /// Width of the title bar's search box (the text part of it). Fixed rather
 /// than filling: the bar also carries the drag surface, and it should not move
 /// around with the length of a query.
@@ -3447,18 +3561,19 @@ const MAIL_ACTION_PADDING: f32 = 128.0;
 const MAIL_ACTION_GLYPH: f32 = 18.0;
 
 /// Padding on the sides of the message list's rows: the hairlines `mail_list`
-/// draws down the column's sides sit just outside it. There is none at the top
-/// — the first mail starts at the column's top edge, with no band of surface
-/// above it, and its own top edge would draw a line under the title bar.
+/// draws down the column's sides sit just outside it.
 const LIST_MARGIN: i8 = 8;
 
-/// The rows' padding inside the list's scroll area — see `LIST_MARGIN` for
-/// why the top is zero. It belongs to the scroll area rather than to the
-/// column, which is what lets the scroll bar reach the column's edge.
+/// The rows' padding inside the list's scroll area. The top is the title
+/// bar's height and it is *inside* the scroll area on purpose: the first mail
+/// starts below the bar at rest, and scrolling takes the padding away with
+/// the rows, which is what slides them under the floating bar. It belongs to
+/// the scroll area rather than to the column, which is what lets the scroll
+/// bar reach the column's edge.
 const LIST_PADDING: egui::Margin = egui::Margin {
     left: LIST_MARGIN,
     right: LIST_MARGIN,
-    top: 0,
+    top: TITLEBAR_HEIGHT_I8,
     bottom: LIST_MARGIN,
 };
 /// The gutter around the reading pane's card — the gap between the card and

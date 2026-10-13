@@ -128,6 +128,7 @@ src/html.rs             HTML mail → egui widgets (subset: blocks, lists, table
 src/blitz_render.rs     HTML mail → rasterized page via Blitz (headless render, net provider, fonts)
 src/css.rs              tiny CSS subset (decls, tag/class/id selectors) for HTML mail
 src/folders.rs          folder kind (name → special mailbox, incl. CJK) + embedded row icons
+src/glass.rs            the floating title bar's frosted backdrop (an OpenGL paint callback)
 src/render_bench.rs     test-only: times both HTML renderers for the same bodies (bench_render)
 src/tray.rs             StatusNotifierItem over raw D-Bus (session bus, std::thread) + svg→ARGB icon
 src/sync.rs             Job/Event enums, worker threads, per-protocol sync logic
@@ -334,7 +335,11 @@ Event (mpsc) ──► drain_events() at frame start ──► merge into Accoun
   line down the left of the block (`indent_has_left_vline` cleared in
   `nav`): in this column that line reads as a rule through the folder list.
   The chrome — title bar and navigation — is the scheme's `panel`; the message
-  list and the reading pane are the lighter `content`. The list column is
+  list and the reading pane are the lighter `content`. The columns run from the
+  window's own top edge, and the title bar floats over them (see the title-bar
+  bullet below): the list keeps clear of it with padding *inside* its scroll
+  area, which scrolls away with the rows, while the navigation and the reading
+  pane are inset by the bar's height and never go under it. The list column is
   framed by a hairline down each side (`mail_list`, drawn at the column's own
   rect), and the reading pane is a card of `content`
   (`CONTENT_CARD_CORNER_RADIUS`) inset by `CONTENT_GUTTER` into the chrome,
@@ -347,13 +352,16 @@ Event (mpsc) ──► drain_events() at frame start ──► merge into Accoun
   above: two pixels, and `item_spacing.y = 0` keeps the layout from adding a
   third. The list's first row draws no top edge — there is no mail above it to
   be separated from, and the edge would land on the title bar's bottom edge,
-  which is deliberately bare. The column's hairlines are `row_edge` too and run its whole height,
+  which is deliberately bare. Which row is first comes from the caller
+  (`message_card`'s `first` flag) rather than from the row's y: the bar's own
+  height is padding above the first mail, so it no longer starts at the
+  column's top edge. The column's hairlines are `row_edge` too and run its whole height,
   and a row paints them again over its own highlight, which is what keeps a
   selected mail's frame visible across its fill. Pane padding lives *inside*
   each scroll area
-  (`Frame::inner_margin(LIST_PADDING)` around the rows — sides and bottom
-  only, so the first mail starts at the column's top edge — and `mail_body`
-  for the mail), not on the panel's frame, which is what lets the scroll bars
+  (`Frame::inner_margin(LIST_PADDING)` around the rows — sides, bottom, and
+  the bar's height at the top, which is what the rows scroll under — and
+  `mail_body` for the mail), not on the panel's frame, which is what lets the scroll bars
   reach the column's edge and the card's edge instead of stopping on the
   padding. egui's
   panel separators are off in both schemes (they would double those hairlines
@@ -397,8 +405,19 @@ Event (mpsc) ──► drain_events() at frame start ──► merge into Accoun
   row whose three lines are centred at y = 20 / 40 / 57), so retuning the list
   is one edit instead of a hunt for literals.
 - The window is undecorated on purpose (`with_decorations(false)` in
-  `main.rs`): `titlebar()` in `app.rs` draws the custom title bar — the
-  application icon (the brand, and the leftmost thing in the bar: the same
+  `main.rs`): `titlebar_area()` in `app.rs` draws the custom title bar — an
+  `egui::Area` fixed to the window's top edge and shown *after* the panels, not
+  a `TopBottomPanel`, because the bar floats over the columns and the message
+  list scrolls under it. At the top of the list it is the solid chrome band it
+  has always been; once the list is scrolled it turns to glass — the fill keeps
+  `GLASS_ALPHA` of the scheme's `panel`, the backdrop behind it is blurred
+  (`src/glass.rs`) and a hairline appears along its bottom edge. One animated
+  value (`TITLEBAR_FLOAT_TIME`) drives all three from the list's own scroll
+  offset (`KimoApp::list_scroll`, captured where its scroll area is built), so
+  scrolling back to the top docks the bar again rather than snapping it, and a
+  list with nothing to scroll — or no list at all — leaves it docked. Inside
+  the bar, left to right: the application icon (the brand, and the leftmost
+  thing in the bar: the same
   embedded PNG the tray serves, downscaled once at startup because egui has
   no mipmaps to filter a 256 px source down to 18 pt), the nav collapse
   toggle, the compose button (the one mail action that needs no mail open, so
@@ -437,6 +456,24 @@ Event (mpsc) ──► drain_events() at frame start ──► merge into Accoun
   `TextEdit` chrome, so the radius is set on the widget visuals in a scope —
   and because the field is deliberately non-interactive, the slot that matters
   is `noninteractive` (egui picks the visuals by `Sense`, not by hover).
+- The frosted backdrop is the one piece of hand-written OpenGL in the app
+  (`src/glass.rs`), because egui has no blur: nothing in the painter can sample
+  what has already been drawn. It is an `egui::PaintCallback`
+  (`egui_glow::CallbackFn`) that copies the pixels behind the bar out of the
+  framebuffer into a texture and draws them back through a separable two-pass
+  blur — horizontal into an offscreen texture, vertical onto the window. A
+  single two-dimensional kernel cheap enough to run per frame is sampled too
+  sparsely and leaves a comb of aliasing over the very letters it is meant to
+  destroy; sampling each axis a pixel and a half apart costs less and dissolves
+  the text instead. egui_glow restores its own GL state after every callback
+  (it calls `prepare_painting` again), so the pass binds program, VAO, textures
+  and framebuffer as it needs them, and disables egui's scissor for its
+  offscreen pass because that scissor is in window pixels. Every failure is
+  soft: a shader that will not compile, or a driver that will not copy out of
+  its own framebuffer, reports once, sets `failed`, and leaves the bar
+  translucent over the crisp content. `NativeOptions::multisampling` therefore
+  stays at eframe's default of 0 — `glCopyTexSubImage2D` is invalid on a
+  multisampled framebuffer, which is exactly the case that fallback covers.
 - Deleting a mail (the title bar's Delete → `KimoApp::delete_selected_message` →
   `Job::DeleteMessage`) is **remote first, local after**: the worker asks the
   server to drop the message and only then deletes the database row
