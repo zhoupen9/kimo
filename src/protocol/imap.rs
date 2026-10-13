@@ -89,11 +89,15 @@ impl ImapClient {
             .filter_map(|line| line.strip_prefix("* LIST "))
             .filter_map(parse_mailbox_name)
             .collect();
-        folders.sort();
-        folders.dedup();
-        if let Some(pos) = folders.iter().position(|f| f.eq_ignore_ascii_case("INBOX")) {
-            let inbox = folders.remove(pos);
-            folders.insert(0, inbox);
+        order_mailboxes(&mut folders);
+        // Every mailbox has at least an INBOX, so an answer that names none is
+        // not one: taking it for a list would say the server has no mailboxes
+        // at all — and a caller using this to decide whether a mailbox is gone
+        // would believe it. It is reported as the protocol failure it is.
+        if folders.is_empty() {
+            return Err(MailError::Protocol(
+                "LIST named no mailbox, not even INBOX".to_string(),
+            ));
         }
         Ok(folders)
     }
@@ -335,6 +339,20 @@ fn parse_mailbox_name(rest: &str) -> Option<String> {
     }
 }
 
+/// The order a folder list is shown in: INBOX first, then the rest by name,
+/// with duplicates dropped. A `LIST` answer goes through this, and so does the
+/// folder list the database cached — the column draws the same mailboxes in the
+/// same order before and after a sync, instead of reordering itself when one
+/// lands.
+pub fn order_mailboxes(folders: &mut Vec<String>) {
+    folders.sort();
+    folders.dedup();
+    if let Some(pos) = folders.iter().position(|f| f.eq_ignore_ascii_case("INBOX")) {
+        let inbox = folders.remove(pos);
+        folders.insert(0, inbox);
+    }
+}
+
 /// Decode a modified UTF-7 (RFC 3501 §5.1.3) mailbox name for display,
 /// e.g. `&XfJT0ZAB-` → `已发送`. Non-ASCII runs are wrapped in `&`…`-`
 /// around a base64-style alphabet (`,` = 63) encoding UTF-16BE; `&-` is a
@@ -484,6 +502,35 @@ mod tests {
             parse_mailbox_name("(\\HasNoChildren) \"/\" INBOX"),
             Some("INBOX".to_string())
         );
+    }
+
+    #[test]
+    fn the_folder_order_puts_inbox_first() {
+        // The order the column draws folders in, and the one a `LIST` answer
+        // comes back in, so a sync does not reorder it.
+        let mut folders = vec![
+            "Sent".to_string(),
+            "Archive".to_string(),
+            "INBOX".to_string(),
+            "Archive".to_string(),
+        ];
+        order_mailboxes(&mut folders);
+        assert_eq!(folders, ["INBOX", "Archive", "Sent"]);
+    }
+
+    /// An answer that names no mailbox is not a mailbox list. Taking it for one
+    /// would say the account has no folders at all — and since a `LIST` is also
+    /// how a delete asks whether the server still has a mailbox, it would say
+    /// every folder is gone.
+    #[test]
+    fn a_list_that_names_no_mailbox_is_refused() {
+        let (account, server) = one_shot_server(vec![(
+            "LIST \"\" \"*\"",
+            "{tag} OK LIST completed\r\n".to_string(),
+        )]);
+        let mut client = ImapClient::connect(&account).unwrap();
+        assert!(client.list_folders().is_err());
+        server.join().unwrap();
     }
 
     /// A canned IMAP server on a loopback port: greet, then answer each

@@ -125,6 +125,11 @@ pub struct Folder {
     /// False until the first successful sync, so the UI can distinguish
     /// "not fetched yet" from "really empty".
     pub synced: bool,
+    /// Whether the server listed this folder the last time it was asked. A
+    /// folder that dropped out of the list keeps its mail — the only copy of it
+    /// this machine has — so the column keeps the row too, and this is what
+    /// lets it say that the server no longer has it.
+    pub listed: bool,
     pub messages: Vec<MailMessage>,
 }
 

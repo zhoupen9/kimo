@@ -204,6 +204,24 @@ Event (mpsc) ──► drain_events() at frame start ──► merge into Accoun
   it first, so the message is not a lie in the one mode that shows the button. It is a per-installation setting rather than a
   build flag so that a development build can be pointed at a real account
   without a sync on every start.
+- The folder list is cached like the mail is, and the `LIST` is only what
+  updates it. `folders.listed` records which mailboxes the last answer named;
+  `db::save_folder_list` writes it in one transaction with the folders
+  themselves — the ones the answer left out are marked unlisted, never deleted,
+  because the mail cached for them is still the only copy of it here — and
+  `db::load_mailboxes` carries the flag into `AccountUiState::folders`, which is
+  what the navigation column opens on. So a start shows the folders the last
+  `LIST` named instead of standing on an offered INBOX until a sync runs, and a
+  sync that finds the same mailboxes changes nothing on screen. Two things are
+  deliberately *not* a mailbox list: an answer that names no mailbox at all
+  (`imap::list_folders` reports it as the protocol error it is, rather than
+  saying the account has no folders), and one whose `LIST` **failed** — that
+  leaves the stored list and its flags alone and reports the error on the
+  account, while the sweep falls back to `db::listed_folders` — the mailboxes
+  the last answer named — so a server that will not list its mailboxes can still
+  have their mail fetched. That list is a fallback, not a display source: the
+  column draws what `LIST` last said. Mail fetched for a folder proves the
+  server has it, so `save_messages` lists it again — the one way back.
 - The Blitz renderer is a `Job::RenderHtml` on a worker thread: it parses,
   styles, lays out and rasterizes the body, resolving every sub-resource
   through `blitz_render::MailNet` (a blocking `NetProvider` that reuses the
@@ -257,8 +275,9 @@ Event (mpsc) ──► drain_events() at frame start ──► merge into Accoun
 - `~/.local/share/kimo/mail.db` — the one database (SQLite, WAL, mode 0600
   because it holds the passwords). `accounts` (id, name, protocol, host,
   port, username, password, tls, position), `folders` (account_id, name,
-  uidvalidity, uid_next, first_num, synced — the middle two are the sync marks
-  of the bullet above), `messages` keyed by `(account_id, folder, uid)` with
+  uidvalidity, uid_next, first_num, synced, listed — the middle two are the sync
+  marks of the bullet above, and `listed` is what the last `LIST` named),
+  `messages` keyed by `(account_id, folder, uid)` with
   the subject, addresses, both bodies, the preview and the bigram column,
   `attachments` and `inline_images` (raw bytes, not base64) as children of a
   message, and the external-content FTS5 table `messages_fts`, which only the
@@ -706,9 +725,26 @@ Event (mpsc) ──► drain_events() at frame start ──► merge into Accoun
   title bar has no account menu: every account is a collapsible section
   (`collapsed_accounts` holds the collapsed ids, in memory only), whose header
   shows the name and the account's unread total and whose folders are indented
-  under it. An account with no folders yet still offers INBOX, since clicking
-  it is what starts the first fetch. Selecting a folder of another account is
-  what makes it the active one.
+  under it. An account with no cached folder at all still offers INBOX, since
+  clicking it is what starts the first fetch. Selecting a folder of another
+  account is what makes it the active one.
+  What it draws is a cache of the display model, the way the reading pane
+  caches the parsed body: `AccountUiState::nav` derives the rows (`FolderRows`)
+  from the account's folder list and mail only when `folders_rev` moved, so a
+  frame costs the drawing rather than a decode, a `folders::kind_of` and an
+  unread count per folder. The revision moves when a `LIST` named **different**
+  mailboxes (`Event::Folders` compares before it replaces), when mail arrives or
+  leaves (`Event::Messages`, `Event::MessageDeleted`) and when a mail is read
+  (`open_message` marks it seen locally) — so a sync that found the same folders
+  leaves the column exactly as it was, and a change is a rebuild of the rows
+  rather than a redraw that happens to look the same. Rows come in the two
+  groups the folder list defines: first the mailboxes the server lists — in
+  `imap::order_mailboxes` order, which is the order a `LIST` answer is given in
+  and the order the cached list is drawn in, so a sync does not reorder the
+  column — and then the ones it does not, which are here for the mail cached
+  under them, drawn weak whatever their unread count with a tooltip saying why,
+  and still clickable. A folder of that second kind is only dropped from the
+  column when it holds no mail at all; its row in the database stays.
 - Folders are custom rows — kind icon, name (elided with an ellipsis), unread
   count right-aligned — because the whole row should be the click target and
   carry the selection highlight, which `selectable_label` cannot do once an

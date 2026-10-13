@@ -553,12 +553,131 @@ fn body_fingerprint(html: &str) -> u64 {
 
 #[derive(Default)]
 pub struct AccountUiState {
+    /// The mailboxes the server lists for this account: what the last `LIST` of
+    /// this session answered, or — before one has run — the mailboxes the
+    /// database recorded as listed. Anything else the account holds is mail
+    /// cached for a folder the server no longer lists.
     pub folders: Vec<String>,
     /// The account's folders and their cached mail, loaded from the database
     /// at startup and kept in memory (the DB is the durable copy).
     pub mailbox: storage::Mailbox,
     pub syncing: bool,
     pub error: Option<String>,
+    /// Bumped whenever `folders` or the cached mail changes. The navigation
+    /// column's rows are derived from it (`FolderRows::rev`), so a frame that
+    /// changed nothing re-derives nothing.
+    folders_rev: u64,
+    /// The column's rows, derived from the two fields above.
+    nav: FolderRows,
+}
+
+impl AccountUiState {
+    /// The rows the navigation column draws, derived from the account's state
+    /// when that has changed since the last derivation and reused until the
+    /// next change. egui redraws the column every frame; what it holds only
+    /// moves when a sync reports a different mailbox list or brings mail.
+    fn nav(&mut self) -> &FolderRows {
+        if self.nav.rev != Some(self.folders_rev) {
+            self.nav = FolderRows::of(&self.mailbox, &self.folders, self.folders_rev);
+        }
+        &self.nav
+    }
+
+    /// The account's folder list or its cached mail changed, so whatever the
+    /// column derived from them is stale. Only a real change calls this: a
+    /// sync that reports the mailboxes it already reported leaves the rows —
+    /// and the column — exactly as they were.
+    fn folders_changed(&mut self) {
+        self.folders_rev = self.folders_rev.wrapping_add(1);
+    }
+}
+
+/// One folder as the navigation column draws it. Deriving this is what the
+/// column caches: the label (decoded from the IMAP wire form), the kind that
+/// picks its icon, its unread count, and whether the server still lists it.
+struct FolderRow {
+    /// The wire form — the row's identity, and what `SELECT` gets.
+    name: String,
+    display: String,
+    kind: FolderKind,
+    unread: usize,
+    /// False for a folder the server no longer lists: the row is kept for the
+    /// mail cached under it, and is drawn as one that is not there any more.
+    listed: bool,
+}
+
+/// The navigation column's rows for one account: what the server lists, then
+/// the folders it does not, kept because they still hold mail. Deriving them
+/// costs a decode, a classification and an unread count per folder; doing it
+/// once per change of the account state rather than once per frame is the
+/// whole point, and it is also what makes a sync that found nothing new a
+/// no-op for the column.
+#[derive(Default)]
+struct FolderRows {
+    /// The `AccountUiState::folders_rev` these were derived from; `None` until
+    /// the first derivation, which no revision equals.
+    rev: Option<u64>,
+    listed: Vec<FolderRow>,
+    unlisted: Vec<FolderRow>,
+    /// Unread mail in the account, for its header. A folder that was never
+    /// fetched counts nothing: nothing here goes to the network.
+    unread: usize,
+    /// True while the account has no folder at all, when the column offers
+    /// INBOX so the first click is what starts its fetch.
+    placeholder: bool,
+}
+
+impl FolderRows {
+    fn of(mailbox: &storage::Mailbox, listed: &[String], rev: u64) -> Self {
+        let mut unread_of: HashMap<&str, usize> = HashMap::new();
+        for folder in &mailbox.folders {
+            unread_of.insert(
+                folder.name.as_str(),
+                folder.messages.iter().filter(|m| !m.seen).count(),
+            );
+        }
+        let row = |name: &str, listed: bool| {
+            // `name` is the IMAP wire form (possibly modified UTF-7); decode it
+            // for the label and for the icon lookup, which matches the
+            // readable name.
+            let display = crate::protocol::imap::decode_mailbox_name(name);
+            FolderRow {
+                kind: folders::kind_of(&display),
+                display,
+                name: name.to_string(),
+                unread: unread_of.get(name).copied().unwrap_or(0),
+                listed,
+            }
+        };
+
+        let mut listed_names = listed.to_vec();
+        crate::protocol::imap::order_mailboxes(&mut listed_names);
+        let mut rows = Self {
+            rev: Some(rev),
+            listed: listed_names.iter().map(|name| row(name, true)).collect(),
+            unlisted: Vec::new(),
+            unread: unread_of.values().sum(),
+            placeholder: false,
+        };
+
+        let listed: HashSet<&str> = listed.iter().map(String::as_str).collect();
+        let mut unlisted_names: Vec<String> = mailbox
+            .folders
+            .iter()
+            .filter(|folder| !listed.contains(folder.name.as_str()) && !folder.messages.is_empty())
+            .map(|folder| folder.name.clone())
+            .collect();
+        crate::protocol::imap::order_mailboxes(&mut unlisted_names);
+        rows.unlisted = unlisted_names.iter().map(|name| row(name, false)).collect();
+
+        // Nothing to list at all: INBOX is worth offering before the first
+        // sync, since clicking it is what starts the fetch.
+        if rows.listed.is_empty() && rows.unlisted.is_empty() {
+            rows.placeholder = true;
+            rows.listed.push(row("INBOX", true));
+        }
+        rows
+    }
 }
 
 /// The fields of the add/edit account form, plus the account it is
@@ -725,8 +844,20 @@ impl KimoApp {
     ) -> Self {
         let mut states = HashMap::new();
         for account in &accounts {
+            let mailbox = mailboxes.get(&account.id).cloned().unwrap_or_default();
+            // The column opens on the folder list the database cached: the
+            // mailboxes the last `LIST` named. The ones it left out are still
+            // there — their mail is — and are drawn as folders the server no
+            // longer has.
+            let folders = mailbox
+                .folders
+                .iter()
+                .filter(|folder| folder.listed)
+                .map(|folder| folder.name.clone())
+                .collect();
             let state = AccountUiState {
-                mailbox: mailboxes.get(&account.id).cloned().unwrap_or_default(),
+                folders,
+                mailbox,
                 ..AccountUiState::default()
             };
             states.insert(account.id.clone(), state);
@@ -816,7 +947,13 @@ impl KimoApp {
                 folders,
             } => {
                 if let Some(state) = self.states.get_mut(&account_id) {
-                    state.folders = folders;
+                    // A `LIST` that names the mailboxes the column already
+                    // shows — a warm sync — is not a change: the rows stay,
+                    // and nothing is derived again.
+                    if state.folders != folders {
+                        state.folders = folders;
+                        state.folders_changed();
+                    }
                 }
             }
             Event::Messages {
@@ -833,8 +970,16 @@ impl KimoApp {
                             name: folder.clone(),
                             uidvalidity: None,
                             synced: false,
+                            // Mail was just fetched for it, so the server has
+                            // this mailbox, whatever the last `LIST` said: it
+                            // is one of the folders the column lists rather
+                            // than one kept for its cached mail.
+                            listed: true,
                             messages: Vec::new(),
                         });
+                    }
+                    if !state.folders.iter().any(|name| name == &folder) {
+                        state.folders.push(folder.clone());
                     }
                     let fc = state
                         .mailbox
@@ -861,6 +1006,12 @@ impl KimoApp {
                     }
                     sort_messages(&mut fc.messages);
                     fc.synced = true;
+                    // Mail was just fetched for it, so the server has this
+                    // mailbox — the `stored` copy of the flag says the same
+                    // thing, and the two have to agree across a restart.
+                    fc.listed = true;
+                    // New mail, and with it a count the column shows.
+                    state.folders_changed();
                 }
             }
             Event::SyncDone { account_id } => {
@@ -885,6 +1036,8 @@ impl KimoApp {
                     if let Some(fc) = state.mailbox.folders.iter_mut().find(|f| f.name == folder) {
                         fc.messages.retain(|m| m.uid != uid);
                     }
+                    // A mail fewer, and one the folder's count was made of.
+                    state.folders_changed();
                 }
                 if self.selected_account.as_deref() == Some(account_id.as_str())
                     && self.selected_folder.as_deref() == Some(folder.as_str())
@@ -980,33 +1133,6 @@ impl KimoApp {
         }
     }
 
-    /// Unread mail in one folder, from the messages already cached for it.
-    fn folder_unread(&self, account_id: &str, folder: &str) -> usize {
-        self.states
-            .get(account_id)
-            .and_then(|state| state.mailbox.folders.iter().find(|f| f.name == folder))
-            .map(|f| f.messages.iter().filter(|m| !m.seen).count())
-            .unwrap_or(0)
-    }
-
-    /// Unread mail across every cached folder of one account — the number on
-    /// its header in the navigation column. Folders that were never fetched
-    /// are simply not counted; nothing here goes to the network.
-    fn account_unread(&self, account_id: &str) -> usize {
-        self.states
-            .get(account_id)
-            .map(|state| {
-                state
-                    .mailbox
-                    .folders
-                    .iter()
-                    .flat_map(|folder| folder.messages.iter())
-                    .filter(|message| !message.seen)
-                    .count()
-            })
-            .unwrap_or(0)
-    }
-
     fn select_folder(&mut self, account_id: String, folder: String, protocol: Protocol) {
         self.selected_account = Some(account_id.clone());
         self.selected_folder = Some(folder.clone());
@@ -1054,6 +1180,8 @@ impl KimoApp {
             if let Some(fc) = state.mailbox.folders.iter_mut().find(|f| f.name == folder) {
                 if let Some(existing) = fc.messages.iter_mut().find(|m| m.uid == msg.uid) {
                     existing.seen = true;
+                    // One mail fewer to count in the folder and the account.
+                    state.folders_changed();
                 }
             }
         }
@@ -2060,27 +2188,49 @@ impl KimoApp {
             );
             return;
         }
-        let accounts = self.accounts.clone();
+        // What a section needs of an account: its id and name for the header,
+        // its protocol for a folder click. Not the account itself — the
+        // password in it has no business being copied once a frame.
+        let accounts: Vec<(String, String, Protocol)> = self
+            .accounts
+            .iter()
+            .map(|account| (account.id.clone(), account.name.clone(), account.protocol))
+            .collect();
         egui::ScrollArea::vertical()
             .auto_shrink([false, false])
             .show(ui, |ui| {
                 ui.add_space(2.0);
-                for account in &accounts {
-                    self.account_section(ui, scheme, account);
+                for (id, name, protocol) in &accounts {
+                    self.account_section(ui, scheme, id, name, *protocol);
                 }
             });
     }
 
     /// One account in the navigation column: a header that collapses it, then
     /// its folders, indented under it.
-    fn account_section(&mut self, ui: &mut egui::Ui, scheme: ColorScheme, account: &Account) {
-        let collapsed = self.collapsed_accounts.contains(&account.id);
-        let unread = self.account_unread(&account.id);
-        if account_row(ui, scheme, &account.name, unread, collapsed).clicked() {
+    fn account_section(
+        &mut self,
+        ui: &mut egui::Ui,
+        scheme: ColorScheme,
+        account_id: &str,
+        account_name: &str,
+        protocol: Protocol,
+    ) {
+        let collapsed = self.collapsed_accounts.contains(account_id);
+        // The rows are derived here and only when the account state changed, so
+        // the header's count comes from them too — they are where the counts
+        // are computed at all.
+        let (unread, placeholder, syncing, error) = {
+            let state = self.states.entry(account_id.to_string()).or_default();
+            let nav = state.nav();
+            let (unread, placeholder) = (nav.unread, nav.placeholder);
+            (unread, placeholder, state.syncing, state.error.clone())
+        };
+        if account_row(ui, scheme, account_name, unread, collapsed).clicked() {
             if collapsed {
-                self.collapsed_accounts.remove(&account.id);
+                self.collapsed_accounts.remove(account_id);
             } else {
-                self.collapsed_accounts.insert(account.id.clone());
+                self.collapsed_accounts.insert(account_id.to_string());
             }
             return;
         }
@@ -2089,39 +2239,45 @@ impl KimoApp {
             return;
         }
 
-        let (folders, syncing, error) = {
-            let state = self.states.entry(account.id.clone()).or_default();
-            (state.folders.clone(), state.syncing, state.error.clone())
-        };
-        let folders_were_empty = folders.is_empty();
-        // Before the first sync there is nothing to list, but INBOX is worth
-        // offering: clicking it is what starts the fetch.
-        let folder_list = if folders.is_empty() {
-            vec!["INBOX".to_string()]
+        // The rows are borrowed from the account state while they are drawn, so
+        // a click is remembered as the folder it landed on and opened once the
+        // drawing has stopped borrowing — the same shape the message list uses.
+        let selected = if self.selected_account.as_deref() == Some(account_id) {
+            self.selected_folder.as_deref()
         } else {
-            folders
+            None
         };
-        ui.indent(("account-folders", &account.id), |ui| {
-            for folder in folder_list {
-                let selected = self.selected_account.as_deref() == Some(account.id.as_str())
-                    && self.selected_folder.as_deref() == Some(folder.as_str());
-                let unread = self.folder_unread(&account.id, &folder);
-                // `folder` is the IMAP wire form (possibly modified UTF-7);
-                // decode it for the label and for the icon lookup, which
-                // matches the readable name.
-                let display = crate::protocol::imap::decode_mailbox_name(folder.as_str());
-                let kind = folders::kind_of(&display);
-                // Only a generic folder has an open variant; the special
-                // mailboxes keep one glyph.
-                let open = selected && kind == FolderKind::Folder;
-                let icon = self.folder_icons.get(&(kind, open)).cloned();
-                let row = folder_row(ui, scheme, icon.as_ref(), &display, unread, selected);
-                if row.clicked() {
-                    self.select_folder(account.id.clone(), folder, account.protocol);
+        let icons = &self.folder_icons;
+        let mut clicked: Option<String> = None;
+        {
+            let state = self.states.entry(account_id.to_string()).or_default();
+            let nav = state.nav();
+            ui.indent(("account-folders", account_id), |ui| {
+                for row in nav.listed.iter().chain(nav.unlisted.iter()) {
+                    let is_selected = selected == Some(row.name.as_str());
+                    // Only a generic folder has an open variant; the special
+                    // mailboxes keep one glyph.
+                    let open = is_selected && row.kind == FolderKind::Folder;
+                    let icon = icons.get(&(row.kind, open));
+                    let response = folder_row(
+                        ui,
+                        scheme,
+                        icon,
+                        &row.display,
+                        row.unread,
+                        is_selected,
+                        row.listed,
+                    );
+                    if response.clicked() {
+                        clicked = Some(row.name.clone());
+                    }
                 }
-            }
-        });
-        if syncing && folders_were_empty {
+            });
+        }
+        if let Some(folder) = clicked {
+            self.select_folder(account_id.to_string(), folder, protocol);
+        }
+        if syncing && placeholder {
             ui.add_space(4.0);
             ui.add(egui::Spinner::new().color(scheme.accent));
         }
@@ -4338,6 +4494,11 @@ fn account_row(
     response
 }
 
+/// One folder in the navigation column. `listed` is whether the server still
+/// has it: a row kept for the mail cached under a folder it no longer lists is
+/// drawn weak whatever its unread count, and says so on hover — it is here for
+/// the mail, not for the mailbox. It stays clickable, because its mail is the
+/// only copy of it on this machine.
 fn folder_row(
     ui: &mut egui::Ui,
     scheme: ColorScheme,
@@ -4345,6 +4506,7 @@ fn folder_row(
     name: &str,
     unread: usize,
     selected: bool,
+    listed: bool,
 ) -> egui::Response {
     const ROW_HEIGHT: f32 = 22.0;
     const ICON_SIZE: f32 = 16.0;
@@ -4364,7 +4526,9 @@ fn folder_row(
         ui.painter().rect_filled(rect, 3.0_f32, scheme.hover);
     }
     // Unread folders read brighter than read ones, as the plain labels did.
-    let color = if selected || unread > 0 {
+    let color = if !listed {
+        scheme.text_weak
+    } else if selected || unread > 0 {
         scheme.text
     } else {
         scheme.text_weak
@@ -4408,7 +4572,11 @@ fn folder_row(
         name,
         color,
     );
-    response
+    if listed {
+        response
+    } else {
+        response.on_hover_text("No longer on the server — the mail cached for it is still here")
+    }
 }
 
 /// The application icon for the title bar: the same embedded 256 px PNG the
@@ -5157,6 +5325,25 @@ mod tests {
         );
     }
 
+    /// One cached mail, as the fixtures build them: the subject follows the
+    /// uid and `seen` is whatever the test needs of it.
+    fn test_message(uid: &str, seen: bool) -> MailMessage {
+        MailMessage {
+            uid: uid.to_string(),
+            subject: format!("Subject {uid}"),
+            from: "Ada <ada@example.com>".to_string(),
+            to: "me@example.com".to_string(),
+            date: "2026-01-01".to_string(),
+            timestamp: Some(1_700_000_000),
+            seen,
+            body_text: "body".to_string(),
+            body_html: None,
+            preview: "preview".to_string(),
+            attachment_names: Vec::new(),
+            inline_images: Vec::new(),
+        }
+    }
+
     /// An app with `count` mails in one folder: no database, no workers, and
     /// nothing to sync. The frame tests below drive it headlessly.
     fn app_with_messages(ctx: &egui::Context, count: usize) -> KimoApp {
@@ -5171,25 +5358,13 @@ mod tests {
             tls: TlsMode::Implicit,
         };
         let messages = (0..count)
-            .map(|index| MailMessage {
-                uid: index.to_string(),
-                subject: format!("Subject {index}"),
-                from: "Ada <ada@example.com>".to_string(),
-                to: "me@example.com".to_string(),
-                date: "2026-01-01".to_string(),
-                timestamp: Some(1_700_000_000),
-                seen: false,
-                body_text: "body".to_string(),
-                body_html: None,
-                preview: "preview".to_string(),
-                attachment_names: Vec::new(),
-                inline_images: Vec::new(),
-            })
+            .map(|index| test_message(&index.to_string(), false))
             .collect();
         let folder = storage::Folder {
             name: "INBOX".to_string(),
             uidvalidity: Some(1),
             synced: true,
+            listed: true,
             messages,
         };
         let mut mailboxes = HashMap::new();
@@ -5199,7 +5374,51 @@ mod tests {
                 folders: vec![folder],
             },
         );
-        KimoApp::assemble(ctx, vec![account], mailboxes, &storage::Settings::default())
+        let mut app =
+            KimoApp::assemble(ctx, vec![account], mailboxes, &storage::Settings::default());
+        // The fixtures below measure geometry, and the warning the app carries
+        // when *this machine's* database cannot be written stands at the top of
+        // the middle column, over the first row. It is a fact about the machine,
+        // not about the layout the test is pinning.
+        app.storage_warning = None;
+        app
+    }
+
+    /// An app whose one account holds the folders given as
+    /// `(name, listed, mails)` — the shape the database hands `assemble` on
+    /// startup, unread mail and all. The navigation tests drive it.
+    fn app_with_folders(ctx: &egui::Context, folders: &[(&str, bool, usize)]) -> KimoApp {
+        let mut app = app_with_messages(ctx, 0);
+        let state = app.states.get_mut("acct").unwrap();
+        state.mailbox.folders = folders
+            .iter()
+            .map(|(name, listed, count)| storage::Folder {
+                name: name.to_string(),
+                uidvalidity: Some(1),
+                synced: *count > 0,
+                listed: *listed,
+                messages: (0..*count)
+                    .map(|index| test_message(&format!("{name}-{index}"), false))
+                    .collect(),
+            })
+            .collect();
+        // The column opens on the mailboxes the last `LIST` named, which is how
+        // `assemble` fills this in.
+        state.folders = state
+            .mailbox
+            .folders
+            .iter()
+            .filter(|folder| folder.listed)
+            .map(|folder| folder.name.clone())
+            .collect();
+        state.folders_changed();
+        app
+    }
+
+    /// The wire names of a group of rows, for the assertions about which
+    /// folders are in which.
+    fn names_of(rows: &[FolderRow]) -> Vec<&str> {
+        rows.iter().map(|row| row.name.as_str()).collect()
     }
 
     /// Every run of text one headless frame of the app drew, for the tests that
@@ -5275,6 +5494,131 @@ mod tests {
                 .iter()
                 .any(|text| text.contains("This folder is empty.")),
             "the column did not say the folder is empty: {texts:?}"
+        );
+    }
+
+    /// The column opens on the folder list the database cached — what the last
+    /// `LIST` named — rather than standing on an offered INBOX until a sync
+    /// runs. That list is also where the two kinds of row come from: the
+    /// mailboxes the server still has, and the ones it does not, which are here
+    /// for the mail cached under them.
+    #[test]
+    fn the_column_opens_on_the_folder_list_the_database_cached() {
+        let ctx = egui::Context::default();
+        crate::fonts::install(&ctx, None, None);
+        let mut app = app_with_folders(
+            &ctx,
+            &[("INBOX", true, 1), ("Sent", true, 0), ("Archive", false, 1)],
+        );
+
+        let texts = frame_texts(&ctx, &mut app);
+        for name in ["INBOX", "Sent", "Archive"] {
+            assert!(
+                texts.iter().any(|text| text == name),
+                "{name} should be in the column before any sync: {texts:?}"
+            );
+        }
+
+        let nav = app.states.get_mut("acct").unwrap().nav();
+        assert_eq!(names_of(&nav.listed), ["INBOX", "Sent"]);
+        assert_eq!(names_of(&nav.unlisted), ["Archive"]);
+        assert_eq!(nav.unread, 2, "the header counts every cached folder");
+    }
+
+    /// An account with nothing cached at all is still offered an INBOX:
+    /// clicking it is what starts the first fetch. That row is the only one the
+    /// column makes up — every other one comes from a folder the account holds.
+    #[test]
+    fn an_account_with_no_folders_yet_is_offered_its_inbox() {
+        let ctx = egui::Context::default();
+        crate::fonts::install(&ctx, None, None);
+        let mut app = app_with_folders(&ctx, &[]);
+
+        assert!(frame_texts(&ctx, &mut app)
+            .iter()
+            .any(|text| text == "INBOX"));
+        let nav = app.states.get_mut("acct").unwrap().nav();
+        assert!(nav.placeholder);
+        assert_eq!(names_of(&nav.listed), ["INBOX"]);
+        assert!(nav.unlisted.is_empty());
+    }
+
+    /// A sync that reports the mailboxes the column already shows is not a
+    /// change: the rows stay the ones already derived. One that reports
+    /// different mailboxes is, and it brings the counts with it.
+    #[test]
+    fn only_a_real_change_rebuilds_the_folder_rows() {
+        let ctx = egui::Context::default();
+        crate::fonts::install(&ctx, None, None);
+        let mut app = app_with_folders(&ctx, &[("INBOX", true, 1)]);
+        run_app_frame(&ctx, &mut app, Vec::new());
+        assert_eq!(
+            app.states.get_mut("acct").unwrap().nav().listed[0].unread,
+            1
+        );
+
+        // Mail arrives behind the rows' back. Nothing says the account changed,
+        // so nothing is derived again — which is exactly what makes a sync that
+        // found the same folders cheap.
+        let state = app.states.get_mut("acct").unwrap();
+        state.mailbox.folders[0]
+            .messages
+            .push(test_message("late", false));
+        assert_eq!(
+            state.nav().listed[0].unread,
+            1,
+            "the rows are the ones already derived"
+        );
+
+        // A warm sync: the same mailbox list, so still nothing to derive.
+        app.apply_event(Event::Folders {
+            account_id: "acct".to_string(),
+            folders: vec!["INBOX".to_string()],
+        });
+        assert_eq!(
+            app.states.get_mut("acct").unwrap().nav().listed[0].unread,
+            1
+        );
+
+        // A sync that found a different list rebuilds the rows, and the count
+        // it brings with it is the current one.
+        app.apply_event(Event::Folders {
+            account_id: "acct".to_string(),
+            folders: vec!["INBOX".to_string(), "Sent".to_string()],
+        });
+        let nav = app.states.get_mut("acct").unwrap().nav();
+        assert_eq!(names_of(&nav.listed), ["INBOX", "Sent"]);
+        assert_eq!(nav.listed[0].unread, 2);
+    }
+
+    /// A folder the server no longer lists keeps its row, in a state of its
+    /// own, because the mail cached under it is the only copy of it here — and
+    /// it stays openable.
+    #[test]
+    fn a_folder_the_server_dropped_keeps_its_row_and_its_mail() {
+        let ctx = egui::Context::default();
+        crate::fonts::install(&ctx, None, None);
+        let mut app = app_with_folders(&ctx, &[("INBOX", true, 1), ("Archive", true, 2)]);
+
+        // The next `LIST` does not name Archive.
+        app.apply_event(Event::Folders {
+            account_id: "acct".to_string(),
+            folders: vec!["INBOX".to_string()],
+        });
+        let nav = app.states.get_mut("acct").unwrap().nav();
+        assert_eq!(names_of(&nav.listed), ["INBOX"]);
+        assert_eq!(names_of(&nav.unlisted), ["Archive"]);
+        assert!(!nav.unlisted[0].listed);
+        assert_eq!(nav.unlisted[0].unread, 2);
+
+        // It is still drawn, and its mail is still there to open.
+        assert!(frame_texts(&ctx, &mut app)
+            .iter()
+            .any(|text| text == "Archive"));
+        assert_eq!(
+            app.folder_messages_of("acct", "Archive")
+                .map(<[MailMessage]>::len),
+            Some(2)
         );
     }
 
