@@ -578,6 +578,47 @@ Event (mpsc) ──► drain_events() at frame start ──► merge into Accoun
   a widget slot, because the stock frame is drawn from
   `Visuals::text_edit_bg_color` (0.36's name for the slot; it is an `Option`
   now).
+  The bar is laid out as *groups*, not as one run of widgets, because what a
+  narrow window used to eat was the window controls: the row simply drew past
+  the end of the bar, and the search box and the six mail cells landed on
+  minimize / maximize / close. `titlebar_rects` carves the bar into the room for
+  its own content (`content`: everything left of the cog) and the fixed right end
+  — the cog, then the three window controls, placed from the window's own edge,
+  the count coming from `titlebar`'s own button list so the two cannot drift —
+  and `titlebar_fit` decides what the room between them holds. Every group is
+  drawn in a rect of its own, its own `UiBuilder::max_rect` and its own
+  `clip_to` for the clip, and that is the rule the rest rests on: a group the bar
+  cannot fit is cut off at its edge rather than drawn over its neighbour, and,
+  since egui hit-tests a widget through its clip rect, a click past that edge
+  belongs to the group next to it instead of to a widget that is not really
+  there. `nothing_in_the_title_bar_is_drawn_into_the_window_controls` holds the
+  drawing to it by sorting a frame's shapes by the clip they were drawn through,
+  which is what tells the bar's right end from a widget that has wandered into
+  it — what the old bar did at every width under about 970 pt.
+  The room is given up in one order (`titlebar_fit`, pinned by
+  `the_title_bar_gives_its_room_up_in_one_order`): the clear chrome in front of
+  the mail actions closes from `MAIL_ACTION_PADDING` down to
+  `MAIL_ACTION_MIN_PADDING` first, then the actions leave — as the one group
+  they are, because half a run of six reads as a mistake rather than as a
+  smaller bar — and only then does the search box narrow, down to
+  `TITLEBAR_SEARCH_FLOOR` and no further, with the box itself the last thing to
+  go. The window's own buttons are what the bar keeps to the end, and every width
+  is monotone in the room, so resizing a window never flickers between two
+  shapes. The account status strip is right-aligned against the cog rather than
+  run after the actions, so a spinner appearing does not move the search box, and
+  the width it measures is what the middle group is fitted around; the actions
+  are placed at an exact x rather than by the row's item spacing, so the gap in
+  front of them is the fit's and not a leftover; and where the box really ended
+  (not where the arithmetic expected it to) is where they start, with the group
+  simply not drawn if the room has run out by then. The fit and the widget also
+  have to agree on what "the box's width" means: `TextEdit::desired_width` is the
+  *whole* box in 0.36, the margins coming out of it rather than being added to
+  it, which is why the rect the widget hands back — the frame, not the inner text
+  rect — is used as the box as it is. Re-adding those margins, as the 0.31-era
+  code did, puts the magnifier 22 pt left of the box, over the compose cell, and
+  stretches the click target over it. The test named
+  `the_search_box_is_as_wide_as_the_fit_planned` is what keeps the fit's number
+  and the widget's the same one.
 - The frosted backdrop is hand-written GPU code (`src/glass.rs`), because egui
   has no blur: nothing in the painter can sample what has already been drawn.
   On wgpu that is a decision about the *frame*, not something a paint callback
