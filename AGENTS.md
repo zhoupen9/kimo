@@ -29,7 +29,9 @@ Kimo is a desktop **email client** GUI written in pure Rust:
 - **Charsets:** mail-parser is built with the `full_encoding` feature
   (pulling in `encoding_rs`, pure Rust) so GB2312/GBK/GB18030/Big5/
   Shift-JIS/… mail decodes to proper UTF-8 instead of Latin-1 mojibake.
-- **Receive-only by design.** There is no SMTP and no mail composing/sending.
+- **Receive-only by design.** There is no SMTP and nothing is ever sent:
+  composing exists as a window that holds a draft in memory (`ComposeDraft`),
+  with its Send button disabled — see the compose-window convention below.
 - **Tray icon:** `src/tray.rs` implements StatusNotifierItem by speaking the
   D-Bus wire protocol directly on a `std::thread` — deliberately not zbus
   (async executor, rule 2) or the GTK tray crates (C, rule 1). The icon is
@@ -86,8 +88,10 @@ Kimo is a desktop **email client** GUI written in pure Rust:
    event channel and draws. Any socket I/O, file scan or other potentially
    slow work must be a `sync::Job` on a worker thread. Workers call
    `ctx.request_repaint()` when they emit.
-4. **No SMTP.** Requests to add outgoing mail are out of scope unless the
-   project owner explicitly reopens that decision.
+4. **No SMTP.** Nothing is sent and no sending code exists: the compose window
+   is an editor whose Send button is drawn disabled. Wiring it to a server —
+   SMTP, a drafts folder on IMAP, anything that puts a written mail somewhere —
+   is out of scope unless the project owner explicitly reopens that decision.
 5. **Keep the dependency tree small.** Every new crate needs a concrete
    justification; prefer std where reasonable.
 6. **UI strings are English.** CJK rendering is handled by the best-effort
@@ -390,8 +394,11 @@ Event (mpsc) ──► drain_events() at frame start ──► merge into Accoun
   application icon (the brand, and the leftmost thing in the bar: the same
   embedded PNG the tray serves, downscaled once at startup because egui has
   no mipmaps to filter a 256 px source down to 18 pt), the nav collapse
-  toggle, the icon-only sync button (Debug mode only: Release syncs on its
-  own), the search box (a field with the magnifier inside it, one widget,
+  toggle, the compose button (the one mail action that needs no mail open, so
+  it sits beside the toggle rather than in the group on the right, which acts
+  on the mail in the reading pane), the icon-only sync button (Debug mode only:
+  Release syncs on its own), the search box (a field with the magnifier inside
+  it, one widget,
   whose click opens the search popup), the group of mail actions
   (`titlebar_mail_actions`: reply, reply all, forward, label, flag, delete, one
   drawing function per glyph, each from a 24×24 outline through `glyph_point`
@@ -423,6 +430,25 @@ Event (mpsc) ──► drain_events() at frame start ──► merge into Accoun
   `TextEdit` chrome, so the radius is set on the widget visuals in a scope —
   and because the field is deliberately non-interactive, the slot that matters
   is `noninteractive` (egui picks the visuals by `Sense`, not by hover).
+- The compose window (`compose_window`, opened by the title bar's pencil) is
+  the app's one `egui::Window`: an `egui::Modal` would block the columns, and
+  writing a mail is not a decision the rest of the app waits on. It floats over
+  the columns and under the modals (egui paints modals in the foreground
+  layer), and there is one of it — `KimoApp::compose` holds the draft, and the
+  button leaves an open window alone rather than resetting what has been typed
+  into it. From is the configured accounts, defaulting to the one whose mail is
+  open and falling back to the first (`compose_from`); To, Cc, Subject and the
+  body are plain strings in `ComposeDraft`, deliberately not widget state: a
+  window opened again must start empty. The boxes are a fixed label column plus
+  what the window's width leaves (`COMPOSE_WIDTH` and friends), the body takes
+  the height the header and footer leave and scrolls inside that, and the first
+  frame puts the keyboard in To.
+  **Nothing is sent and nothing is persisted.** Kimo speaks IMAP and POP3 only
+  (hard rule 4), so Send is drawn disabled with the reason on its tooltip and
+  the footer says so in words; there is no drafts folder, so closing the window
+  — its ✕ or Discard — is the end of the mail, which is the only copy of it.
+  Wiring any of that up is a decision for the project owner, not an oversight
+  to fix in passing.
 - `preferences_modal()` is the one place to configure Kimo: an
   `egui::Modal` (backdrop click or Escape closes it) with a sidebar of
   pages — **General** (the working mode), **Accounts** (account list with
@@ -567,6 +593,10 @@ Do not "fix" these casually — they are known:
   another size, or yet another custom prime, still fails the handshake with
   `SelectedUnofferedKxGroup`; see the FFDHE convention above for what to add.
 - No message deletion/expunge (IMAP `\Deleted` + EXPUNGE, POP3 `DELE`).
+- Nothing a mail is written into can leave the machine: the compose window's
+  draft cannot be sent (no SMTP), saved, or reopened once its window is
+  closed, and the title bar's reply / reply all / forward / label / flag /
+  delete buttons are drawn but not wired to anything yet.
 - Credentials in plain text in `mail.db` (mode 0600, see above); no
   OAuth2/XOAUTH2. The database is not encrypted, and the app never renames or
   deletes it on its own: a corrupt file is the user's to move aside.
