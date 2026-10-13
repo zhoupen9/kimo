@@ -6,20 +6,31 @@ description = "Kimo — a pure-Rust email client (IMAP & POP3) with an egui inte
 license = "MIT"
 
 [dependencies]
-# egui and eframe move in lockstep (see AGENTS.md). eframe's own default is the
-# wgpu renderer now; Kimo keeps the glow one, which is what `src/glass.rs` draws
-# the floating title bar's blur with (`egui_glow` paint callbacks), and leaves
-# out the features it has no use for: `links` would pull a browser opener, and
-# `web_screen_reader` is web-only. The clipboard comes with eframe's own
-# `egui-winit` dependency.
-eframe = { version = "0.36", default-features = false, features = [
-    "accesskit",
-    "default_fonts",
-    "glow",
+# Kimo drives the window and the GPU itself — winit for the window and the
+# event loop, `egui-winit` for input, `egui-wgpu` for egui's meshes (see
+# `src/gpu.rs`) — rather than going through eframe. The reason is the floating
+# title bar's frosted backdrop: the blur needs the pixels behind the bar, and
+# wgpu gives no way to read a render target from inside the pass that draws it
+# (that is GL's `glCopyTexSubImage2D`, which the glow build leaned on), so the
+# frame has to be drawn in two passes with the backdrop copied and blurred
+# between them. Only the code that builds the render passes can do that, and
+# eframe owns its passes. egui and the egui crates stay in lockstep.
+egui = "0.36"
+egui-wgpu = "0.36"
+egui-winit = { version = "0.36", default-features = false, features = [
+    "clipboard",
+    "links",
     "wayland",
     "x11",
 ] }
-egui = "0.36"
+pollster = "0.4"
+wgpu = "30"
+winit = { version = "0.30", default-features = false, features = [
+    "rwh_06",
+    "wayland",
+    "wayland-dlopen",
+    "x11",
+] }
 
 # TLS: rustls with the pure-Rust `ring` crypto provider (no OpenSSL / aws-lc-rs).
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }

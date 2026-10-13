@@ -50,7 +50,7 @@ use crate::models::{Account, InlineImage, MailMessage, Protocol, TlsMode};
 use crate::storage::{self, Folder, Mailbox};
 
 /// The schema version this build writes and understands.
-pub const SCHEMA_VERSION: i64 = 2;
+pub const SCHEMA_VERSION: i64 = 3;
 
 /// How long a statement waits for another writer before giving up. Jobs hold
 /// the connection only around their SQL, so this is a backstop, not a plan.
@@ -87,6 +87,10 @@ CREATE TABLE IF NOT EXISTS folders (
     uid_next    INTEGER,
     first_num   INTEGER,
     synced      INTEGER NOT NULL DEFAULT 0,
+    -- 1 when the last `LIST` named this mailbox, 0 when the row is kept only
+    -- for the mail cached for it — a mailbox deleted on the server keeps its
+    -- mail here, and the column draws it as one the server no longer has.
+    listed      INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (account_id, name)
 );
 
@@ -170,6 +174,14 @@ END;
 const MIGRATE_V2_SQL: &str = r#"
 ALTER TABLE folders ADD COLUMN uid_next  INTEGER;
 ALTER TABLE folders ADD COLUMN first_num INTEGER;
+"#;
+
+/// The step from `user_version` 2 to 3: whether a folder is one the server
+/// still lists. A database from before the step cannot know, and every folder
+/// in it came from a `LIST` in the first place, so they all start listed —
+/// which is also what the column drew before. The next sync records the truth.
+const MIGRATE_V3_SQL: &str = r#"
+ALTER TABLE folders ADD COLUMN listed INTEGER NOT NULL DEFAULT 1;
 "#;
 
 /// IMAP's sync mark as a function of what is stored: one past the highest UID
@@ -409,6 +421,12 @@ fn migrate(conn: &mut Connection, legacy: Option<(&Path, &Path)>) -> MailResult<
         tx.pragma_update(None, "user_version", 2)?;
         tx.commit()?;
     }
+    if start < 3 {
+        let tx = conn.transaction()?;
+        tx.execute_batch(MIGRATE_V3_SQL)?;
+        tx.pragma_update(None, "user_version", 3)?;
+        tx.commit()?;
+    }
     Ok(())
 }
 
@@ -607,8 +625,10 @@ fn set_first_num_on(
     first_num: u32,
 ) -> MailResult<()> {
     conn.execute(
-        "INSERT INTO folders (account_id, name, uidvalidity, synced, first_num)
-         VALUES (?1, ?2, NULL, 0, ?3)
+        // A POP3 drop has no `LIST` to be listed by, and this is its INBOX: a
+        // folder created by fetching mail is one the server has.
+        "INSERT INTO folders (account_id, name, uidvalidity, synced, first_num, listed)
+         VALUES (?1, ?2, NULL, 0, ?3, 1)
          ON CONFLICT(account_id, name) DO UPDATE SET first_num = excluded.first_num",
         params![account_id, folder, first_num],
     )?;
@@ -679,23 +699,26 @@ fn load_mailboxes_on(
     }
 
     {
-        let mut stmt = conn
-            .prepare("SELECT account_id, name, uidvalidity, synced FROM folders ORDER BY name")?;
+        let mut stmt = conn.prepare(
+            "SELECT account_id, name, uidvalidity, synced, listed FROM folders ORDER BY name",
+        )?;
         let rows = stmt.query_map([], |row| {
             Ok((
                 row.get::<_, String>(0)?,
                 row.get::<_, String>(1)?,
                 row.get::<_, Option<u32>>(2)?,
                 row.get::<_, i64>(3)?,
+                row.get::<_, i64>(4)?,
             ))
         })?;
         for row in rows {
-            let (account_id, name, uidvalidity, synced) = row?;
+            let (account_id, name, uidvalidity, synced, listed) = row?;
             if let Some(mailbox) = mailboxes.get_mut(&account_id) {
                 mailbox.folders.push(Folder {
                     name,
                     uidvalidity,
                     synced: synced != 0,
+                    listed: listed != 0,
                     messages: Vec::new(),
                 });
             }
@@ -791,7 +814,9 @@ fn load_mailboxes_on(
 
 /// Remember the mailboxes an IMAP `LIST` returned. Folders are not deleted when
 /// they disappear from the server: their cached mail is still the only copy of
-/// it this machine has.
+/// it this machine has. What the answer does change is which of them count as
+/// listed — it is the server's current mailbox list, so a folder it left out is
+/// marked as one it no longer has.
 pub fn save_folder_list(account_id: &str, folders: &[String]) -> MailResult<()> {
     let mut db = db()?;
     save_folder_list_on(db.conn_mut(), account_id, folders)
@@ -804,9 +829,17 @@ fn save_folder_list_on(
 ) -> MailResult<()> {
     let tx = conn.transaction()?;
     {
+        // The answer replaces the record, so the folders missing from it go
+        // first. Everything else about the row — the sync marks, the mail —
+        // stays where it was: only what the server *lists* is in question here.
+        tx.execute(
+            "UPDATE folders SET listed = 0 WHERE account_id = ?1",
+            params![account_id],
+        )?;
         let mut stmt = tx.prepare(
-            "INSERT INTO folders (account_id, name, uidvalidity, synced) VALUES (?1, ?2, NULL, 0)
-             ON CONFLICT(account_id, name) DO NOTHING",
+            "INSERT INTO folders (account_id, name, uidvalidity, synced, listed)
+             VALUES (?1, ?2, NULL, 0, 1)
+             ON CONFLICT(account_id, name) DO UPDATE SET listed = 1",
         )?;
         for folder in folders {
             stmt.execute(params![account_id, folder])?;
@@ -814,6 +847,26 @@ fn save_folder_list_on(
     }
     tx.commit()?;
     Ok(())
+}
+
+/// The folders the last `LIST` named for one account. A sync whose `LIST` failed
+/// falls back on this: they are the mailboxes it knows the server has, and so
+/// the ones worth trying. A folder the answer left out is deliberately not in
+/// it — it is already known to be gone.
+pub fn listed_folders(account_id: &str) -> MailResult<Vec<String>> {
+    let db = db()?;
+    listed_folders_on(db.conn(), account_id)
+}
+
+fn listed_folders_on(conn: &Connection, account_id: &str) -> MailResult<Vec<String>> {
+    let mut stmt = conn
+        .prepare("SELECT name FROM folders WHERE account_id = ?1 AND listed = 1 ORDER BY name")?;
+    let rows = stmt.query_map([account_id], |row| row.get::<_, String>(0))?;
+    let mut folders = Vec::new();
+    for row in rows {
+        folders.push(row?);
+    }
+    Ok(folders)
 }
 
 /// Store a freshly fetched batch for one folder. For an IMAP account the same
@@ -857,8 +910,13 @@ fn save_messages_on(
     }
 
     tx.execute(
-        "INSERT INTO folders (account_id, name, uidvalidity, synced) VALUES (?1, ?2, ?3, 1)
-         ON CONFLICT(account_id, name) DO UPDATE SET uidvalidity = excluded.uidvalidity, synced = 1",
+        // Mail was just fetched for it, so the server has this mailbox: the row
+        // ends up listed either way. That is also what the column does with a
+        // folder a fetch brought mail for, so the two agree across a restart.
+        "INSERT INTO folders (account_id, name, uidvalidity, synced, listed)
+         VALUES (?1, ?2, ?3, 1, 1)
+         ON CONFLICT(account_id, name) DO UPDATE SET
+             uidvalidity = excluded.uidvalidity, synced = 1, listed = 1",
         params![account_id, folder, uidvalidity],
     )?;
 
@@ -1288,6 +1346,17 @@ mod tests {
 
     fn count(conn: &Connection, sql: &str) -> i64 {
         conn.query_row(sql, [], |row| row.get(0)).unwrap()
+    }
+
+    /// The folders of one account the server is recorded as listing.
+    fn listed_on(conn: &Connection, account_id: &str) -> Vec<String> {
+        let mut stmt = conn
+            .prepare("SELECT name FROM folders WHERE account_id = ?1 AND listed = 1 ORDER BY name")
+            .unwrap();
+        let rows = stmt
+            .query_map([account_id], |row| row.get::<_, String>(0))
+            .unwrap();
+        rows.map(|row| row.unwrap()).collect()
     }
 
     /// How many messages the FTS index matches for an expression.
@@ -1761,6 +1830,75 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
+    /// What a `LIST` answer decides: which folders count as ones the server
+    /// still has. A folder it leaves out is not deleted — the mail cached for
+    /// it is the only copy of it here — but it stops being listed, which is
+    /// what the navigation column draws it as. A fetch that reaches one of
+    /// them again is proof the server has it after all.
+    #[test]
+    fn the_list_decides_which_folders_the_server_still_has() {
+        let (mut conn, dir) = test_db("listed-folders");
+        save_account_on(&conn, &account("work")).unwrap();
+        let all = [
+            "INBOX".to_string(),
+            "Sent".to_string(),
+            "Archive".to_string(),
+        ];
+        save_folder_list_on(&mut conn, "work", &all).unwrap();
+        assert_eq!(listed_on(&conn, "work"), ["Archive", "INBOX", "Sent"]);
+
+        // The next answer names only INBOX.
+        save_folder_list_on(&mut conn, "work", &["INBOX".to_string()]).unwrap();
+        assert_eq!(listed_on(&conn, "work"), ["INBOX"]);
+        assert_eq!(
+            count(
+                &conn,
+                "SELECT COUNT(*) FROM folders WHERE account_id = 'work'"
+            ),
+            3,
+            "the folders it left out keep their mail, and their rows"
+        );
+        assert_eq!(
+            listed_folders_on(&conn, "work").unwrap(),
+            ["INBOX"],
+            "so what a failed LIST falls back on is what the last one named"
+        );
+
+        // Mail fetched for one of them means the server has it.
+        save_messages_on(
+            &mut conn,
+            "work",
+            "Archive",
+            None,
+            &[message("1", "a", "a")],
+        )
+        .unwrap();
+        assert_eq!(listed_on(&conn, "work"), ["Archive", "INBOX"]);
+
+        // The same for POP3, which has no `LIST` to be listed by: its INBOX is
+        // listed by the sync that fetches it.
+        let mut pop = account("pop");
+        pop.protocol = Protocol::Pop3;
+        save_account_on(&conn, &pop).unwrap();
+        set_first_num_on(&conn, "pop", "INBOX", 1).unwrap();
+        assert_eq!(listed_on(&conn, "pop"), ["INBOX"]);
+
+        // And the loaded mailboxes carry the flag the column starts on.
+        let mailboxes = load_mailboxes_on(&conn, &["work".to_string()]).unwrap();
+        let listed = |name: &str| {
+            mailboxes["work"]
+                .folders
+                .iter()
+                .find(|folder| folder.name == name)
+                .unwrap()
+                .listed
+        };
+        assert!(listed("INBOX") && listed("Archive"));
+        assert!(!listed("Sent"));
+        integrity_check_on(&conn).unwrap();
+        let _ = fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn a_version_1_database_gets_its_imap_mark_derived() {
         let (mut conn, dir) = test_db("migrate-v2");
@@ -1778,11 +1916,12 @@ mod tests {
         save_account_on(&conn, &pop).unwrap();
         save_messages_on(&mut conn, "pop", "INBOX", None, &[message("1", "a", "a")]).unwrap();
 
-        // Rewind to the shape version 1 shipped: no marks at all, and the
-        // version that says so.
+        // Rewind to the shape version 1 shipped: no marks, no listedness, and
+        // the version that says so.
         conn.execute_batch(
             "ALTER TABLE folders DROP COLUMN uid_next;
-             ALTER TABLE folders DROP COLUMN first_num;",
+             ALTER TABLE folders DROP COLUMN first_num;
+             ALTER TABLE folders DROP COLUMN listed;",
         )
         .unwrap();
         conn.pragma_update(None, "user_version", 1).unwrap();

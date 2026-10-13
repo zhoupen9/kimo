@@ -7,7 +7,10 @@ Read this before changing anything.
 
 Kimo is a desktop **email client** GUI written in pure Rust:
 
-- **GUI:** eframe/egui (immediate mode, pinned to the 0.36 line).
+- **GUI:** egui (immediate mode, pinned to the 0.36 line), driven directly
+  through winit + `egui-winit` + `egui-wgpu` instead of through eframe, because
+  the floating title bar's blur needs the frame split in two — see the
+  renderer convention below.
 - **Protocols:** IMAP4rev1 and POP3 **only**, implemented by hand in
   `src/protocol/` — no `imap`/`async-imap`/`pop` crates.
 - **TLS:** rustls with the pure-Rust `ring` crypto provider + webpki-roots.
@@ -85,7 +88,7 @@ Kimo is a desktop **email client** GUI written in pure Rust:
 2. **No async runtime.** Networking runs on short-lived `std::thread` jobs
    (see `src/sync.rs`); results come back over `std::sync::mpsc`. Do not
    introduce tokio, async-std, or an executor.
-3. **Never block the UI thread.** `eframe::App::ui` only drains the
+3. **Never block the UI thread.** `KimoApp::ui` only drains the
    event channel and draws. Any socket I/O, file scan or other potentially
    slow work must be a `sync::Job` on a worker thread. Workers call
    `ctx.request_repaint()` when they emit.
@@ -115,7 +118,8 @@ done. There is no CI yet — that discipline is on you.
 ## Architecture
 
 ```
-src/main.rs             entry point; installs the rustls provider (ring + FFDHE), launches eframe
+src/main.rs             entry point; the winit event loop, the window, egui's input state
+src/gpu.rs              the wgpu side: device, surface, egui's renderer, and one frame
 src/app.rs              all UI: KimoApp state, panels, preferences modal, event handling
 src/models.rs           Account / Protocol / TlsMode / MailMessage (plain types: nothing is serialised any more)
 src/error.rs            MailError + MailResult
@@ -129,7 +133,7 @@ src/html.rs             HTML mail → egui widgets (subset: blocks, lists, table
 src/blitz_render.rs     HTML mail → rasterized page via Blitz (headless render, net provider, fonts)
 src/css.rs              tiny CSS subset (decls, tag/class/id selectors) for HTML mail
 src/folders.rs          folder kind (name → special mailbox, incl. CJK) + embedded row icons
-src/glass.rs            the floating title bar's frosted backdrop (an OpenGL paint callback)
+src/glass.rs            the floating title bar's frosted backdrop (wgpu passes + a paint callback)
 src/render_bench.rs     test-only: times both HTML renderers for the same bodies (bench_render)
 src/tray.rs             StatusNotifierItem over raw D-Bus (session bus, std::thread) + svg→ARGB icon
 src/sync.rs             Job/Event enums, worker threads, per-protocol sync logic
@@ -200,6 +204,24 @@ Event (mpsc) ──► drain_events() at frame start ──► merge into Accoun
   it first, so the message is not a lie in the one mode that shows the button. It is a per-installation setting rather than a
   build flag so that a development build can be pointed at a real account
   without a sync on every start.
+- The folder list is cached like the mail is, and the `LIST` is only what
+  updates it. `folders.listed` records which mailboxes the last answer named;
+  `db::save_folder_list` writes it in one transaction with the folders
+  themselves — the ones the answer left out are marked unlisted, never deleted,
+  because the mail cached for them is still the only copy of it here — and
+  `db::load_mailboxes` carries the flag into `AccountUiState::folders`, which is
+  what the navigation column opens on. So a start shows the folders the last
+  `LIST` named instead of standing on an offered INBOX until a sync runs, and a
+  sync that finds the same mailboxes changes nothing on screen. Two things are
+  deliberately *not* a mailbox list: an answer that names no mailbox at all
+  (`imap::list_folders` reports it as the protocol error it is, rather than
+  saying the account has no folders), and one whose `LIST` **failed** — that
+  leaves the stored list and its flags alone and reports the error on the
+  account, while the sweep falls back to `db::listed_folders` — the mailboxes
+  the last answer named — so a server that will not list its mailboxes can still
+  have their mail fetched. That list is a fallback, not a display source: the
+  column draws what `LIST` last said. Mail fetched for a folder proves the
+  server has it, so `save_messages` lists it again — the one way back.
 - The Blitz renderer is a `Job::RenderHtml` on a worker thread: it parses,
   styles, lays out and rasterizes the body, resolving every sub-resource
   through `blitz_render::MailNet` (a blocking `NetProvider` that reuses the
@@ -211,12 +233,27 @@ Event (mpsc) ──► drain_events() at frame start ──► merge into Accoun
   window resize. At most two pages are cached; a cached page is reused, scaled
   down and never up, while the pane stays within `BLITZ_REUSE_RATIO` of the
   width it was laid out for; and a render starts only once the geometry has
-  held still for `BLITZ_SETTLE`, so a splitter drag or an animated window
-  resize queues one render at the end instead of one per frame. Every request
-  takes a fresh `blitz_render::Cancellation` ticket: a render whose ticket is
-  stale gives up mid-layout (and between raster slices) and reports *nothing*,
-  so a superseded render can never be mistaken for a failure of the newer one.
-  Never render Blitz HTML on the UI thread.
+  held still for `GEOMETRY_SETTLE`, so a splitter drag or an animated window
+  resize queues one render at the end instead of one per frame (the built-in
+  renderer waits the same time, see the next bullet). Every
+  request takes a fresh `blitz_render::Cancellation` ticket: a render whose
+  ticket is stale gives up mid-layout (and between raster slices) and reports
+  *nothing*, so a superseded render can never be mistaken for a failure of the
+  newer one. Never render Blitz HTML on the UI thread.
+- The built-in renderer keeps two things between frames in `KimoApp::body`
+  (`BodyCache`), because a splitter drag moves the reading pane's width on every
+  frame and the whole body is otherwise re-derived on each one: the *parsed
+  body* (`html::Document`, since html5ever's parse is the larger half of what a
+  frame costs and the tree does not change while the mail is open) and the
+  *width it settled at*. The body is laid out at that width while the pane is
+  moving — in a scope of its own, because a ui never gets narrower than what it
+  has already drawn (`set_max_width` widens the max back to the min rect) — so a
+  drag clips the mail instead of re-shaping every run of text in it; once the
+  geometry has held still for `GEOMETRY_SETTLE` it reflows once, for the width
+  the pane came to rest at. A new mail, or a body re-fetched under the same uid
+  (`body_fingerprint`), drops the document and is laid out at the pane's own
+  width at once. Do not draw the body outside that scope, and do not "fix" the
+  hold by narrowing the card's own ui.
 - Searching is a job like any other: `Job::Search { seq, query }` runs
   `search::run` on a worker and answers `Event::SearchResults { seq, hits }`.
   Every request takes a new `seq`, and the UI drops an answer whose `seq` is not
@@ -225,7 +262,7 @@ Event (mpsc) ──► drain_events() at frame start ──► merge into Accoun
   title-bar box only displays the query — and Enter skips the wait;
   `search_applied` is the query the results on screen already answer, which is
   what keeps an unchanged query from searching again every frame. The request
-  is pumped from `KimoApp::update`, not from the message list: the popup that
+  is pumped from `KimoApp::ui`, not from the message list: the popup that
   edits the query sits outside every column.
 - Remote mutations are `UID STORE +FLAGS.SILENT (\Seen)` (IMAP) and, behind
   the title bar's Delete button, `\Deleted` + `UID EXPUNGE` (IMAP) or `DELE`
@@ -238,8 +275,9 @@ Event (mpsc) ──► drain_events() at frame start ──► merge into Accoun
 - `~/.local/share/kimo/mail.db` — the one database (SQLite, WAL, mode 0600
   because it holds the passwords). `accounts` (id, name, protocol, host,
   port, username, password, tls, position), `folders` (account_id, name,
-  uidvalidity, uid_next, first_num, synced — the middle two are the sync marks
-  of the bullet above), `messages` keyed by `(account_id, folder, uid)` with
+  uidvalidity, uid_next, first_num, synced, listed — the middle two are the sync
+  marks of the bullet above, and `listed` is what the last `LIST` named),
+  `messages` keyed by `(account_id, folder, uid)` with
   the subject, addresses, both bodies, the preview and the bigram column,
   `attachments` and `inline_images` (raw bytes, not base64) as children of a
   message, and the external-content FTS5 table `messages_fts`, which only the
@@ -324,10 +362,10 @@ Event (mpsc) ──► drain_events() at frame start ──► merge into Accoun
 - Pure parsing helpers (e.g. `extract_uid`, `literal_size`, `html_to_text`)
   live next to their users and get `#[cfg(test)]` unit tests — that is where
   tests go in this codebase; no `tests/` directory yet.
-- egui and eframe are pinned in lockstep (`0.36`), and the step from 0.31 was
-  not a version bump but a change of shape: 0.36 draws the whole app into one
-  root `Ui` (`eframe::App::ui` — there is no `Context`-level `update` any
-  more), the side panels are `egui::Panel::left`/`right` shown *onto* that `Ui`
+- egui is pinned to the `0.36` line, with `egui-winit`, `egui-wgpu` and `wgpu`
+  moving in lockstep, and the step from 0.31 was not a version bump but a change
+  of shape: 0.36 draws the whole app into one root `Ui` (`KimoApp::ui` — there
+  is no `Context`-level `update` any more), the side panels are `egui::Panel::left`/`right` shown *onto* that `Ui`
   (with `min_size`/`default_size`, not `min_width`/`default_width`), the
   context's `screen_rect`/`available_rect` are `viewport_rect`/`content_rect`
   (the message list's own rect is taken from `mail_list`, which records it),
@@ -336,12 +374,32 @@ Event (mpsc) ──► drain_events() at frame start ──► merge into Accoun
   in both of them and sets the preference from Kimo's own system detection, so
   a stock widget is never drawn in egui's palette. The layout tests run their
   frame through `run_frame`, because epaint panics on a dropped
-  `TexturesDelta`. eframe's *default* renderer is wgpu now; Kimo asks for
-  `default-features = false` plus `glow` (with `accesskit`, `default_fonts`,
-  `wayland`, `x11`) because the floating title bar's blur is an `egui_glow`
-  paint callback — the one place the backend shows — and wgpu would be a large
-  dependency for an app that draws no 3D. Read the egui CHANGELOG before
-  bumping again.
+  `TexturesDelta`. The integration is `src/gpu.rs` + `src/main.rs`, not
+  eframe: eframe owns the frame's render pass, and the glass needs it split in
+  two (see the frosted-backdrop bullet). `main.rs` is a winit
+  `ApplicationHandler` — window, `egui_winit::State` for input, egui's repaint
+  callback turned into a `ControlFlow::WaitUntil` timer (a deadline that has
+  not come round yet must be *left in place*: a loop that consumes it sleeps
+  through the frame egui asked for), and
+  `egui_winit::process_viewport_commands` for the commands the title bar sends
+  (drag, minimize, maximize), with two catches that are the loop's own to
+  handle: a close is only *recorded* by it, as a `ViewportEvent::Close` in the
+  `ViewportInfo` it is handed (in eframe that recording is the app's chance to
+  refuse the close, via `CancelClose`), so the loop reads it and ends itself —
+  the tray's Quit takes the same path — and that info has to be refreshed from
+  the window every frame (`egui_winit::update_viewport_info`) and handed to
+  egui as `RawInput::viewports`, because `egui-winit` itself fills in nothing
+  but the scale factor: without it `i.viewport().maximized`, which draws the
+  title bar's maximize/restore glyph, is always `None` and the maximize button
+  can never restore. The renderer is wgpu, and its 0.36-era API
+  is young: `InstanceDescriptor` is built by `new_with_display_handle`,
+  presenting is `Queue::present`, pipeline layouts take
+  `bind_group_layouts: &[Some(&layout)]` and `immediate_size`, passes and
+  pipelines take `multiview_mask`, and a `TexturesDelta` must be emptied
+  (`set.clear()` as it is uploaded, `free` when the frame is on its way)
+  because epaint panics on one that is dropped unapplied. Keep `egui`,
+  `egui-winit`, `egui-wgpu` and `wgpu` in lockstep when bumping, and read the
+  egui CHANGELOG before doing it.
 - Layout is a three-column mail client: left navigation (collapsible via
   the title-bar toggle; auto-collapses when the window is narrower than
   640px — see `NAV_AUTO_COLLAPSE_WIDTH`), the central column (while a search is
@@ -366,7 +424,24 @@ Event (mpsc) ──► drain_events() at frame start ──► merge into Accoun
   card at all. The card is the pane's own scroll container — headers, rule and
   body scroll together, and the scroll bar runs down the card's edge rather
   than down the body's — and it still hugs a short mail: it is exactly as tall
-  as the mail until the mail outgrows the pane. Both highlights in the list are the mail's whole row: a square
+  as the mail until the mail outgrows the pane. It scrolls *both* ways, which is
+  what keeps the splitter honest: with horizontal scrolling off, a mail whose
+  layout cannot be narrower than the pane (a fixed-width table — most HTML
+  mail) widened this scroll area, and through it the panel's *content* rect,
+  which is the rect egui persists as the panel's width for the next frame
+  (`PanelState`); a splitter drag therefore sprang back to the mail's width on
+  release, and since egui's `Grid` keeps its column widths between frames the
+  pane could never be dragged narrower than the widest it had ever been for
+  that mail. The horizontal bar appears only when the mail really is wider than
+  the pane, and a newly opened mail resets both offsets. The list lays out only
+  the rows its viewport shows (`virtual_rows`, which is
+  `ScrollArea::show_rows` with this column's arithmetic: the first row starts
+  below the title bar's padding, inside the scroll area, so a row range counted
+  from the content's own origin would be off by it — and the row a partly
+  scrolled viewport starts in could be skipped), and it draws them straight out
+  of the account state: mail is never copied to be listed, so a click is
+  remembered as the mail it landed on and opened once the list has stopped
+  borrowing that state. Both highlights in the list are the mail's whole row: a square
   block spanning the column edge to edge. A mail draws its own edges instead of
   sharing a rule with its neighbour — left, right and bottom in `row_edge`, the
   top in the fainter `row_edge_top`, each a pixel inside its own rect — so what
@@ -464,6 +539,19 @@ Event (mpsc) ──► drain_events() at frame start ──► merge into Accoun
   the pointer. They are not `egui::Button`s for that reason — a stock button
   draws a card-colored frame with a border, which in a title bar reads as a
   widget among window chrome. Don't re-enable system decorations.
+  The window is transparent (`with_transparent(true)` in `main.rs`) and its
+  four corners are cut out of the frame by `gpu::CornerMask`: the last draw of
+  a frame scales the four corner squares of the surface by the corner's
+  coverage, through a `Zero`/`OneMinusSrcAlpha` blend on the colour *and* the
+  alpha so that what is cut stays premultiplied, and the compositor shows what
+  is behind the window there. That is why the surface is configured with
+  `CompositeAlphaMode::PreMultiplied` — `Auto` resolves to `Opaque`, which
+  would cut black corners instead — and why a surface with no alpha mode at all
+  keeps its square corners rather than gaining black ones.
+  `WINDOW_CORNER_RADIUS` (8 pt) is also the radius a compositor-side window
+  rule has to agree with (niri's `geometry-corner-radius`): without it the
+  compositor still assumes a square window and its shadow shows through the
+  cut corners.
   The mail actions are *flat*, like every other button in the bar — each one is
   `titlebar_flat_button`, the same window-control-wide, bar-tall cell the nav
   toggle and the cog use, empty at rest and filled under the pointer. They are
@@ -475,7 +563,7 @@ Event (mpsc) ──► drain_events() at frame start ──► merge into Accoun
   `weak_text_color`, stops sensing clicks and never fills. Delete is wired —
   it is the one action whose job exists so far — and the other five still run
   nothing, so a click on one of them is not even read.
-  The bar is `TITLEBAR_HEIGHT` (48 pt) tall and the search box fills all but
+  The bar is `TITLEBAR_HEIGHT` (40 pt) tall and the search box fills all but
   16 pt of that (`TITLEBAR_SEARCH_HEIGHT`), with a rounder corner than the
   stock widget radius (`SEARCH_BOX_CORNER_RADIUS`); its frame is stock
   `TextEdit` chrome, so the radius is set on the widget visuals in a scope —
@@ -490,24 +578,29 @@ Event (mpsc) ──► drain_events() at frame start ──► merge into Accoun
   a widget slot, because the stock frame is drawn from
   `Visuals::text_edit_bg_color` (0.36's name for the slot; it is an `Option`
   now).
-- The frosted backdrop is the one piece of hand-written OpenGL in the app
-  (`src/glass.rs`), because egui has no blur: nothing in the painter can sample
-  what has already been drawn. It is an `egui::PaintCallback`
-  (`egui_glow::CallbackFn`) that copies the pixels behind the bar out of the
-  framebuffer into a texture and draws them back through a separable two-pass
-  blur — horizontal into an offscreen texture, vertical onto the window. A
-  single two-dimensional kernel cheap enough to run per frame is sampled too
-  sparsely and leaves a comb of aliasing over the very letters it is meant to
-  destroy; sampling each axis a pixel and a half apart costs less and dissolves
-  the text instead. egui_glow restores its own GL state after every callback
-  (it calls `prepare_painting` again), so the pass binds program, VAO, textures
-  and framebuffer as it needs them, and disables egui's scissor for its
-  offscreen pass because that scissor is in window pixels. Every failure is
-  soft: a shader that will not compile, or a driver that will not copy out of
-  its own framebuffer, reports once, sets `failed`, and leaves the bar
-  translucent over the crisp content. `NativeOptions::multisampling` therefore
-  stays at eframe's default of 0 — `glCopyTexSubImage2D` is invalid on a
-  multisampled framebuffer, which is exactly the case that fallback covers.
+- The frosted backdrop is hand-written GPU code (`src/glass.rs`), because egui
+  has no blur: nothing in the painter can sample what has already been drawn.
+  On wgpu that is a decision about the *frame*, not something a paint callback
+  can do on its own: a texture cannot be sampled by the pass that is drawing
+  it, and the pass's target here is the window's surface, which is not even
+  created with `COPY_SRC`. So the frame is split around the glass —
+  `crate::gpu` renders everything *behind* the bar into an offscreen scene
+  texture, `Glass::blur` copies the bar's strip of it into a texture of the
+  strip's own size (a texture-to-texture copy, the one thing wgpu allows) and
+  blurs that in two passes, and the second half of the frame — the bar's fill,
+  its icons, its text — is drawn onto the surface over the blurred strip. Where
+  the split falls is egui's own shape list: the glass callback is the first
+  shape that belongs to the second half, and the callback is also what draws
+  the strip, into the viewport egui has already set to the bar.
+  The blur is separable because a single two-dimensional kernel cheap enough to
+  run per frame is sampled too sparsely and leaves a comb of aliasing over the
+  very letters it is meant to destroy; seventeen taps a pixel and a half apart,
+  twice, cost less and dissolve the text instead. One pipeline does all three
+  draws, since with a step of zero the blur is a plain copy. Every failure is
+  soft: a device that will not take the pipeline or the textures reports once,
+  sets `failed`, and leaves the bar translucent over the crisp content. There
+  is no multisampling to fight here — this integration asks for none — which is
+  what the copy wants anyway.
 - Deleting a mail (the title bar's Delete → `KimoApp::delete_selected_message` →
   `Job::DeleteMessage`) is **remote first, local after**: the worker asks the
   server to drop the message and only then deletes the database row
@@ -632,9 +725,26 @@ Event (mpsc) ──► drain_events() at frame start ──► merge into Accoun
   title bar has no account menu: every account is a collapsible section
   (`collapsed_accounts` holds the collapsed ids, in memory only), whose header
   shows the name and the account's unread total and whose folders are indented
-  under it. An account with no folders yet still offers INBOX, since clicking
-  it is what starts the first fetch. Selecting a folder of another account is
-  what makes it the active one.
+  under it. An account with no cached folder at all still offers INBOX, since
+  clicking it is what starts the first fetch. Selecting a folder of another
+  account is what makes it the active one.
+  What it draws is a cache of the display model, the way the reading pane
+  caches the parsed body: `AccountUiState::nav` derives the rows (`FolderRows`)
+  from the account's folder list and mail only when `folders_rev` moved, so a
+  frame costs the drawing rather than a decode, a `folders::kind_of` and an
+  unread count per folder. The revision moves when a `LIST` named **different**
+  mailboxes (`Event::Folders` compares before it replaces), when mail arrives or
+  leaves (`Event::Messages`, `Event::MessageDeleted`) and when a mail is read
+  (`open_message` marks it seen locally) — so a sync that found the same folders
+  leaves the column exactly as it was, and a change is a rebuild of the rows
+  rather than a redraw that happens to look the same. Rows come in the two
+  groups the folder list defines: first the mailboxes the server lists — in
+  `imap::order_mailboxes` order, which is the order a `LIST` answer is given in
+  and the order the cached list is drawn in, so a sync does not reorder the
+  column — and then the ones it does not, which are here for the mail cached
+  under them, drawn weak whatever their unread count with a tooltip saying why,
+  and still clickable. A folder of that second kind is only dropped from the
+  column when it holds no mail at all; its row in the database stays.
 - Folders are custom rows — kind icon, name (elided with an ellipsis), unread
   count right-aligned — because the whole row should be the click target and
   carry the selection highlight, which `selectable_label` cannot do once an
@@ -676,10 +786,16 @@ Event (mpsc) ──► drain_events() at frame start ──► merge into Accoun
   `cargo test --release -- --ignored --nocapture bench_render` times both
   renderers on a short mail, a newsletter-shaped fixture and — with
   `KIMO_BENCH_DB=~/.local/share/kimo/mail.db` — the median-sized and largest
-  HTML bodies in the database. Note what the two numbers mean: the built-in
-  renderer re-parses and re-lays out the body on *every* frame the reading
-  pane is visible (there is no cache of the widget tree), while Blitz pays
-  once per (message, pane width) on a worker thread.
+  HTML bodies in the database. Note what the numbers mean: the built-in
+  renderer lays the body out on *every* frame the reading pane is visible —
+  there is no cache of the widget tree — but it parses it once and keeps the
+  width it settled at (`BodyCache`), so a frame costs the layout, not the parse
+  and not a reflow per pixel of a splitter drag. Blitz pays parse, layout and
+  rasterization once per (message, pane width), on a worker thread. For whole
+  frames rather than bodies — including what a splitter drag costs — `app.rs`
+  has `bench_frame_cost`, which drives the real app headlessly at a fixed
+  splitter position and while it is being dragged:
+  `cargo test --release -- --ignored --nocapture bench_frame_cost`.
 - Blitz is built with `blitz-dom`'s default features **off**: its
   `system-fonts` feature would link fontconfig (a C library, hard rule 1).
   `blitz_render` therefore registers fonts from disk itself (a curated set —

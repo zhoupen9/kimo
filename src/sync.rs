@@ -450,22 +450,37 @@ fn sync_queue(open: Option<&str>, listed: &[String], warmed: &[String]) -> Vec<S
 fn sync_imap(account: &Account, open: Option<&str>, tx: &Sender<Event>) -> MailResult<()> {
     with_imap(account, |client| {
         client.login(&account.username, &account.password)?;
-        let folders = client
-            .list_folders()
-            .unwrap_or_else(|_| vec!["INBOX".to_string()]);
-        // Remember the mailboxes first: a folder the database does not know
-        // would refuse the mail fetched for it below (the messages table has a
-        // foreign key onto folders).
-        db::save_folder_list(&account.id, &folders)?;
-        let _ = tx.send(Event::Folders {
-            account_id: account.id.clone(),
-            folders: folders.clone(),
-        });
-        let queue = sync_queue(open, &folders, &db::synced_folders(&account.id)?);
         // One folder that fails — a mailbox the server refuses, a connection
         // that dropped — must not cost the others their sync. The first error
-        // is reported once the rest is done.
+        // is reported once the rest is done, and the mailbox list is one of the
+        // things that can fail.
         let mut failure: Option<MailError> = None;
+        let folders = match client.list_folders() {
+            Ok(folders) => {
+                // Remember the mailboxes first: a folder the database does not
+                // know would refuse the mail fetched for it below (the messages
+                // table has a foreign key onto folders). The answer also says
+                // which folders the server still has — one it left out keeps
+                // its cached mail and is drawn as one the server no longer
+                // lists.
+                db::save_folder_list(&account.id, &folders)?;
+                let _ = tx.send(Event::Folders {
+                    account_id: account.id.clone(),
+                    folders: folders.clone(),
+                });
+                folders
+            }
+            // A `LIST` that failed is not a mailbox list, and it must not be
+            // mistaken for one: the stored list stands — the column keeps
+            // drawing it, unchanged — and the sweep falls back on the mailboxes
+            // the last answer named, so a server that will not list its
+            // mailboxes can still have their mail fetched, INBOX first.
+            Err(error) => {
+                failure = Some(error);
+                db::listed_folders(&account.id)?
+            }
+        };
+        let queue = sync_queue(open, &folders, &db::synced_folders(&account.id)?);
         for folder in queue {
             if let Err(error) = fetch_folder_into(client, &folder, account, tx) {
                 failure = failure.or(Some(error));

@@ -373,8 +373,11 @@ pub struct KimoApp {
     blitz_cancel: crate::blitz_render::Cancellation,
     /// Key waiting for the pane geometry to settle, and since when. Splitter
     /// drags and compositor resize animations move the geometry every frame;
-    /// see `BLITZ_SETTLE`.
+    /// see `GEOMETRY_SETTLE`.
     pending_blitz_key: Option<(String, Instant)>,
+    /// The built-in renderer's copy of the mail on screen: the parsed body and
+    /// the width it is laid out for. See [`BodyCache`].
+    body: BodyCache,
     /// Message the reading pane's scroll offset belongs to, so opening another
     /// mail starts at the top instead of mid-page.
     scrolled_message: Option<String>,
@@ -430,14 +433,251 @@ enum ImageStatus {
     Ready(egui::TextureHandle),
 }
 
+/// What the built-in renderer keeps between frames for the mail on screen.
+///
+/// Two things are worth keeping, and a splitter drag is what makes both of
+/// them matter. The **parsed body**, because html5ever's parse is the larger
+/// half of what a body costs per frame and the tree does not change while the
+/// mail is open. And the **width the body was laid out for**, because every
+/// new width re-shapes every run of text in it: dragging the splitter changes
+/// the pane's width on every frame, so without this the whole body is re-laid
+/// out — the most expensive thing the app can be asked to do — once per frame
+/// of the drag.
+///
+/// So the body keeps the width it settled at while the pane is moving, and the
+/// pane clips it (the mail is briefly cut off, or briefly short of the pane's
+/// new edge). Once the geometry has held still for `GEOMETRY_SETTLE` the body
+/// reflows once, for the width the pane has settled at — the same wait Blitz's
+/// renderer makes before it renders a new width, for the same reason.
+#[derive(Default)]
+struct BodyCache {
+    /// `<folder>/<uid>` of the mail this holds.
+    identity: String,
+    /// Hash of the body, so a re-fetch that replaces the body of a uid the
+    /// pane is already showing is noticed (`body_fingerprint`).
+    fingerprint: u64,
+    document: Option<crate::html::Document>,
+    /// The width the body is laid out for; `None` until it has been laid out
+    /// once.
+    width: Option<f32>,
+    /// The width the pane wants now — quantized, so that a pixel of jitter is
+    /// not a reflow — and since when it has wanted it.
+    pending: Option<(u32, Instant)>,
+}
+
+impl BodyCache {
+    /// The document and the width to lay it out at for this frame, parsing the
+    /// body when the cache does not already hold it.
+    fn get(
+        &mut self,
+        ctx: &egui::Context,
+        identity: &str,
+        fingerprint: u64,
+        html: &str,
+        wanted: f32,
+        now: Instant,
+    ) -> (&crate::html::Document, f32) {
+        if self.document.is_none() || self.identity != identity || self.fingerprint != fingerprint {
+            self.identity = identity.to_string();
+            self.fingerprint = fingerprint;
+            self.document = Some(crate::html::Document::parse(html));
+            // A body the cache has not seen has no earlier layout to hold on
+            // to: it is laid out at the pane's own width at once.
+            self.width = None;
+            self.pending = None;
+        }
+        let width = self.layout_width(ctx, wanted, now);
+        (self.document(), width)
+    }
+
+    /// The body, which `get` has made sure is parsed.
+    fn document(&self) -> &crate::html::Document {
+        self.document.as_ref().expect("filled in by `get`")
+    }
+
+    /// The width to lay the body out at, given the width `wanted` the pane has
+    /// now. Anything else is a reflow, and a reflow waits for the geometry to
+    /// settle (see `BodyCache`); while it waits the pane is asked for a repaint
+    /// when the wait is over, since nothing else would make one happen.
+    fn layout_width(&mut self, ctx: &egui::Context, wanted: f32, now: Instant) -> f32 {
+        let wanted_key = quantize(wanted, 2);
+        let Some(width) = self.width else {
+            self.width = Some(wanted);
+            self.pending = None;
+            return wanted;
+        };
+        if quantize(width, 2) == wanted_key {
+            self.pending = None;
+            return width;
+        }
+        match self.pending {
+            Some((key, since)) if key == wanted_key => {
+                let waited = now.duration_since(since);
+                if waited >= GEOMETRY_SETTLE {
+                    self.width = Some(wanted);
+                    self.pending = None;
+                    wanted
+                } else {
+                    ctx.request_repaint_after(GEOMETRY_SETTLE - waited);
+                    width
+                }
+            }
+            _ => {
+                // A width the pane has just moved to (or is still moving
+                // through) starts the wait over.
+                self.pending = Some((wanted_key, now));
+                ctx.request_repaint_after(GEOMETRY_SETTLE);
+                width
+            }
+        }
+    }
+
+    /// Drop the parsed body: what is on screen is another renderer's, or none.
+    fn forget(&mut self) {
+        self.document = None;
+        self.identity.clear();
+        self.fingerprint = 0;
+        self.width = None;
+        self.pending = None;
+    }
+}
+
+/// A fingerprint of a body. Length alone would not do: a re-fetch can bring a
+/// different body of the same size under a uid the pane already shows.
+fn body_fingerprint(html: &str) -> u64 {
+    use std::hash::{Hash as _, Hasher as _};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    html.hash(&mut hasher);
+    hasher.finish()
+}
+
 #[derive(Default)]
 pub struct AccountUiState {
+    /// The mailboxes the server lists for this account: what the last `LIST` of
+    /// this session answered, or — before one has run — the mailboxes the
+    /// database recorded as listed. Anything else the account holds is mail
+    /// cached for a folder the server no longer lists.
     pub folders: Vec<String>,
     /// The account's folders and their cached mail, loaded from the database
     /// at startup and kept in memory (the DB is the durable copy).
     pub mailbox: storage::Mailbox,
     pub syncing: bool,
     pub error: Option<String>,
+    /// Bumped whenever `folders` or the cached mail changes. The navigation
+    /// column's rows are derived from it (`FolderRows::rev`), so a frame that
+    /// changed nothing re-derives nothing.
+    folders_rev: u64,
+    /// The column's rows, derived from the two fields above.
+    nav: FolderRows,
+}
+
+impl AccountUiState {
+    /// The rows the navigation column draws, derived from the account's state
+    /// when that has changed since the last derivation and reused until the
+    /// next change. egui redraws the column every frame; what it holds only
+    /// moves when a sync reports a different mailbox list or brings mail.
+    fn nav(&mut self) -> &FolderRows {
+        if self.nav.rev != Some(self.folders_rev) {
+            self.nav = FolderRows::of(&self.mailbox, &self.folders, self.folders_rev);
+        }
+        &self.nav
+    }
+
+    /// The account's folder list or its cached mail changed, so whatever the
+    /// column derived from them is stale. Only a real change calls this: a
+    /// sync that reports the mailboxes it already reported leaves the rows —
+    /// and the column — exactly as they were.
+    fn folders_changed(&mut self) {
+        self.folders_rev = self.folders_rev.wrapping_add(1);
+    }
+}
+
+/// One folder as the navigation column draws it. Deriving this is what the
+/// column caches: the label (decoded from the IMAP wire form), the kind that
+/// picks its icon, its unread count, and whether the server still lists it.
+struct FolderRow {
+    /// The wire form — the row's identity, and what `SELECT` gets.
+    name: String,
+    display: String,
+    kind: FolderKind,
+    unread: usize,
+    /// False for a folder the server no longer lists: the row is kept for the
+    /// mail cached under it, and is drawn as one that is not there any more.
+    listed: bool,
+}
+
+/// The navigation column's rows for one account: what the server lists, then
+/// the folders it does not, kept because they still hold mail. Deriving them
+/// costs a decode, a classification and an unread count per folder; doing it
+/// once per change of the account state rather than once per frame is the
+/// whole point, and it is also what makes a sync that found nothing new a
+/// no-op for the column.
+#[derive(Default)]
+struct FolderRows {
+    /// The `AccountUiState::folders_rev` these were derived from; `None` until
+    /// the first derivation, which no revision equals.
+    rev: Option<u64>,
+    listed: Vec<FolderRow>,
+    unlisted: Vec<FolderRow>,
+    /// Unread mail in the account, for its header. A folder that was never
+    /// fetched counts nothing: nothing here goes to the network.
+    unread: usize,
+    /// True while the account has no folder at all, when the column offers
+    /// INBOX so the first click is what starts its fetch.
+    placeholder: bool,
+}
+
+impl FolderRows {
+    fn of(mailbox: &storage::Mailbox, listed: &[String], rev: u64) -> Self {
+        let mut unread_of: HashMap<&str, usize> = HashMap::new();
+        for folder in &mailbox.folders {
+            unread_of.insert(
+                folder.name.as_str(),
+                folder.messages.iter().filter(|m| !m.seen).count(),
+            );
+        }
+        let row = |name: &str, listed: bool| {
+            // `name` is the IMAP wire form (possibly modified UTF-7); decode it
+            // for the label and for the icon lookup, which matches the
+            // readable name.
+            let display = crate::protocol::imap::decode_mailbox_name(name);
+            FolderRow {
+                kind: folders::kind_of(&display),
+                display,
+                name: name.to_string(),
+                unread: unread_of.get(name).copied().unwrap_or(0),
+                listed,
+            }
+        };
+
+        let mut listed_names = listed.to_vec();
+        crate::protocol::imap::order_mailboxes(&mut listed_names);
+        let mut rows = Self {
+            rev: Some(rev),
+            listed: listed_names.iter().map(|name| row(name, true)).collect(),
+            unlisted: Vec::new(),
+            unread: unread_of.values().sum(),
+            placeholder: false,
+        };
+
+        let listed: HashSet<&str> = listed.iter().map(String::as_str).collect();
+        let mut unlisted_names: Vec<String> = mailbox
+            .folders
+            .iter()
+            .filter(|folder| !listed.contains(folder.name.as_str()) && !folder.messages.is_empty())
+            .map(|folder| folder.name.clone())
+            .collect();
+        crate::protocol::imap::order_mailboxes(&mut unlisted_names);
+        rows.unlisted = unlisted_names.iter().map(|name| row(name, false)).collect();
+
+        // Nothing to list at all: INBOX is worth offering before the first
+        // sync, since clicking it is what starts the fetch.
+        if rows.listed.is_empty() && rows.unlisted.is_empty() {
+            rows.placeholder = true;
+            rows.listed.push(row("INBOX", true));
+        }
+        rows
+    }
 }
 
 /// The fields of the add/edit account form, plus the account it is
@@ -536,11 +776,17 @@ impl AccountForm {
 }
 
 impl KimoApp {
-    pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
+    /// The title bar's glass: the integration reads the rect it recorded for
+    /// this frame and blurs that strip of the scene (`crate::gpu`).
+    pub(crate) fn glass(&self) -> &Glass {
+        &self.glass
+    }
+
+    pub fn new(ctx: &egui::Context) -> Self {
         // egui's built-in fonts only cover Latin/Cyrillic/Greek, so the CJK
         // fallback goes in immediately; the families picked in Preferences are
         // applied once the worker scan below has resolved their files.
-        crate::fonts::install(&cc.egui_ctx, None, None);
+        crate::fonts::install(ctx, None, None);
 
         let settings = storage::load_settings();
         // The accounts and their mail live in the database; this is the one
@@ -557,22 +803,73 @@ impl KimoApp {
                 .collect::<Vec<_>>(),
         )
         .unwrap_or_default();
+        let app = Self::assemble(ctx, accounts, mailboxes, &settings);
+
+        // System-tray icon (best effort; StatusNotifierItem over D-Bus).
+        crate::tray::spawn(app.ctx.clone());
+
+        // Font families for Preferences → Appearance. The scan reads every
+        // installed face's name table, so it runs on a worker thread; the
+        // picked families are applied when the result arrives.
+        sync::spawn(Job::ScanFonts, app.ctx.clone(), app.tx.clone());
+
+        // The one sync nobody asks for. Debug mode skips it: the cached mail
+        // still loads from the database, and the title-bar button is there for
+        // when the network is wanted.
+        if app.working_mode.syncs_automatically() {
+            for account in app.accounts.clone() {
+                sync::spawn(
+                    Job::Sync {
+                        account,
+                        purge: false,
+                        folder: None,
+                    },
+                    app.ctx.clone(),
+                    app.tx.clone(),
+                );
+            }
+        }
+
+        app
+    }
+
+    /// The app's state, with nothing behind it: no tray, no font scan and no
+    /// startup sync. `new` is this plus those three; the probes that drive
+    /// frames headlessly (`probe_splitter_drag`) build their app here.
+    fn assemble(
+        ctx: &egui::Context,
+        accounts: Vec<Account>,
+        mailboxes: HashMap<String, storage::Mailbox>,
+        settings: &storage::Settings,
+    ) -> Self {
         let mut states = HashMap::new();
         for account in &accounts {
+            let mailbox = mailboxes.get(&account.id).cloned().unwrap_or_default();
+            // The column opens on the folder list the database cached: the
+            // mailboxes the last `LIST` named. The ones it left out are still
+            // there — their mail is — and are drawn as folders the server no
+            // longer has.
+            let folders = mailbox
+                .folders
+                .iter()
+                .filter(|folder| folder.listed)
+                .map(|folder| folder.name.clone())
+                .collect();
             let state = AccountUiState {
-                mailbox: mailboxes.get(&account.id).cloned().unwrap_or_default(),
+                folders,
+                mailbox,
                 ..AccountUiState::default()
             };
             states.insert(account.id.clone(), state);
         }
 
         // Folder-list icons: white PNGs (see `folders`), tinted per row.
-        let folder_icons = load_folder_icons(&cc.egui_ctx);
-        let brand_icon = load_brand_icon(&cc.egui_ctx);
+        let folder_icons = load_folder_icons(ctx);
+        let brand_icon = load_brand_icon(ctx);
 
         let (tx, rx) = mpsc::channel();
         let mut app = Self {
-            ctx: cc.egui_ctx.clone(),
+            ctx: ctx.clone(),
             tx,
             rx,
             accounts,
@@ -616,6 +913,7 @@ impl KimoApp {
             blitz_order: Vec::new(),
             blitz_cancel: crate::blitz_render::Cancellation::default(),
             pending_blitz_key: None,
+            body: BodyCache::default(),
             scrolled_message: None,
             list_column: egui::Rect::ZERO,
             list_scroll: 0.0,
@@ -624,31 +922,6 @@ impl KimoApp {
 
         app.selected_account = app.accounts.first().map(|a| a.id.clone());
         app.selected_folder = Some("INBOX".to_string());
-
-        // System-tray icon (best effort; StatusNotifierItem over D-Bus).
-        crate::tray::spawn(app.ctx.clone());
-
-        // Font families for Preferences → Appearance. The scan reads every
-        // installed face's name table, so it runs on a worker thread; the
-        // picked families are applied when the result arrives.
-        sync::spawn(Job::ScanFonts, app.ctx.clone(), app.tx.clone());
-
-        // The one sync nobody asks for. Debug mode skips it: the cached mail
-        // still loads from the database, and the title-bar button is there for
-        // when the network is wanted.
-        if app.working_mode.syncs_automatically() {
-            for account in app.accounts.clone() {
-                sync::spawn(
-                    Job::Sync {
-                        account,
-                        purge: false,
-                        folder: None,
-                    },
-                    app.ctx.clone(),
-                    app.tx.clone(),
-                );
-            }
-        }
 
         app
     }
@@ -674,7 +947,13 @@ impl KimoApp {
                 folders,
             } => {
                 if let Some(state) = self.states.get_mut(&account_id) {
-                    state.folders = folders;
+                    // A `LIST` that names the mailboxes the column already
+                    // shows — a warm sync — is not a change: the rows stay,
+                    // and nothing is derived again.
+                    if state.folders != folders {
+                        state.folders = folders;
+                        state.folders_changed();
+                    }
                 }
             }
             Event::Messages {
@@ -691,8 +970,16 @@ impl KimoApp {
                             name: folder.clone(),
                             uidvalidity: None,
                             synced: false,
+                            // Mail was just fetched for it, so the server has
+                            // this mailbox, whatever the last `LIST` said: it
+                            // is one of the folders the column lists rather
+                            // than one kept for its cached mail.
+                            listed: true,
                             messages: Vec::new(),
                         });
+                    }
+                    if !state.folders.iter().any(|name| name == &folder) {
+                        state.folders.push(folder.clone());
                     }
                     let fc = state
                         .mailbox
@@ -719,6 +1006,12 @@ impl KimoApp {
                     }
                     sort_messages(&mut fc.messages);
                     fc.synced = true;
+                    // Mail was just fetched for it, so the server has this
+                    // mailbox — the `stored` copy of the flag says the same
+                    // thing, and the two have to agree across a restart.
+                    fc.listed = true;
+                    // New mail, and with it a count the column shows.
+                    state.folders_changed();
                 }
             }
             Event::SyncDone { account_id } => {
@@ -743,6 +1036,8 @@ impl KimoApp {
                     if let Some(fc) = state.mailbox.folders.iter_mut().find(|f| f.name == folder) {
                         fc.messages.retain(|m| m.uid != uid);
                     }
+                    // A mail fewer, and one the folder's count was made of.
+                    state.folders_changed();
                 }
                 if self.selected_account.as_deref() == Some(account_id.as_str())
                     && self.selected_folder.as_deref() == Some(folder.as_str())
@@ -838,33 +1133,6 @@ impl KimoApp {
         }
     }
 
-    /// Unread mail in one folder, from the messages already cached for it.
-    fn folder_unread(&self, account_id: &str, folder: &str) -> usize {
-        self.states
-            .get(account_id)
-            .and_then(|state| state.mailbox.folders.iter().find(|f| f.name == folder))
-            .map(|f| f.messages.iter().filter(|m| !m.seen).count())
-            .unwrap_or(0)
-    }
-
-    /// Unread mail across every cached folder of one account — the number on
-    /// its header in the navigation column. Folders that were never fetched
-    /// are simply not counted; nothing here goes to the network.
-    fn account_unread(&self, account_id: &str) -> usize {
-        self.states
-            .get(account_id)
-            .map(|state| {
-                state
-                    .mailbox
-                    .folders
-                    .iter()
-                    .flat_map(|folder| folder.messages.iter())
-                    .filter(|message| !message.seen)
-                    .count()
-            })
-            .unwrap_or(0)
-    }
-
     fn select_folder(&mut self, account_id: String, folder: String, protocol: Protocol) {
         self.selected_account = Some(account_id.clone());
         self.selected_folder = Some(folder.clone());
@@ -912,6 +1180,8 @@ impl KimoApp {
             if let Some(fc) = state.mailbox.folders.iter_mut().find(|f| f.name == folder) {
                 if let Some(existing) = fc.messages.iter_mut().find(|m| m.uid == msg.uid) {
                     existing.seen = true;
+                    // One mail fewer to count in the folder and the account.
+                    state.folders_changed();
                 }
             }
         }
@@ -1413,14 +1683,6 @@ impl KimoApp {
             .folders
             .iter()
             .find(|f| f.name == *folder)
-    }
-
-    /// Messages of the currently selected folder, newest first — what the
-    /// list shows while no search is active.
-    fn current_messages(&self) -> Vec<MailMessage> {
-        self.current_folder()
-            .map(|folder| folder.messages.clone())
-            .unwrap_or_default()
     }
 
     fn selected_folder_synced(&self) -> bool {
@@ -1926,27 +2188,49 @@ impl KimoApp {
             );
             return;
         }
-        let accounts = self.accounts.clone();
+        // What a section needs of an account: its id and name for the header,
+        // its protocol for a folder click. Not the account itself — the
+        // password in it has no business being copied once a frame.
+        let accounts: Vec<(String, String, Protocol)> = self
+            .accounts
+            .iter()
+            .map(|account| (account.id.clone(), account.name.clone(), account.protocol))
+            .collect();
         egui::ScrollArea::vertical()
             .auto_shrink([false, false])
             .show(ui, |ui| {
                 ui.add_space(2.0);
-                for account in &accounts {
-                    self.account_section(ui, scheme, account);
+                for (id, name, protocol) in &accounts {
+                    self.account_section(ui, scheme, id, name, *protocol);
                 }
             });
     }
 
     /// One account in the navigation column: a header that collapses it, then
     /// its folders, indented under it.
-    fn account_section(&mut self, ui: &mut egui::Ui, scheme: ColorScheme, account: &Account) {
-        let collapsed = self.collapsed_accounts.contains(&account.id);
-        let unread = self.account_unread(&account.id);
-        if account_row(ui, scheme, &account.name, unread, collapsed).clicked() {
+    fn account_section(
+        &mut self,
+        ui: &mut egui::Ui,
+        scheme: ColorScheme,
+        account_id: &str,
+        account_name: &str,
+        protocol: Protocol,
+    ) {
+        let collapsed = self.collapsed_accounts.contains(account_id);
+        // The rows are derived here and only when the account state changed, so
+        // the header's count comes from them too — they are where the counts
+        // are computed at all.
+        let (unread, placeholder, syncing, error) = {
+            let state = self.states.entry(account_id.to_string()).or_default();
+            let nav = state.nav();
+            let (unread, placeholder) = (nav.unread, nav.placeholder);
+            (unread, placeholder, state.syncing, state.error.clone())
+        };
+        if account_row(ui, scheme, account_name, unread, collapsed).clicked() {
             if collapsed {
-                self.collapsed_accounts.remove(&account.id);
+                self.collapsed_accounts.remove(account_id);
             } else {
-                self.collapsed_accounts.insert(account.id.clone());
+                self.collapsed_accounts.insert(account_id.to_string());
             }
             return;
         }
@@ -1955,39 +2239,45 @@ impl KimoApp {
             return;
         }
 
-        let (folders, syncing, error) = {
-            let state = self.states.entry(account.id.clone()).or_default();
-            (state.folders.clone(), state.syncing, state.error.clone())
-        };
-        let folders_were_empty = folders.is_empty();
-        // Before the first sync there is nothing to list, but INBOX is worth
-        // offering: clicking it is what starts the fetch.
-        let folder_list = if folders.is_empty() {
-            vec!["INBOX".to_string()]
+        // The rows are borrowed from the account state while they are drawn, so
+        // a click is remembered as the folder it landed on and opened once the
+        // drawing has stopped borrowing — the same shape the message list uses.
+        let selected = if self.selected_account.as_deref() == Some(account_id) {
+            self.selected_folder.as_deref()
         } else {
-            folders
+            None
         };
-        ui.indent(("account-folders", &account.id), |ui| {
-            for folder in folder_list {
-                let selected = self.selected_account.as_deref() == Some(account.id.as_str())
-                    && self.selected_folder.as_deref() == Some(folder.as_str());
-                let unread = self.folder_unread(&account.id, &folder);
-                // `folder` is the IMAP wire form (possibly modified UTF-7);
-                // decode it for the label and for the icon lookup, which
-                // matches the readable name.
-                let display = crate::protocol::imap::decode_mailbox_name(folder.as_str());
-                let kind = folders::kind_of(&display);
-                // Only a generic folder has an open variant; the special
-                // mailboxes keep one glyph.
-                let open = selected && kind == FolderKind::Folder;
-                let icon = self.folder_icons.get(&(kind, open)).cloned();
-                let row = folder_row(ui, scheme, icon.as_ref(), &display, unread, selected);
-                if row.clicked() {
-                    self.select_folder(account.id.clone(), folder, account.protocol);
+        let icons = &self.folder_icons;
+        let mut clicked: Option<String> = None;
+        {
+            let state = self.states.entry(account_id.to_string()).or_default();
+            let nav = state.nav();
+            ui.indent(("account-folders", account_id), |ui| {
+                for row in nav.listed.iter().chain(nav.unlisted.iter()) {
+                    let is_selected = selected == Some(row.name.as_str());
+                    // Only a generic folder has an open variant; the special
+                    // mailboxes keep one glyph.
+                    let open = is_selected && row.kind == FolderKind::Folder;
+                    let icon = icons.get(&(row.kind, open));
+                    let response = folder_row(
+                        ui,
+                        scheme,
+                        icon,
+                        &row.display,
+                        row.unread,
+                        is_selected,
+                        row.listed,
+                    );
+                    if response.clicked() {
+                        clicked = Some(row.name.clone());
+                    }
                 }
-            }
-        });
-        if syncing && folders_were_empty {
+            });
+        }
+        if let Some(folder) = clicked {
+            self.select_folder(account_id.to_string(), folder, protocol);
+        }
+        if syncing && placeholder {
             ui.add_space(4.0);
             ui.add(egui::Spinner::new().color(scheme.accent));
         }
@@ -2396,8 +2686,22 @@ impl KimoApp {
     }
 
     /// The middle column while no search is active: the selected folder's mail.
+    ///
+    /// The rows are drawn straight out of the account state — mail bodies are
+    /// large, so the list never copies them — and only the ones the viewport
+    /// shows are laid out at all (see `virtual_rows`). A click is remembered as
+    /// the mail it landed on and opened after the list has been drawn, when the
+    /// borrow of the state it came from is over.
     fn folder_messages(&mut self, ui: &mut egui::Ui) {
-        let messages = self.current_messages();
+        // A folder the account does not have yet — INBOX before the first
+        // sync, which the navigation offers because clicking it is what starts
+        // the fetch — is an empty one, and gets the same placeholder.
+        let messages = self
+            .selected_account
+            .as_deref()
+            .zip(self.selected_folder.as_deref())
+            .and_then(|(account_id, folder)| self.folder_messages_of(account_id, folder))
+            .unwrap_or(&[]);
         if messages.is_empty() {
             self.list_scroll = 0.0;
             ui.centered_and_justified(|ui| {
@@ -2410,9 +2714,10 @@ impl KimoApp {
             });
             return;
         }
+        let mut clicked: Option<MailMessage> = None;
         let list = egui::ScrollArea::vertical()
             .auto_shrink([false, false])
-            .show(ui, |ui| {
+            .show_viewport(ui, |ui, viewport| {
                 egui::Frame::new()
                     .inner_margin(LIST_PADDING)
                     .show(ui, |ui| {
@@ -2420,13 +2725,41 @@ impl KimoApp {
                         // mails are the rows' own edges, so the layout must not
                         // add space of its own between them.
                         ui.spacing_mut().item_spacing.y = 0.0;
-                        for (index, msg) in messages.iter().enumerate() {
-                            self.message_row(ui, msg, index == 0);
-                        }
+                        virtual_rows(
+                            ui,
+                            viewport,
+                            LIST_PADDING.top as f32,
+                            MESSAGE_ROW_HEIGHT,
+                            messages.len(),
+                            |ui, rows| {
+                                for index in rows {
+                                    if self.message_row(ui, &messages[index], index == 0).clicked()
+                                    {
+                                        clicked = Some(messages[index].clone());
+                                    }
+                                }
+                            },
+                        );
                     });
             });
         // Scrolled away from the top, the bar floats over this list.
         self.list_scroll = list.state.offset.y;
+        if let Some(msg) = clicked {
+            self.open_message(&msg);
+        }
+    }
+
+    /// The mail of one folder of one account, for as long as the caller keeps
+    /// the borrow. Nothing is copied: the list and the reading pane both read
+    /// the state as it is.
+    fn folder_messages_of(&self, account_id: &str, folder: &str) -> Option<&[MailMessage]> {
+        self.states
+            .get(account_id)?
+            .mailbox
+            .folders
+            .iter()
+            .find(|candidate| candidate.name == folder)
+            .map(|folder| folder.messages.as_slice())
     }
 
     /// The middle column while a search is active: one card per hit.
@@ -2449,24 +2782,38 @@ impl KimoApp {
             });
             return;
         }
-        // Taken out for the duration so the rows can be painted while `self` is
-        // borrowed mutably (a click opens a mail); put back below.
-        let hits = std::mem::take(&mut self.search_hits);
+        // A hit is what a click landed on, opened once the list has been drawn:
+        // `open_hit` walks the account state, which the rows are borrowing.
+        let mut clicked: Option<SearchHit> = None;
+        let hits = &self.search_hits;
         let list = egui::ScrollArea::vertical()
             .auto_shrink([false, false])
-            .show(ui, |ui| {
+            .show_viewport(ui, |ui, viewport| {
                 egui::Frame::new()
                     .inner_margin(LIST_PADDING)
                     .show(ui, |ui| {
                         ui.spacing_mut().item_spacing.y = 0.0;
-                        for (index, hit) in hits.iter().enumerate() {
-                            self.search_row(ui, hit, index == 0);
-                        }
+                        virtual_rows(
+                            ui,
+                            viewport,
+                            LIST_PADDING.top as f32,
+                            MESSAGE_ROW_HEIGHT,
+                            hits.len(),
+                            |ui, rows| {
+                                for index in rows {
+                                    if self.search_row(ui, &hits[index], index == 0).clicked() {
+                                        clicked = Some(hits[index].clone());
+                                    }
+                                }
+                            },
+                        );
                     });
             });
-        self.search_hits = hits;
         // A scrolled result list floats the bar exactly like the folder's does.
         self.list_scroll = list.state.offset.y;
+        if let Some(hit) = clicked {
+            self.open_hit(&hit);
+        }
     }
 
     /// Ask for what the search popup is showing, once the query has held still;
@@ -2554,8 +2901,10 @@ impl KimoApp {
     }
 
     /// One message card in the folder list. `first` is the list's own first
-    /// card, which is the one that draws no line above itself.
-    fn message_row(&mut self, ui: &mut egui::Ui, msg: &MailMessage, first: bool) {
+    /// card, which is the one that draws no line above itself. The row only
+    /// draws itself — the list it belongs to opens whatever was clicked, once
+    /// it has stopped borrowing the state this was read from.
+    fn message_row(&self, ui: &mut egui::Ui, msg: &MailMessage, first: bool) -> egui::Response {
         let selected = self.selected_message.as_deref() == Some(msg.uid.as_str());
         let preview = if msg.preview.is_empty() {
             " ".to_string()
@@ -2570,15 +2919,12 @@ impl KimoApp {
             unread: !msg.seen,
             selected,
         };
-        let response = self.message_card(ui, &card, first);
-        if response.clicked() {
-            self.open_message(msg);
-        }
+        self.message_card(ui, &card, first)
     }
 
     /// One search result: the same card, with where the mail lives and the line
     /// the query matched as its third line.
-    fn search_row(&mut self, ui: &mut egui::Ui, hit: &SearchHit, first: bool) {
+    fn search_row(&self, ui: &mut egui::Ui, hit: &SearchHit, first: bool) -> egui::Response {
         let selected = self.selected_message.as_deref() == Some(hit.uid.as_str())
             && self.selected_folder.as_deref() == Some(hit.folder.as_str());
         let account = self
@@ -2599,10 +2945,7 @@ impl KimoApp {
             unread: !hit.seen,
             selected,
         };
-        let response = self.message_card(ui, &card, first);
-        if response.clicked() {
-            self.open_hit(hit);
-        }
+        self.message_card(ui, &card, first)
     }
 
     /// One card in the middle column: avatar on the left; sender + timestamp,
@@ -2796,6 +3139,8 @@ impl KimoApp {
         );
         let Some(msg) = self.selected_message_view() else {
             self.mail_scroll = 0.0;
+            // Nothing on the card, so nothing to keep parsed behind it.
+            self.body.forget();
             let _ = ui.scope_builder(egui::UiBuilder::new().max_rect(below_bar), |ui| {
                 ui.centered_and_justified(|ui| {
                     ui.label(egui::RichText::new("No mail selected").weak().heading());
@@ -2835,7 +3180,17 @@ impl KimoApp {
         );
         let used = ui
             .scope_builder(egui::UiBuilder::new().max_rect(inner), |ui| {
-                let mut scroll = egui::ScrollArea::vertical()
+                // Both directions on purpose. With horizontal scrolling off,
+                // a mail whose layout cannot be narrower than the pane — a
+                // fixed-width table, which is most HTML mail — made this
+                // scroll area wider than the pane, and through it the panel's
+                // *content* rect. egui persists that rect as the panel's width
+                // for the next frame, so the splitter sprang back to the
+                // mail's width on release: the pane could never be dragged
+                // narrower than the mail inside it. Scrolling the overflow
+                // sideways keeps the pane's width the user's, and the
+                // horizontal bar only appears when the mail really is wider.
+                let mut scroll = egui::ScrollArea::both()
                     // Full width, but only as tall as the mail: the card around
                     // a short message hugs it instead of running to the pane's
                     // floor, while a long one takes the pane and scrolls.
@@ -2844,7 +3199,11 @@ impl KimoApp {
                     // from the other renderer would land in empty space.
                     .id_salt(("mail-card", self.html_renderer.as_str()));
                 if new_message {
-                    scroll = scroll.vertical_scroll_offset(0.0);
+                    // A newly opened mail starts at its top *left*: the
+                    // horizontal offset outlives the message otherwise.
+                    scroll = scroll
+                        .vertical_scroll_offset(0.0)
+                        .horizontal_scroll_offset(0.0);
                 }
                 let output = scroll.show(ui, |ui| self.mail_card(ui, &msg));
                 // Scrolled away from the top, the bar floats over this card.
@@ -2921,6 +3280,7 @@ impl KimoApp {
         // Blitz takes the whole body; the built-in renderer below
         // needs the app's resource pipeline, so it stays as is.
         if let (HtmlRenderer::Blitz, Some(html)) = (self.html_renderer, html) {
+            self.body.forget();
             self.blitz_view(ui, msg, html);
             return;
         }
@@ -2954,6 +3314,24 @@ impl KimoApp {
                     inline_map.insert(image.cid.clone(), texture.clone());
                 }
             }
+            // The parsed body and the width it is laid out for, both kept
+            // between frames (see `BodyCache`): a splitter drag moves the pane
+            // width on every frame, and this is what keeps the body from being
+            // parsed and re-shaped on every one of them.
+            let identity = format!(
+                "{}/{}",
+                self.selected_folder.as_deref().unwrap_or("-"),
+                msg.uid
+            );
+            let wanted = ui.available_width();
+            let (document, width) = self.body.get(
+                &egui_ctx,
+                &identity,
+                body_fingerprint(html),
+                html,
+                wanted,
+                Instant::now(),
+            );
             let mut html_ctx = crate::html::HtmlContext {
                 images: &textures,
                 inline_images: &inline_map,
@@ -2961,7 +3339,20 @@ impl KimoApp {
                 missing_images: Vec::new(),
                 missing_stylesheets: Vec::new(),
             };
-            crate::html::render(ui, html, &mut html_ctx);
+            // The body is laid out in a scope of its own, and *that* is what
+            // holds its width: the card has already drawn its headers across
+            // the pane, and a ui never gets narrower than what it has drawn
+            // (`Placer::set_max_width` widens the max back to the min rect), so
+            // a narrower width has to be a fresh scope rather than a narrower
+            // `max_width` on this one.
+            let start = ui.cursor().min;
+            let body = egui::Rect::from_min_max(
+                start,
+                egui::pos2(start.x + width, ui.max_rect().bottom()),
+            );
+            ui.scope_builder(egui::UiBuilder::new().max_rect(body), |ui| {
+                crate::html::render_document(ui, document, &mut html_ctx);
+            });
             let missing_images = std::mem::take(&mut html_ctx.missing_images);
             let missing_sheets = std::mem::take(&mut html_ctx.missing_stylesheets);
             for url in missing_images {
@@ -2971,8 +3362,10 @@ impl KimoApp {
                 self.request_stylesheet(url);
             }
         } else if !msg.body_text.is_empty() {
+            self.body.forget();
             ui.label(msg.body_text.as_str());
         } else {
+            self.body.forget();
             ui.label(egui::RichText::new("(no text body)").weak());
         }
     }
@@ -3409,11 +3802,12 @@ fn swatch(ui: &mut egui::Ui, color: egui::Color32) {
     );
 }
 
-impl eframe::App for KimoApp {
-    /// One frame. egui 0.36 hands the app a root `Ui` to draw into rather than
-    /// a `Context`; the context is cloned out of it because the areas, modals,
-    /// animations and layer painting below are all context-level.
-    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+impl KimoApp {
+    /// One frame. The integration (`crate::gpu`) hands over the root `Ui` egui
+    /// 0.36 draws the whole app into; the context is cloned out of it because
+    /// the areas, modals, animations and layer painting below are all
+    /// context-level.
+    pub fn ui(&mut self, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
         let ctx = &ctx;
         self.drain_events();
@@ -3534,17 +3928,17 @@ impl eframe::App for KimoApp {
 /// The title bar's height. The integer form is the one the message list's
 /// top padding wants (`egui::Margin` is in whole points), and the only place
 /// the two could drift apart.
-const TITLEBAR_HEIGHT_I8: i8 = 48;
+const TITLEBAR_HEIGHT_I8: i8 = 40;
 const TITLEBAR_HEIGHT: f32 = TITLEBAR_HEIGHT_I8 as f32;
 const TITLEBAR_BUTTON_WIDTH: f32 = 42.0;
 /// How long the bar takes to turn from docked chrome into glass and back.
 /// Short enough to feel like a state change rather than an animation.
 const TITLEBAR_FLOAT_TIME: f32 = 0.16;
 /// What the bar's fill keeps of its alpha while it floats: the rest is the
-/// blurred mail showing through. High enough that the bar's own icons and
-/// query stay crisp, low enough that the smudge behind them reads as mail
-/// rather than as a smeared background.
-const GLASS_ALPHA: f32 = 0.62;
+/// blurred mail showing through. At 0.25 the blurred mail *is* the bar's body
+/// and the fill is a tint over it; the bar's own icons and query stay crisp
+/// because they are painted over that fill at full strength.
+const GLASS_ALPHA: f32 = 0.25;
 /// The same for the search box's own fill, which is lighter than the bar's to
 /// begin with: it keeps a little less of it, so the box is glass too and the
 /// mail still shows through it. The stroke is what keeps it reading as a
@@ -3668,11 +4062,15 @@ const BLITZ_PAGE_MARGIN: f32 = 8.0;
 const BLITZ_WIDTH_STEP: u32 = 32;
 const BLITZ_PAGES_CACHED: usize = 2;
 
-/// How long the pane geometry must hold still before a render starts.
-/// Dragging the splitter, or a compositor animating a window resize, changes
-/// it every frame; rendering each intermediate step would keep a core busy for
-/// results that are all discarded but the last.
-const BLITZ_SETTLE: Duration = Duration::from_millis(180);
+/// How long the pane geometry must hold still before the reading pane lays the
+/// mail out for it again. Dragging the splitter, or a compositor animating a
+/// window resize, changes it every frame; both renderers wait the same time,
+/// for the same reason — every intermediate width would be work that is
+/// discarded as soon as the pointer moves again. What they do while they wait
+/// differs: Blitz renders on a worker and has nothing to show until a render
+/// lands, while the built-in renderer keeps drawing the width it has (see
+/// `BodyCache`) and so reflows only once, when the drag is over.
+const GEOMETRY_SETTLE: Duration = Duration::from_millis(180);
 
 /// A finished page may be scaled down instead of re-rendered while the pane
 /// stays within this factor of the width the page was laid out for. Re-flowing
@@ -3680,6 +4078,43 @@ const BLITZ_SETTLE: Duration = Duration::from_millis(180);
 /// vertical scrollbar, which narrows the pane when it appears, from
 /// invalidating the very page that made it appear.
 const BLITZ_REUSE_RATIO: f32 = 1.25;
+
+/// Lay out the rows a vertical scroll area actually shows, and nothing else.
+///
+/// `egui::ScrollArea::show_rows` is this, for a list whose first row starts at
+/// the top of the content. This column's does not: the title bar's height is
+/// padding *above* the first row, inside the scroll area (`LIST_PADDING`), so
+/// rows placed from the content's own origin would sit that much too high, and
+/// the row a partly scrolled viewport starts in could be skipped — `show_rows`
+/// divides the scroll offset by the row height, which is off by the padding.
+///
+/// `pad_top` is that padding, in points; `viewport` is the scroll area's own
+/// viewport rect, in content coordinates, with zero at the content's top.
+fn virtual_rows<R>(
+    ui: &mut egui::Ui,
+    viewport: egui::Rect,
+    pad_top: f32,
+    row_height: f32,
+    total: usize,
+    add_contents: impl FnOnce(&mut egui::Ui, std::ops::Range<usize>) -> R,
+) -> R {
+    // The rows' own height; the frame around them adds its padding back.
+    ui.set_height(row_height * total as f32);
+    let visible = |y: f32| ((y - pad_top) / row_height).max(0.0);
+    let first = (visible(viewport.min.y).floor() as usize).min(total);
+    // One past the last row the viewport can reach: the ceil, plus whatever
+    // part of the next row is on screen.
+    let last = ((visible(viewport.max.y).ceil() as usize) + 1).min(total);
+    let top = ui.max_rect().top() + first as f32 * row_height;
+    let bottom = ui.max_rect().top() + last as f32 * row_height;
+    let rect = egui::Rect::from_x_y_ranges(ui.max_rect().x_range(), top..=bottom);
+    ui.scope_builder(egui::UiBuilder::new().max_rect(rect), |rows_ui| {
+        // Keep the widgets' auto ids stable as the list scrolls.
+        rows_ui.skip_ahead_auto_ids(first);
+        add_contents(rows_ui, first..last)
+    })
+    .inner
+}
 
 /// True when a popup field was left by pressing Enter — the search popup takes
 /// that as "run it now" from any of its boxes, not only the text one.
@@ -3748,7 +4183,7 @@ fn search_settle(
 /// What to do about a page that is not cached yet.
 #[derive(Debug, PartialEq, Eq)]
 enum BlitzWait {
-    /// The geometry has held still for `BLITZ_SETTLE`: render now.
+    /// The geometry has held still for `GEOMETRY_SETTLE`: render now.
     Start,
     /// Still settling; look again after this long.
     Wait(Duration),
@@ -3760,14 +4195,14 @@ fn blitz_settle(pending: Option<(&str, Instant)>, key: &str, now: Instant) -> Bl
     match pending {
         Some((pending, since)) if pending == key => {
             let waited = now.saturating_duration_since(since);
-            if waited >= BLITZ_SETTLE {
+            if waited >= GEOMETRY_SETTLE {
                 BlitzWait::Start
             } else {
-                BlitzWait::Wait(BLITZ_SETTLE - waited)
+                BlitzWait::Wait(GEOMETRY_SETTLE - waited)
             }
         }
         // Another geometry was pending, or none: this one starts settling now.
-        _ => BlitzWait::Wait(BLITZ_SETTLE),
+        _ => BlitzWait::Wait(GEOMETRY_SETTLE),
     }
 }
 
@@ -4059,6 +4494,11 @@ fn account_row(
     response
 }
 
+/// One folder in the navigation column. `listed` is whether the server still
+/// has it: a row kept for the mail cached under a folder it no longer lists is
+/// drawn weak whatever its unread count, and says so on hover — it is here for
+/// the mail, not for the mailbox. It stays clickable, because its mail is the
+/// only copy of it on this machine.
 fn folder_row(
     ui: &mut egui::Ui,
     scheme: ColorScheme,
@@ -4066,6 +4506,7 @@ fn folder_row(
     name: &str,
     unread: usize,
     selected: bool,
+    listed: bool,
 ) -> egui::Response {
     const ROW_HEIGHT: f32 = 22.0;
     const ICON_SIZE: f32 = 16.0;
@@ -4085,7 +4526,9 @@ fn folder_row(
         ui.painter().rect_filled(rect, 3.0_f32, scheme.hover);
     }
     // Unread folders read brighter than read ones, as the plain labels did.
-    let color = if selected || unread > 0 {
+    let color = if !listed {
+        scheme.text_weak
+    } else if selected || unread > 0 {
         scheme.text
     } else {
         scheme.text_weak
@@ -4129,7 +4572,11 @@ fn folder_row(
         name,
         color,
     );
-    response
+    if listed {
+        response
+    } else {
+        response.on_hover_text("No longer on the server — the mail cached for it is still here")
+    }
 }
 
 /// The application icon for the title bar: the same embedded 256 px PNG the
@@ -4603,6 +5050,158 @@ fn civil_from_days(z: i64) -> (i64, u32, u32) {
 mod tests {
     use super::*;
 
+    /// One headless frame of the real app at a given splitter position, timed
+    /// the way the integration times one: egui's own pass plus the
+    /// tessellation the renderer would do.
+    fn probe_frame(ctx: &egui::Context, app: &mut KimoApp, pane: f32, scale: f32) -> Duration {
+        // Where the drag has the splitter: egui keeps a side panel's width as
+        // its `PanelState`, and the next frame reads it back — which is
+        // exactly what a drag frame updates.
+        ctx.data_mut(|d| {
+            d.insert_persisted(
+                egui::Id::new("mail_content"),
+                egui::containers::panel::PanelState {
+                    outer_rect: egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(pane, 900.0),
+                    ),
+                },
+            )
+        });
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1400.0, 900.0),
+            )),
+            ..Default::default()
+        };
+        let start = Instant::now();
+        let mut output = ctx.run_ui(input, |ui| app.ui(ui));
+        let shapes = std::mem::take(&mut output.shapes);
+        let _ = ctx.tessellate(shapes, scale);
+        output.textures_delta.clear();
+        start.elapsed()
+    }
+
+    fn probe_median(times: &mut [Duration]) -> Duration {
+        times.sort();
+        times[times.len() / 2]
+    }
+
+    fn probe_ms(duration: Duration) -> f64 {
+        duration.as_secs_f64() * 1000.0
+    }
+
+    /// The real database, if this machine has one: the probe drives the app on
+    /// the mail actually cached here. Read-only; no workers are started.
+    fn probe_app(ctx: &egui::Context) -> Option<KimoApp> {
+        let accounts = crate::db::load_accounts().ok()?;
+        if accounts.is_empty() {
+            return None;
+        }
+        let ids: Vec<String> = accounts.iter().map(|a| a.id.clone()).collect();
+        let mailboxes = crate::db::load_mailboxes(&ids).unwrap_or_default();
+        let settings = storage::load_settings();
+        let mut app = KimoApp::assemble(ctx, accounts, mailboxes, &settings);
+        // The folder with the most mail, and the largest HTML body in it: the
+        // worst case a splitter drag can be asked to re-lay out.
+        let (account_id, folder) = app
+            .states
+            .iter()
+            .flat_map(|(id, state)| {
+                state
+                    .mailbox
+                    .folders
+                    .iter()
+                    .map(move |folder| (id.clone(), folder))
+            })
+            .max_by_key(|(_, folder)| folder.messages.len())
+            .map(|(id, folder)| (id, folder.name.clone()))?;
+        let uid = app
+            .states
+            .get(&account_id)?
+            .mailbox
+            .folders
+            .iter()
+            .find(|folder_| folder_.name == folder)?
+            .messages
+            .iter()
+            .max_by_key(|msg| msg.body_html.as_ref().map_or(0, String::len))?
+            .uid
+            .clone();
+        app.selected_account = Some(account_id);
+        app.selected_folder = Some(folder);
+        app.selected_message = Some(uid);
+        Some(app)
+    }
+
+    /// How long one frame of the real app takes, at a fixed splitter position
+    /// and while the splitter is being dragged:
+    ///
+    ///     cargo test --release -- --ignored --nocapture bench_frame_cost
+    ///
+    /// The drag is what this exists for: it moves the reading pane's width
+    /// every frame, which used to re-parse and re-lay out the whole mail body
+    /// and every row of the message list on each one. It reads the developer's
+    /// own `mail.db` (`~/.local/share/kimo/`), picks the folder with the most
+    /// mail and the largest HTML body in it — the worst case a drag can be
+    /// asked to lay out — and prints medians with the mail open and with
+    /// nothing selected. A developer tool, not a test: nothing here asserts.
+    #[test]
+    #[ignore = "developer tool; prints frame times for a splitter drag and asserts nothing"]
+    fn bench_frame_cost() {
+        let ctx = egui::Context::default();
+        let scale = 2.0;
+        let Some(mut app) = probe_app(&ctx) else {
+            println!("no mail database: nothing to measure");
+            return;
+        };
+        println!(
+            "probe: {} / {} / {} messages, body {} KB",
+            app.selected_account.as_deref().unwrap_or("-"),
+            app.selected_folder.as_deref().unwrap_or("-"),
+            app.folder_messages_of(
+                app.selected_account.as_deref().unwrap_or_default(),
+                app.selected_folder.as_deref().unwrap_or_default()
+            )
+            .map_or(0, <[MailMessage]>::len),
+            app.selected_message_view()
+                .and_then(|msg| msg.body_html)
+                .map_or(0, |html| html.len() / 1024),
+        );
+
+        for open in [true, false] {
+            if !open {
+                app.selected_message = None;
+            }
+            // Fixed geometry, then a drag that moves the splitter 4 pt a frame
+            // through the widths a real drag passes over.
+            for mode in ["fixed", "drag"] {
+                let mut times = Vec::new();
+                for step in 0..24 {
+                    let pane = if mode == "fixed" {
+                        520.0
+                    } else {
+                        700.0 - step as f32 * 4.0
+                    };
+                    let elapsed = probe_frame(&ctx, &mut app, pane, scale);
+                    if step > 2 {
+                        times.push(elapsed);
+                    }
+                }
+                let median = probe_median(&mut times);
+                let max = times.last().copied().unwrap_or_default();
+                println!(
+                    "  {:10}  {:4}  median {:7.2} ms  max {:7.2} ms",
+                    if open { "mail open" } else { "no mail" },
+                    mode,
+                    probe_ms(median),
+                    probe_ms(max),
+                );
+            }
+        }
+    }
+
     #[test]
     fn html_renderer_round_trips_through_settings() {
         assert_eq!(HtmlRenderer::parse("blitz"), HtmlRenderer::Blitz);
@@ -4698,7 +5297,7 @@ mod tests {
         // Never seen before: nothing renders on the first frame.
         assert_eq!(
             blitz_settle(None, "page", start),
-            BlitzWait::Wait(BLITZ_SETTLE)
+            BlitzWait::Wait(GEOMETRY_SETTLE)
         );
         // Still settling: report what is left of the wait.
         assert_eq!(
@@ -4707,11 +5306,11 @@ mod tests {
                 "page",
                 start + Duration::from_millis(100)
             ),
-            BlitzWait::Wait(BLITZ_SETTLE - Duration::from_millis(100))
+            BlitzWait::Wait(GEOMETRY_SETTLE - Duration::from_millis(100))
         );
         // Held still long enough: render.
         assert_eq!(
-            blitz_settle(Some(("page", start)), "page", start + BLITZ_SETTLE),
+            blitz_settle(Some(("page", start)), "page", start + GEOMETRY_SETTLE),
             BlitzWait::Start
         );
         // A geometry that changed again starts a fresh wait, however long the
@@ -4720,10 +5319,690 @@ mod tests {
             blitz_settle(
                 Some(("page", start)),
                 "page-moved",
-                start + BLITZ_SETTLE * 4
+                start + GEOMETRY_SETTLE * 4
             ),
-            BlitzWait::Wait(BLITZ_SETTLE)
+            BlitzWait::Wait(GEOMETRY_SETTLE)
         );
+    }
+
+    /// One cached mail, as the fixtures build them: the subject follows the
+    /// uid and `seen` is whatever the test needs of it.
+    fn test_message(uid: &str, seen: bool) -> MailMessage {
+        MailMessage {
+            uid: uid.to_string(),
+            subject: format!("Subject {uid}"),
+            from: "Ada <ada@example.com>".to_string(),
+            to: "me@example.com".to_string(),
+            date: "2026-01-01".to_string(),
+            timestamp: Some(1_700_000_000),
+            seen,
+            body_text: "body".to_string(),
+            body_html: None,
+            preview: "preview".to_string(),
+            attachment_names: Vec::new(),
+            inline_images: Vec::new(),
+        }
+    }
+
+    /// An app with `count` mails in one folder: no database, no workers, and
+    /// nothing to sync. The frame tests below drive it headlessly.
+    fn app_with_messages(ctx: &egui::Context, count: usize) -> KimoApp {
+        let account = Account {
+            id: "acct".to_string(),
+            name: "Test".to_string(),
+            protocol: Protocol::Imap,
+            host: "imap.example.com".to_string(),
+            port: 993,
+            username: "ada".to_string(),
+            password: "secret".to_string(),
+            tls: TlsMode::Implicit,
+        };
+        let messages = (0..count)
+            .map(|index| test_message(&index.to_string(), false))
+            .collect();
+        let folder = storage::Folder {
+            name: "INBOX".to_string(),
+            uidvalidity: Some(1),
+            synced: true,
+            listed: true,
+            messages,
+        };
+        let mut mailboxes = HashMap::new();
+        mailboxes.insert(
+            account.id.clone(),
+            storage::Mailbox {
+                folders: vec![folder],
+            },
+        );
+        let mut app =
+            KimoApp::assemble(ctx, vec![account], mailboxes, &storage::Settings::default());
+        // The fixtures below measure geometry, and the warning the app carries
+        // when *this machine's* database cannot be written stands at the top of
+        // the middle column, over the first row. It is a fact about the machine,
+        // not about the layout the test is pinning.
+        app.storage_warning = None;
+        app
+    }
+
+    /// An app whose one account holds the folders given as
+    /// `(name, listed, mails)` — the shape the database hands `assemble` on
+    /// startup, unread mail and all. The navigation tests drive it.
+    fn app_with_folders(ctx: &egui::Context, folders: &[(&str, bool, usize)]) -> KimoApp {
+        let mut app = app_with_messages(ctx, 0);
+        let state = app.states.get_mut("acct").unwrap();
+        state.mailbox.folders = folders
+            .iter()
+            .map(|(name, listed, count)| storage::Folder {
+                name: name.to_string(),
+                uidvalidity: Some(1),
+                synced: *count > 0,
+                listed: *listed,
+                messages: (0..*count)
+                    .map(|index| test_message(&format!("{name}-{index}"), false))
+                    .collect(),
+            })
+            .collect();
+        // The column opens on the mailboxes the last `LIST` named, which is how
+        // `assemble` fills this in.
+        state.folders = state
+            .mailbox
+            .folders
+            .iter()
+            .filter(|folder| folder.listed)
+            .map(|folder| folder.name.clone())
+            .collect();
+        state.folders_changed();
+        app
+    }
+
+    /// The wire names of a group of rows, for the assertions about which
+    /// folders are in which.
+    fn names_of(rows: &[FolderRow]) -> Vec<&str> {
+        rows.iter().map(|row| row.name.as_str()).collect()
+    }
+
+    /// Every run of text one headless frame of the app drew, for the tests that
+    /// care what a column says.
+    fn frame_texts(ctx: &egui::Context, app: &mut KimoApp) -> Vec<String> {
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1400.0, 900.0),
+            )),
+            ..Default::default()
+        };
+        let mut output = ctx.run_ui(input, |ui| app.ui(ui));
+        output.textures_delta.clear();
+        let mut texts = Vec::new();
+        for clipped in &output.shapes {
+            collect_text(&clipped.shape, &mut texts);
+        }
+        texts
+    }
+
+    fn collect_text(shape: &egui::Shape, out: &mut Vec<String>) {
+        match shape {
+            egui::Shape::Text(text) => out.push(text.galley.text().to_string()),
+            egui::Shape::Vec(shapes) => {
+                for shape in shapes {
+                    collect_text(shape, out);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// A folder the account has not fetched yet — INBOX, offered by the
+    /// navigation before the first sync — is empty as far as the list is
+    /// concerned, and the column has to say which kind of empty it is rather
+    /// than standing bare. (It stands bare if the list gives up on a folder it
+    /// cannot find.)
+    #[test]
+    fn an_unfetched_folder_says_so_instead_of_standing_empty() {
+        let ctx = egui::Context::default();
+        crate::fonts::install(&ctx, None, None);
+        let account = Account {
+            id: "acct".to_string(),
+            name: "Test".to_string(),
+            protocol: Protocol::Imap,
+            host: "imap.example.com".to_string(),
+            port: 993,
+            username: "ada".to_string(),
+            password: "secret".to_string(),
+            tls: TlsMode::Implicit,
+        };
+        // No folders at all: the account has never synced.
+        let mut app = KimoApp::assemble(
+            &ctx,
+            vec![account],
+            HashMap::new(),
+            &storage::Settings::default(),
+        );
+        assert_eq!(app.selected_folder.as_deref(), Some("INBOX"));
+        assert!(app.folder_messages_of("acct", "INBOX").is_none());
+        let texts = frame_texts(&ctx, &mut app);
+        assert!(
+            texts.iter().any(|text| text.contains("Not fetched yet")),
+            "the column did not say the folder is unfetched: {texts:?}"
+        );
+
+        // A folder that has synced, with no mail in it, says the other thing.
+        let mut app = app_with_messages(&ctx, 0);
+        let texts = frame_texts(&ctx, &mut app);
+        assert!(
+            texts
+                .iter()
+                .any(|text| text.contains("This folder is empty.")),
+            "the column did not say the folder is empty: {texts:?}"
+        );
+    }
+
+    /// The column opens on the folder list the database cached — what the last
+    /// `LIST` named — rather than standing on an offered INBOX until a sync
+    /// runs. That list is also where the two kinds of row come from: the
+    /// mailboxes the server still has, and the ones it does not, which are here
+    /// for the mail cached under them.
+    #[test]
+    fn the_column_opens_on_the_folder_list_the_database_cached() {
+        let ctx = egui::Context::default();
+        crate::fonts::install(&ctx, None, None);
+        let mut app = app_with_folders(
+            &ctx,
+            &[("INBOX", true, 1), ("Sent", true, 0), ("Archive", false, 1)],
+        );
+
+        let texts = frame_texts(&ctx, &mut app);
+        for name in ["INBOX", "Sent", "Archive"] {
+            assert!(
+                texts.iter().any(|text| text == name),
+                "{name} should be in the column before any sync: {texts:?}"
+            );
+        }
+
+        let nav = app.states.get_mut("acct").unwrap().nav();
+        assert_eq!(names_of(&nav.listed), ["INBOX", "Sent"]);
+        assert_eq!(names_of(&nav.unlisted), ["Archive"]);
+        assert_eq!(nav.unread, 2, "the header counts every cached folder");
+    }
+
+    /// An account with nothing cached at all is still offered an INBOX:
+    /// clicking it is what starts the first fetch. That row is the only one the
+    /// column makes up — every other one comes from a folder the account holds.
+    #[test]
+    fn an_account_with_no_folders_yet_is_offered_its_inbox() {
+        let ctx = egui::Context::default();
+        crate::fonts::install(&ctx, None, None);
+        let mut app = app_with_folders(&ctx, &[]);
+
+        assert!(frame_texts(&ctx, &mut app)
+            .iter()
+            .any(|text| text == "INBOX"));
+        let nav = app.states.get_mut("acct").unwrap().nav();
+        assert!(nav.placeholder);
+        assert_eq!(names_of(&nav.listed), ["INBOX"]);
+        assert!(nav.unlisted.is_empty());
+    }
+
+    /// A sync that reports the mailboxes the column already shows is not a
+    /// change: the rows stay the ones already derived. One that reports
+    /// different mailboxes is, and it brings the counts with it.
+    #[test]
+    fn only_a_real_change_rebuilds_the_folder_rows() {
+        let ctx = egui::Context::default();
+        crate::fonts::install(&ctx, None, None);
+        let mut app = app_with_folders(&ctx, &[("INBOX", true, 1)]);
+        run_app_frame(&ctx, &mut app, Vec::new());
+        assert_eq!(
+            app.states.get_mut("acct").unwrap().nav().listed[0].unread,
+            1
+        );
+
+        // Mail arrives behind the rows' back. Nothing says the account changed,
+        // so nothing is derived again — which is exactly what makes a sync that
+        // found the same folders cheap.
+        let state = app.states.get_mut("acct").unwrap();
+        state.mailbox.folders[0]
+            .messages
+            .push(test_message("late", false));
+        assert_eq!(
+            state.nav().listed[0].unread,
+            1,
+            "the rows are the ones already derived"
+        );
+
+        // A warm sync: the same mailbox list, so still nothing to derive.
+        app.apply_event(Event::Folders {
+            account_id: "acct".to_string(),
+            folders: vec!["INBOX".to_string()],
+        });
+        assert_eq!(
+            app.states.get_mut("acct").unwrap().nav().listed[0].unread,
+            1
+        );
+
+        // A sync that found a different list rebuilds the rows, and the count
+        // it brings with it is the current one.
+        app.apply_event(Event::Folders {
+            account_id: "acct".to_string(),
+            folders: vec!["INBOX".to_string(), "Sent".to_string()],
+        });
+        let nav = app.states.get_mut("acct").unwrap().nav();
+        assert_eq!(names_of(&nav.listed), ["INBOX", "Sent"]);
+        assert_eq!(nav.listed[0].unread, 2);
+    }
+
+    /// A folder the server no longer lists keeps its row, in a state of its
+    /// own, because the mail cached under it is the only copy of it here — and
+    /// it stays openable.
+    #[test]
+    fn a_folder_the_server_dropped_keeps_its_row_and_its_mail() {
+        let ctx = egui::Context::default();
+        crate::fonts::install(&ctx, None, None);
+        let mut app = app_with_folders(&ctx, &[("INBOX", true, 1), ("Archive", true, 2)]);
+
+        // The next `LIST` does not name Archive.
+        app.apply_event(Event::Folders {
+            account_id: "acct".to_string(),
+            folders: vec!["INBOX".to_string()],
+        });
+        let nav = app.states.get_mut("acct").unwrap().nav();
+        assert_eq!(names_of(&nav.listed), ["INBOX"]);
+        assert_eq!(names_of(&nav.unlisted), ["Archive"]);
+        assert!(!nav.unlisted[0].listed);
+        assert_eq!(nav.unlisted[0].unread, 2);
+
+        // It is still drawn, and its mail is still there to open.
+        assert!(frame_texts(&ctx, &mut app)
+            .iter()
+            .any(|text| text == "Archive"));
+        assert_eq!(
+            app.folder_messages_of("acct", "Archive")
+                .map(<[MailMessage]>::len),
+            Some(2)
+        );
+    }
+
+    /// One headless frame of an app under test, with the given input events.
+    fn run_app_frame(ctx: &egui::Context, app: &mut KimoApp, events: Vec<egui::Event>) {
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1400.0, 900.0),
+            )),
+            events,
+            ..Default::default()
+        };
+        let mut output = ctx.run_ui(input, |ui| app.ui(ui));
+        output.textures_delta.clear();
+    }
+
+    /// Clicking a row opens that mail: the list draws itself from the account
+    /// state and only remembers what was clicked, so this is the test that the
+    /// click still lands on the mail under the pointer (`folder_messages`).
+    #[test]
+    fn clicking_a_row_opens_that_mail() {
+        let ctx = egui::Context::default();
+        crate::fonts::install(&ctx, None, None);
+        let mut app = app_with_messages(&ctx, 5);
+        run_app_frame(&ctx, &mut app, Vec::new());
+
+        // The second row: below the title bar's padding, one row down, inside
+        // the message column (the navigation is 200 pt wide).
+        let pos = egui::pos2(300.0, TITLEBAR_HEIGHT + MESSAGE_ROW_HEIGHT * 1.5);
+        run_app_frame(&ctx, &mut app, vec![egui::Event::PointerMoved(pos)]);
+        for pressed in [true, false] {
+            run_app_frame(
+                &ctx,
+                &mut app,
+                vec![egui::Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Primary,
+                    pressed,
+                    modifiers: egui::Modifiers::default(),
+                }],
+            );
+        }
+
+        assert_eq!(app.selected_message.as_deref(), Some("1"));
+        // Opening it marks it seen on the spot — the row's own copy, not just
+        // the database's.
+        assert!(app.folder_messages_of("acct", "INBOX").unwrap()[1].seen);
+    }
+
+    /// Scroll the list, then click a row: the row the pointer lands on is the
+    /// mail that opens, which is the whole point of laying out only the rows
+    /// the viewport shows (`virtual_rows`) and of the ids that keep them
+    /// stable as the list scrolls.
+    #[test]
+    fn clicking_a_row_after_scrolling_opens_the_mail_that_is_there() {
+        let ctx = egui::Context::default();
+        crate::fonts::install(&ctx, None, None);
+        let mut app = app_with_messages(&ctx, 60);
+        run_app_frame(&ctx, &mut app, Vec::new());
+
+        let over_list = egui::pos2(300.0, 400.0);
+        run_app_frame(&ctx, &mut app, vec![egui::Event::PointerMoved(over_list)]);
+        run_app_frame(
+            &ctx,
+            &mut app,
+            vec![egui::Event::MouseWheel {
+                unit: egui::MouseWheelUnit::Point,
+                delta: egui::vec2(0.0, -400.0),
+                phase: egui::TouchPhase::Move,
+                modifiers: egui::Modifiers::default(),
+            }],
+        );
+        // The scroll area animates its offset: let it come to rest.
+        for _ in 0..30 {
+            run_app_frame(&ctx, &mut app, Vec::new());
+        }
+        let offset = app.list_scroll;
+        assert!(offset > 0.0, "the list did not scroll");
+
+        // Something comfortably inside the viewport, in the list's padding
+        // below the title bar; the row there is the one the offset puts there.
+        let y = TITLEBAR_HEIGHT + MESSAGE_ROW_HEIGHT * 2.5;
+        let expected = ((y - TITLEBAR_HEIGHT + offset) / MESSAGE_ROW_HEIGHT).floor() as usize;
+        let pos = egui::pos2(300.0, y);
+        run_app_frame(&ctx, &mut app, vec![egui::Event::PointerMoved(pos)]);
+        for pressed in [true, false] {
+            run_app_frame(
+                &ctx,
+                &mut app,
+                vec![egui::Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Primary,
+                    pressed,
+                    modifiers: egui::Modifiers::default(),
+                }],
+            );
+        }
+
+        assert_eq!(
+            app.selected_message.as_deref(),
+            Some(expected.to_string().as_str())
+        );
+    }
+
+    /// Dragging the splitter with the pointer, the way a user does: the pane
+    /// narrows, and the body keeps the width it settled at until the drag has
+    /// stopped — which is the whole fix for a drag that used to re-lay the mail
+    /// out on every frame.
+    #[test]
+    fn a_splitter_drag_holds_the_body_until_the_geometry_settles() {
+        let ctx = egui::Context::default();
+        crate::fonts::install(&ctx, None, None);
+        let mut app = app_with_messages(&ctx, 20);
+        let html =
+            "<p>one two three four five six seven eight nine ten eleven twelve</p>".repeat(40);
+        app.states
+            .get_mut("acct")
+            .unwrap()
+            .mailbox
+            .folders
+            .first_mut()
+            .unwrap()
+            .messages
+            .first_mut()
+            .unwrap()
+            .body_html = Some(html);
+        app.selected_message = Some("0".to_string());
+
+        let pane_width = |ctx: &egui::Context| {
+            egui::containers::panel::PanelState::load(ctx, egui::Id::new("mail_content"))
+                .expect("the reading pane stored its width")
+                .outer_rect
+                .width()
+        };
+        run_app_frame(&ctx, &mut app, Vec::new());
+        let settled = pane_width(&ctx);
+        // The body is narrower than the pane by the card's gutter, its padding
+        // and the scroll bar; that inset is what a reflow has to keep.
+        let body_width = app.body.width.expect("the body was laid out");
+        let inset = settled - body_width;
+        assert!(inset > 0.0, "the body should be inside the pane");
+
+        // Press on the splitter and pull it right — narrowing the pane, which
+        // is the drag that used to cost a reflow a frame. The grab strip
+        // straddles the pane's left edge, but the message list's own widget
+        // reaches exactly to it and is drawn later, so the half that is
+        // reachable is the one just inside the pane (`resize_grab_radius_side`
+        // is 3 pt).
+        let splitter = egui::pos2(1400.0 - settled + 1.5, 400.0);
+        run_app_frame(&ctx, &mut app, vec![egui::Event::PointerMoved(splitter)]);
+        run_app_frame(
+            &ctx,
+            &mut app,
+            vec![egui::Event::PointerButton {
+                pos: splitter,
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: egui::Modifiers::default(),
+            }],
+        );
+        // egui stores a panel's width only when the drag ends (`PanelState` is
+        // deliberately left at the pre-drag size), so the live edge is the one
+        // the message list recorded: its right side is the pane's left.
+        let pane_left = |app: &KimoApp| app.list_column.right();
+        let start_left = pane_left(&app);
+        let mut pos = splitter;
+        for _ in 0..10 {
+            pos.x += 8.0;
+            run_app_frame(&ctx, &mut app, vec![egui::Event::PointerMoved(pos)]);
+            // The mail does not follow the pointer: it is still laid out for
+            // the width it settled at, however far the pane has moved.
+            assert_eq!(
+                app.body.width,
+                Some(body_width),
+                "the body reflowed mid-drag"
+            );
+        }
+        assert!(
+            pane_left(&app) > start_left + 1.0,
+            "the pane did not follow the drag"
+        );
+        run_app_frame(
+            &ctx,
+            &mut app,
+            vec![egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::default(),
+            }],
+        );
+
+        // The drag is over: the pane has stored the width it came to rest at,
+        // and once the geometry has held still for the settle time the body
+        // reflows once for it.
+        let narrower = pane_width(&ctx);
+        assert!(narrower < settled, "the pane did not settle narrower");
+        std::thread::sleep(GEOMETRY_SETTLE + Duration::from_millis(20));
+        run_app_frame(&ctx, &mut app, Vec::new());
+        let reflowed = app.body.width.expect("the body is still laid out");
+        assert!(
+            (reflowed - (narrower - inset)).abs() < 1.0,
+            "the body reflowed to {reflowed}, expected {}",
+            narrower - inset
+        );
+    }
+
+    /// The scope the body is laid out in is what holds its width: the card has
+    /// already drawn its headers across the pane, and egui refuses to make a ui
+    /// narrower than what it has drawn, so this is the check that the mail is
+    /// really wrapped for the width the cache holds and not for the pane's.
+    #[test]
+    fn the_body_is_wrapped_for_the_width_the_cache_holds() {
+        let ctx = egui::Context::default();
+        crate::fonts::install(&ctx, None, None);
+        let mut app = app_with_messages(&ctx, 1);
+        let html = format!(
+            "<p>{}</p>",
+            "the quick brown fox jumps over the lazy dog ".repeat(40)
+        );
+        app.states
+            .get_mut("acct")
+            .unwrap()
+            .mailbox
+            .folders
+            .first_mut()
+            .unwrap()
+            .messages
+            .first_mut()
+            .unwrap()
+            .body_html = Some(html.clone());
+        let msg = app.folder_messages_of("acct", "INBOX").unwrap()[0].clone();
+
+        let images: HashMap<String, egui::TextureHandle> = HashMap::new();
+        let inline: HashMap<String, egui::TextureHandle> = HashMap::new();
+        let sheets: HashMap<String, String> = HashMap::new();
+        // The height of a body laid out inside a `pane`-wide ui, through a
+        // scope of `laid_out` width — the nesting `mail_body` makes.
+        let height = |app: &mut KimoApp, pane: f32, laid_out: f32, body: Option<&MailMessage>| {
+            let mut measured = 0.0_f32;
+            let input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(1000.0, 4000.0),
+                )),
+                ..Default::default()
+            };
+            let mut output = ctx.run_ui(input, |ui| {
+                let pane_rect =
+                    egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(pane, 4000.0));
+                ui.scope_builder(egui::UiBuilder::new().max_rect(pane_rect), |ui| {
+                    ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Wrap);
+                    match body {
+                        Some(msg) => app.mail_body(ui, msg),
+                        None => {
+                            let body_rect = egui::Rect::from_min_size(
+                                ui.cursor().min,
+                                egui::vec2(laid_out, ui.max_rect().bottom()),
+                            );
+                            let document = crate::html::Document::parse(&html);
+                            let mut html_ctx = crate::html::HtmlContext {
+                                images: &images,
+                                inline_images: &inline,
+                                stylesheets: &sheets,
+                                missing_images: Vec::new(),
+                                missing_stylesheets: Vec::new(),
+                            };
+                            ui.scope_builder(egui::UiBuilder::new().max_rect(body_rect), |ui| {
+                                crate::html::render_document(ui, &document, &mut html_ctx);
+                            });
+                        }
+                    }
+                    measured = ui.min_rect().height();
+                });
+            });
+            output.textures_delta.clear();
+            measured
+        };
+
+        // The same body at two widths: the narrower pane wraps it taller, so
+        // the two heights tell the two layouts apart.
+        let wide = height(&mut app, 500.0, 500.0, None);
+        let narrow = height(&mut app, 300.0, 300.0, None);
+        assert!(wide < narrow - 20.0, "{wide} vs {narrow}");
+
+        // The body has settled at 500 pt…
+        app.body.get(
+            &ctx,
+            "INBOX/0",
+            body_fingerprint(&html),
+            &html,
+            500.0,
+            Instant::now(),
+        );
+        // …and the pane is 300 pt wide now. The mail keeps the layout it has:
+        // the height is the wide one, not the height the pane would wrap it to.
+        let held = height(&mut app, 300.0, 300.0, Some(&msg));
+        assert!(
+            (held - wide).abs() < 2.0,
+            "laid out at {held}, expected the held width's {wide} (narrow would be {narrow})"
+        );
+    }
+
+    #[test]
+    fn the_body_keeps_its_width_while_the_pane_moves() {
+        let ctx = egui::Context::default();
+        let start = Instant::now();
+        let mut cache = BodyCache::default();
+        let html = "<p>Hello</p>";
+        let fingerprint = body_fingerprint(html);
+        let width_at = |cache: &mut BodyCache, wanted, now| {
+            cache.get(&ctx, "INBOX/1", fingerprint, html, wanted, now).1
+        };
+
+        // A body the cache has not seen is laid out at the pane's own width.
+        assert_eq!(width_at(&mut cache, 500.0, start), 500.0);
+        // A pane that moved is not a reflow: the body keeps the width it has,
+        // and the clock starts.
+        assert_eq!(width_at(&mut cache, 480.0, start), 500.0);
+        // Still moving: same width, clock restarted.
+        assert_eq!(
+            width_at(&mut cache, 460.0, start + Duration::from_millis(100)),
+            500.0
+        );
+        // Held still for the settle time: the body reflows, once.
+        assert_eq!(
+            width_at(
+                &mut cache,
+                460.0,
+                start + Duration::from_millis(100) + GEOMETRY_SETTLE
+            ),
+            460.0
+        );
+        // The width it has now is not a reflow again.
+        assert_eq!(
+            width_at(
+                &mut cache,
+                460.0,
+                start + Duration::from_millis(100) + GEOMETRY_SETTLE * 2
+            ),
+            460.0
+        );
+        // And a width the pane only visits for a moment never reaches the body.
+        assert_eq!(
+            width_at(
+                &mut cache,
+                700.0,
+                start + Duration::from_millis(100) + GEOMETRY_SETTLE * 3
+            ),
+            460.0
+        );
+    }
+
+    #[test]
+    fn the_body_cache_reparses_a_body_that_changed() {
+        let ctx = egui::Context::default();
+        let now = Instant::now();
+        let mut cache = BodyCache::default();
+        let first = "<p>one</p>";
+        let second = "<p>two</p>";
+        let laid_out_at = |cache: &mut BodyCache, identity: &str, html: &str, wanted| {
+            cache
+                .get(&ctx, identity, body_fingerprint(html), html, wanted, now)
+                .1
+        };
+
+        // First sight of a body: laid out at the pane's own width.
+        assert_eq!(laid_out_at(&mut cache, "INBOX/1", first, 400.0), 400.0);
+        // The same body a frame later, with the pane moved: the width it has.
+        assert_eq!(laid_out_at(&mut cache, "INBOX/1", first, 380.0), 400.0);
+        // Another mail is a new body, and a new body is laid out at once
+        // rather than held at the width the old one was laid out for.
+        assert_eq!(cache.identity, "INBOX/1");
+        assert_eq!(laid_out_at(&mut cache, "INBOX/2", first, 320.0), 320.0);
+        assert_eq!(cache.identity, "INBOX/2");
+        // So is another body under the same uid: a re-fetch can replace a
+        // body the pane is already showing.
+        assert_eq!(laid_out_at(&mut cache, "INBOX/2", second, 300.0), 300.0);
+        assert_eq!(cache.fingerprint, body_fingerprint(second));
+        // Switching renderer, or opening a mail with no HTML at all, drops it.
+        cache.forget();
+        assert!(cache.document.is_none());
+        assert_eq!(laid_out_at(&mut cache, "INBOX/2", second, 280.0), 280.0);
     }
 
     #[test]

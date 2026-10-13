@@ -46,9 +46,33 @@ struct Seg {
     link: Option<String>,
 }
 
+/// A parsed mail body, ready to be laid out as often as the pane wants.
+///
+/// Parsing is html5ever's and it is not cheap: on a 100 KB newsletter it is
+/// about two thirds of what the built-in renderer costs per frame, and the
+/// reading pane draws the same body on every frame. So the pane parses once
+/// per body — `app.rs` keeps one of these — and re-walks the tree each frame,
+/// which is what actually lays the mail out.
+pub struct Document(Html);
+
+impl Document {
+    pub fn parse(html: &str) -> Self {
+        Self(Html::parse_fragment(html))
+    }
+}
+
 /// Parse `html` and lay it out into `ui` as flowing blocks.
+///
+/// Test-only: a pane that draws the same body every frame parses it once
+/// ([`Document::parse`]) and lays that out with [`render_document`], which is
+/// what `app.rs` does.
+#[cfg(test)]
 pub fn render(ui: &mut Ui, html: &str, html_ctx: &mut HtmlContext<'_>) {
-    let frag = Html::parse_fragment(html);
+    render_document(ui, &Document::parse(html), html_ctx);
+}
+
+/// Lay out a body [`Document::parse`] has already parsed.
+pub fn render_document(ui: &mut Ui, doc: &Document, html_ctx: &mut HtmlContext<'_>) {
     let mut r = Renderer {
         pending: Vec::new(),
         ids: 0,
@@ -59,7 +83,7 @@ pub fn render(ui: &mut Ui, html: &str, html_ctx: &mut HtmlContext<'_>) {
             .collect(),
         ctx: html_ctx,
     };
-    for node in frag.tree.root().children() {
+    for node in doc.0.tree.root().children() {
         r.node(ui, node, &Seg::default());
     }
     r.flush(ui);
