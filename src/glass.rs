@@ -1,393 +1,514 @@
-//! A frosted-glass backdrop for the floating title bar.
+//! A frosted-glass backdrop for the floating title bar, on wgpu.
 //!
 //! egui cannot blur: nothing in the painter can sample what has already been
-//! drawn, and there is no blur primitive. The *renderer* can, through a paint
-//! callback — so the backdrop is a small OpenGL pass of our own
-//! (`egui_glow::CallbackFn`): the pixels behind the bar are copied out of the
-//! framebuffer into a texture and drawn back, blurred. The bar then paints its
-//! translucent fill over that, which is what turns the mail scrolling under it
-//! into a smudge of its colors instead of unreadable text.
+//! drawn, and there is no blur primitive. The *renderer* can — so the backdrop
+//! is a small pass of our own: the pixels behind the bar are copied into a
+//! texture, blurred, and drawn back before the bar paints its translucent fill
+//! over them, which is what turns the mail scrolling under the bar into a
+//! smudge of its colors instead of unreadable text.
+//!
+//! wgpu cannot do what the glow build did, though. There the copy was
+//! `glCopyTexSubImage2D` *inside* the pass that draws the bar: OpenGL will read
+//! the framebuffer it is currently drawing into. wgpu will not — a texture
+//! cannot be sampled while it is a pass's attachment, and the attachment here
+//! is the window's surface, which is not even created with `COPY_SRC`. So the
+//! frame is split around this pass instead (see `crate::gpu`): everything
+//! behind the bar is drawn into an offscreen *scene* texture, this module
+//! copies the bar's strip of it (a plain texture-to-texture copy, the one
+//! thing wgpu does allow), blurs it in two separable passes, and the rest of
+//! the frame — the bar's fill, its icons, its text — is drawn onto the window
+//! with the blurred strip under it. The callback is the seam between the two
+//! halves of the frame and, in the second half, the thing that draws the strip.
 //!
 //! The blur is separable — a horizontal pass into an offscreen texture of the
-//! bar's size, then a vertical one back onto the window — because a single
-//! two-dimensional kernel cheap enough to run per frame is sampled too sparsely
-//! to hide the detail it is meant to destroy: nine taps four pixels apart left
-//! a visible comb over the text. Seventeen taps a pixel and a half apart, twice,
-//! cost less and leave nothing readable.
+//! bar's size, then a vertical one — because a single two-dimensional kernel
+//! cheap enough to run per frame is sampled too sparsely to hide the detail it
+//! is meant to destroy: nine taps four pixels apart left a visible comb over
+//! the text. Seventeen taps a pixel and a half apart, twice, cost less and
+//! leave nothing readable. Both passes draw one full-viewport triangle (the
+//! strip *is* the viewport), and the same pipeline draws the result: with a
+//! step of zero the blur is a plain copy.
 //!
-//! egui_glow restores its own GL state after every callback (it calls
-//! `prepare_painting` again), so this pass binds program, VAO, textures and
-//! framebuffer as it needs them and leaves them bound. Both passes draw one
-//! full-screen quad — the bar *is* the viewport — so there is no projection to
-//! set up, only the viewport of the offscreen pass, which is the bar's size.
-//!
-//! Every failure here is soft. A driver that will not compile the shader or
-//! refuses to copy out of the framebuffer — a multisampled one would, which is
-//! why `main.rs` keeps eframe's `multisampling` at its default of 0 — leaves
-//! the bar translucent over the crisp content instead of frosted, and `failed`
-//! keeps it from trying again every frame.
+//! Every failure here is soft. A device that will not take the pipeline or the
+//! textures — for want of a format, say — reports once, sets `failed`, and
+//! leaves the bar translucent over the crisp content instead of frosted.
 
 use std::sync::{Arc, Mutex};
 
-use eframe::egui_glow;
-use eframe::glow;
+use egui_wgpu::CallbackTrait;
 
-/// The blur kernel: `TAPS` samples either side of a fragment, `STEP_PX`
-/// physical pixels apart, run once per axis. Sampling inside the pixel grid is
-/// what keeps text from aliasing into a pattern instead of dissolving.
-const TAPS: i32 = 8;
+/// The width of one blur step, in physical pixels: the shader takes its taps
+/// this far apart (see [`SHADER`], which carries the tap count and the loop
+/// that reads them). Sampling inside the pixel grid is what keeps text from
+/// aliasing into a pattern instead of dissolving.
 const STEP_PX: f32 = 2.0;
 
 /// The glass pass, shared with the paint callback it hands to egui. Cloning it
-/// clones a handle: the GL objects are made once, on the first callback.
+/// clones a handle: the GPU objects are made once, on the first floating frame.
 #[derive(Clone, Default)]
 pub struct Glass {
-    blur: Arc<Mutex<Option<Blur>>>,
+    shared: Arc<Mutex<Shared>>,
+}
+
+#[derive(Default)]
+struct Shared {
+    /// The bar's rect this frame, in points, recorded by `Glass::backdrop`.
+    /// It is what tells the integration where the frame splits and what to
+    /// blur; `None` means the bar is docked and the frame needs none of it.
+    rect: Option<egui::Rect>,
+    /// The GPU objects, made on the first frame that needs them.
+    gpu: Option<Gpu>,
+    /// Set for good once the device has refused something: the bar is then only
+    /// translucent, and nothing here runs again.
+    failed: bool,
 }
 
 impl Glass {
     /// Blur whatever has already been drawn behind `rect`.
     ///
-    /// egui runs a callback in the order the shape was added, so this belongs
-    /// *before* the fill and the glyphs that sit on the glass. Nothing is
-    /// painted outside `rect`: egui has already set the viewport to it.
+    /// This belongs *before* the fill and the glyphs that sit on the glass,
+    /// which is also where the frame is split: everything added before it is
+    /// drawn into the scene texture the blur reads, everything after it onto
+    /// the window, over the blurred strip.
     pub fn backdrop(&self, painter: &egui::Painter, rect: egui::Rect) {
         if !rect.is_positive() {
             return;
         }
-        let blur = self.blur.clone();
-        painter.add(egui::Shape::Callback(egui::PaintCallback {
-            rect,
-            callback: Arc::new(egui_glow::CallbackFn::new(move |info, painter| {
-                let Ok(mut slot) = blur.lock() else {
-                    return;
-                };
-                let blur = slot.get_or_insert_with(Blur::default);
-                blur.paint(painter.gl(), painter.intermediate_fbo(), &info);
-            })),
-        }));
+        if let Ok(mut shared) = self.shared.lock() {
+            shared.rect = Some(rect);
+        }
+        let callback = GlassCallback {
+            shared: self.shared.clone(),
+        };
+        painter.add(egui::Shape::Callback(
+            egui_wgpu::Callback::new_paint_callback(rect, callback),
+        ));
     }
-}
 
-/// The GL objects of the pass, made on first use and kept for the life of the
-/// context (a new context would rebuild everything from scratch anyway).
-#[derive(Default)]
-struct Blur {
-    program: Option<glow::Program>,
-    vao: Option<glow::VertexArray>,
-    vbo: Option<glow::Buffer>,
-    /// The pixels behind the bar, copied out of the framebuffer.
-    source: Option<glow::Texture>,
-    /// The horizontal pass's result, drawn into the next pass.
-    target: Option<glow::Texture>,
-    /// The framebuffer `target` is attached to.
-    fbo: Option<glow::Framebuffer>,
-    /// The size `source` and `target` were made for, so a resized bar makes
-    /// new ones.
-    size: [i32; 2],
-    /// Set for good once the driver has refused something: the bar is then only
-    /// translucent.
-    failed: bool,
-}
+    /// Forget last frame's bar: `backdrop` records this frame's.
+    pub(crate) fn begin_frame(&self) {
+        if let Ok(mut shared) = self.shared.lock() {
+            shared.rect = None;
+        }
+    }
 
-impl Blur {
-    /// Copy the pixels behind the bar and draw them back blurred.
-    fn paint(
-        &mut self,
-        gl: &glow::Context,
-        window_fbo: Option<glow::Framebuffer>,
-        info: &egui::PaintCallbackInfo,
+    /// The bar's rect in physical pixels, clamped to the window, or `None`
+    /// when the bar is docked (or the pass has failed).
+    pub(crate) fn rect_px(&self, pixels_per_point: f32, size: [u32; 2]) -> Option<[u32; 4]> {
+        let shared = self.shared.lock().ok()?;
+        if shared.failed {
+            return None;
+        }
+        let rect = shared.rect?;
+        let x = (rect.min.x * pixels_per_point)
+            .round()
+            .clamp(0.0, size[0] as f32) as u32;
+        let y = (rect.min.y * pixels_per_point)
+            .round()
+            .clamp(0.0, size[1] as f32) as u32;
+        let width = (rect.width() * pixels_per_point)
+            .round()
+            .clamp(0.0, (size[0] - x) as f32) as u32;
+        let height = (rect.height() * pixels_per_point)
+            .round()
+            .clamp(0.0, (size[1] - y) as f32) as u32;
+        (width > 0 && height > 0).then_some([x, y, width, height])
+    }
+
+    /// Where the frame splits: the index of the glass callback in the frame's
+    /// shapes, which is the first shape that must be drawn *over* the blurred
+    /// strip rather than into the scene behind it.
+    pub(crate) fn split(&self, shapes: &[egui::ClippedPrimitive]) -> Option<usize> {
+        let shared = self.shared.lock().ok()?;
+        if shared.failed {
+            return None;
+        }
+        let rect = shared.rect?;
+        shapes.iter().position(|shape| match &shape.primitive {
+            egui::epaint::Primitive::Callback(callback) => {
+                // The same rect, to within the rounding layout does to it.
+                (callback.rect.min - rect.min).length() < 0.5
+                    && (callback.rect.size() - rect.size()).length() < 0.5
+            }
+            _ => false,
+        })
+    }
+
+    /// Make the pass's textures and pipeline for a strip of this size, if they
+    /// are not already made for it.
+    pub(crate) fn ensure(
+        &self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        format: wgpu::TextureFormat,
+        size: [u32; 2],
     ) {
-        use glow::HasContext as _;
-
-        if self.failed {
+        if size[0] == 0 || size[1] == 0 {
             return;
         }
-        let viewport = info.viewport_in_pixels();
-        let (width, height) = (viewport.width_px, viewport.height_px);
-        if width <= 0 || height <= 0 {
+        let Ok(mut shared) = self.shared.lock() else {
+            return;
+        };
+        if shared.failed
+            || shared
+                .gpu
+                .as_ref()
+                .is_some_and(|gpu| gpu.fits(format, size))
+        {
             return;
         }
-        if self.program.is_none() {
-            if let Err(error) = self.build(gl) {
-                self.fail(&error);
-                return;
+        let scope = device.push_error_scope(wgpu::ErrorFilter::Validation);
+        let gpu = Gpu::new(device, queue, format, size);
+        let error = pollster::block_on(scope.pop());
+        match (gpu, error) {
+            (Some(gpu), None) => shared.gpu = Some(gpu),
+            (_, Some(error)) => {
+                shared.failed = true;
+                eprintln!("kimo: the title bar will not be frosted: {error}");
             }
+            (None, None) => {}
         }
+    }
 
-        unsafe {
-            // The offscreen pass has its own coordinate system, so egui's
-            // scissor (the bar, in window pixels) cannot stay on; it re-enables
-            // it after this callback.
-            gl.disable(glow::SCISSOR_TEST);
-
-            if self.size != [width, height] {
-                self.discard_textures(gl);
-                self.size = [width, height];
-                match Self::new_target(gl, width, height) {
-                    Ok((source, target, fbo)) => {
-                        self.source = Some(source);
-                        self.target = Some(target);
-                        self.fbo = Some(fbo);
-                    }
-                    Err(error) => {
-                        self.fail(&error);
-                        return;
-                    }
-                }
-            }
-            let (Some(program), Some(vao), Some(source), Some(target), Some(fbo)) =
-                (self.program, self.vao, self.source, self.target, self.fbo)
-            else {
-                return;
-            };
-
-            // Everything drawn before the bar is in the framebuffer we are
-            // painting into, so the backdrop is one copy out of it.
-            gl.active_texture(glow::TEXTURE0);
-            gl.bind_texture(glow::TEXTURE_2D, Some(source));
-            gl.copy_tex_sub_image_2d(
-                glow::TEXTURE_2D,
-                0,
-                0,
-                0,
-                viewport.left_px,
-                viewport.from_bottom_px,
+    /// Copy the bar's strip out of `scene` and blur it, into the texture the
+    /// callback draws. This runs between the frame's two halves, so the scene
+    /// holds everything *behind* the bar and nothing of the bar itself.
+    pub(crate) fn blur(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        scene: &wgpu::Texture,
+        rect: [u32; 4],
+    ) {
+        let Ok(shared) = self.shared.lock() else {
+            return;
+        };
+        let Some(gpu) = shared.gpu.as_ref() else {
+            return;
+        };
+        if shared.failed {
+            return;
+        }
+        let [x, y, width, height] = rect;
+        encoder.copy_texture_to_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: scene,
+                mip_level: 0,
+                origin: wgpu::Origin3d { x, y, z: 0 },
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::TexelCopyTextureInfo {
+                texture: &gpu.strip.texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::Extent3d {
                 width,
                 height,
-            );
-            let error = gl.get_error();
-            if error != glow::NO_ERROR {
-                // A driver that will not read its own framebuffer (the copy is
-                // invalid on a multisampled one) leaves the texture alone and
-                // the bar translucent over the content instead of frosted.
-                self.fail(&format!("GL error {error:#x} on the framebuffer copy"));
-                return;
-            }
-
-            gl.use_program(Some(program));
-            gl.bind_vertex_array(Some(vao));
-            let texture_uniform = gl.get_uniform_location(program, "u_texture");
-            let step_uniform = gl.get_uniform_location(program, "u_step");
-            if let Some(location) = &texture_uniform {
-                gl.uniform_1_i32(Some(location), 0);
-            }
-            let step = |gl: &glow::Context, x: f32, y: f32| {
-                if let Some(location) = &step_uniform {
-                    gl.uniform_2_f32(Some(location), x, y);
-                }
-            };
-
-            // Horizontal, offscreen: the quad covers the whole target, so the
-            // viewport is its size rather than the bar's place in the window.
-            gl.bind_framebuffer(glow::FRAMEBUFFER, Some(fbo));
-            gl.viewport(0, 0, width, height);
-            step(gl, STEP_PX / width as f32, 0.0);
-            gl.draw_arrays(glow::TRIANGLE_STRIP, 0, 4);
-
-            // Vertical, back onto the bar itself.
-            gl.bind_framebuffer(glow::FRAMEBUFFER, window_fbo);
-            gl.viewport(viewport.left_px, viewport.from_bottom_px, width, height);
-            gl.bind_texture(glow::TEXTURE_2D, Some(target));
-            step(gl, 0.0, STEP_PX / height as f32);
-            gl.draw_arrays(glow::TRIANGLE_STRIP, 0, 4);
-        }
-    }
-
-    /// Report a failure once and stop trying: the bar stays translucent.
-    fn fail(&mut self, error: &str) {
-        self.failed = true;
-        eprintln!("kimo: the title bar will not be frosted: {error}");
-    }
-
-    /// Free what a resize replaces.
-    unsafe fn discard_textures(&mut self, gl: &glow::Context) {
-        use glow::HasContext as _;
-
-        if let Some(texture) = self.source.take() {
-            gl.delete_texture(texture);
-        }
-        if let Some(texture) = self.target.take() {
-            gl.delete_texture(texture);
-        }
-        if let Some(fbo) = self.fbo.take() {
-            gl.delete_framebuffer(fbo);
-        }
-    }
-
-    /// The two textures of the pass and the framebuffer the first one draws
-    /// into: the copy of the bar, and the horizontally blurred result.
-    unsafe fn new_target(
-        gl: &glow::Context,
-        width: i32,
-        height: i32,
-    ) -> Result<(glow::Texture, glow::Texture, glow::Framebuffer), String> {
-        use glow::HasContext as _;
-
-        let source = new_texture(gl, width, height)?;
-        let target = new_texture(gl, width, height)?;
-        let fbo = gl.create_framebuffer()?;
-        gl.bind_framebuffer(glow::FRAMEBUFFER, Some(fbo));
-        gl.framebuffer_texture_2d(
-            glow::FRAMEBUFFER,
-            glow::COLOR_ATTACHMENT0,
-            glow::TEXTURE_2D,
-            Some(target),
-            0,
+                depth_or_array_layers: 1,
+            },
         );
-        let status = gl.check_framebuffer_status(glow::FRAMEBUFFER);
-        gl.bind_framebuffer(glow::FRAMEBUFFER, None);
-        if status != glow::FRAMEBUFFER_COMPLETE {
-            gl.delete_framebuffer(fbo);
-            gl.delete_texture(target);
-            gl.delete_texture(source);
-            return Err(format!("incomplete framebuffer: {status:#x}"));
-        }
-        Ok((source, target, fbo))
-    }
-
-    /// Compile the pass: one program, one VAO holding the quad.
-    fn build(&mut self, gl: &glow::Context) -> Result<(), String> {
-        use glow::HasContext as _;
-
-        unsafe {
-            let version = egui_glow::ShaderVersion::get(gl);
-            // `#version 140` and `#version 300 es` both take the modern
-            // in/out interface; a context older than either is not one eframe
-            // runs on, and a shader that will not build is a soft failure.
-            let header = format!(
-                "{}{}",
-                version.version_declaration(),
-                if version.is_embedded() {
-                    "precision mediump float;\n"
-                } else {
-                    ""
-                }
-            );
-            let taps = TAPS;
-            let samples = (2 * TAPS + 1) as f32;
-            let vertex = format!(
-                "{header}in vec2 a_pos;\nin vec2 a_uv;\nout vec2 v_uv;\n\
-                 void main() {{\n    v_uv = a_uv;\n    gl_Position = vec4(a_pos, 0.0, 1.0);\n}}\n"
-            );
-            let fragment = format!(
-                "{header}uniform sampler2D u_texture;\nuniform vec2 u_step;\nin vec2 v_uv;\n\
-                 out vec4 f_color;\nvoid main() {{\n    vec4 sum = vec4(0.0);\n    \
-                 for (int i = -{taps}; i <= {taps}; ++i) {{\n        \
-                 sum += texture(u_texture, v_uv + vec2(float(i)) * u_step);\n    }}\n    \
-                 f_color = sum / {samples};\n}}\n"
-            );
-
-            let program = gl.create_program()?;
-            let mut shaders = Vec::new();
-            for (kind, source) in [
-                (glow::VERTEX_SHADER, &vertex),
-                (glow::FRAGMENT_SHADER, &fragment),
-            ] {
-                let shader = gl.create_shader(kind)?;
-                gl.shader_source(shader, source);
-                gl.compile_shader(shader);
-                if !gl.get_shader_compile_status(shader) {
-                    let log = gl.get_shader_info_log(shader);
-                    gl.delete_shader(shader);
-                    for shader in shaders {
-                        gl.detach_shader(program, shader);
-                        gl.delete_shader(shader);
-                    }
-                    gl.delete_program(program);
-                    return Err(log);
-                }
-                gl.attach_shader(program, shader);
-                shaders.push(shader);
-            }
-            gl.link_program(program);
-            let linked = gl.get_program_link_status(program);
-            let log = gl.get_program_info_log(program);
-            for shader in shaders {
-                gl.detach_shader(program, shader);
-                gl.delete_shader(shader);
-            }
-            if !linked {
-                gl.delete_program(program);
-                return Err(log);
-            }
-
-            // A triangle strip over the whole viewport: the bar *is* the
-            // viewport here, so the NDC corners are the bar's corners and the
-            // texture's own corners are the uvs.
-            let quad: [f32; 16] = [
-                -1.0, -1.0, 0.0, 0.0, //
-                1.0, -1.0, 1.0, 0.0, //
-                -1.0, 1.0, 0.0, 1.0, //
-                1.0, 1.0, 1.0, 1.0, //
-            ];
-            let bytes = std::slice::from_raw_parts(
-                quad.as_ptr().cast::<u8>(),
-                std::mem::size_of_val(&quad),
-            );
-            let vao = gl.create_vertex_array()?;
-            let vbo = gl.create_buffer()?;
-            gl.bind_vertex_array(Some(vao));
-            gl.bind_buffer(glow::ARRAY_BUFFER, Some(vbo));
-            gl.buffer_data_u8_slice(glow::ARRAY_BUFFER, bytes, glow::STATIC_DRAW);
-            let stride = 4 * std::mem::size_of::<f32>() as i32;
-            for (name, offset) in [("a_pos", 0), ("a_uv", 8)] {
-                if let Some(location) = gl.get_attrib_location(program, name) {
-                    gl.enable_vertex_attrib_array(location);
-                    gl.vertex_attrib_pointer_f32(location, 2, glow::FLOAT, false, stride, offset);
-                }
-            }
-
-            self.program = Some(program);
-            self.vao = Some(vao);
-            self.vbo = Some(vbo);
-            Ok(())
-        }
+        // One pass per axis: the bind group carries that axis's step, and each
+        // pass draws the one triangle over its whole viewport.
+        gpu.blur_pass(encoder, &gpu.first.view, &gpu.strip.bind_group);
+        gpu.blur_pass(encoder, &gpu.second.view, &gpu.first.bind_group);
     }
 }
 
-/// A texture the size of the bar, with linear sampling clamped to its edge: the
-/// blur reads past the edges, and clamping keeps the far side from bleeding in.
-unsafe fn new_texture(
-    gl: &glow::Context,
-    width: i32,
-    height: i32,
-) -> Result<glow::Texture, String> {
-    use glow::HasContext as _;
+/// The GPU objects of the pass, made on the first floating frame and kept until
+/// the window — or the bar — changes size.
+struct Gpu {
+    /// One pipeline for all three draws: the two blur axes, and the copy the
+    /// callback does with a step of zero.
+    pipeline: wgpu::RenderPipeline,
+    /// The pixels behind the bar, copied out of the scene.
+    strip: Target,
+    /// The horizontal pass's result.
+    first: Target,
+    /// The vertical pass's result, which the callback draws.
+    second: Target,
+    format: wgpu::TextureFormat,
+    size: [u32; 2],
+}
 
-    let texture = gl.create_texture()?;
-    gl.bind_texture(glow::TEXTURE_2D, Some(texture));
-    gl.tex_parameter_i32(
-        glow::TEXTURE_2D,
-        glow::TEXTURE_MIN_FILTER,
-        glow::LINEAR as i32,
-    );
-    gl.tex_parameter_i32(
-        glow::TEXTURE_2D,
-        glow::TEXTURE_MAG_FILTER,
-        glow::LINEAR as i32,
-    );
-    gl.tex_parameter_i32(
-        glow::TEXTURE_2D,
-        glow::TEXTURE_WRAP_S,
-        glow::CLAMP_TO_EDGE as i32,
-    );
-    gl.tex_parameter_i32(
-        glow::TEXTURE_2D,
-        glow::TEXTURE_WRAP_T,
-        glow::CLAMP_TO_EDGE as i32,
-    );
-    // No pixels of our own: whatever samples this fills it first.
-    gl.tex_image_2d(
-        glow::TEXTURE_2D,
-        0,
-        glow::RGBA8 as i32,
-        width,
-        height,
-        0,
-        glow::RGBA,
-        glow::UNSIGNED_BYTE,
-        glow::PixelUnpackData::Slice(None),
-    );
-    Ok(texture)
+impl Gpu {
+    fn new(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        format: wgpu::TextureFormat,
+        size: [u32; 2],
+    ) -> Option<Self> {
+        let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("kimo_glass"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+            ],
+        });
+
+        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("kimo_glass"),
+            source: wgpu::ShaderSource::Wgsl(SHADER.into()),
+        });
+        let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("kimo_glass"),
+            bind_group_layouts: &[Some(&layout)],
+            immediate_size: 0,
+        });
+        let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("kimo_glass"),
+            layout: Some(&pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &shader,
+                entry_point: Some("vs_main"),
+                compilation_options: Default::default(),
+                buffers: &[],
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &shader,
+                entry_point: Some("fs_main"),
+                compilation_options: Default::default(),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format,
+                    blend: None,
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+            }),
+            primitive: wgpu::PrimitiveState::default(),
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState::default(),
+            multiview_mask: None,
+            cache: None,
+        });
+
+        let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("kimo_glass"),
+            // Clamped: the strip's edge samples its own edge, not the far side.
+            address_mode_u: wgpu::AddressMode::ClampToEdge,
+            address_mode_v: wgpu::AddressMode::ClampToEdge,
+            address_mode_w: wgpu::AddressMode::ClampToEdge,
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            ..Default::default()
+        });
+
+        // The step of each pass, which is what makes one shader do all three:
+        // a pixel and a half either side per axis, none at all for the copy.
+        // Written once — they only change when the bar is resized.
+        let step = |x: f32, y: f32| {
+            let buffer = device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("kimo_glass_step"),
+                size: 8,
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            queue.write_buffer(&buffer, 0, &floats(x, y));
+            buffer
+        };
+        let (width, height) = (size[0] as f32, size[1] as f32);
+        let steps = [
+            step(STEP_PX / width, 0.0),
+            step(0.0, STEP_PX / height),
+            step(0.0, 0.0),
+        ];
+
+        let mut textures = Vec::new();
+        for label in ["kimo_glass_strip", "kimo_glass_first", "kimo_glass_second"] {
+            textures.push(device.create_texture(&wgpu::TextureDescriptor {
+                label: Some(label),
+                size: wgpu::Extent3d {
+                    width: size[0],
+                    height: size[1],
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format,
+                usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                    | wgpu::TextureUsages::TEXTURE_BINDING
+                    | wgpu::TextureUsages::COPY_DST,
+                view_formats: &[],
+            }));
+        }
+        let mut target = |index: usize| {
+            let texture = textures.remove(0);
+            let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+            let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("kimo_glass"),
+                layout: &layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: wgpu::BindingResource::TextureView(&view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: wgpu::BindingResource::Sampler(&sampler),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: steps[index].as_entire_binding(),
+                    },
+                ],
+            });
+            Target {
+                texture,
+                view,
+                bind_group,
+            }
+        };
+        let (strip, first, second) = (target(0), target(1), target(2));
+
+        Some(Self {
+            pipeline,
+            strip,
+            first,
+            second,
+            format,
+            size,
+        })
+    }
+
+    fn fits(&self, format: wgpu::TextureFormat, size: [u32; 2]) -> bool {
+        self.format == format && self.size == size
+    }
+
+    /// One axis of the blur, or the copy: a triangle over the whole target,
+    /// sampling `sources` through its own bind group.
+    fn blur_pass(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        target: &wgpu::TextureView,
+        source: &wgpu::BindGroup,
+    ) {
+        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("kimo_glass_blur"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: target,
+                resolve_target: None,
+                depth_slice: None,
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                    store: wgpu::StoreOp::Store,
+                },
+            })],
+            depth_stencil_attachment: None,
+            timestamp_writes: None,
+            occlusion_query_set: None,
+            multiview_mask: None,
+        });
+        pass.set_pipeline(&self.pipeline);
+        pass.set_bind_group(0, source, &[]);
+        pass.draw(0..3, 0..1);
+    }
+}
+
+/// The one texture a pass reads from and writes to.
+struct Target {
+    texture: wgpu::Texture,
+    view: wgpu::TextureView,
+    bind_group: wgpu::BindGroup,
+}
+
+/// What the bar adds to the frame: in the second half it draws the blurred
+/// strip, into the viewport egui has already set to the bar.
+struct GlassCallback {
+    shared: Arc<Mutex<Shared>>,
+}
+
+impl CallbackTrait for GlassCallback {
+    fn paint(
+        &self,
+        _info: egui::PaintCallbackInfo,
+        pass: &mut wgpu::RenderPass<'static>,
+        _resources: &egui_wgpu::CallbackResources,
+    ) {
+        let Ok(shared) = self.shared.lock() else {
+            return;
+        };
+        let Some(gpu) = shared.gpu.as_ref() else {
+            return;
+        };
+        if shared.failed {
+            return;
+        }
+        pass.set_pipeline(&gpu.pipeline);
+        pass.set_bind_group(0, &gpu.second.bind_group, &[]);
+        pass.draw(0..3, 0..1);
+    }
+}
+
+/// The pass's shader. One triangle covers the viewport — the strip (or the bar)
+/// *is* the viewport, so there is no projection to set up, only the uv of the
+/// corner that says which way the texture reads.
+const SHADER: &str = r#"
+struct Uniforms {
+    step: vec2<f32>,
+};
+
+@group(0) @binding(0) var source: texture_2d<f32>;
+@group(0) @binding(1) var source_sampler: sampler;
+@group(0) @binding(2) var<uniform> uniforms: Uniforms;
+
+struct VertexOut {
+    @builtin(position) position: vec4<f32>,
+    @location(0) uv: vec2<f32>,
+};
+
+const TAPS: i32 = 8;
+const SAMPLES: f32 = 17.0;
+
+@vertex
+fn vs_main(@builtin(vertex_index) index: u32) -> VertexOut {
+    // (0,0), (2,0), (0,2): one triangle over the whole clip square, whose uv
+    // runs 0..1 with v = 0 at the top, as the texture does.
+    let corner = vec2<f32>(f32((index << 1u) & 2u), f32(index & 2u));
+    var out: VertexOut;
+    out.position = vec4<f32>(corner.x * 2.0 - 1.0, 1.0 - corner.y * 2.0, 0.0, 1.0);
+    out.uv = corner;
+    return out;
+}
+
+@fragment
+fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
+    var sum = vec4<f32>(0.0);
+    for (var i: i32 = -TAPS; i <= TAPS; i = i + 1) {
+        sum = sum + textureSample(source, source_sampler, in.uv + vec2<f32>(f32(i), 0.0) * uniforms.step);
+    }
+    return sum / SAMPLES;
+}
+"#;
+
+/// Two little-endian floats for a uniform buffer. (wgpu's own bytemuck is not
+/// a dependency of this crate.)
+fn floats(x: f32, y: f32) -> [u8; 8] {
+    let mut bytes = [0u8; 8];
+    bytes[0..4].copy_from_slice(&x.to_le_bytes());
+    bytes[4..8].copy_from_slice(&y.to_le_bytes());
+    bytes
 }

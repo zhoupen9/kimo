@@ -536,11 +536,17 @@ impl AccountForm {
 }
 
 impl KimoApp {
-    pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
+    /// The title bar's glass: the integration reads the rect it recorded for
+    /// this frame and blurs that strip of the scene (`crate::gpu`).
+    pub(crate) fn glass(&self) -> &Glass {
+        &self.glass
+    }
+
+    pub fn new(ctx: &egui::Context) -> Self {
         // egui's built-in fonts only cover Latin/Cyrillic/Greek, so the CJK
         // fallback goes in immediately; the families picked in Preferences are
         // applied once the worker scan below has resolved their files.
-        crate::fonts::install(&cc.egui_ctx, None, None);
+        crate::fonts::install(ctx, None, None);
 
         let settings = storage::load_settings();
         // The accounts and their mail live in the database; this is the one
@@ -567,12 +573,12 @@ impl KimoApp {
         }
 
         // Folder-list icons: white PNGs (see `folders`), tinted per row.
-        let folder_icons = load_folder_icons(&cc.egui_ctx);
-        let brand_icon = load_brand_icon(&cc.egui_ctx);
+        let folder_icons = load_folder_icons(ctx);
+        let brand_icon = load_brand_icon(ctx);
 
         let (tx, rx) = mpsc::channel();
         let mut app = Self {
-            ctx: cc.egui_ctx.clone(),
+            ctx: ctx.clone(),
             tx,
             rx,
             accounts,
@@ -3409,11 +3415,12 @@ fn swatch(ui: &mut egui::Ui, color: egui::Color32) {
     );
 }
 
-impl eframe::App for KimoApp {
-    /// One frame. egui 0.36 hands the app a root `Ui` to draw into rather than
-    /// a `Context`; the context is cloned out of it because the areas, modals,
-    /// animations and layer painting below are all context-level.
-    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+impl KimoApp {
+    /// One frame. The integration (`crate::gpu`) hands over the root `Ui` egui
+    /// 0.36 draws the whole app into; the context is cloned out of it because
+    /// the areas, modals, animations and layer painting below are all
+    /// context-level.
+    pub fn ui(&mut self, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
         let ctx = &ctx;
         self.drain_events();

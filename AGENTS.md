@@ -7,7 +7,10 @@ Read this before changing anything.
 
 Kimo is a desktop **email client** GUI written in pure Rust:
 
-- **GUI:** eframe/egui (immediate mode, pinned to the 0.36 line).
+- **GUI:** egui (immediate mode, pinned to the 0.36 line), driven directly
+  through winit + `egui-winit` + `egui-wgpu` instead of through eframe, because
+  the floating title bar's blur needs the frame split in two — see the
+  renderer convention below.
 - **Protocols:** IMAP4rev1 and POP3 **only**, implemented by hand in
   `src/protocol/` — no `imap`/`async-imap`/`pop` crates.
 - **TLS:** rustls with the pure-Rust `ring` crypto provider + webpki-roots.
@@ -85,7 +88,7 @@ Kimo is a desktop **email client** GUI written in pure Rust:
 2. **No async runtime.** Networking runs on short-lived `std::thread` jobs
    (see `src/sync.rs`); results come back over `std::sync::mpsc`. Do not
    introduce tokio, async-std, or an executor.
-3. **Never block the UI thread.** `eframe::App::ui` only drains the
+3. **Never block the UI thread.** `KimoApp::ui` only drains the
    event channel and draws. Any socket I/O, file scan or other potentially
    slow work must be a `sync::Job` on a worker thread. Workers call
    `ctx.request_repaint()` when they emit.
@@ -115,7 +118,8 @@ done. There is no CI yet — that discipline is on you.
 ## Architecture
 
 ```
-src/main.rs             entry point; installs the rustls provider (ring + FFDHE), launches eframe
+src/main.rs             entry point; the winit event loop, the window, egui's input state
+src/gpu.rs              the wgpu side: device, surface, egui's renderer, and one frame
 src/app.rs              all UI: KimoApp state, panels, preferences modal, event handling
 src/models.rs           Account / Protocol / TlsMode / MailMessage (plain types: nothing is serialised any more)
 src/error.rs            MailError + MailResult
@@ -129,7 +133,7 @@ src/html.rs             HTML mail → egui widgets (subset: blocks, lists, table
 src/blitz_render.rs     HTML mail → rasterized page via Blitz (headless render, net provider, fonts)
 src/css.rs              tiny CSS subset (decls, tag/class/id selectors) for HTML mail
 src/folders.rs          folder kind (name → special mailbox, incl. CJK) + embedded row icons
-src/glass.rs            the floating title bar's frosted backdrop (an OpenGL paint callback)
+src/glass.rs            the floating title bar's frosted backdrop (wgpu passes + a paint callback)
 src/render_bench.rs     test-only: times both HTML renderers for the same bodies (bench_render)
 src/tray.rs             StatusNotifierItem over raw D-Bus (session bus, std::thread) + svg→ARGB icon
 src/sync.rs             Job/Event enums, worker threads, per-protocol sync logic
@@ -225,7 +229,7 @@ Event (mpsc) ──► drain_events() at frame start ──► merge into Accoun
   title-bar box only displays the query — and Enter skips the wait;
   `search_applied` is the query the results on screen already answer, which is
   what keeps an unchanged query from searching again every frame. The request
-  is pumped from `KimoApp::update`, not from the message list: the popup that
+  is pumped from `KimoApp::ui`, not from the message list: the popup that
   edits the query sits outside every column.
 - Remote mutations are `UID STORE +FLAGS.SILENT (\Seen)` (IMAP) and, behind
   the title bar's Delete button, `\Deleted` + `UID EXPUNGE` (IMAP) or `DELE`
@@ -324,10 +328,10 @@ Event (mpsc) ──► drain_events() at frame start ──► merge into Accoun
 - Pure parsing helpers (e.g. `extract_uid`, `literal_size`, `html_to_text`)
   live next to their users and get `#[cfg(test)]` unit tests — that is where
   tests go in this codebase; no `tests/` directory yet.
-- egui and eframe are pinned in lockstep (`0.36`), and the step from 0.31 was
-  not a version bump but a change of shape: 0.36 draws the whole app into one
-  root `Ui` (`eframe::App::ui` — there is no `Context`-level `update` any
-  more), the side panels are `egui::Panel::left`/`right` shown *onto* that `Ui`
+- egui is pinned to the `0.36` line, with `egui-winit`, `egui-wgpu` and `wgpu`
+  moving in lockstep, and the step from 0.31 was not a version bump but a change
+  of shape: 0.36 draws the whole app into one root `Ui` (`KimoApp::ui` — there
+  is no `Context`-level `update` any more), the side panels are `egui::Panel::left`/`right` shown *onto* that `Ui`
   (with `min_size`/`default_size`, not `min_width`/`default_width`), the
   context's `screen_rect`/`available_rect` are `viewport_rect`/`content_rect`
   (the message list's own rect is taken from `mail_list`, which records it),
@@ -336,12 +340,23 @@ Event (mpsc) ──► drain_events() at frame start ──► merge into Accoun
   in both of them and sets the preference from Kimo's own system detection, so
   a stock widget is never drawn in egui's palette. The layout tests run their
   frame through `run_frame`, because epaint panics on a dropped
-  `TexturesDelta`. eframe's *default* renderer is wgpu now; Kimo asks for
-  `default-features = false` plus `glow` (with `accesskit`, `default_fonts`,
-  `wayland`, `x11`) because the floating title bar's blur is an `egui_glow`
-  paint callback — the one place the backend shows — and wgpu would be a large
-  dependency for an app that draws no 3D. Read the egui CHANGELOG before
-  bumping again.
+  `TexturesDelta`. The integration is `src/gpu.rs` + `src/main.rs`, not
+  eframe: eframe owns the frame's render pass, and the glass needs it split in
+  two (see the frosted-backdrop bullet). `main.rs` is a winit
+  `ApplicationHandler` — window, `egui_winit::State` for input, egui's repaint
+  callback turned into a `ControlFlow::WaitUntil` timer (a deadline that has
+  not come round yet must be *left in place*: a loop that consumes it sleeps
+  through the frame egui asked for), and
+  `egui_winit::process_viewport_commands` for the commands the title bar sends
+  (drag, minimize, maximize, close). The renderer is wgpu, and its 0.36-era API
+  is young: `InstanceDescriptor` is built by `new_with_display_handle`,
+  presenting is `Queue::present`, pipeline layouts take
+  `bind_group_layouts: &[Some(&layout)]` and `immediate_size`, passes and
+  pipelines take `multiview_mask`, and a `TexturesDelta` must be emptied
+  (`set.clear()` as it is uploaded, `free` when the frame is on its way)
+  because epaint panics on one that is dropped unapplied. Keep `egui`,
+  `egui-winit`, `egui-wgpu` and `wgpu` in lockstep when bumping, and read the
+  egui CHANGELOG before doing it.
 - Layout is a three-column mail client: left navigation (collapsible via
   the title-bar toggle; auto-collapses when the window is narrower than
   640px — see `NAV_AUTO_COLLAPSE_WIDTH`), the central column (while a search is
@@ -490,24 +505,29 @@ Event (mpsc) ──► drain_events() at frame start ──► merge into Accoun
   a widget slot, because the stock frame is drawn from
   `Visuals::text_edit_bg_color` (0.36's name for the slot; it is an `Option`
   now).
-- The frosted backdrop is the one piece of hand-written OpenGL in the app
-  (`src/glass.rs`), because egui has no blur: nothing in the painter can sample
-  what has already been drawn. It is an `egui::PaintCallback`
-  (`egui_glow::CallbackFn`) that copies the pixels behind the bar out of the
-  framebuffer into a texture and draws them back through a separable two-pass
-  blur — horizontal into an offscreen texture, vertical onto the window. A
-  single two-dimensional kernel cheap enough to run per frame is sampled too
-  sparsely and leaves a comb of aliasing over the very letters it is meant to
-  destroy; sampling each axis a pixel and a half apart costs less and dissolves
-  the text instead. egui_glow restores its own GL state after every callback
-  (it calls `prepare_painting` again), so the pass binds program, VAO, textures
-  and framebuffer as it needs them, and disables egui's scissor for its
-  offscreen pass because that scissor is in window pixels. Every failure is
-  soft: a shader that will not compile, or a driver that will not copy out of
-  its own framebuffer, reports once, sets `failed`, and leaves the bar
-  translucent over the crisp content. `NativeOptions::multisampling` therefore
-  stays at eframe's default of 0 — `glCopyTexSubImage2D` is invalid on a
-  multisampled framebuffer, which is exactly the case that fallback covers.
+- The frosted backdrop is hand-written GPU code (`src/glass.rs`), because egui
+  has no blur: nothing in the painter can sample what has already been drawn.
+  On wgpu that is a decision about the *frame*, not something a paint callback
+  can do on its own: a texture cannot be sampled by the pass that is drawing
+  it, and the pass's target here is the window's surface, which is not even
+  created with `COPY_SRC`. So the frame is split around the glass —
+  `crate::gpu` renders everything *behind* the bar into an offscreen scene
+  texture, `Glass::blur` copies the bar's strip of it into a texture of the
+  strip's own size (a texture-to-texture copy, the one thing wgpu allows) and
+  blurs that in two passes, and the second half of the frame — the bar's fill,
+  its icons, its text — is drawn onto the surface over the blurred strip. Where
+  the split falls is egui's own shape list: the glass callback is the first
+  shape that belongs to the second half, and the callback is also what draws
+  the strip, into the viewport egui has already set to the bar.
+  The blur is separable because a single two-dimensional kernel cheap enough to
+  run per frame is sampled too sparsely and leaves a comb of aliasing over the
+  very letters it is meant to destroy; seventeen taps a pixel and a half apart,
+  twice, cost less and dissolve the text instead. One pipeline does all three
+  draws, since with a step of zero the blur is a plain copy. Every failure is
+  soft: a device that will not take the pipeline or the textures reports once,
+  sets `failed`, and leaves the bar translucent over the crisp content. There
+  is no multisampling to fight here — this integration asks for none — which is
+  what the copy wants anyway.
 - Deleting a mail (the title bar's Delete → `KimoApp::delete_selected_message` →
   `Job::DeleteMessage`) is **remote first, local after**: the worker asks the
   server to drop the message and only then deletes the database row
