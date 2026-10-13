@@ -390,7 +390,16 @@ Event (mpsc) ──► drain_events() at frame start ──► merge into Accoun
   card at all. The card is the pane's own scroll container — headers, rule and
   body scroll together, and the scroll bar runs down the card's edge rather
   than down the body's — and it still hugs a short mail: it is exactly as tall
-  as the mail until the mail outgrows the pane. Both highlights in the list are the mail's whole row: a square
+  as the mail until the mail outgrows the pane. It scrolls *both* ways, which is
+  what keeps the splitter honest: with horizontal scrolling off, a mail whose
+  layout cannot be narrower than the pane (a fixed-width table — most HTML
+  mail) widened this scroll area, and through it the panel's *content* rect,
+  which is the rect egui persists as the panel's width for the next frame
+  (`PanelState`); a splitter drag therefore sprang back to the mail's width on
+  release, and since egui's `Grid` keeps its column widths between frames the
+  pane could never be dragged narrower than the widest it had ever been for
+  that mail. The horizontal bar appears only when the mail really is wider than
+  the pane, and a newly opened mail resets both offsets. Both highlights in the list are the mail's whole row: a square
   block spanning the column edge to edge. A mail draws its own edges instead of
   sharing a rule with its neighbour — left, right and bottom in `row_edge`, the
   top in the fainter `row_edge_top`, each a pixel inside its own rect — so what

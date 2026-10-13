@@ -2841,7 +2841,17 @@ impl KimoApp {
         );
         let used = ui
             .scope_builder(egui::UiBuilder::new().max_rect(inner), |ui| {
-                let mut scroll = egui::ScrollArea::vertical()
+                // Both directions on purpose. With horizontal scrolling off,
+                // a mail whose layout cannot be narrower than the pane — a
+                // fixed-width table, which is most HTML mail — made this
+                // scroll area wider than the pane, and through it the panel's
+                // *content* rect. egui persists that rect as the panel's width
+                // for the next frame, so the splitter sprang back to the
+                // mail's width on release: the pane could never be dragged
+                // narrower than the mail inside it. Scrolling the overflow
+                // sideways keeps the pane's width the user's, and the
+                // horizontal bar only appears when the mail really is wider.
+                let mut scroll = egui::ScrollArea::both()
                     // Full width, but only as tall as the mail: the card around
                     // a short message hugs it instead of running to the pane's
                     // floor, while a long one takes the pane and scrolls.
@@ -2850,7 +2860,11 @@ impl KimoApp {
                     // from the other renderer would land in empty space.
                     .id_salt(("mail-card", self.html_renderer.as_str()));
                 if new_message {
-                    scroll = scroll.vertical_scroll_offset(0.0);
+                    // A newly opened mail starts at its top *left*: the
+                    // horizontal offset outlives the message otherwise.
+                    scroll = scroll
+                        .vertical_scroll_offset(0.0)
+                        .horizontal_scroll_offset(0.0);
                 }
                 let output = scroll.show(ui, |ui| self.mail_card(ui, &msg));
                 // Scrolled away from the top, the bar floats over this card.
