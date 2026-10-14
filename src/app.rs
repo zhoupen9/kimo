@@ -4354,18 +4354,29 @@ impl KimoApp {
             }
             let output = scroll.show(ui, |ui| {
                 // One card per mail, oldest first — a mail of its own is
-                // the same card, drawn once.
+                // the same card, drawn once. `add_space` leaves egui's own item
+                // spacing on top of what it is asked for, so every room asked
+                // for here is the room wanted minus that spacing.
                 for (index, mail) in conversation.messages.iter().enumerate() {
-                    if index > 0 {
-                        // `add_space` leaves egui's own item spacing on top of
-                        // what it is asked for, and the room between two cards
-                        // is chrome: ask for the gap minus that spacing, so the
-                        // chrome between them is the gap itself.
+                    if index == 0 {
+                        // The pane's first card starts *below* the floating title
+                        // bar rather than behind it — `CONTENT_GUTTER` under the
+                        // bar, like the card's other three sides — so the card's
+                        // top edge is on screen, rounded corners and all. The
+                        // room is space in the scroll area and not padding inside
+                        // the card, which is what lets it scroll away with the
+                        // card: the mail still passes under the glass.
+                        // The room is asked for as it is: nothing has been laid
+                        // out above this card, so there is no item spacing
+                        // under it to make up for (see the gap below).
+                        ui.add_space(TITLEBAR_HEIGHT);
+                    } else {
+                        // The chrome showing between two cards of a conversation.
                         ui.add_space(
                             (CONVERSATION_CARD_GAP - ui.spacing().item_spacing.y).max(0.0),
                         );
                     }
-                    cards.push(self.mail_card(ui, mail, index == 0));
+                    cards.push(self.mail_card(ui, mail));
                 }
             });
             // Scrolled away from the top, the bar floats over the cards.
@@ -4405,14 +4416,13 @@ impl KimoApp {
         &mut self,
         ui: &mut egui::Ui,
         msg: &MailMessage,
-        first: bool,
     ) -> (egui::layers::ShapeIdx, egui::Rect) {
         let where_to_put = ui.painter().add(egui::Shape::Noop);
         let laid_out = egui::Frame::new()
             .inner_margin(egui::Margin {
                 left: CONTENT_PADDING_I8,
                 right: CONTENT_PADDING_I8,
-                top: CONTENT_PADDING_I8 + if first { TITLEBAR_HEIGHT_I8 } else { 0 },
+                top: CONTENT_PADDING_I8,
                 bottom: CONTENT_PADDING_I8,
             })
             .show(ui, |ui| self.mail_sheet(ui, msg))
@@ -4465,10 +4475,10 @@ impl KimoApp {
     /// have to have them — a Blitz body is a raster that a worker made, and the
     /// cards are not part of it — and because they are the last thing on the
     /// card, below the body whichever way the body was drawn. They are one run
-    /// across the mail's own column, wrapped where the next card does not fit: a
-    /// fixed width each (`ATTACHMENT_CARD_WIDTH`), so what a mail came with
-    /// reads as a row of parts rather than as one card per line, and a pane too
-    /// narrow for the whole run wraps instead of cutting it.
+    /// across the mail's own column, wrapped where the next card does not fit:
+    /// each as wide as the name it carries wants (`attachment_card`), so what a
+    /// mail came with reads as a row of parts rather than as one card per line,
+    /// and a pane too narrow for the whole run wraps instead of cutting it.
     fn attachment_cards(&mut self, ui: &mut egui::Ui, msg: &MailMessage, column: f32) {
         if msg.attachments.is_empty() {
             return;
@@ -4490,7 +4500,7 @@ impl KimoApp {
             ui.spacing_mut().item_spacing = egui::Vec2::splat(ATTACHMENT_CARD_GAP);
             ui.horizontal_wrapped(|ui| {
                 for (index, attachment) in msg.attachments.iter().enumerate() {
-                    if attachment_card(ui, attachment).clicked() {
+                    if attachment_card(ui, attachment, column).clicked() {
                         clicked = Some(index);
                     }
                 }
@@ -5535,16 +5545,22 @@ const CONTENT_CARD_CORNER_RADIUS: u8 = 8;
 /// the chrome showing between them: a conversation is one card per mail
 /// (`mail_card`), each of them the card a mail on its own gets.
 const CONVERSATION_CARD_GAP: f32 = 12.0;
-/// The attachment cards under a mail's body: one card per file, one fixed width
-/// and the height of a line of the list, laid across the mail's own column and
-/// wrapped onto the next row when the next card does not fit — `ATTACHMENT_CARD_GAP`
-/// between two of them either way, and `ATTACHMENT_CARDS_TOP_GAP` between the
-/// run and the body above it. The width is what a file name and, under it, the
-/// type and the size want; the card's own paddings are the glyph's inset, its
-/// size, the gap it leaves the text and the text's own right inset, and a name
-/// longer than the room it leaves is cut with a tooltip to show it.
-const ATTACHMENT_CARD_WIDTH: f32 = 200.0;
+/// The attachment cards under a mail's body: one card per file, as wide as the
+/// name and the type it carries want — never narrower than `ATTACHMENT_CARD_MIN_WIDTH`
+/// and never wider than the mail's own column — and the height of a line of the
+/// list. They are laid across that column and wrapped onto the next row when the
+/// next card does not fit, `ATTACHMENT_CARD_GAP` between two of them either
+/// way, and `ATTACHMENT_CARDS_TOP_GAP` between the run and the body above it.
+/// The card's own paddings are the glyph's inset, its size, the gap it leaves
+/// the text and the text's own right inset; only a name the column itself cannot
+/// hold is cut, and the tooltip then shows it.
+const ATTACHMENT_CARD_MIN_WIDTH: f32 = 140.0;
 const ATTACHMENT_CARD_HEIGHT: f32 = 52.0;
+/// The card's two lines, in points: the file name and, under it, the type and
+/// the size. Both are smaller than the body text — a card is a note about the
+/// mail, not part of it.
+const ATTACHMENT_NAME_FONT_SIZE: f32 = 11.0;
+const ATTACHMENT_META_FONT_SIZE: f32 = 9.0;
 const ATTACHMENT_CARD_GAP: f32 = 8.0;
 const ATTACHMENT_CARDS_TOP_GAP: f32 = 18.0;
 const ATTACHMENT_CARD_CORNER_RADIUS: u8 = 6;
@@ -6251,20 +6267,42 @@ fn truncate_galley(
 /// with the type and the size under the name for mail that was fetched with
 /// them.
 ///
-/// The card is a fixed width (`ATTACHMENT_CARD_WIDTH`), so a run of them reads
-/// as the parts of one mail rather than as a column of its own, and the *whole
-/// card* is
-/// the link rather than the points of the name: the name is drawn in the
+/// The card is as wide as the name and type it carries want, so a run of them
+/// reads as the parts of one mail rather than as a column of its own, and the
+/// *whole card* is the link rather than the points of the name: the name is
+/// drawn in the
 /// scheme's link color the way an HTML link is, the card fills with the hover
 /// color while the pointer is on it, the name is underlined then, and the
 /// pointer becomes a hand. Those are the four things that say a target is
 /// there — and it is a real one now: the bytes are on the server, and a click
 /// fetches them (see the attachment-card convention in AGENTS.md). The hover
 /// text is what shows a name the column had to cut.
-fn attachment_card(ui: &mut egui::Ui, attachment: &Attachment) -> egui::Response {
+fn attachment_card(ui: &mut egui::Ui, attachment: &Attachment, column: f32) -> egui::Response {
     let scheme = theme::of(ui.ctx());
+    let name_font = egui::FontId::proportional(ATTACHMENT_NAME_FONT_SIZE);
+    let meta_font = egui::FontId::proportional(ATTACHMENT_META_FONT_SIZE);
+    let meta_text = attachment_meta(attachment);
+    // What the card has to hold: the name, and the type and the size under it.
+    // It is as wide as the wider of the two wants — a file's name is never cut
+    // while the mail's column can hold it — and no wider than that column.
+    let (name, meta) = ui.ctx().fonts_mut(|fonts| {
+        (
+            fonts.layout_no_wrap(attachment.name.clone(), name_font, scheme.link),
+            (!meta_text.is_empty())
+                .then(|| fonts.layout_no_wrap(meta_text.clone(), meta_font, scheme.text_weak)),
+        )
+    });
+    let text = name
+        .size()
+        .x
+        .max(meta.as_ref().map_or(0.0, |meta| meta.size().x));
+    let chrome = ATTACHMENT_GLYPH + ATTACHMENT_CARD_PADDING * 3.0;
+    let width = (text + chrome).clamp(
+        ATTACHMENT_CARD_MIN_WIDTH,
+        column.max(ATTACHMENT_CARD_MIN_WIDTH),
+    );
     let (rect, response) = ui.allocate_exact_size(
-        egui::vec2(ATTACHMENT_CARD_WIDTH, ATTACHMENT_CARD_HEIGHT),
+        egui::vec2(width, ATTACHMENT_CARD_HEIGHT),
         egui::Sense::click(),
     );
     if !ui.is_rect_visible(rect) {
@@ -6293,13 +6331,34 @@ fn attachment_card(ui: &mut egui::Ui, attachment: &Attachment) -> egui::Response
     paint_file_icon(ui.painter(), glyph, scheme.text_weak);
 
     let left = glyph.right() + ATTACHMENT_CARD_PADDING;
-    let width = (rect.right() - ATTACHMENT_CARD_PADDING - left).max(1.0);
-    let body = egui::TextStyle::Body.resolve(ui.style());
-    let small = egui::TextStyle::Small.resolve(ui.style());
-    let name = truncate_galley(ui.ctx(), &attachment.name, body.size, scheme.link, width);
-    let meta_text = attachment_meta(attachment);
-    let meta = (!meta_text.is_empty())
-        .then(|| truncate_galley(ui.ctx(), &meta_text, small.size, scheme.text_weak, width));
+    // What both lines are drawn in. Only a column too narrow for the name cuts
+    // it — the one case the width above could not answer — and the tooltip then
+    // carries the whole of it.
+    let room = (rect.right() - ATTACHMENT_CARD_PADDING - left).max(1.0);
+    let name = if name.size().x > room {
+        truncate_galley(
+            ui.ctx(),
+            &attachment.name,
+            ATTACHMENT_NAME_FONT_SIZE,
+            scheme.link,
+            room,
+        )
+    } else {
+        name
+    };
+    let meta = meta.map(|meta| {
+        if meta.size().x > room {
+            truncate_galley(
+                ui.ctx(),
+                &meta_text,
+                ATTACHMENT_META_FONT_SIZE,
+                scheme.text_weak,
+                room,
+            )
+        } else {
+            meta
+        }
+    });
 
     // The name and what is under it are one block, centred on the card.
     let name_height = name.size().y;
@@ -8232,8 +8291,8 @@ mod tests {
         assert_eq!(cards.len(), three.len(), "one card per part: {cards:?}");
         for card in &cards {
             assert!(
-                (card.width() - ATTACHMENT_CARD_WIDTH).abs() < 0.5,
-                "every card is the fixed width, whatever it holds: {cards:?}"
+                card.width() >= ATTACHMENT_CARD_MIN_WIDTH - 0.5,
+                "a card is at least the floor wide, whatever it holds: {cards:?}"
             );
         }
         // The cards sharing a top edge are one row, in the order they were laid
@@ -8280,6 +8339,56 @@ mod tests {
         );
     }
 
+    /// A card is as wide as the file's name wants rather than a fixed width, and
+    /// the name is drawn whole: the ellipsis is only for a name the mail's own
+    /// column cannot hold.
+    #[test]
+    fn an_attachment_card_shows_the_whole_name() {
+        let ctx = egui::Context::default();
+        crate::fonts::install(&ctx, None, None);
+        let mut app = app_with_messages(&ctx, 1);
+        let part = |name: &str| Attachment {
+            name: name.to_string(),
+            content_type: "application/pdf".to_string(),
+            size: 68 * 1024,
+        };
+        let long = "quarterly-report-2026-with-notes.pdf";
+        app.states
+            .get_mut("acct")
+            .expect("the fixture account")
+            .mailbox
+            .folders[0]
+            .messages[0]
+            .attachments = vec![part("chart.png"), part(long)];
+        app.selected_account = Some("acct".to_string());
+        app.selected_folder = Some("INBOX".to_string());
+        app.selected_message = Some("0".to_string());
+
+        // The pane sizes the first frame; the cards are on screen from the
+        // second one on, the way the app draws them live.
+        let _ = frame_texts(&ctx, &mut app);
+        let texts = frame_texts(&ctx, &mut app);
+        // Both names are drawn verbatim: a cut one would end in the ellipsis
+        // instead, and no text of either name would be there to find.
+        for name in ["chart.png", long] {
+            assert!(
+                texts.iter().any(|text| text == name),
+                "{name} is on its card whole: {texts:?}"
+            );
+        }
+
+        let cards = attachment_cards_in(&ctx, &mut app);
+        assert_eq!(cards.len(), 2, "one card per part: {cards:?}");
+        let widest = cards.iter().map(|card| card.width()).fold(0.0, f32::max);
+        let narrowest = cards
+            .iter()
+            .map(|card| card.width())
+            .fold(f32::MAX, f32::min);
+        assert!(
+            widest > narrowest + 20.0,
+            "the name is what a card is as wide as: {cards:?}"
+        );
+    }
     /// Clicking an attachment card starts a download: the app finds the account
     /// and the mail the pane is showing, and hands the worker the part's place
     /// and the file's name. What the worker does with them is `sync`'s own
@@ -8920,9 +9029,12 @@ mod tests {
                 "a card spans the pane, gutter to gutter: {card:?}"
             );
         }
+        // The first card starts below the floating title bar — the gutter under
+        // the bar, like its other sides — so its top edge, and with it the two
+        // rounded corners, is on screen rather than behind the glass.
         assert!(
-            (first.top() - CONTENT_GUTTER).abs() < 0.5,
-            "the pane's cards start at the pane's top, not under the bar's height: {first:?}"
+            (first.top() - (TITLEBAR_HEIGHT + CONTENT_GUTTER)).abs() < 0.5,
+            "the pane's first card starts under the bar's height: {first:?}"
         );
         let gap = second.top() - first.bottom();
         assert!(

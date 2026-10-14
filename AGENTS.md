@@ -519,7 +519,11 @@ Event (mpsc) ──► drain_events() at frame start ──► merge into Accoun
   is a card of `content`
   (`CONTENT_CARD_CORNER_RADIUS`) inset by `CONTENT_GUTTER` into the chrome,
   whose left side doubles as the splitter; with nothing selected there is no
-  card at all. **A conversation is that card once per mail** — not a card
+  card at all. The first card of what the pane shows starts *below* the floating
+  bar — the bar's height is space above it in the scroll area, not padding
+  inside it — so its top edge and its two rounded corners are on screen; the
+  space scrolls away with the card, which is what still lets the mail pass under
+  the glass. **A conversation is that card once per mail** — not a card
   holding a card per mail — stacked oldest first with `CONVERSATION_CARD_GAP`
   of chrome showing between two of them, so every mail of a thread sits on the
   pane the way a mail on its own does. Each card is drawn by the pane and not
@@ -566,9 +570,10 @@ Event (mpsc) ──► drain_events() at frame start ──► merge into Accoun
   (`Frame::inner_margin(LIST_PADDING)` around the rows — the sides, and the
   bar's height at the top, which is what the rows scroll under; there is no
   bottom padding, because the list's card ends with its last mail — and
-  `mail_card` for each mail: the card's own padding all round, and the bar's
-  height on top of it for the first card of what the pane shows — and only for
-  that one), not on the panel's frame, which is what lets the scroll bars reach
+  `mail_card` for each mail: the card's own padding all round, and — above the
+  first card of what the pane shows, and only that one — the bar's height as
+  space in the scroll area rather than padding on the card), not on the panel's
+  frame, which is what lets the scroll bars reach
   the column's edge and the pane's edge instead of stopping on the padding.
   egui's panel separators are off in both schemes (they would double those
   hairlines and the card's gutter) and the two boundary pixels are repainted
@@ -932,12 +937,18 @@ Event (mpsc) ──► drain_events() at frame start ──► merge into Accoun
   the file name, and — under the name — the MIME type and the size, whichever
   of the two the mail was fetched with (`attachment_meta`; `human_size` counts
   in binary units, the way a file manager on this desktop does, and drops a
-  `.0`). **The cards are one run, not one per line**: a fixed width each
-  (`ATTACHMENT_CARD_WIDTH`, a name's worth of room and no more) laid across the
-  mail's own column and wrapped onto the next row where the next one does not
-  fit (`horizontal_wrapped`, `ATTACHMENT_CARD_GAP` both ways), so a mail with
-  ten parts is a block of cards rather than ten lines, and a pane too narrow for
-  the run wraps instead of cutting it. The run is laid out in a scope of its own
+  `.0`). **The cards are one run, not one per line**: each as wide as the name
+  and the type under it want — `ATTACHMENT_CARD_MIN_WIDTH` at the floor, the
+  mail's own column at the ceiling — laid across that column and wrapped onto
+  the next row where the next one does not fit (`horizontal_wrapped`,
+  `ATTACHMENT_CARD_GAP` both ways), so a mail with ten parts is a block of cards
+  rather than ten lines, and a pane too narrow for the run wraps instead of
+  cutting it. **A name is drawn whole** — the card is measured from it
+  (`layout_no_wrap`, `ATTACHMENT_NAME_FONT_SIZE`) rather than given a width to
+  be cut down to, and only a name the column itself cannot hold falls back to
+  `truncate_galley` with the tooltip carrying the whole of it. Both of a card's
+  lines are smaller than the body text (11 pt and 9 pt): a card is a note about
+  the mail, not part of it. The run is laid out in a scope of its own
   — the column the headers were drawn across, taken from the pane *before* the
   body is drawn — because a body wider than that column (a fixed-width HTML
   table) widens the ui as it lays itself out, and the cards belong to the mail,
