@@ -271,7 +271,10 @@ Event (mpsc) ──► drain_events() at frame start ──► merge into Accoun
   frame and the whole body is otherwise re-derived on each one: the *parsed
   body* (`html::Document`, since html5ever's parse is the larger half of what a
   frame costs and the tree does not change while the mail is open) and the
-  *width it settled at*. The body is laid out at that width while the pane is
+  *width it settled at*. There is one entry per mail on screen — a conversation
+  shows several, and the pane asks for every one of them on every frame — up to
+  `BODY_CACHE` of them, the mail off screen longest being the one a new body
+  evicts. The body is laid out at that width while the pane is
   moving — in a scope of its own, because a ui never gets narrower than what it
   has already drawn (`set_max_width` widens the max back to the min rect) — so a
   drag clips the mail instead of re-shaping every run of text in it; once the
@@ -609,14 +612,41 @@ Event (mpsc) ──► drain_events() at frame start ──► merge into Accoun
   or through `In-Reply-To` when the client wrote no chain, and a mail whose
   headers say nothing joins the thread of the subject it answers (a prefix like
   `Re:` or `答复:` stripped, either colon; two mails that merely share a subject
-  stay apart) — and the list draws one row per thread. A thread's row is its
-  own: the newest mail's sender, date and preview under the thread's subject,
-  the count of what it holds beside the date, a paperclip when any of its mails
-  has one, and the twisty at the left. Clicking it opens or closes the
-  conversation, and opening one opens the mail the row speaks for. An open
-  conversation's mails are rows of their own under it, oldest first, inset by
-  `THREAD_INDENT` with the thread's spine down the left — `RowPlace` is what a
-  row draws around itself: its twisty, its spine, or nothing. Every row is
+  stay apart) — and the list draws one row per conversation. A conversation's row
+  is its own: the newest mail's sender, date and preview under the thread's
+  subject, the count of what it holds beside the date, a paperclip when any of
+  its mails has one, and a chevron at the left: a thin line drawing kept at a
+  subdued strength of the row's own weak color (`THREAD_CHEVRON_ALPHA`), coming
+  up to the full color under the pointer — a control at the edge of a row, not
+  part of the mail. A conversation of one is not a conversation: it is a plain
+  mail row, with nothing in the chevron's column, and the pane shows it the way
+  it always has. **Every row is inset by that column**, conversation or not
+  (`RowPlace::indent`): the avatars line up down the whole list, and a mail with
+  nothing to open leaves the column as the placeholder it is rather than starting
+  a step further left than its neighbours.
+  **The row and the chevron do different things.** The *chevron* opens and closes
+  the thread's mails under it in the list — and does nothing else, so the list's
+  shape only ever changes when the user asks for it. The *row* opens the
+  conversation in the reading pane: every mail it holds, oldest first, as a card
+  of its own (`conversation_card`, one step in from the pane's card), so a
+  thread reads as the mails it is made of rather than as one long document with
+  three sets of headers in it. That is `KimoApp::open_conversation`, which takes
+  the thread the selection is in from the list's own model; with nothing
+  threading, or a model that does not cover the folder, it is the mail alone and
+  the pane draws a single card as before. The pane's scroll offset is keyed by
+  the *conversation* (`Conversation::key`), so opening another mail of the thread
+  already on screen does not jump back to its top.
+  The chevron is a click target of its own (`ui.interact` over the row's, with
+  `RowResponse` reporting the two), it is a line drawing rather than the filled
+  triangle the navigation column's sections use, and it is the only thing that
+  writes `open_threads`, which is in memory only and keyed by `Thread::key` (the
+  thread's oldest uid, stable while the thread is). Because the rows a frame drew
+  are the ones it had before the click, a toggle asks for a repaint itself: a
+  pointer that stops moving asks for no frame of its own, and the list would sit
+  there looking as if the click was lost.
+  An open conversation's mails are rows of their own under it, oldest first,
+  with the thread's spine down that same left column — `RowPlace` is what a row
+  draws in it: its chevron, its spine, or nothing. Every row is
   `MESSAGE_ROW_HEIGHT` tall whatever it is, which is what keeps `virtual_rows`
   honest: threading changes *which* rows there are, not how tall one is. The rows
   are derived rather than built in the drawing: `KimoApp::list_rows` (`ListRows`)
@@ -624,11 +654,7 @@ Event (mpsc) ──► drain_events() at frame start ──► merge into Accoun
   (`AccountUiState::folders_rev`, which a mail marked read moves too), the
   account or folder, the threading switch, or the set of open threads
   (`open_rev`) changes — grouping a folder is a map, a union-find and a sort over
-  all of it, and the list is drawn on every frame. `open_threads` is in memory
-  only, keyed by `Thread::key` (the thread's oldest uid, which is stable while
-  the thread is); a folder the pane has just moved to — or threading switched on
-  — opens the conversation of the mail it is showing, so the list and the pane
-  never start out disagreeing, and nothing else reopens a thread the user closed.
+  all of it, and the list is drawn on every frame.
   **Search results are deliberately not threaded**: they are a flat list of hits,
   and where a hit sits among its own folder's conversations is not what was
   asked for. Threading is a preference (`threaded` in settings.json,
@@ -1113,7 +1139,9 @@ Do not "fix" these casually — they are known:
   sender wrote no ids at all — by subject: a reply joins the subject it answers,
   but a conversation whose mails were filed into different folders (or into and
   out of a Trash) is more than one conversation here. Search results are a flat
-  list of hits and are not grouped at all.
+  list of hits and are not grouped at all, and the reading pane shows a
+  conversation only while the list is threading: with the preference off, a
+  click opens the one mail it always did.
 - TLS finite-field DH covers the 2048-bit groups listed in
   `src/protocol/ffdhe.rs` and nothing else. A server whose DHE group is
   another size, or yet another custom prime, still fails the handshake with

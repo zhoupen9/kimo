@@ -20,8 +20,10 @@ rustls with the `ring` crypto provider and Mozilla's root certificates.
 - Folder listing (IMAP), folder selection and per-folder caches
 - Message list with unread markers and text preview, grouped into
   conversations: one row per thread — its newest mail, how many it holds and a
-  paperclip — opening into the mails it has (grouped by `References` and
-  `In-Reply-To`, or by subject for mail cached before Kimo kept those)
+  paperclip — with the chevron at its left opening the thread's mails in the
+  list and a click on the row showing the whole conversation in the reading
+  pane, one card per mail (grouped by `References` and `In-Reply-To`, or by
+  subject for mail cached before Kimo kept those)
 - A paperclip in the message list for mail that has attachments, and a card
   each under the mail itself: the file name (a link that downloads the file into
   `~/Downloads`), its MIME type and its size — the bytes themselves stay on the

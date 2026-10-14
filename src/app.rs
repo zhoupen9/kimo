@@ -527,6 +527,16 @@ fn list_rows_of(
     }
     let mut rows = Vec::with_capacity(threads.len());
     for (thread, conversation) in threads.iter().enumerate() {
+        if conversation.messages.len() == 1 {
+            // A conversation of one is a mail: it is drawn like one — no
+            // chevron, no indent, nothing to open — and the reading pane shows
+            // it the way it always has.
+            rows.push(ListRow::Message {
+                index: conversation.messages[0],
+                in_thread: false,
+            });
+            continue;
+        }
         rows.push(ListRow::Thread { thread });
         if open.contains(&conversation.key) {
             rows.extend(conversation.messages.iter().map(|&index| ListRow::Message {
@@ -536,6 +546,16 @@ fn list_rows_of(
         }
     }
     rows
+}
+
+/// What the reading pane shows: the mails of one conversation, oldest first,
+/// and the key the pane's scroll offset belongs to.
+struct Conversation {
+    /// The thread's key, or the mail's own uid when it is not part of one — what
+    /// `KimoApp::scrolled_message` compares, so that opening another mail of
+    /// the conversation already on screen does not jump back to its top.
+    key: String,
+    messages: Vec<MailMessage>,
 }
 
 /// One row of the message list: a thread's own row, or one mail.
@@ -627,19 +647,36 @@ enum ImageStatus {
 /// renderer makes before it renders a new width, for the same reason.
 #[derive(Default)]
 struct BodyCache {
+    /// One entry per mail on screen. A conversation is several mails, and the
+    /// pane asks for every one of them on every frame — a cache of a single
+    /// body would re-parse all but one of them per frame, which is the cost
+    /// this exists to avoid.
+    entries: Vec<BodyEntry>,
+}
+
+/// One mail's parsed body and the width it settled at.
+struct BodyEntry {
     /// `<folder>/<uid>` of the mail this holds.
     identity: String,
     /// Hash of the body, so a re-fetch that replaces the body of a uid the
     /// pane is already showing is noticed (`body_fingerprint`).
     fingerprint: u64,
-    document: Option<crate::html::Document>,
+    document: crate::html::Document,
     /// The width the body is laid out for; `None` until it has been laid out
     /// once.
     width: Option<f32>,
     /// The width the pane wants now — quantized, so that a pixel of jitter is
     /// not a reflow — and since when it has wanted it.
     pending: Option<(u32, Instant)>,
+    /// When this body was last asked for, so the entry evicted for a new one is
+    /// the mail that has been off screen longest.
+    used: Instant,
 }
+
+/// How many bodies the built-in renderer keeps parsed. A conversation is a
+/// handful of mails and one more is the mail the pane moves to next; eight
+/// parsed bodies is a few hundred kilobytes at worst.
+const BODY_CACHE: usize = 8;
 
 impl BodyCache {
     /// The document and the width to lay it out at for this frame, parsing the
@@ -653,24 +690,54 @@ impl BodyCache {
         wanted: f32,
         now: Instant,
     ) -> (&crate::html::Document, f32) {
-        if self.document.is_none() || self.identity != identity || self.fingerprint != fingerprint {
-            self.identity = identity.to_string();
-            self.fingerprint = fingerprint;
-            self.document = Some(crate::html::Document::parse(html));
-            // A body the cache has not seen has no earlier layout to hold on
-            // to: it is laid out at the pane's own width at once.
-            self.width = None;
-            self.pending = None;
-        }
-        let width = self.layout_width(ctx, wanted, now);
-        (self.document(), width)
+        let index = match self
+            .entries
+            .iter()
+            .position(|entry| entry.identity == identity && entry.fingerprint == fingerprint)
+        {
+            Some(index) => index,
+            None => {
+                // The same mail with a new body (a re-fetch under a uid the pane
+                // already shows), or one it has not seen: either way what is
+                // held is dropped and parsed again.
+                self.entries.retain(|entry| entry.identity != identity);
+                if self.entries.len() >= BODY_CACHE {
+                    if let Some((oldest, _)) = self
+                        .entries
+                        .iter()
+                        .enumerate()
+                        .min_by_key(|(_, entry)| entry.used)
+                    {
+                        self.entries.remove(oldest);
+                    }
+                }
+                self.entries.push(BodyEntry {
+                    identity: identity.to_string(),
+                    fingerprint,
+                    document: crate::html::Document::parse(html),
+                    // A body the cache has not seen has no earlier layout to
+                    // hold on to: it is laid out at the pane's own width at
+                    // once.
+                    width: None,
+                    pending: None,
+                    used: now,
+                });
+                self.entries.len() - 1
+            }
+        };
+        let entry = &mut self.entries[index];
+        entry.used = now;
+        let width = entry.layout_width(ctx, wanted, now);
+        (&entry.document, width)
     }
 
-    /// The body, which `get` has made sure is parsed.
-    fn document(&self) -> &crate::html::Document {
-        self.document.as_ref().expect("filled in by `get`")
+    /// Drop every parsed body: what is on screen is another renderer's, or none.
+    fn forget(&mut self) {
+        self.entries.clear();
     }
+}
 
+impl BodyEntry {
     /// The width to lay the body out at, given the width `wanted` the pane has
     /// now. Anything else is a reflow, and a reflow waits for the geometry to
     /// settle (see `BodyCache`); while it waits the pane is asked for a repaint
@@ -706,15 +773,6 @@ impl BodyCache {
                 width
             }
         }
-    }
-
-    /// Drop the parsed body: what is on screen is another renderer's, or none.
-    fn forget(&mut self) {
-        self.document = None;
-        self.identity.clear();
-        self.fingerprint = 0;
-        self.width = None;
-        self.pending = None;
     }
 }
 
@@ -2066,6 +2124,58 @@ impl KimoApp {
             .cloned()
     }
 
+    /// What the reading pane shows for the selected mail: the conversation it
+    /// belongs to, oldest first, when the list is threading and its model covers
+    /// the folder — or the mail on its own, which is what a folder whose model
+    /// has not been derived yet, and threading turned off, get.
+    ///
+    /// The mails are copied because the pane draws them with `&mut self` (the
+    /// body cache, the inline images) while they live in the account state; a
+    /// conversation is a handful of mails, and their bodies are the only large
+    /// part of them.
+    fn open_conversation(&self) -> Option<Conversation> {
+        let selected = self.selected_message_view()?;
+        let alone = Conversation {
+            key: selected.uid.clone(),
+            messages: vec![selected],
+        };
+        if !self.threaded {
+            return Some(alone);
+        }
+        let (Some(account), Some(folder)) = (
+            self.selected_account.as_deref(),
+            self.selected_folder.as_deref(),
+        ) else {
+            return Some(alone);
+        };
+        let Some(rows) = self
+            .list_rows
+            .as_ref()
+            .filter(|rows| rows.account == account && rows.folder == folder)
+        else {
+            return Some(alone);
+        };
+        let Some(messages) = self.folder_messages_of(account, folder) else {
+            return Some(alone);
+        };
+        let uid = self.selected_message.as_deref().unwrap_or_default();
+        let Some(thread) = rows
+            .threads
+            .iter()
+            .find(|thread| thread.messages.len() > 1 && thread.holds(messages, uid))
+        else {
+            return Some(alone);
+        };
+        Some(Conversation {
+            key: thread.key.clone(),
+            messages: thread
+                .messages
+                .iter()
+                .map(|&index| messages[index].clone())
+                .collect(),
+        })
+    }
+
     /// Whether a mail is open in the reading pane — the state the title bar's
     /// mail actions are enabled by. It asks the pane's own question, so a uid
     /// left over from a folder or a search the window has moved on from (the
@@ -3328,9 +3438,9 @@ impl KimoApp {
             .and_then(|(account_id, folder)| self.folder_messages_of(account_id, folder))
             .expect("checked just above");
         let mut clicked: Option<MailMessage> = None;
-        // A conversation's own row was clicked: what it opens or closes is
+        // A conversation's chevron was clicked: whether it opens or closes is
         // applied once the borrow of the state is over.
-        let mut toggled: Option<(String, bool, MailMessage)> = None;
+        let mut toggled: Option<String> = None;
         let list = egui::ScrollArea::vertical()
             .auto_shrink([false, false])
             .show_viewport(ui, |ui, viewport| {
@@ -3356,19 +3466,26 @@ impl KimoApp {
                                             let conversation = &rows.threads[thread];
                                             let open =
                                                 self.open_threads.contains(&conversation.key);
-                                            let response = self.thread_row(
+                                            let drawn = self.thread_row(
                                                 ui,
                                                 conversation,
                                                 messages,
                                                 open,
                                                 first,
                                             );
-                                            if response.clicked() {
-                                                toggled = Some((
-                                                    conversation.key.clone(),
-                                                    open,
-                                                    messages[conversation.newest].clone(),
-                                                ));
+                                            // The chevron is what opens and
+                                            // closes the mails in the list; the
+                                            // row opens the conversation in the
+                                            // pane. A click on one is not a
+                                            // click on the other.
+                                            if drawn
+                                                .chevron
+                                                .is_some_and(|chevron| chevron.clicked())
+                                            {
+                                                toggled = Some(conversation.key.clone());
+                                            } else if drawn.row.clicked() {
+                                                clicked =
+                                                    Some(messages[conversation.newest].clone());
                                             }
                                         }
                                         ListRow::Message { index, in_thread } => {
@@ -3377,13 +3494,11 @@ impl KimoApp {
                                             } else {
                                                 RowPlace::Plain
                                             };
-                                            let response = self.message_row(
-                                                ui,
-                                                &messages[index],
-                                                first,
-                                                place,
-                                            );
-                                            if response.clicked() {
+                                            if self
+                                                .message_row(ui, &messages[index], first, place)
+                                                .row
+                                                .clicked()
+                                            {
                                                 clicked = Some(messages[index].clone());
                                             }
                                         }
@@ -3400,17 +3515,18 @@ impl KimoApp {
         // viewport is at its bottom by definition.
         let end = (list.content_size.y - list.inner_rect.height()).max(0.0);
         let at_end = list.state.offset.y >= end - 1.0;
-        // Opening a conversation shows the mail its row speaks for; closing one
-        // leaves the pane where it is, and either way the list is told to
-        // derive its rows again.
-        if let Some((key, open, newest)) = toggled {
-            if open {
-                self.open_threads.remove(&key);
-            } else {
+        // The chevron opens or closes the thread's mails in the list, and
+        // nothing else: the conversation in the pane is the row's business, and
+        // opening a thread does not move the reading pane. The rows this frame
+        // was drawn from are the ones it had before the click, so the change is
+        // asked for now — a pointer that stops moving asks for no frame of its
+        // own, and the list would sit there looking as if the click was lost.
+        if let Some(key) = toggled {
+            if !self.open_threads.remove(&key) {
                 self.open_threads.insert(key);
-                clicked = Some(newest);
             }
             self.open_rev += 1;
+            self.ctx.request_repaint();
         }
         if at_end {
             self.load_older_button(ui);
@@ -3450,38 +3566,20 @@ impl KimoApp {
             }
         }
 
-        // A folder the pane has just moved to — or threading switched on — opens
-        // the conversation of the mail it is showing, so the list and the pane
-        // do not start out disagreeing. Anything else keeps the user's own
-        // open and closed conversations as they are.
-        let reset = self.list_rows.as_ref().is_none_or(|rows| {
-            rows.account != account || rows.folder != folder || rows.threaded != self.threaded
-        });
-        let mut open = self.open_threads.clone();
-        let selected = self.selected_message.clone();
+        // Which conversations are open is the user's own doing — the chevron is
+        // the only thing that changes it — so a folder the pane moves to opens
+        // nothing: the reading pane shows the conversation where the mail is,
+        // and the list stays the shape the user left it in.
+        let open = self.open_threads.clone();
 
         // The mail is borrowed from the state and the model lives on `self`, so
         // what is derived is built from its own borrow and handed over once it
         // is owned.
         let derived = self.folder_messages_of(&account, &folder).map(|messages| {
             let threads = threads::group(messages);
-            if reset {
-                if let Some(uid) = selected.as_deref() {
-                    if let Some(thread) = threads
-                        .iter()
-                        .find(|thread| thread.messages.iter().any(|&i| messages[i].uid == uid))
-                    {
-                        open.insert(thread.key.clone());
-                    }
-                }
-            }
             let rows = list_rows_of(&threads, messages.len(), &open, self.threaded);
             (threads, rows)
         });
-        if open != self.open_threads {
-            self.open_threads = open;
-            self.open_rev += 1;
-        }
         self.list_rows = derived.map(|(threads, rows)| ListRows {
             account,
             folder,
@@ -3632,7 +3730,7 @@ impl KimoApp {
                             hits.len(),
                             |ui, rows| {
                                 for index in rows {
-                                    if self.search_row(ui, &hits[index], index == 0).clicked() {
+                                    if self.search_row(ui, &hits[index], index == 0).row.clicked() {
                                         clicked = Some(hits[index].clone());
                                     }
                                 }
@@ -3741,8 +3839,8 @@ impl KimoApp {
         ui: &mut egui::Ui,
         msg: &MailMessage,
         first: bool,
-        place: RowPlace,
-    ) -> egui::Response {
+        place: RowPlace<'_>,
+    ) -> RowResponse {
         let selected = self.selected_message.as_deref() == Some(msg.uid.as_str());
         let preview = if msg.preview.is_empty() {
             " ".to_string()
@@ -3764,7 +3862,7 @@ impl KimoApp {
 
     /// One conversation's own card in the folder list: the newest mail's sender,
     /// date and preview under the thread's subject, the count of what the thread
-    /// holds beside the date, and the twisty at the left that opens it. It is
+    /// holds beside the date, and the chevron at the left that opens it. It is
     /// selected — and struck as unread — the way the mail it speaks for is, so
     /// the row and the pane never disagree about what is open.
     fn thread_row(
@@ -3774,7 +3872,7 @@ impl KimoApp {
         messages: &[MailMessage],
         open: bool,
         first: bool,
-    ) -> egui::Response {
+    ) -> RowResponse {
         let newest = &messages[thread.newest];
         let selected = self
             .selected_message
@@ -3796,6 +3894,7 @@ impl KimoApp {
             place: RowPlace::Thread {
                 open,
                 count: thread.messages.len(),
+                key: &thread.key,
             },
         };
         self.message_card(ui, &card, first)
@@ -3803,7 +3902,7 @@ impl KimoApp {
 
     /// One search result: the same card, with where the mail lives and the line
     /// the query matched as its third line.
-    fn search_row(&self, ui: &mut egui::Ui, hit: &SearchHit, first: bool) -> egui::Response {
+    fn search_row(&self, ui: &mut egui::Ui, hit: &SearchHit, first: bool) -> RowResponse {
         let selected = self.selected_message.as_deref() == Some(hit.uid.as_str())
             && self.selected_folder.as_deref() == Some(hit.folder.as_str());
         let account = self
@@ -3835,7 +3934,7 @@ impl KimoApp {
     /// title and a muted third line stacked on the right. The folder list and
     /// the search results share it — only what the three lines say differs —
     /// and `first` marks the card the list starts with.
-    fn message_card(&self, ui: &mut egui::Ui, card: &CardText, first: bool) -> egui::Response {
+    fn message_card(&self, ui: &mut egui::Ui, card: &CardText, first: bool) -> RowResponse {
         let scheme = theme::of(ui.ctx());
         let (rect, resp) = ui.allocate_exact_size(
             egui::vec2(ui.available_width(), MESSAGE_ROW_HEIGHT),
@@ -3904,40 +4003,46 @@ impl KimoApp {
 
         // Where the row sits in the list: a conversation's own row and the
         // mails it holds are inset, and the room that leaves at the left is
-        // where the twisty — or the thread's guide line — is drawn.
+        // where the chevron — or the thread's guide line — is drawn.
         let indent = card.place.indent();
+        let mut chevron = None;
         match card.place {
-            RowPlace::Thread { open, .. } => {
-                // The twisty a folder section in the navigation column has:
-                // pointing right while the thread is closed, down while open.
+            RowPlace::Thread { open, key, .. } => {
                 let centre = egui::pos2(
-                    rect.left() + (THREAD_INDENT - THREAD_TWISTY) / 2.0,
+                    rect.left() + (THREAD_INDENT - THREAD_CHEVRON) / 2.0,
                     rect.center().y,
                 );
-                let half = THREAD_TWISTY / 2.0;
-                let triangle = if open {
-                    vec![
-                        egui::pos2(centre.x - half, centre.y - 3.0),
-                        egui::pos2(centre.x + half, centre.y - 3.0),
-                        egui::pos2(centre.x, centre.y + 4.0),
-                    ]
+                // The chevron is a target of its own: the row's click opens the
+                // conversation in the reading pane, and the chevron is what
+                // opens the mails under it in the list. It is a line drawing
+                // rather than the filled triangle a folder section has, and it
+                // takes the pointer through a widget with a hover fill to say
+                // so.
+                let target =
+                    egui::Rect::from_center_size(centre, egui::Vec2::splat(THREAD_CHEVRON + 8.0));
+                let response = ui.interact(
+                    target,
+                    egui::Id::new(("thread-chevron", key)),
+                    egui::Sense::click(),
+                );
+                if response.hovered() {
+                    painter.rect_filled(target, 4.0, scheme.hover);
+                    ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                }
+                // Thin and muted at rest, and the row's own weak color under
+                // the pointer: it is a control, not part of the mail.
+                let color = if response.hovered() {
+                    scheme.text_weak
                 } else {
-                    vec![
-                        egui::pos2(centre.x - 3.0, centre.y - half),
-                        egui::pos2(centre.x + 4.0, centre.y),
-                        egui::pos2(centre.x - 3.0, centre.y + half),
-                    ]
+                    scheme.text_weak.gamma_multiply(THREAD_CHEVRON_ALPHA)
                 };
-                painter.add(egui::Shape::convex_polygon(
-                    triangle,
-                    scheme.text_weak,
-                    egui::Stroke::NONE,
-                ));
+                paint_chevron(painter, centre, THREAD_CHEVRON, open, color);
+                chevron = Some(response);
             }
             RowPlace::InThread => {
                 // The thread's spine, row by row: each of its mails draws its
                 // own segment, and the segments meet because the rows do.
-                let x = rect.left() + (THREAD_INDENT - THREAD_TWISTY) / 2.0;
+                let x = rect.left() + (THREAD_INDENT - THREAD_CHEVRON) / 2.0;
                 painter.with_clip_rect(column).line_segment(
                     [egui::pos2(x, rect.top()), egui::pos2(x, rect.bottom())],
                     egui::Stroke::new(1.0_f32, scheme.row_edge),
@@ -4066,7 +4171,7 @@ impl KimoApp {
             scheme.text_weak,
         );
 
-        resp
+        RowResponse { row: resp, chevron }
     }
 
     /// Right column: the selected message on the card the reading pane floats
@@ -4101,7 +4206,7 @@ impl KimoApp {
             egui::pos2(panel.left(), panel.top() + TITLEBAR_HEIGHT),
             panel.max,
         );
-        let Some(msg) = self.selected_message_view() else {
+        let Some(conversation) = self.open_conversation() else {
             self.mail_scroll = 0.0;
             // Nothing on the card, so nothing to keep parsed behind it.
             self.body.forget();
@@ -4113,14 +4218,16 @@ impl KimoApp {
             return;
         };
 
-        // A newly opened message starts at the top. The scroll offset is per
-        // pane, not per message, so without this the next mail opens wherever
+        // A newly opened conversation starts at the top. The scroll offset is
+        // per pane, not per mail, so without this the next one opens wherever
         // the previous one was left — for a Blitz page that means the top of
-        // the page is simply not on screen.
+        // the page is simply not on screen. It is keyed by the conversation and
+        // not by the mail: opening another mail of the thread already on screen
+        // is not a reason to scroll away from where the reader was.
         let message_key = format!(
             "{}/{}",
             self.selected_folder.as_deref().unwrap_or("-"),
-            msg.uid
+            conversation.key
         );
         let new_message = self.scrolled_message.as_deref() != Some(message_key.as_str());
         if new_message {
@@ -4169,7 +4276,34 @@ impl KimoApp {
                         .vertical_scroll_offset(0.0)
                         .horizontal_scroll_offset(0.0);
                 }
-                let output = scroll.show(ui, |ui| self.mail_card(ui, &msg));
+                let output = scroll.show(ui, |ui| {
+                    if let [msg] = conversation.messages.as_slice() {
+                        // A mail of its own: the pane's card is its card.
+                        self.mail_card(ui, msg);
+                        return;
+                    }
+                    // A conversation: one card per mail, oldest first, inside
+                    // the pane's own card — the padding the single mail's card
+                    // keeps (the title bar's height at the top, so the first
+                    // card can scroll under the glass) is kept once, around all
+                    // of them.
+                    egui::Frame::new()
+                        .inner_margin(egui::Margin {
+                            left: CONTENT_PADDING_I8,
+                            right: CONTENT_PADDING_I8,
+                            top: TITLEBAR_HEIGHT_I8 + CONTENT_PADDING_I8,
+                            bottom: CONTENT_PADDING_I8,
+                        })
+                        .show(ui, |ui| {
+                            ui.set_min_width(ui.available_width());
+                            for (index, mail) in conversation.messages.iter().enumerate() {
+                                if index > 0 {
+                                    ui.add_space(CONVERSATION_CARD_GAP);
+                                }
+                                self.conversation_card(ui, mail);
+                            }
+                        });
+                });
                 // Scrolled away from the top, the bar floats over this card.
                 self.mail_scroll = output.state.offset.y;
             })
@@ -4201,40 +4335,60 @@ impl KimoApp {
                 top: TITLEBAR_HEIGHT_I8 + CONTENT_PADDING_I8,
                 bottom: CONTENT_PADDING_I8,
             })
-            .show(ui, |ui| {
-                ui.set_min_width(ui.available_width());
-                // The mail's own column: the headers draw across it and so do
-                // the attachment cards at the foot. Taken before anything is
-                // laid out, because a body wider than the pane — a fixed-width
-                // HTML table — widens the ui as it is drawn, and the cards
-                // belong to the mail, not to what the mail overflowed by.
-                let column = ui.available_width();
-                ui.heading(msg.subject.as_str());
-                ui.label(
-                    egui::RichText::new(format!("From: {}", msg.from))
-                        .small()
-                        .weak(),
-                );
-                if !msg.to.is_empty() {
-                    ui.label(
-                        egui::RichText::new(format!("To: {}", msg.to))
-                            .small()
-                            .weak(),
-                    );
-                }
-                if !msg.date.is_empty() {
-                    ui.label(
-                        egui::RichText::new(format!("Date: {}", msg.date))
-                            .small()
-                            .weak(),
-                    );
-                }
-                // The rule between the headers and the body spans the card, not
-                // just the mail's text column.
-                ui.add(egui::Separator::default().grow(CONTENT_PADDING.x));
-                self.mail_body(ui, msg);
-                self.attachment_cards(ui, msg, column);
-            });
+            .show(ui, |ui| self.mail_sheet(ui, msg));
+    }
+
+    /// One mail of a conversation: the sheet a mail on its own fills, drawn as a
+    /// card of its own — the scheme's faint fill, a hairline, its own padding —
+    /// inside the pane's card, so a thread reads as the mails it is made of
+    /// rather than as one long document with three sets of headers in it.
+    fn conversation_card(&mut self, ui: &mut egui::Ui, msg: &MailMessage) {
+        let scheme = theme::of(ui.ctx());
+        egui::Frame::new()
+            .fill(scheme.card)
+            .stroke(egui::Stroke::new(1.0_f32, scheme.border))
+            .corner_radius(CONVERSATION_CARD_CORNER_RADIUS)
+            .inner_margin(egui::Margin::same(CONVERSATION_CARD_PADDING_I8))
+            .show(ui, |ui| self.mail_sheet(ui, msg));
+    }
+
+    /// What one mail says and nothing around it: the headers, the rule under
+    /// them, the body and the cards of what it came with. The pane pads the card
+    /// around a mail on its own (`mail_card`) and each card of a conversation
+    /// pads itself (`conversation_card`), which is why the padding is not here.
+    fn mail_sheet(&mut self, ui: &mut egui::Ui, msg: &MailMessage) {
+        ui.set_min_width(ui.available_width());
+        // The mail's own column: the headers draw across it and so do the
+        // attachment cards at the foot. Taken before anything is laid out,
+        // because a body wider than the pane — a fixed-width HTML table —
+        // widens the ui as it is drawn, and the cards belong to the mail, not
+        // to what the mail overflowed by.
+        let column = ui.available_width();
+        ui.heading(msg.subject.as_str());
+        ui.label(
+            egui::RichText::new(format!("From: {}", msg.from))
+                .small()
+                .weak(),
+        );
+        if !msg.to.is_empty() {
+            ui.label(
+                egui::RichText::new(format!("To: {}", msg.to))
+                    .small()
+                    .weak(),
+            );
+        }
+        if !msg.date.is_empty() {
+            ui.label(
+                egui::RichText::new(format!("Date: {}", msg.date))
+                    .small()
+                    .weak(),
+            );
+        }
+        // The rule between the headers and the body spans the card, not just the
+        // mail's text column.
+        ui.add(egui::Separator::default().grow(CONTENT_PADDING.x));
+        self.mail_body(ui, msg);
+        self.attachment_cards(ui, msg, column);
     }
 
     /// What the mail came with: one card per attachment, under the body.
@@ -5224,6 +5378,13 @@ const CONTENT_PADDING: egui::Vec2 =
     egui::vec2(CONTENT_PADDING_I8 as f32, CONTENT_PADDING_I8 as f32);
 /// Corner radius of the reading pane's card.
 const CONTENT_CARD_CORNER_RADIUS: u8 = 8;
+/// A conversation's cards in the reading pane: the room between two of them,
+/// the padding each keeps around its own mail, and the corner radius they are
+/// drawn with — the same faint fill and hairline the attachment cards use, one
+/// step in from the pane's own card.
+const CONVERSATION_CARD_GAP: f32 = 12.0;
+const CONVERSATION_CARD_PADDING_I8: i8 = 10;
+const CONVERSATION_CARD_CORNER_RADIUS: u8 = 6;
 /// The attachment cards under a mail's body: one card per file, as tall as a
 /// line of the list, with the gap between two of them and the room the section
 /// keeps between itself and the body above it. The card's own paddings are the
@@ -5700,28 +5861,46 @@ struct CardText<'a> {
     has_attachments: bool,
     /// Where the row sits in the list: a mail on its own, a conversation's own
     /// row, or one mail of an open conversation.
-    place: RowPlace,
+    place: RowPlace<'a>,
 }
 
 /// Where a card sits in the message list, which is what it draws around
-/// itself: a plain mail row, a conversation's own row (inset, with the twisty
+/// itself: a mail on its own, a conversation's own row (inset, with the chevron
 /// that opens it and the count of what it holds), or one mail of an open
 /// conversation (inset under it, with the thread's guide line at the left).
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum RowPlace {
+enum RowPlace<'a> {
     Plain,
-    Thread { open: bool, count: usize },
+    /// `open` is whether the thread's mails are under it, `count` how many
+    /// there are, and `key` what the chevron's own click target is identified
+    /// by — an id that moves between frames would lose the pointer state.
+    Thread {
+        open: bool,
+        count: usize,
+        key: &'a str,
+    },
     InThread,
 }
 
-impl RowPlace {
-    /// How far the row's avatar and text are inset from the column's edge.
+impl RowPlace<'_> {
+    /// How far the row's avatar and text are inset from the column's edge. Every
+    /// row is inset, a conversation's and a mail's alike: the chevron's column
+    /// is reserved on all of them, so the avatars line up down the whole list,
+    /// and a mail with nothing to open leaves that column empty rather than
+    /// starting a step further left than its neighbours.
     fn indent(self) -> f32 {
-        match self {
-            Self::Plain => 0.0,
-            Self::Thread { .. } | Self::InThread => THREAD_INDENT,
-        }
+        THREAD_INDENT
     }
+}
+
+/// What one row's clicks were: the row itself, and — for a conversation — the
+/// chevron that opens and closes it. The two are separate targets, which is
+/// what keeps a click on the mail from changing the list's shape: the row opens
+/// the conversation in the reading pane, the chevron opens the mails in the
+/// list.
+struct RowResponse {
+    row: egui::Response,
+    chevron: Option<egui::Response>,
 }
 
 const MESSAGE_ROW_HEIGHT: f32 = 68.0;
@@ -5735,11 +5914,17 @@ const ROW_DATE_FONT_SIZE: f32 = 11.0;
 const ROW_TITLE_FONT_SIZE: f32 = 12.0;
 const ROW_PREVIEW_FONT_SIZE: f32 = 11.0;
 /// How far a conversation's own row — and the mails it holds — are inset from
-/// the column's edge, and the room the twisty is drawn in at the left of that.
-/// The two are one number: what the twisty is drawn in is exactly what the
-/// thread's mails are inset by, so the block reads as one thing.
+/// the column's edge, and the room the chevron is drawn in at the left of that.
+/// The two are one number: what the chevron is drawn in is exactly what the
+/// thread's mails are inset by, so the block reads as one thing. Every row is
+/// inset by it, a mail with nothing to open included, so the avatars line up
+/// down the whole list.
 const THREAD_INDENT: f32 = 18.0;
-const THREAD_TWISTY: f32 = 10.0;
+const THREAD_CHEVRON: f32 = 10.0;
+/// How much of the row's own weak color the chevron keeps at rest. It is a
+/// quiet control at the edge of a row, and it comes up to the full color under
+/// the pointer, which is what says it can be clicked.
+const THREAD_CHEVRON_ALPHA: f32 = 0.65;
 /// The paperclip a row draws when the mail has parts: the box its outline is
 /// drawn in (`paint_clip_icon` maps the glyph's 24-unit design onto it), the
 /// width the clip actually comes out at — a clip is taller than it is wide, so
@@ -6392,6 +6577,33 @@ fn outline_point(center: egui::Pos2, x: f32, y: f32, size: f32) -> egui::Pos2 {
 /// on `center` and drawn at `MAIL_ACTION_GLYPH`.
 fn glyph_point(center: egui::Pos2, x: f32, y: f32) -> egui::Pos2 {
     outline_point(center, x, y, MAIL_ACTION_GLYPH)
+}
+
+/// The chevron a conversation's row carries at its left: a line drawing — two
+/// strokes meeting at a point — rather than a filled triangle, pointing right
+/// while the thread's mails are hidden and down while they are under it.
+fn paint_chevron(
+    painter: &egui::Painter,
+    centre: egui::Pos2,
+    size: f32,
+    open: bool,
+    color: egui::Color32,
+) {
+    let half = size / 2.0;
+    let points = if open {
+        vec![
+            egui::pos2(centre.x - half, centre.y - half * 0.45),
+            egui::pos2(centre.x, centre.y + half * 0.55),
+            egui::pos2(centre.x + half, centre.y - half * 0.45),
+        ]
+    } else {
+        vec![
+            egui::pos2(centre.x - half * 0.45, centre.y - half),
+            egui::pos2(centre.x + half * 0.55, centre.y),
+            egui::pos2(centre.x - half * 0.45, centre.y + half),
+        ]
+    };
+    painter.add(egui::Shape::line(points, egui::Stroke::new(1.0_f32, color)));
 }
 
 /// The paperclip a message row draws when the mail has parts: the wire of a
@@ -7146,6 +7358,16 @@ mod tests {
         rows.iter().map(|row| row.name.as_str()).collect()
     }
 
+    /// The width the built-in renderer holds one mail's body at, for the tests
+    /// that read the layout the pane settled on — `None` when it holds none.
+    fn held_body_width(app: &KimoApp, identity: &str) -> Option<f32> {
+        app.body
+            .entries
+            .iter()
+            .find(|entry| entry.identity == identity)
+            .and_then(|entry| entry.width)
+    }
+
     /// Every run of text one headless frame of the app drew, for the tests that
     /// care what a column says.
     fn frame_texts(ctx: &egui::Context, app: &mut KimoApp) -> Vec<String> {
@@ -7736,6 +7958,71 @@ mod tests {
         );
     }
 
+    /// Every row is inset by the chevron's column, a mail with nothing to open
+    /// included: the avatars line up down the whole list, and the mail that has
+    /// nothing to expand simply leaves the column empty.
+    #[test]
+    fn every_row_is_inset_by_the_chevron_column() {
+        let ctx = egui::Context::default();
+        crate::fonts::install(&ctx, None, None);
+        let mut app = app_with_threaded_mail(
+            &ctx,
+            vec![
+                threaded_mail("3", "Re: Hello", "c@example.com", &["a@example.com"], 300),
+                threaded_mail("1", "Hello", "a@example.com", &[], 100),
+                threaded_mail("4", "Groceries", "d@example.com", &[], 50),
+            ],
+        );
+
+        let shapes = frame_shapes_at(&ctx, &mut app, 1400.0);
+        let column = app.list_column;
+        let avatars = avatars_in(&shapes, column);
+        assert_eq!(
+            avatars.len(),
+            2,
+            "a conversation's row and a mail's, one avatar each: {avatars:?}"
+        );
+        assert_eq!(
+            avatars[0].x, avatars[1].x,
+            "the two rows start at the same x: {avatars:?}"
+        );
+        let expected =
+            column.left() + LIST_PADDING.left as f32 + THREAD_INDENT + 8.0 + AVATAR_DIAMETER / 2.0;
+        assert!(
+            (avatars[0].x - expected).abs() < 0.5,
+            "the avatar is at {}, expected {expected}",
+            avatars[0].x
+        );
+    }
+
+    /// The avatars a frame drew in the message list: the filled circles the rows
+    /// put their sender's initial on.
+    fn avatars_in(shapes: &[egui::epaint::ClippedShape], column: egui::Rect) -> Vec<egui::Pos2> {
+        let mut out = Vec::new();
+        for clipped in shapes {
+            collect_avatars(&clipped.shape, column, &mut out);
+        }
+        out
+    }
+
+    fn collect_avatars(shape: &egui::Shape, column: egui::Rect, out: &mut Vec<egui::Pos2>) {
+        match shape {
+            egui::Shape::Circle(circle)
+                if (circle.radius * 2.0 - AVATAR_DIAMETER).abs() < 0.5
+                    && circle.center.y > TITLEBAR_HEIGHT
+                    && column.contains(circle.center) =>
+            {
+                out.push(circle.center);
+            }
+            egui::Shape::Vec(shapes) => {
+                for shape in shapes {
+                    collect_avatars(shape, column, out);
+                }
+            }
+            _ => {}
+        }
+    }
+
     /// One mail of a folder the threading tests hand to the list: the headers a
     /// conversation is stitched from are arguments, and the folder's own order
     /// is newest first, which is what the timestamp says.
@@ -7759,7 +8046,10 @@ mod tests {
         mail.timestamp = Some(ts);
         mail.date = String::new();
         mail.body_text = format!("body of {uid}");
-        mail.preview = format!("body of {uid}");
+        // The preview and the body differ on purpose: the list shows the first
+        // and the reading pane the second, and a test that reads the frame
+        // cannot tell them apart otherwise.
+        mail.preview = format!("preview of {uid}");
         mail
     }
 
@@ -7810,7 +8100,15 @@ mod tests {
         let closed: std::collections::HashSet<String> = std::collections::HashSet::new();
         assert_eq!(
             list_rows_of(&threads, mails.len(), &closed, true),
-            vec![ListRow::Thread { thread: 0 }, ListRow::Thread { thread: 1 }]
+            vec![
+                ListRow::Thread { thread: 0 },
+                // A conversation of one is a mail, and is drawn like one: no
+                // chevron, no indent, nothing to open.
+                ListRow::Message {
+                    index: 3,
+                    in_thread: false
+                },
+            ]
         );
 
         // Open: the conversation's own row, then its mails oldest first.
@@ -7832,7 +8130,10 @@ mod tests {
                     index: 0,
                     in_thread: true
                 },
-                ListRow::Thread { thread: 1 },
+                ListRow::Message {
+                    index: 3,
+                    in_thread: false
+                },
             ]
         );
 
@@ -7850,20 +8151,9 @@ mod tests {
 
     /// A conversation is one row showing its newest mail under the thread's
     /// subject, with the count of what it holds — and the mails inside it get no
-    /// rows of their own until it is opened.
-    #[test]
-    fn a_conversation_is_one_row_until_it_is_opened() {
-        let ctx = egui::Context::default();
-        crate::fonts::install(&ctx, None, None);
-        // Read mail, so the row draws each line once: an unread one is struck
-        // through twice (`paint_row_text`), which is another test's subject.
-        let mut newest = threaded_mail("3", "Re: Hello", "c@example.com", &["a@example.com"], 300);
-        newest.seen = true;
-        let mut oldest = threaded_mail("1", "Hello", "a@example.com", &[], 100);
-        oldest.seen = true;
-        let mut app = app_with_threaded_mail(&ctx, vec![newest, oldest]);
-
-        let texts = frame_texts(&ctx, &mut app);
+    /// rows of their own until the chevron is clicked.
+    fn a_conversation_row(app: &mut KimoApp, ctx: &egui::Context) -> egui::Pos2 {
+        let texts = frame_texts(ctx, app);
         assert_eq!(
             texts.iter().filter(|text| *text == "Hello").count(),
             1,
@@ -7878,46 +8168,100 @@ mod tests {
             "the row says how many mails it holds: {texts:?}"
         );
         assert!(
-            texts.iter().any(|text| text == "body of 3"),
+            texts.iter().any(|text| text == "preview of 3"),
             "and shows what the newest one says: {texts:?}"
         );
+        egui::pos2(300.0, TITLEBAR_HEIGHT + MESSAGE_ROW_HEIGHT / 2.0)
+    }
 
-        // Clicking it opens the conversation and the mail its row speaks for.
-        click_at(
-            &ctx,
-            &mut app,
-            egui::pos2(300.0, TITLEBAR_HEIGHT + MESSAGE_ROW_HEIGHT / 2.0),
-        );
-        let texts = frame_texts(&ctx, &mut app);
-        assert!(
-            texts.iter().any(|text| text == "Re: Hello"),
-            "the thread opened: {texts:?}"
-        );
+    /// Two read mails of one conversation, and an app showing their folder. Read
+    /// so the row draws each line once: an unread one is struck through twice
+    /// (`paint_row_text`), which is another test's subject.
+    fn app_with_one_conversation(ctx: &egui::Context) -> KimoApp {
+        let mut newest = threaded_mail("3", "Re: Hello", "c@example.com", &["a@example.com"], 300);
+        newest.seen = true;
+        let mut oldest = threaded_mail("1", "Hello", "a@example.com", &[], 100);
+        oldest.seen = true;
+        app_with_threaded_mail(ctx, vec![newest, oldest])
+    }
+
+    /// Clicking a conversation's row opens it in the reading pane — every mail
+    /// it holds, oldest first, as cards of their own — and leaves the list
+    /// exactly as it was: opening the list's own rows is the chevron's business.
+    #[test]
+    fn clicking_a_conversation_opens_it_in_the_pane_and_not_in_the_list() {
+        let ctx = egui::Context::default();
+        crate::fonts::install(&ctx, None, None);
+        let mut app = app_with_one_conversation(&ctx);
+        let row = a_conversation_row(&mut app, &ctx);
+        let before = app.list_rows.as_ref().expect("rows").rows.clone();
+
+        click_at(&ctx, &mut app, row);
+
         assert_eq!(
             app.selected_message.as_deref(),
             Some("3"),
-            "the newest mail of the thread is the one that opened"
+            "the conversation opens on the mail its row speaks for"
+        );
+        let rows = app.list_rows.as_ref().expect("rows");
+        assert_eq!(rows.rows, before, "the list did not change shape");
+
+        // The pane holds the whole conversation: both mails, in reading order.
+        let texts = frame_texts(&ctx, &mut app);
+        let oldest = texts
+            .iter()
+            .position(|text| text == "body of 1")
+            .unwrap_or_else(|| panic!("the oldest mail is not on the pane: {texts:?}"));
+        let newest = texts
+            .iter()
+            .position(|text| text == "body of 3")
+            .unwrap_or_else(|| panic!("the newest mail is not on the pane: {texts:?}"));
+        assert!(
+            oldest < newest,
+            "a conversation reads oldest first: {texts:?}"
+        );
+    }
+
+    /// The chevron is what opens and closes a conversation's mails in the list,
+    /// and it does nothing else: no mail is opened by it, and the pane is left
+    /// where it was.
+    #[test]
+    fn the_chevron_opens_and_closes_the_mails_under_a_conversation() {
+        let ctx = egui::Context::default();
+        crate::fonts::install(&ctx, None, None);
+        let mut app = app_with_one_conversation(&ctx);
+        let row = a_conversation_row(&mut app, &ctx);
+        let chevron = egui::pos2(app.list_column.left() + 12.0, row.y);
+
+        click_at(&ctx, &mut app, chevron);
+        // The click is applied at the end of the frame that saw it, so the rows
+        // it opened are the next frame's to derive.
+        let _ = frame_texts(&ctx, &mut app);
+        let rows = app.list_rows.as_ref().expect("rows").rows.clone();
+        assert!(
+            rows.iter().any(|row| matches!(
+                row,
+                ListRow::Message {
+                    in_thread: true,
+                    ..
+                }
+            )),
+            "the mails are under the row now: {rows:?}"
+        );
+        assert_eq!(
+            app.selected_message, None,
+            "opening a conversation in the list does not open a mail"
         );
 
-        // Clicking the row again closes it, and leaves the pane alone.
-        click_at(
-            &ctx,
-            &mut app,
-            egui::pos2(300.0, TITLEBAR_HEIGHT + MESSAGE_ROW_HEIGHT / 2.0),
-        );
+        // The chevron of the first row has not moved, so the same click closes
+        // it again.
+        click_at(&ctx, &mut app, chevron);
         let _ = frame_texts(&ctx, &mut app);
-        // The rows are what says the conversation is closed again: the pane is
-        // still showing the mail that was opened, which is where a "Re: Hello"
-        // in the frame comes from now.
-        let rows = app.list_rows.as_ref().expect("the list derived its rows");
+        let rows = app.list_rows.as_ref().expect("rows").rows.clone();
         assert!(
-            rows.rows
-                .iter()
-                .all(|row| matches!(row, ListRow::Thread { .. })),
-            "the thread closed again: {:?}",
-            rows.rows
+            rows.iter().all(|row| matches!(row, ListRow::Thread { .. })),
+            "the conversation closed again: {rows:?}"
         );
-        assert_eq!(app.selected_message.as_deref(), Some("3"));
     }
 
     /// Threading is a preference, and it is the list's shape: turned off, every
@@ -8237,7 +8581,7 @@ mod tests {
                 Some(egui::Rect::from_two_pos(points[0], points[1]))
             }
             egui::Shape::QuadraticBezier(quad) => Some(egui::Rect::from_points(&quad.points)),
-            // A path only counts when it is a line drawing: the twisty that
+            // A path only counts when it is a line drawing: the chevron that
             // opens a conversation is a filled polygon, and it is no more a
             // glyph than the avatar's circle is.
             egui::Shape::Path(path) if path.fill == egui::Color32::TRANSPARENT => {
@@ -8741,7 +9085,7 @@ mod tests {
         let settled = pane_width(&ctx);
         // The body is narrower than the pane by the card's gutter, its padding
         // and the scroll bar; that inset is what a reflow has to keep.
-        let body_width = app.body.width.expect("the body was laid out");
+        let body_width = held_body_width(&app, "INBOX/0").expect("the body was laid out");
         let inset = settled - body_width;
         assert!(inset > 0.0, "the body should be inside the pane");
 
@@ -8775,7 +9119,7 @@ mod tests {
             // The mail does not follow the pointer: it is still laid out for
             // the width it settled at, however far the pane has moved.
             assert_eq!(
-                app.body.width,
+                held_body_width(&app, "INBOX/0"),
                 Some(body_width),
                 "the body reflowed mid-drag"
             );
@@ -8802,7 +9146,7 @@ mod tests {
         assert!(narrower < settled, "the pane did not settle narrower");
         std::thread::sleep(GEOMETRY_SETTLE + Duration::from_millis(20));
         run_app_frame(&ctx, &mut app, Vec::new());
-        let reflowed = app.body.width.expect("the body is still laid out");
+        let reflowed = held_body_width(&app, "INBOX/0").expect("the body is still laid out");
         assert!(
             (reflowed - (narrower - inset)).abs() < 1.0,
             "the body reflowed to {reflowed}, expected {}",
@@ -8974,18 +9318,61 @@ mod tests {
         // The same body a frame later, with the pane moved: the width it has.
         assert_eq!(laid_out_at(&mut cache, "INBOX/1", first, 380.0), 400.0);
         // Another mail is a new body, and a new body is laid out at once
-        // rather than held at the width the old one was laid out for.
-        assert_eq!(cache.identity, "INBOX/1");
+        // rather than held at the width the old one was laid out for. The
+        // first mail keeps its own entry: a conversation shows several at once.
+        assert_eq!(cache.entries.len(), 1);
         assert_eq!(laid_out_at(&mut cache, "INBOX/2", first, 320.0), 320.0);
-        assert_eq!(cache.identity, "INBOX/2");
-        // So is another body under the same uid: a re-fetch can replace a
-        // body the pane is already showing.
+        assert_eq!(cache.entries.len(), 2);
+        // The first one is still there, at the width it settled at.
+        assert_eq!(laid_out_at(&mut cache, "INBOX/1", first, 300.0), 400.0);
+        // Another body under the same uid is a new body: a re-fetch can replace
+        // one the pane is already showing.
         assert_eq!(laid_out_at(&mut cache, "INBOX/2", second, 300.0), 300.0);
-        assert_eq!(cache.fingerprint, body_fingerprint(second));
+        assert_eq!(
+            cache.entries[1].fingerprint,
+            body_fingerprint(second),
+            "the entry was parsed again, not left as it was"
+        );
         // Switching renderer, or opening a mail with no HTML at all, drops it.
         cache.forget();
-        assert!(cache.document.is_none());
+        assert!(cache.entries.is_empty());
         assert_eq!(laid_out_at(&mut cache, "INBOX/2", second, 280.0), 280.0);
+    }
+
+    /// A conversation is several bodies at once, and the cache is bounded: the
+    /// mail that has been off screen longest is the one a new body evicts.
+    #[test]
+    fn the_body_cache_holds_a_conversation_and_evicts_the_oldest() {
+        let ctx = egui::Context::default();
+        let start = Instant::now();
+        let mut cache = BodyCache::default();
+        let html = "<p>Hello</p>";
+        let fingerprint = body_fingerprint(html);
+        let at = |cache: &mut BodyCache, uid: &str, now| {
+            cache.get(&ctx, uid, fingerprint, html, 400.0, now).1
+        };
+
+        // Every mail of a conversation is held, not just the last one asked
+        // for: the pane walks all of them on every frame.
+        for index in 0..BODY_CACHE {
+            at(&mut cache, &format!("INBOX/{index}"), start);
+        }
+        assert_eq!(cache.entries.len(), BODY_CACHE);
+        // One more evicts the mail used longest ago — the first, which nothing
+        // has asked for since.
+        at(&mut cache, "INBOX/extra", start + Duration::from_millis(10));
+        assert_eq!(cache.entries.len(), BODY_CACHE);
+        assert!(
+            !cache
+                .entries
+                .iter()
+                .any(|entry| entry.identity == "INBOX/0"),
+            "the oldest entry is the one that went"
+        );
+        assert!(cache
+            .entries
+            .iter()
+            .any(|entry| entry.identity == "INBOX/extra"));
     }
 
     #[test]
