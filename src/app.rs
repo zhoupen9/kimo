@@ -5372,17 +5372,21 @@ const LOAD_OLDER_HEIGHT: f32 = 26.0;
 const LOAD_OLDER_MARGIN: f32 = 12.0;
 const LOAD_OLDER_CORNER_RADIUS: u8 = SEARCH_BOX_CORNER_RADIUS;
 
-/// The rows' padding inside the list's scroll area. The top is the title
-/// bar's height and it is *inside* the scroll area on purpose: the first mail
-/// starts below the bar at rest, and scrolling takes the padding away with
-/// the rows, which is what slides them under the floating bar. It belongs to
-/// the scroll area rather than to the column, which is what lets the scroll
-/// bar reach the column's edge.
+/// The rows' padding inside the list's scroll area: the sides (`LIST_MARGIN`,
+/// which keeps the mails off the hairlines the card is framed by) and the top.
+/// The top is the title bar's height and it is *inside* the scroll area on
+/// purpose: the first mail starts below the bar at rest, and scrolling takes
+/// the padding away with the rows, which is what slides them under the floating
+/// bar. It belongs to the scroll area rather than to the column, which is what
+/// lets the scroll bar reach the column's edge. **There is no bottom padding**:
+/// the list's card ends with its last mail (`list_card`), so a padding below
+/// the rows would be a strip of surface under the last mail — and, scrolled to
+/// the end, a strip of nothing under it.
 const LIST_PADDING: egui::Margin = egui::Margin {
     left: LIST_MARGIN,
     right: LIST_MARGIN,
     top: TITLEBAR_HEIGHT_I8,
-    bottom: LIST_MARGIN,
+    bottom: 0,
 };
 /// The gutter around the reading pane's card — the gap between the card and
 /// the list column, and the chrome showing between the card and the panel's
@@ -8121,7 +8125,9 @@ mod tests {
         let shapes = frame_shapes_at(&ctx, &mut app, 1400.0);
         let column = app.list_column;
         let card = list_card_in(&shapes, column, content).expect("the list sits on a card");
-        let expected = TITLEBAR_HEIGHT + 3.0 * MESSAGE_ROW_HEIGHT + LIST_PADDING.bottom as f32;
+        // The bar's height the first mail starts below, the rows, and nothing
+        // below the last of them: the card ends with the mail.
+        let expected = TITLEBAR_HEIGHT + 3.0 * MESSAGE_ROW_HEIGHT;
         assert!(
             (card.height() - expected).abs() < 1.0,
             "the card is {} tall, expected {expected}: {card:?}",

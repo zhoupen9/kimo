@@ -504,7 +504,8 @@ Event (mpsc) ──► drain_events() at frame start ──► merge into Accoun
   list's rows, and the reading pane's cards, their headers included, which
   is why mail passes under the glass there too. **The list column is a card
   too** (`list_card`): the panel behind it is chrome, and the card is as tall as
-  the list's own content — the rows and `LIST_PADDING` — so a folder with three
+  the list's own content — the bar's height and the rows, and *nothing* below
+  the last of them — so a folder with three
   mails leaves the chrome below them instead of a column of empty surface, a
   list that outgrows the window fills the column as it always did, and a column
   with nothing to list (no account, an empty folder, a search with no hits) has
@@ -560,8 +561,9 @@ Event (mpsc) ──► drain_events() at frame start ──► merge into Accoun
   and a row paints them again over its own highlight, which is what keeps a
   selected mail's frame visible across its fill. Pane padding lives *inside*
   each scroll area
-  (`Frame::inner_margin(LIST_PADDING)` around the rows — sides, bottom, and
-  the bar's height at the top, which is what the rows scroll under — and
+  (`Frame::inner_margin(LIST_PADDING)` around the rows — the sides, and the
+  bar's height at the top, which is what the rows scroll under; there is no
+  bottom padding, because the list's card ends with its last mail — and
   `mail_card` for each mail: the card's own padding all round, and the bar's
   height on top of it for the first card of what the pane shows — and only for
   that one), not on the panel's frame, which is what lets the scroll bars reach
