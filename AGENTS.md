@@ -594,9 +594,12 @@ Event (mpsc) ──► drain_events() at frame start ──► merge into Accoun
   and does not change the layout the galley was measured for, so the ellipsis
   cut and the right-aligned timestamp stay exactly where they were. The row's
   font sizes are the `ROW_DATE_FONT_SIZE` / `ROW_TITLE_FONT_SIZE` /
-  `ROW_PREVIEW_FONT_SIZE` constants next to `MESSAGE_ROW_HEIGHT` (a 68 pt
-  row whose three lines are centred at y = 20 / 40 / 57), so retuning the list
-  is one edit instead of a hunt for literals. The three lines are elided by
+  `ROW_PREVIEW_FONT_SIZE` constants next to `MESSAGE_ROW_HEIGHT`, and where
+  they sit are `ROW_SENDER_Y` / `ROW_SUBJECT_Y` / `ROW_PREVIEW_Y` (a 68 pt
+  row, its three lines placed as one block centred in it: the room above the
+  sender's line is the room below the preview, which
+  `the_rows_three_lines_are_centred_in_the_row` pins), so retuning the list is
+  one edit instead of a hunt for literals. The three lines are elided by
   epaint itself (`truncate_galley`: one `LayoutJob` whose `max_rows` is 1 and
   whose overflow character is the ellipsis), never by a search that lays a
   galley out per probe to measure it: the list re-lays out every visible row on

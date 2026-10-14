@@ -4083,7 +4083,7 @@ impl KimoApp {
                 .fonts_mut(|f| f.layout_no_wrap(count.to_string(), small, scheme.text_weak));
             line_right -= badge.size().x;
             painter.galley(
-                egui::pos2(line_right, rect.top() + 20.0 - badge.size().y * 0.5),
+                egui::pos2(line_right, rect.top() + ROW_SENDER_Y - badge.size().y * 0.5),
                 badge,
                 scheme.text_weak,
             );
@@ -4098,7 +4098,7 @@ impl KimoApp {
         });
         let date_pos = egui::pos2(
             line_right - date_galley.size().x,
-            rect.top() + 20.0 - date_galley.size().y * 0.5,
+            rect.top() + ROW_SENDER_Y - date_galley.size().y * 0.5,
         );
         painter.galley(date_pos, date_galley, scheme.text_weak);
         let sender_max_width = (date_pos.x - text_left - 12.0).max(40.0);
@@ -4111,7 +4111,7 @@ impl KimoApp {
         );
         paint_row_text(
             painter,
-            egui::pos2(text_left, rect.top() + 20.0 - sender.size().y * 0.5),
+            egui::pos2(text_left, rect.top() + ROW_SENDER_Y - sender.size().y * 0.5),
             sender,
             title_color,
             card.unread,
@@ -4134,7 +4134,10 @@ impl KimoApp {
         );
         paint_row_text(
             painter,
-            egui::pos2(text_left, rect.top() + 40.0 - subject.size().y * 0.5),
+            egui::pos2(
+                text_left,
+                rect.top() + ROW_SUBJECT_Y - subject.size().y * 0.5,
+            ),
             subject,
             title_color,
             card.unread,
@@ -4145,7 +4148,10 @@ impl KimoApp {
             paint_clip_icon(
                 painter,
                 egui::Rect::from_center_size(
-                    egui::pos2(text_right - ROW_CLIP_WIDTH / 2.0, rect.top() + 40.0),
+                    egui::pos2(
+                        text_right - ROW_CLIP_WIDTH / 2.0,
+                        rect.top() + ROW_SUBJECT_Y,
+                    ),
                     egui::vec2(ROW_CLIP_SIZE, ROW_CLIP_SIZE),
                 ),
                 scheme.text_weak,
@@ -4162,7 +4168,7 @@ impl KimoApp {
             text_right - text_left,
         );
         painter.galley(
-            egui::pos2(text_left, rect.top() + 57.0 - third.size().y * 0.5),
+            egui::pos2(text_left, rect.top() + ROW_PREVIEW_Y - third.size().y * 0.5),
             third,
             scheme.text_weak,
         );
@@ -5922,6 +5928,16 @@ const AVATAR_FONT_SIZE: f32 = 14.0;
 const ROW_DATE_FONT_SIZE: f32 = 11.0;
 const ROW_TITLE_FONT_SIZE: f32 = 12.0;
 const ROW_PREVIEW_FONT_SIZE: f32 = 11.0;
+/// Where those three lines are centred, measured down from the row's top edge:
+/// the sender and the timestamp, the subject under it, and the preview under
+/// that. They are one block centred in the row — the subject line is the one
+/// straddling the middle of `MESSAGE_ROW_HEIGHT` — which is what leaves the room
+/// above the sender's line and the room below the preview the same; spacing the
+/// lines from the row's top edge left the preview twice as close to the bottom
+/// as the sender was to the top.
+const ROW_SENDER_Y: f32 = 15.0;
+const ROW_SUBJECT_Y: f32 = 35.0;
+const ROW_PREVIEW_Y: f32 = 52.0;
 /// How far a conversation's own row — and the mails it holds — are inset from
 /// the column's edge, and the room the chevron is drawn in at the left of that.
 /// The two are one number: what the chevron is drawn in is exactly what the
@@ -7441,6 +7457,33 @@ mod tests {
         texts
     }
 
+    /// The boxes of every run of text a frame drew inside `rect` — a galley's own
+    /// rect, which is what a row places its lines by, not the ink drawn on it.
+    fn text_boxes_in(shapes: &[egui::epaint::ClippedShape], rect: egui::Rect) -> Vec<egui::Rect> {
+        let mut out = Vec::new();
+        for clipped in shapes {
+            collect_text_boxes(&clipped.shape, rect, &mut out);
+        }
+        out
+    }
+
+    fn collect_text_boxes(shape: &egui::Shape, rect: egui::Rect, out: &mut Vec<egui::Rect>) {
+        match shape {
+            egui::Shape::Text(text) => {
+                let drawn = egui::Rect::from_min_size(text.pos, text.galley.size());
+                if rect.contains_rect(drawn) {
+                    out.push(drawn);
+                }
+            }
+            egui::Shape::Vec(shapes) => {
+                for shape in shapes {
+                    collect_text_boxes(shape, rect, out);
+                }
+            }
+            _ => {}
+        }
+    }
+
     fn collect_text_color(shape: &egui::Shape, out: &mut Vec<(String, egui::Color32)>) {
         match shape {
             egui::Shape::Text(text) => {
@@ -7976,6 +8019,44 @@ mod tests {
         assert!(
             !strokes.is_empty(),
             "a search hit with a file draws no clip: {strokes:?}"
+        );
+    }
+
+    /// The row's three lines are one block, centred in the row: the room above
+    /// the sender's line is the room below the preview. Placing them from the
+    /// row's top edge instead left the preview half as far from the bottom as
+    /// the sender was from the top, which is what the eye reads as a row whose
+    /// mail is falling out of it.
+    #[test]
+    fn the_rows_three_lines_are_centred_in_the_row() {
+        let ctx = egui::Context::default();
+        crate::fonts::install(&ctx, None, None);
+        let mut app = app_with_messages(&ctx, 2);
+        let shapes = frame_shapes_at(&ctx, &mut app, 1400.0);
+        let column = app.list_column;
+        let row = egui::Rect::from_min_size(
+            egui::pos2(column.left(), column.top() + TITLEBAR_HEIGHT),
+            egui::vec2(column.width(), MESSAGE_ROW_HEIGHT),
+        );
+
+        // Everything the row draws text with, the avatar's initial included:
+        // the block the eye sees is all of it.
+        let lines = text_boxes_in(&shapes, row);
+        assert!(
+            lines.len() >= 4,
+            "the row's sender, date, subject and preview: {lines:?}"
+        );
+        let top = lines
+            .iter()
+            .fold(f32::INFINITY, |top, line| top.min(line.top()));
+        let bottom = lines
+            .iter()
+            .fold(f32::NEG_INFINITY, |bottom, line| bottom.max(line.bottom()));
+        let middle = (top + bottom) / 2.0;
+        assert!(
+            (middle - row.center().y).abs() < 2.5,
+            "the row's text is centred on {}, not {middle}: {lines:?}",
+            row.center().y
         );
     }
 
