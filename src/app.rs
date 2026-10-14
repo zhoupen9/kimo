@@ -23,7 +23,7 @@
 //! a mail on the wire, and the one that says what the server said when it did
 //! not.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
@@ -238,6 +238,16 @@ impl MailAction {
             MailAction::Delete => "Delete — removes this mail from the server too",
             other => other.label(),
         }
+    }
+}
+
+/// What the Delete cell says in select mode, where what it would delete is a
+/// selection rather than the one mail the reading pane shows. The count is the
+/// one thing the seven glyphs cannot say.
+fn delete_selection_tooltip(count: usize) -> String {
+    match count {
+        1 => "Delete — removes the selected mail from the server too".to_string(),
+        n => format!("Delete — removes the {n} selected mails from the server too"),
     }
 }
 
@@ -508,6 +518,17 @@ pub struct KimoApp {
     /// The list as it is drawn, derived from the folder's mail rather than
     /// built on every frame — see [`ListRows`].
     list_rows: Option<ListRows>,
+    /// Whether the message list is in select mode: every row draws a checkbox
+    /// in place of its avatar, and a click on the row itself — anywhere but
+    /// the box — leaves the mode instead of opening a mail. In memory only:
+    /// which mails are being picked is a per-session thing, the way the open
+    /// conversations are.
+    select_mode: bool,
+    /// The mail checked in select mode, by the identity the database keys a
+    /// message by — a search lists hits from every folder at once, so a uid on
+    /// its own would not do. Dropped whenever the column moves to another list
+    /// (`cancel_select`).
+    selected_mails: HashSet<MailKey>,
     /// The same for the reading pane's card, which scrolls the whole mail:
     /// either column scrolled is content under the floating bar. Zero while
     /// no mail is open.
@@ -578,6 +599,46 @@ enum ListRow {
     /// One mail, `index` into the folder's messages. `in_thread` marks the
     /// ones an open thread holds, which are drawn indented under it.
     Message { index: usize, in_thread: bool },
+}
+
+/// One mail as the selection knows it: the identity the database keys a
+/// message by. A uid on its own would not do — a search lists hits from every
+/// folder and account at once — and the two extra strings are what a delete
+/// groups its jobs by (`delete_batches`).
+#[derive(Clone, PartialEq, Eq, Hash, Debug)]
+struct MailKey {
+    account: String,
+    folder: String,
+    uid: String,
+}
+
+impl MailKey {
+    fn new(account: &str, folder: &str, uid: &str) -> Self {
+        Self {
+            account: account.to_string(),
+            folder: folder.to_string(),
+            uid: uid.to_string(),
+        }
+    }
+}
+
+/// What select mode's Delete sends: the checked mail grouped by the account and
+/// folder it lives in — one job per group, because one job is one connection —
+/// with each group in uid order, so the same selection is always the same
+/// jobs. A selection made in a folder is one group; one made over a search's
+/// hits can be several.
+fn delete_batches(mails: &HashSet<MailKey>) -> BTreeMap<(String, String), Vec<String>> {
+    let mut batches: BTreeMap<(String, String), Vec<String>> = BTreeMap::new();
+    for key in mails {
+        batches
+            .entry((key.account.clone(), key.folder.clone()))
+            .or_default()
+            .push(key.uid.clone());
+    }
+    for uids in batches.values_mut() {
+        uids.sort();
+    }
+    batches
 }
 
 /// The message list's model of the folder it is showing: the mail grouped into
@@ -1250,6 +1311,8 @@ impl KimoApp {
             open_threads: HashSet::new(),
             open_rev: 0,
             list_rows: None,
+            select_mode: false,
+            selected_mails: HashSet::new(),
         };
 
         app.selected_account = app.accounts.first().map(|a| a.id.clone());
@@ -1388,6 +1451,12 @@ impl KimoApp {
             } => {
                 // The worker has already taken the mail off the server and
                 // out of the database; what is left is this in-memory copy.
+                //
+                // A checked mail that went is not checked any more: its row is
+                // about to leave the list, and the selection must not keep a
+                // key nothing on screen stands for.
+                self.selected_mails
+                    .remove(&MailKey::new(&account_id, &folder, &uid));
                 if let Some(state) = self.states.get_mut(&account_id) {
                     if let Some(fc) = state.mailbox.folders.iter_mut().find(|f| f.name == folder) {
                         fc.messages.retain(|m| m.uid != uid);
@@ -1558,6 +1627,9 @@ impl KimoApp {
         self.selected_account = Some(account_id.clone());
         self.selected_folder = Some(folder.clone());
         self.selected_message = None;
+        // The column is about to show another folder's mail, and a selection is
+        // a selection of the list it was made on.
+        self.cancel_select();
 
         let needs_fetch = match self.states.get(&account_id) {
             Some(state) => match state.mailbox.folders.iter().find(|f| f.name == folder) {
@@ -1625,6 +1697,8 @@ impl KimoApp {
     fn delete_account(&mut self, account_id: &str) {
         self.accounts.retain(|a| a.id != account_id);
         self.states.remove(account_id);
+        // Whatever was checked of it is not on screen any more.
+        self.cancel_select();
         if self.selected_account.as_deref() == Some(account_id) {
             self.selected_account = self.accounts.first().map(|a| a.id.clone());
             self.selected_folder = Some("INBOX".to_string());
@@ -1683,16 +1757,22 @@ impl KimoApp {
         );
     }
 
-    /// Delete the mail the reading pane shows, by way of a worker thread: the
-    /// server is told first and the database row goes only once it has agreed
-    /// (`Job::DeleteMessage`), so mail that is still on the server is never
-    /// dropped here. The row leaves the list when the deletion comes back
-    /// (`Event::MessageDeleted`), which is also where the reading pane is
-    /// cleared if it was showing it.
+    /// Delete what the title bar's Delete is about: the mail the reading pane
+    /// shows, or — while the list is in select mode — every mail checked in it.
+    ///
+    /// Either way it is by way of a worker thread: the server is told first and
+    /// each database row goes only once it has agreed (`Job::DeleteMessage`), so
+    /// mail that is still on the server is never dropped here. The rows leave
+    /// the list when the deletion comes back (`Event::MessageDeleted`), which is
+    /// also where the reading pane is cleared if it was showing one of them.
     ///
     /// Nothing asks first: the button is the confirmation, and a deletion that
     /// cannot be undone is what the tooltip says it is.
     fn delete_selected_message(&mut self) {
+        if self.select_mode {
+            self.delete_checked_messages();
+            return;
+        }
         // The reading pane's own question, so a uid it no longer shows is no
         // mail to delete — the same test the buttons' enabled state makes.
         if !self.has_selected_message() {
@@ -1712,11 +1792,36 @@ impl KimoApp {
             Job::DeleteMessage {
                 account,
                 folder,
-                uid,
+                uids: vec![uid],
             },
             self.ctx.clone(),
             self.tx.clone(),
         );
+    }
+
+    /// Delete every checked mail. The selection is grouped by the folder the
+    /// mails live in — a search can check hits from several accounts at once —
+    /// and each group is one job on one connection (`delete_batches`).
+    ///
+    /// Nothing is cleared here: each row leaves the list when
+    /// `Event::MessageDeleted` says the server agreed, and a mail the server
+    /// refused keeps both its copies and its check, so the button is there to be
+    /// pressed again.
+    fn delete_checked_messages(&mut self) {
+        for ((account_id, folder), uids) in delete_batches(&self.selected_mails) {
+            let Some(account) = self.accounts.iter().find(|a| a.id == account_id).cloned() else {
+                continue;
+            };
+            sync::spawn(
+                Job::DeleteMessage {
+                    account,
+                    folder,
+                    uids,
+                },
+                self.ctx.clone(),
+                self.tx.clone(),
+            );
+        }
     }
 
     /// Save the add/edit form: mint an account (and a fresh id) for a new
@@ -1774,11 +1879,13 @@ impl KimoApp {
             self.selected_account = Some(account_id.clone());
             self.selected_folder = Some("INBOX".to_string());
             self.selected_message = None;
+            self.cancel_select();
         } else if switches_mailbox && self.selected_account.as_deref() == Some(account_id.as_str())
         {
             // The folder list and its mail are about to be replaced.
             self.selected_folder = Some("INBOX".to_string());
             self.selected_message = None;
+            self.cancel_select();
         }
         self.show_account_form = false;
     }
@@ -2240,6 +2347,22 @@ impl KimoApp {
         };
         self.current_folder()
             .is_some_and(|folder| folder.messages.iter().any(|m| m.uid == uid))
+    }
+
+    /// Whether the bar draws one of the seven mail actions enabled.
+    ///
+    /// In view mode the answer is the mail the reading pane shows, the way it
+    /// always was. **Select mode is the other answer**: reply, reply all,
+    /// forward, label, flag and export are all about one mail — the one on the
+    /// pane — and the list is what the click is about now, so they are drawn
+    /// dimmed and sense nothing; Delete, which takes a whole selection, is the
+    /// one left live, and only while something is checked.
+    fn mail_action_enabled(&self, action: MailAction) -> bool {
+        if self.select_mode {
+            action == MailAction::Delete && !self.selected_mails.is_empty()
+        } else {
+            self.has_selected_message()
+        }
     }
 
     // ----- UI ----------------------------------------------------------------
@@ -2761,7 +2884,10 @@ impl KimoApp {
     /// They act on the mail open in the reading pane, so that is what enables
     /// them (`has_selected_message`): with no mail there the seven glyphs are
     /// dimmed, the buttons stop sensing clicks and nothing fills under the
-    /// pointer.
+    /// pointer. **Select mode is the other answer**: the list is what the click
+    /// is about then, and Delete — the one action that has something to do with
+    /// more than one mail — is the only one of the seven left enabled
+    /// (`mail_action_enabled`).
     ///
     /// Every cell is one of the bar's buttons — `TITLEBAR_BUTTON_SIZE` square,
     /// `TITLEBAR_BUTTON_GAP` from the next one, empty at rest and filled under
@@ -2782,8 +2908,8 @@ impl KimoApp {
         // The run lays itself out: `TITLEBAR_BUTTON_GAP` between the cells, which
         // is the gap `titlebar_cells_width` — and through it the fit — assumes.
         row.spacing_mut().item_spacing.x = TITLEBAR_BUTTON_GAP;
-        let enabled = self.has_selected_message();
         for action in MailAction::ALL {
+            let enabled = self.mail_action_enabled(action);
             let response = titlebar_button(row, enabled);
             let color = if enabled {
                 visuals.text_color()
@@ -2801,7 +2927,17 @@ impl KimoApp {
                 MailAction::Delete => paint_delete_icon(painter, response.rect, color),
             }
             let response = response.on_hover_text(if enabled {
-                action.tooltip().to_string()
+                if self.select_mode && action == MailAction::Delete {
+                    delete_selection_tooltip(self.selected_mails.len())
+                } else {
+                    action.tooltip().to_string()
+                }
+            } else if self.select_mode {
+                if action == MailAction::Delete {
+                    "Delete — no mail selected".to_string()
+                } else {
+                    format!("{} — not available in select mode", action.label())
+                }
             } else {
                 format!("{} — no mail selected", action.label())
             });
@@ -3493,16 +3629,25 @@ impl KimoApp {
         // The rows are the list's model and the mail they name lives in the
         // account state: both are read here, and only read.
         let rows = self.list_rows.as_ref().expect("derived just above");
+        let (Some(account), Some(folder)) = (
+            self.selected_account.as_deref(),
+            self.selected_folder.as_deref(),
+        ) else {
+            return None;
+        };
         let messages = self
-            .selected_account
-            .as_deref()
-            .zip(self.selected_folder.as_deref())
-            .and_then(|(account_id, folder)| self.folder_messages_of(account_id, folder))
+            .folder_messages_of(account, folder)
             .expect("checked just above");
         let mut clicked: Option<MailMessage> = None;
         // A conversation's chevron was clicked: whether it opens or closes is
         // applied once the borrow of the state is over.
         let mut toggled: Option<String> = None;
+        // A box was clicked: the mail it stands for — one mail, or every mail of
+        // a conversation — is checked once the borrow of the state is over.
+        let mut checked: Option<Vec<MailKey>> = None;
+        // A click on a row in select mode is the way out of it, and nothing
+        // else: it does not open the mail under the pointer.
+        let mut leave_select = false;
         let list = egui::ScrollArea::vertical()
             .auto_shrink([false, false])
             .show_viewport(ui, |ui, viewport| {
@@ -3535,19 +3680,39 @@ impl KimoApp {
                                                 open,
                                                 first,
                                             );
-                                            // The chevron is what opens and
-                                            // closes the mails in the list; the
-                                            // row opens the conversation in the
-                                            // pane. A click on one is not a
-                                            // click on the other.
-                                            if drawn
+                                            // The box checks every mail the
+                                            // conversation holds, the chevron
+                                            // opens and closes them in the
+                                            // list, and the row opens the
+                                            // conversation in the pane — or, in
+                                            // select mode, leaves it. A click on
+                                            // one is not a click on another.
+                                            if drawn.checkbox.clicked() {
+                                                checked = Some(
+                                                    conversation
+                                                        .messages
+                                                        .iter()
+                                                        .map(|&index| {
+                                                            MailKey::new(
+                                                                account,
+                                                                folder,
+                                                                &messages[index].uid,
+                                                            )
+                                                        })
+                                                        .collect(),
+                                                );
+                                            } else if drawn
                                                 .chevron
                                                 .is_some_and(|chevron| chevron.clicked())
                                             {
                                                 toggled = Some(conversation.key.clone());
                                             } else if drawn.row.clicked() {
-                                                clicked =
-                                                    Some(messages[conversation.newest].clone());
+                                                if self.select_mode {
+                                                    leave_select = true;
+                                                } else {
+                                                    clicked =
+                                                        Some(messages[conversation.newest].clone());
+                                                }
                                             }
                                         }
                                         ListRow::Message { index, in_thread } => {
@@ -3556,12 +3721,24 @@ impl KimoApp {
                                             } else {
                                                 RowPlace::Plain
                                             };
-                                            if self
-                                                .message_row(ui, &messages[index], first, place)
-                                                .row
-                                                .clicked()
-                                            {
-                                                clicked = Some(messages[index].clone());
+                                            let drawn = self.message_row(
+                                                ui,
+                                                &messages[index],
+                                                first,
+                                                place,
+                                            );
+                                            if drawn.checkbox.clicked() {
+                                                checked = Some(vec![MailKey::new(
+                                                    account,
+                                                    folder,
+                                                    &messages[index].uid,
+                                                )]);
+                                            } else if drawn.row.clicked() {
+                                                if self.select_mode {
+                                                    leave_select = true;
+                                                } else {
+                                                    clicked = Some(messages[index].clone());
+                                                }
                                             }
                                         }
                                     }
@@ -3588,6 +3765,17 @@ impl KimoApp {
                 self.open_threads.insert(key);
             }
             self.open_rev += 1;
+            self.ctx.request_repaint();
+        }
+        // A checked row and the way out of select mode. Like the chevron, what
+        // the click made is what the next frame draws, so the frame is asked
+        // for here rather than waited for.
+        if let Some(keys) = checked {
+            self.toggle_check(keys);
+            self.ctx.request_repaint();
+        }
+        if leave_select {
+            self.cancel_select();
             self.ctx.request_repaint();
         }
         if at_end {
@@ -3652,6 +3840,92 @@ impl KimoApp {
             threads,
             rows,
         });
+    }
+
+    /// The folder the list is showing, as `(account, folder)`: what a folder
+    /// row's selection key and its checkbox id are built from. The rows are only
+    /// drawn while a folder is open — the search results have a row of their
+    /// own, `search_row`, which names the folder each hit lives in — so the two
+    /// empty fallbacks describe a list that cannot be drawn anyway.
+    fn list_folder(&self) -> (&str, &str) {
+        (
+            self.selected_account.as_deref().unwrap_or_default(),
+            self.selected_folder.as_deref().unwrap_or_default(),
+        )
+    }
+
+    /// What a folder row's checkbox draws: `None` in view mode — where the
+    /// avatar stands and the pointer alone brings an empty box over the row it
+    /// is on — and otherwise the state of the mail the row stands for. `uids`
+    /// is that mail, or every mail of the conversation the row speaks for.
+    fn folder_checkbox(&self, uids: &[&str]) -> Option<CheckState> {
+        if !self.select_mode {
+            return None;
+        }
+        let (account, folder) = self.list_folder();
+        let keys: Vec<MailKey> = uids
+            .iter()
+            .map(|uid| MailKey::new(account, folder, uid))
+            .collect();
+        Some(self.check_state(&keys))
+    }
+
+    /// The same for one search hit, which names the folder it lives in — one
+    /// hit is one mail, so its box has no state between off and on.
+    fn hit_checkbox(&self, hit: &SearchHit) -> Option<CheckState> {
+        if !self.select_mode {
+            return None;
+        }
+        let key = MailKey::new(&hit.account_id, &hit.folder, &hit.uid);
+        Some(if self.selected_mails.contains(&key) {
+            CheckState::On
+        } else {
+            CheckState::Off
+        })
+    }
+
+    /// What a box says about the mails it stands for: nothing checked is off,
+    /// everything checked is on, and a conversation with only some of its mails
+    /// checked — which is what opening it and unchecking one mail reaches — is
+    /// in between. An empty run is nothing checked, which is what a row that
+    /// stands for no mail says.
+    fn check_state(&self, keys: &[MailKey]) -> CheckState {
+        let checked = keys
+            .iter()
+            .filter(|key| self.selected_mails.contains(*key))
+            .count();
+        match checked {
+            0 => CheckState::Off,
+            n if n == keys.len() => CheckState::On,
+            _ => CheckState::Partial,
+        }
+    }
+
+    /// A checkbox was clicked: that is what turns select mode on, and the mails
+    /// the row stands for go into the selection — or out of it when they were
+    /// all in it, which is how a checked conversation is unchecked.
+    fn toggle_check(&mut self, keys: Vec<MailKey>) {
+        if keys.is_empty() {
+            return;
+        }
+        self.select_mode = true;
+        let all = keys.iter().all(|key| self.selected_mails.contains(key));
+        for key in keys {
+            if all {
+                self.selected_mails.remove(&key);
+            } else {
+                self.selected_mails.insert(key);
+            }
+        }
+    }
+
+    /// Leave select mode and drop what was checked. The column is a list of
+    /// something — a folder, a query — and a selection is a selection *of* it:
+    /// whatever moves the column to another list ends the mode rather than
+    /// leaving checks behind for rows that are not on screen any more.
+    fn cancel_select(&mut self) {
+        self.select_mode = false;
+        self.selected_mails.clear();
     }
 
     /// `Load older mail`, floating over the bottom of the message list: the
@@ -3778,8 +4052,13 @@ impl KimoApp {
             return None;
         }
         // A hit is what a click landed on, opened once the list has been drawn:
-        // `open_hit` walks the account state, which the rows are borrowing.
+        // `open_hit` walks the account state, which the rows are borrowing. A
+        // click on a hit's box checks it instead (and a click on the row itself
+        // leaves select mode), and a hit names its own folder, so the key is
+        // built from the hit and not from the column.
         let mut clicked: Option<SearchHit> = None;
+        let mut checked: Option<Vec<MailKey>> = None;
+        let mut leave_select = false;
         let hits = &self.search_hits;
         let list = egui::ScrollArea::vertical()
             .auto_shrink([false, false])
@@ -3796,8 +4075,20 @@ impl KimoApp {
                             hits.len(),
                             |ui, rows| {
                                 for index in rows {
-                                    if self.search_row(ui, &hits[index], index == 0).row.clicked() {
-                                        clicked = Some(hits[index].clone());
+                                    let hit = &hits[index];
+                                    let drawn = self.search_row(ui, hit, index == 0);
+                                    if drawn.checkbox.clicked() {
+                                        checked = Some(vec![MailKey::new(
+                                            &hit.account_id,
+                                            &hit.folder,
+                                            &hit.uid,
+                                        )]);
+                                    } else if drawn.row.clicked() {
+                                        if self.select_mode {
+                                            leave_select = true;
+                                        } else {
+                                            clicked = Some(hit.clone());
+                                        }
                                     }
                                 }
                             },
@@ -3806,6 +4097,14 @@ impl KimoApp {
             });
         // A scrolled result list floats the bar exactly like the folder's does.
         self.list_scroll = list.state.offset.y;
+        if let Some(keys) = checked {
+            self.toggle_check(keys);
+            self.ctx.request_repaint();
+        }
+        if leave_select {
+            self.cancel_select();
+            self.ctx.request_repaint();
+        }
         if let Some(hit) = clicked {
             self.open_hit(&hit);
         }
@@ -3817,6 +4116,13 @@ impl KimoApp {
     fn pump_search(&mut self, force: bool) {
         if force {
             self.search_pending = None;
+            // Enter (or Search/Clear) applies the query now. A *different*
+            // query is a different list of hits, and a selection is a selection
+            // of the list it was made on: the checks go with it. Re-running the
+            // query already applied is not a change — the list is the same one.
+            if self.search_applied.as_ref() != Some(&self.search) {
+                self.cancel_select();
+            }
             self.spawn_search();
             return;
         }
@@ -3834,13 +4140,18 @@ impl KimoApp {
                 if self.search.is_active() {
                     self.search_pending = Some((self.search.clone(), now));
                 } else {
-                    // An emptied bar goes back to the folder view at once.
+                    // An emptied bar goes back to the folder view at once, and
+                    // the column is another list than the hits were.
                     self.search_pending = None;
+                    self.cancel_select();
                     self.spawn_search();
                 }
             }
             SearchWait::Run => {
                 self.search_pending = None;
+                // The query moved: another set of hits, and nothing checked on
+                // the one before it is on this one.
+                self.cancel_select();
                 self.spawn_search();
             }
         }
@@ -3908,12 +4219,18 @@ impl KimoApp {
         first: bool,
         place: RowPlace<'_>,
     ) -> RowResponse {
-        let selected = self.selected_message.as_deref() == Some(msg.uid.as_str());
+        // The whole row is filled for what is open in the pane and for what is
+        // checked in select mode alike: the box says which mail is which, and
+        // the fill says how much of the list a Delete is about.
+        let checkbox = self.folder_checkbox(&[&msg.uid]);
+        let selected = self.selected_message.as_deref() == Some(msg.uid.as_str())
+            || checkbox == Some(CheckState::On);
         let preview = if msg.preview.is_empty() {
             " ".to_string()
         } else {
             msg.preview.clone()
         };
+        let (account, folder) = self.list_folder();
         let card = CardText {
             from: &msg.from,
             title: &msg.subject,
@@ -3923,6 +4240,8 @@ impl KimoApp {
             selected,
             has_attachments: !msg.attachments.is_empty(),
             place,
+            checkbox,
+            checkbox_id: checkbox_id("mail-checkbox", account, folder, &msg.uid),
         };
         self.message_card(ui, &card, first)
     }
@@ -3941,15 +4260,28 @@ impl KimoApp {
         first: bool,
     ) -> RowResponse {
         let newest = &messages[thread.newest];
+        let uids: Vec<&str> = thread
+            .messages
+            .iter()
+            .map(|&index| messages[index].uid.as_str())
+            .collect();
+        let checkbox = self.folder_checkbox(&uids);
         let selected = self
             .selected_message
             .as_deref()
-            .is_some_and(|uid| thread.holds(messages, uid));
+            .is_some_and(|uid| thread.holds(messages, uid))
+            || checkbox == Some(CheckState::On);
         let preview = if newest.preview.is_empty() {
             " ".to_string()
         } else {
             newest.preview.clone()
         };
+        let (account, folder) = self.list_folder();
+        // The conversation's box speaks for every mail it holds: `folder_checkbox`
+        // says which of them are checked, and `Partial` is the box that stands
+        // for a thread whose mails were checked one by one under it. Only a
+        // thread that is wholly in fills its row; a half-checked one keeps the
+        // plain surface and says so with the dash.
         let card = CardText {
             from: &newest.from,
             title: &thread.subject,
@@ -3963,6 +4295,11 @@ impl KimoApp {
                 count: thread.messages.len(),
                 key: &thread.key,
             },
+            checkbox,
+            // The thread's own key, not its mails': the conversation's row and
+            // the oldest mail under it can be the same uid, and two widgets may
+            // not share one id.
+            checkbox_id: checkbox_id("thread-checkbox", account, folder, &thread.key),
         };
         self.message_card(ui, &card, first)
     }
@@ -3970,8 +4307,10 @@ impl KimoApp {
     /// One search result: the same card, with where the mail lives and the line
     /// the query matched as its third line.
     fn search_row(&self, ui: &mut egui::Ui, hit: &SearchHit, first: bool) -> RowResponse {
-        let selected = self.selected_message.as_deref() == Some(hit.uid.as_str())
-            && self.selected_folder.as_deref() == Some(hit.folder.as_str());
+        let checkbox = self.hit_checkbox(hit);
+        let selected = (self.selected_message.as_deref() == Some(hit.uid.as_str())
+            && self.selected_folder.as_deref() == Some(hit.folder.as_str()))
+            || checkbox == Some(CheckState::On);
         let account = self
             .accounts
             .iter()
@@ -3993,6 +4332,10 @@ impl KimoApp {
             // Search results are a flat list of hits: where a hit sits in its
             // own folder's conversations is not what was asked for.
             place: RowPlace::Plain,
+            checkbox,
+            // A hit names the folder it lives in, which is what keeps two
+            // accounts' uids apart on one screen.
+            checkbox_id: checkbox_id("mail-checkbox", &hit.account_id, &hit.folder, &hit.uid),
         };
         self.message_card(ui, &card, first)
     }
@@ -4008,6 +4351,32 @@ impl KimoApp {
             egui::Sense::click(),
         );
 
+        // Where the row's avatar sits — and with it the box select mode puts in
+        // its place: the two are one slot, so the column of boxes lines up with
+        // the column of circles. Where the row sits in the list is the other
+        // half of that (`RowPlace::indent`).
+        let indent = card.place.indent();
+        let (diameter, initial) = card.place.avatar();
+        let avatar_center =
+            egui::pos2(rect.left() + 8.0 + indent + diameter / 2.0, rect.center().y);
+        let box_rect =
+            egui::Rect::from_center_size(avatar_center, egui::Vec2::splat(CHECKBOX_SIZE));
+        // The box is a target on every row, drawn or not: egui hit-tests a pass
+        // against the widget rects of the previous one, so a target that only
+        // appears once the pointer is already on it is a target a click can
+        // miss.
+        let checkbox = ui.interact(
+            egui::Rect::from_center_size(
+                avatar_center,
+                egui::Vec2::splat(CHECKBOX_SIZE + CHECKBOX_PADDING * 2.0),
+            ),
+            card.checkbox_id,
+            egui::Sense::click(),
+        );
+        // The pointer on the box is the pointer on the row: the box is a
+        // control inside the row, not a hole in it.
+        let hovered = resp.hovered() || checkbox.hovered();
+
         // Both highlights are the mail's whole row: a square block that fills
         // the column edge to edge, hairlines included, rather than a rounded
         // pill inset from the text. The row's own rect only spans the mail's
@@ -4020,7 +4389,7 @@ impl KimoApp {
             painter
                 .with_clip_rect(column)
                 .rect_filled(full, 0.0, scheme.selection);
-        } else if resp.hovered() {
+        } else if hovered {
             painter
                 .with_clip_rect(column)
                 .rect_filled(full, 0.0, scheme.hover);
@@ -4068,10 +4437,9 @@ impl KimoApp {
             edge,
         );
 
-        // Where the row sits in the list: a conversation's own row and the
-        // mails it holds are inset, and the room that leaves at the left is
-        // where the chevron is drawn.
-        let indent = card.place.indent();
+        // The room the row's inset leaves at the left is where the chevron is
+        // drawn: a conversation's own row and the mails it holds are stepped in,
+        // and the chevron's column is reserved on every row.
         let mut chevron = None;
         match card.place {
             RowPlace::Thread { open, key, .. } => {
@@ -4112,25 +4480,38 @@ impl KimoApp {
             RowPlace::InThread | RowPlace::Plain => {}
         }
 
-        // Avatar: deterministic color per sender, initial centered in it — a
-        // smaller one for a mail of an open conversation, which with the step
-        // the row is inset by is what says at a glance that the mail belongs to
-        // the conversation above it.
-        let (diameter, initial) = card.place.avatar();
-        let avatar_center =
-            egui::pos2(rect.left() + 8.0 + indent + diameter / 2.0, rect.center().y);
-        painter.circle_filled(
-            avatar_center,
-            diameter / 2.0,
-            sender_color(scheme, card.from),
-        );
-        painter.text(
-            avatar_center,
-            egui::Align2::CENTER_CENTER,
-            sender_initial(card.from),
-            egui::FontId::proportional(initial),
-            scheme.avatar_text,
-        );
+        // The box, or the avatar it stands in front of: select mode draws one
+        // on every row, and in view mode the pointer brings one over the row it
+        // is on — which is the way into the mode. The avatar is deterministic
+        // color per sender with the initial centered in it, a smaller one for a
+        // mail of an open conversation, which with the step the row is inset by
+        // is what says at a glance that the mail belongs to the conversation
+        // above it.
+        match card.checkbox.or(hovered.then_some(CheckState::Off)) {
+            Some(state) => {
+                if checkbox.hovered() {
+                    // The target filled the way the chevron's is: what says the
+                    // box is a control rather than a glyph on the row.
+                    painter.rect_filled(checkbox.rect, CHECKBOX_CORNER_RADIUS, scheme.hover);
+                    ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                }
+                paint_checkbox(painter, box_rect, state, checkbox.hovered(), scheme);
+            }
+            None => {
+                painter.circle_filled(
+                    avatar_center,
+                    diameter / 2.0,
+                    sender_color(scheme, card.from),
+                );
+                painter.text(
+                    avatar_center,
+                    egui::Align2::CENTER_CENTER,
+                    sender_initial(card.from),
+                    egui::FontId::proportional(initial),
+                    scheme.avatar_text,
+                );
+            }
+        }
 
         let text_left = avatar_center.x + diameter / 2.0 + 10.0;
         let text_right = rect.right() - 10.0;
@@ -4240,7 +4621,11 @@ impl KimoApp {
             scheme.text_weak,
         );
 
-        RowResponse { row: resp, chevron }
+        RowResponse {
+            row: resp,
+            chevron,
+            checkbox,
+        }
     }
 
     /// Right column: the selected mail on the card the reading pane floats on —
@@ -6070,6 +6455,8 @@ struct CardText<'a> {
     /// The sender and the title are struck through: the codebase's stand-in
     /// for bold, see the message-row convention in AGENTS.md.
     unread: bool,
+    /// The row takes the scheme's selection fill: the mail open in the reading
+    /// pane, or — in select mode — one whose box is checked.
     selected: bool,
     /// The mail has parts, so the row draws a paperclip at the end of its
     /// title line. Both lists can answer it: a folder's mail from what was
@@ -6078,6 +6465,25 @@ struct CardText<'a> {
     /// Where the row sits in the list: a mail on its own, a conversation's own
     /// row, or one mail of an open conversation.
     place: RowPlace<'a>,
+    /// What the row's checkbox says, or `None` in view mode — where the avatar
+    /// stands and the pointer alone brings an empty box over the row it is on.
+    /// `Some` is select mode, and in it every row carries a box.
+    checkbox: Option<CheckState>,
+    /// The widget id the box's click target is registered under: one per row,
+    /// stable between frames the way the chevron's key is.
+    checkbox_id: egui::Id,
+}
+
+/// What a row's checkbox says about the mail the row stands for.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum CheckState {
+    /// Nothing the row stands for is checked.
+    Off,
+    /// Some of what it stands for is: a conversation whose mails were checked
+    /// one by one in the list under it.
+    Partial,
+    /// All of it is.
+    On,
 }
 
 /// Where a card sits in the message list, which is what it draws around
@@ -6126,18 +6532,33 @@ impl RowPlace<'_> {
     }
 }
 
-/// What one row's clicks were: the row itself, and — for a conversation — the
-/// chevron that opens and closes it. The two are separate targets, which is
-/// what keeps a click on the mail from changing the list's shape: the row opens
-/// the conversation in the reading pane, the chevron opens the mails in the
-/// list.
+/// What one row's clicks were: the row itself, the checkbox that stands in the
+/// avatar's place, and — for a conversation — the chevron that opens and closes
+/// it. The three are separate targets, which is what keeps one click from being
+/// another: the row opens the conversation in the reading pane (or, in select
+/// mode, leaves it), the chevron opens the mails in the list, and the box
+/// checks the mail the row stands for.
 struct RowResponse {
     row: egui::Response,
     chevron: Option<egui::Response>,
+    /// The box, on every row: it is a target whether or not it is drawn — see
+    /// `message_card`.
+    checkbox: egui::Response,
 }
 
 const MESSAGE_ROW_HEIGHT: f32 = 68.0;
 const AVATAR_DIAMETER: f32 = 32.0;
+/// The checkbox a row draws where its avatar would be — select mode's control,
+/// and the way into the mode — with the room its click target keeps around the
+/// box on every side, which is also the rounded fill it shows under the
+/// pointer. The box is not the avatar's size: it is a control, and an 18 pt box
+/// in a 32 pt slot reads as one, while a 32 pt box would read as a button.
+const CHECKBOX_SIZE: f32 = 18.0;
+const CHECKBOX_PADDING: f32 = 5.0;
+const CHECKBOX_CORNER_RADIUS: u8 = 4;
+/// The width of the check drawn on a checked box, and of the dash a partly
+/// checked conversation gets.
+const CHECKBOX_STROKE: f32 = 2.0;
 /// Font size of the avatar's initial — a bit under half the diameter.
 const AVATAR_FONT_SIZE: f32 = 14.0;
 /// Font sizes of the row's three lines, in points: the timestamp, the title
@@ -6876,6 +7297,72 @@ fn outline_point(center: egui::Pos2, x: f32, y: f32, size: f32) -> egui::Pos2 {
 /// on `center` and drawn at `MAIL_ACTION_GLYPH`.
 fn glyph_point(center: egui::Pos2, x: f32, y: f32) -> egui::Pos2 {
     outline_point(center, x, y, MAIL_ACTION_GLYPH)
+}
+
+/// The widget id of a row's checkbox: one per row, stable between frames the
+/// way the chevron's key is. `tag` keeps a conversation's box apart from the
+/// box of the mail it holds — the two can be the same mail — and the account and
+/// folder keep a search's hits apart, since two accounts can hold one uid.
+fn checkbox_id(tag: &'static str, account: &str, folder: &str, key: &str) -> egui::Id {
+    egui::Id::new((tag, account, folder, key))
+}
+
+/// The checkbox a row draws in place of its avatar: `Off` is an outline — the
+/// accent under the pointer, which is what says it can be clicked — and `On` is
+/// a filled box with the scheme's check on it. `Partial`, which only a
+/// conversation with some of its mails checked reaches, is the same fill with a
+/// dash: the box stands for the whole thread, and the thread is partly in.
+fn paint_checkbox(
+    painter: &egui::Painter,
+    rect: egui::Rect,
+    state: CheckState,
+    hovered: bool,
+    scheme: ColorScheme,
+) {
+    match state {
+        CheckState::Off => {
+            let color = if hovered {
+                scheme.accent
+            } else {
+                scheme.text_weak
+            };
+            painter.rect_stroke(
+                rect,
+                CHECKBOX_CORNER_RADIUS,
+                egui::Stroke::new(1.0_f32, color),
+                egui::StrokeKind::Inside,
+            );
+        }
+        CheckState::On | CheckState::Partial => {
+            painter.rect_filled(rect, CHECKBOX_CORNER_RADIUS, scheme.accent);
+            let stroke = egui::Stroke::new(CHECKBOX_STROKE, scheme.on_accent);
+            if state == CheckState::On {
+                // The check: a short stroke down into the corner and a long one
+                // back up out of it — one path, two turns, and no glyph from
+                // the icon set, since a checkbox is not one of the bar's own
+                // 24×24 outlines.
+                let g = |x: f32, y: f32| {
+                    egui::pos2(
+                        rect.left() + rect.width() * x,
+                        rect.top() + rect.height() * y,
+                    )
+                };
+                painter.add(egui::Shape::line(
+                    vec![g(0.26, 0.52), g(0.43, 0.7), g(0.74, 0.32)],
+                    stroke,
+                ));
+            } else {
+                let mid = rect.center().y;
+                painter.line_segment(
+                    [
+                        egui::pos2(rect.left() + 4.0, mid),
+                        egui::pos2(rect.right() - 4.0, mid),
+                    ],
+                    stroke,
+                );
+            }
+        }
+    }
 }
 
 /// The chevron a conversation's row carries at its left: a line drawing — two
@@ -9273,6 +9760,559 @@ mod tests {
             app.selected_message.as_deref(),
             Some(expected.to_string().as_str())
         );
+    }
+
+    /// Where a row's checkbox sits: the avatar's slot, `row` rows down the
+    /// list. A mail of an open conversation is a step further in with a smaller
+    /// circle, and the box follows the slot the circle is in.
+    fn checkbox_center(app: &KimoApp, row: usize, in_thread: bool) -> egui::Pos2 {
+        let (indent, diameter) = if in_thread {
+            (THREAD_INDENT + THREAD_STEP, THREAD_AVATAR_DIAMETER)
+        } else {
+            (THREAD_INDENT, AVATAR_DIAMETER)
+        };
+        egui::pos2(
+            app.list_column.left() + LIST_MARGIN as f32 + indent + 8.0 + diameter / 2.0,
+            TITLEBAR_HEIGHT + MESSAGE_ROW_HEIGHT * (row as f32 + 0.5),
+        )
+    }
+
+    /// The checkboxes a frame drew in the message list, top to bottom: a
+    /// `CHECKBOX_SIZE` square with the box's corner radius. Nothing else in the
+    /// list is that shape — the hover fill behind a box is wider than the box,
+    /// and a row's own edges are hairlines across the whole column.
+    fn checkboxes_in(shapes: &[egui::epaint::ClippedShape], column: egui::Rect) -> Vec<egui::Rect> {
+        let mut out = Vec::new();
+        for clipped in shapes {
+            collect_checkboxes(&clipped.shape, column, &mut out);
+        }
+        out
+    }
+
+    fn collect_checkboxes(shape: &egui::Shape, column: egui::Rect, out: &mut Vec<egui::Rect>) {
+        match shape {
+            egui::Shape::Rect(rect) => {
+                let size = rect.rect.size();
+                if rect.corner_radius == egui::CornerRadius::same(CHECKBOX_CORNER_RADIUS)
+                    && (size.x - CHECKBOX_SIZE).abs() < 0.5
+                    && (size.y - CHECKBOX_SIZE).abs() < 0.5
+                    && column.contains_rect(rect.rect)
+                {
+                    out.push(rect.rect);
+                }
+            }
+            egui::Shape::Vec(shapes) => {
+                for shape in shapes {
+                    collect_checkboxes(shape, column, out);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// The boxes select mode draws are the avatar's slot, and the avatar is what
+    /// they replace: a frame without the pointer is all circles, and the pointer
+    /// on a row trades exactly that row's circle for a box. Hovering is how the
+    /// mode is entered, so the way in is where the mail's mark already is.
+    #[test]
+    fn the_pointer_puts_a_checkbox_where_the_avatar_was() {
+        let ctx = egui::Context::default();
+        crate::fonts::install(&ctx, None, None);
+        let mut app = app_with_messages(&ctx, 3);
+
+        let shapes = frame_shapes_at(&ctx, &mut app, 1400.0);
+        let column = app.list_column;
+        assert!(
+            checkboxes_in(&shapes, column).is_empty(),
+            "the avatars stand while the pointer is away"
+        );
+        assert_eq!(avatars_in(&shapes, column).len(), 3);
+
+        // The pointer on the second row. It is moved in one frame and the shapes
+        // are read from the next: egui hit-tests against the previous frame's
+        // rects.
+        let at = checkbox_center(&app, 1, false);
+        frame_shapes_with(&ctx, &mut app, 1400.0, vec![egui::Event::PointerMoved(at)]);
+        let shapes = frame_shapes_at(&ctx, &mut app, 1400.0);
+        let boxes = checkboxes_in(&shapes, column);
+        assert_eq!(
+            boxes.len(),
+            1,
+            "one box, over the row under the pointer: {boxes:?}"
+        );
+        assert_eq!(boxes[0].center(), at, "and it is in the avatar's slot");
+        assert_eq!(
+            avatars_in(&shapes, column).len(),
+            2,
+            "the row under the pointer gave its avatar up"
+        );
+    }
+
+    /// A click on the box turns select mode on and checks the mail the row
+    /// stands for. From then on the boxes are not the pointer's business: every
+    /// row in the list carries one, and the avatars are gone with the mode.
+    #[test]
+    fn clicking_a_box_enters_select_mode_with_a_box_on_every_row() {
+        let ctx = egui::Context::default();
+        crate::fonts::install(&ctx, None, None);
+        let mut app = app_with_messages(&ctx, 3);
+        let _ = frame_shapes_at(&ctx, &mut app, 1400.0);
+        let column = app.list_column;
+
+        let at = checkbox_center(&app, 1, false);
+        click_at(&ctx, &mut app, at);
+        assert!(app.select_mode, "a click on a box is the way into the mode");
+        assert!(
+            app.selected_mails
+                .contains(&MailKey::new("acct", "INBOX", "1")),
+            "the box checks the mail its row stands for"
+        );
+        assert_eq!(
+            app.selected_message, None,
+            "and a click on the box is not a click on the mail"
+        );
+
+        // A second box adds to the selection rather than replacing it — which is
+        // the whole point of the mode — and a click on a checked one takes that
+        // mail out again without leaving the mode.
+        let second = checkbox_center(&app, 2, false);
+        click_at(&ctx, &mut app, second);
+        assert_eq!(app.selected_mails.len(), 2, "two mails are checked now");
+        assert!(
+            app.selected_mails
+                .contains(&MailKey::new("acct", "INBOX", "2")),
+            "the box that was clicked is the mail that joined"
+        );
+        click_at(&ctx, &mut app, second);
+        assert_eq!(
+            app.selected_mails.len(),
+            1,
+            "and clicking it again unchecks it"
+        );
+        assert!(app.select_mode, "unchecking does not leave the mode");
+
+        // Away from the rows, so what is drawn is the mode and not the hover.
+        frame_shapes_with(
+            &ctx,
+            &mut app,
+            1400.0,
+            vec![egui::Event::PointerMoved(egui::pos2(1000.0, 500.0))],
+        );
+        let shapes = frame_shapes_at(&ctx, &mut app, 1400.0);
+        assert_eq!(checkboxes_in(&shapes, column).len(), 3, "one box per row");
+        assert!(
+            avatars_in(&shapes, column).is_empty(),
+            "select mode has no avatars at all"
+        );
+        assert_eq!(
+            fills_in_color(&shapes, theme::of(&ctx).accent).len(),
+            1,
+            "the checked mail is the one filled box"
+        );
+    }
+
+    /// In select mode the row itself is not the mail any more: a click on it —
+    /// anywhere but the box — is the way out of the mode, and it does not open
+    /// the mail under the pointer or move the reading pane either.
+    #[test]
+    fn a_click_on_the_row_leaves_select_mode_without_opening_the_mail() {
+        let ctx = egui::Context::default();
+        crate::fonts::install(&ctx, None, None);
+        let mut app = app_with_messages(&ctx, 3);
+        app.selected_message = Some("2".to_string());
+        let _ = frame_shapes_at(&ctx, &mut app, 1400.0);
+
+        let at = checkbox_center(&app, 1, false);
+        click_at(&ctx, &mut app, at);
+        assert!(app.select_mode);
+        assert!(!app.selected_mails.is_empty());
+
+        click_at(
+            &ctx,
+            &mut app,
+            egui::pos2(320.0, TITLEBAR_HEIGHT + MESSAGE_ROW_HEIGHT * 1.5),
+        );
+        assert!(!app.select_mode, "a click beside the box is the way out");
+        assert!(app.selected_mails.is_empty(), "and the checks go with it");
+        assert_eq!(
+            app.selected_message.as_deref(),
+            Some("2"),
+            "the row's click opened nothing"
+        );
+    }
+
+    /// The marks a frame drew inside a box, as the number of points each has: the
+    /// check on a checked box is one line of three points, and the dash of a
+    /// partly checked conversation a single two-point segment.
+    fn strokes_in(shapes: &[egui::epaint::ClippedShape], rect: egui::Rect) -> Vec<usize> {
+        let mut out = Vec::new();
+        for clipped in shapes {
+            collect_strokes(&clipped.shape, rect, &mut out);
+        }
+        out
+    }
+
+    fn collect_strokes(shape: &egui::Shape, rect: egui::Rect, out: &mut Vec<usize>) {
+        match shape {
+            egui::Shape::LineSegment { points, .. } => {
+                let bounds = egui::Rect::from_two_pos(points[0], points[1]);
+                if rect.contains_rect(bounds) {
+                    out.push(2);
+                }
+            }
+            egui::Shape::Path(path) if path.fill == egui::Color32::TRANSPARENT => {
+                let bounds = egui::Rect::from_points(&path.points);
+                if rect.contains_rect(bounds) {
+                    out.push(path.points.len());
+                }
+            }
+            egui::Shape::Vec(shapes) => {
+                for shape in shapes {
+                    collect_strokes(shape, rect, out);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// A box says *what* it holds and not only that it holds something: a checked
+    /// box is the accent fill with the check drawn on it, and a conversation with
+    /// only part of its mail checked gets the dash instead. The two are different
+    /// drawings, which is what keeps a half-checked thread from reading as a
+    /// checked one.
+    #[test]
+    fn a_partly_checked_conversation_draws_a_dash_instead_of_a_check() {
+        let ctx = egui::Context::default();
+        crate::fonts::install(&ctx, None, None);
+        let mut app = app_with_one_conversation(&ctx);
+        let _ = frame_shapes_at(&ctx, &mut app, 1400.0);
+        // Open the conversation, then check its oldest mail alone: the
+        // conversation's own box is the one left in between.
+        let key = app
+            .list_rows
+            .as_ref()
+            .expect("the list derived its rows")
+            .threads[0]
+            .key
+            .clone();
+        app.open_threads.insert(key);
+        app.open_rev += 1;
+        app.select_mode = true;
+        app.selected_mails
+            .insert(MailKey::new("acct", "INBOX", "1"));
+
+        let shapes = frame_shapes_at(&ctx, &mut app, 1400.0);
+        let column = app.list_column;
+        let mut boxes = checkboxes_in(&shapes, column);
+        boxes.sort_by(|a, b| a.top().total_cmp(&b.top()));
+        assert_eq!(
+            boxes.len(),
+            3,
+            "the conversation and its two mails: {boxes:?}"
+        );
+
+        let conversation = strokes_in(&shapes, boxes[0]);
+        assert_eq!(
+            conversation,
+            vec![2],
+            "a partly checked conversation draws the dash: {conversation:?}"
+        );
+        let checked = strokes_in(&shapes, boxes[1]);
+        assert_eq!(
+            checked,
+            vec![3],
+            "a checked mail draws the check: {checked:?}"
+        );
+        assert!(
+            strokes_in(&shapes, boxes[2]).is_empty(),
+            "and an unchecked one draws nothing: {:?}",
+            strokes_in(&shapes, boxes[2])
+        );
+    }
+
+    /// A checked row is filled the way the reading pane's own mail is: the box is
+    /// the precise mark, and the fill is what says at a glance how much of the
+    /// list a Delete is about. A half-checked conversation's own row is not
+    /// filled — the dash is what says it is partly in.
+    #[test]
+    fn a_checked_row_takes_the_selection_fill() {
+        let ctx = egui::Context::default();
+        crate::fonts::install(&ctx, None, None);
+        let mut app = app_with_messages(&ctx, 3);
+        app.select_mode = true;
+        app.selected_mails
+            .insert(MailKey::new("acct", "INBOX", "1"));
+
+        let shapes = frame_shapes_at(&ctx, &mut app, 1400.0);
+        let selection = theme::of(&ctx).selection;
+        let filled: Vec<egui::Rect> = fills_in_color(&shapes, selection)
+            .into_iter()
+            .filter(|rect| rect.height() >= MESSAGE_ROW_HEIGHT)
+            .collect();
+        assert_eq!(filled.len(), 1, "one checked row, one fill: {filled:?}");
+        let row = filled[0];
+        assert_eq!(
+            row.top(),
+            TITLEBAR_HEIGHT + MESSAGE_ROW_HEIGHT,
+            "the filled row is the second one — the mail that is checked"
+        );
+    }
+
+    /// A conversation's row stands for every mail it holds, so its box takes
+    /// them all in — and out — at once. Checking one mail of it in the list
+    /// under it leaves the conversation's own box saying *some*, which is what
+    /// the dash is for.
+    #[test]
+    fn a_conversations_box_takes_its_whole_thread_in_and_out() {
+        let ctx = egui::Context::default();
+        crate::fonts::install(&ctx, None, None);
+        let mut app = app_with_one_conversation(&ctx);
+        let _ = frame_shapes_at(&ctx, &mut app, 1400.0);
+
+        let at = checkbox_center(&app, 0, false);
+        click_at(&ctx, &mut app, at);
+        assert_eq!(app.selected_mails.len(), 2, "the whole conversation");
+        for uid in ["3", "1"] {
+            assert!(
+                app.selected_mails
+                    .contains(&MailKey::new("acct", "INBOX", uid)),
+                "mail {uid} is checked"
+            );
+        }
+
+        // Open the conversation the way the chevron does: its mails get rows —
+        // and boxes — of their own, oldest first under it.
+        let key = app
+            .list_rows
+            .as_ref()
+            .expect("the list derived its rows")
+            .threads[0]
+            .key
+            .clone();
+        app.open_threads.insert(key);
+        app.open_rev += 1;
+        let _ = frame_shapes_at(&ctx, &mut app, 1400.0);
+        let at = checkbox_center(&app, 1, true);
+        click_at(&ctx, &mut app, at);
+        assert_eq!(
+            app.selected_mails.len(),
+            1,
+            "unchecking one mail of the conversation leaves the other"
+        );
+        assert_eq!(
+            app.folder_checkbox(&["3", "1"]),
+            Some(CheckState::Partial),
+            "the conversation's own box says some of it is checked"
+        );
+    }
+
+    /// Select mode is the list's business, not the reading pane's: the actions
+    /// that are about one mail — reply, reply all, forward, label, flag, export
+    /// — are disabled, and Delete, which takes the whole selection, is the one
+    /// left live while something is checked.
+    #[test]
+    fn select_mode_leaves_delete_as_the_only_live_action() {
+        let ctx = egui::Context::default();
+        crate::fonts::install(&ctx, None, None);
+        let mut app = app_with_messages(&ctx, 3);
+        app.selected_message = Some("0".to_string());
+        assert!(
+            app.mail_action_enabled(MailAction::Reply),
+            "view mode: the pane's mail is what the seven act on"
+        );
+
+        app.select_mode = true;
+        for action in MailAction::ALL {
+            assert!(
+                !app.mail_action_enabled(action),
+                "nothing is checked yet, so {action:?} has nothing to act on"
+            );
+        }
+        app.selected_mails
+            .insert(MailKey::new("acct", "INBOX", "1"));
+        for action in MailAction::ALL {
+            assert_eq!(
+                app.mail_action_enabled(action),
+                action == MailAction::Delete,
+                "only Delete takes more than one mail: {action:?}"
+            );
+        }
+
+        // And the bar says which mail or how many: a count is the one thing the
+        // seven glyphs cannot show.
+        assert_eq!(
+            delete_selection_tooltip(1),
+            "Delete — removes the selected mail from the server too"
+        );
+        assert_eq!(
+            delete_selection_tooltip(3),
+            "Delete — removes the 3 selected mails from the server too"
+        );
+    }
+
+    /// The bar's own half of that: a disabled cell neither senses clicks nor
+    /// fills under the pointer. This puts the pointer on Reply and on Delete in
+    /// select mode and reads what each one drew.
+    #[test]
+    fn the_title_bar_dims_the_one_mail_actions_in_select_mode() {
+        let ctx = egui::Context::default();
+        crate::fonts::install(&ctx, None, None);
+        let mut app = app_with_messages(&ctx, 3);
+        app.selected_message = Some("0".to_string());
+        frame_shapes_at(&ctx, &mut app, 1400.0);
+        let search = ctx
+            .read_response(egui::Id::new("titlebar-search"))
+            .expect("the bar drew no search box")
+            .rect;
+        let bar = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1400.0, TITLEBAR_HEIGHT));
+        let rects = titlebar_rects(bar, 3);
+        let actions = titlebar_cells_width(MailAction::ALL.len());
+        let fit = titlebar_fit(rects.cog.min.x - search.left(), actions);
+        assert!(fit.actions, "the bar gave the actions up at 1400 pt");
+        let cell = |action: MailAction| {
+            let index = MailAction::ALL
+                .iter()
+                .position(|candidate| *candidate == action)
+                .expect("one of the seven");
+            egui::pos2(
+                search.right()
+                    + fit.padding
+                    + index as f32 * (TITLEBAR_BUTTON_SIZE + TITLEBAR_BUTTON_GAP)
+                    + TITLEBAR_BUTTON_SIZE / 2.0,
+                TITLEBAR_HEIGHT / 2.0,
+            )
+        };
+
+        app.select_mode = true;
+        app.selected_mails
+            .insert(MailKey::new("acct", "INBOX", "1"));
+        assert!(
+            fill_under_the_pointer(&ctx, &mut app, 1400.0, cell(MailAction::Reply)).is_none(),
+            "a disabled action does not fill under the pointer"
+        );
+        assert!(
+            fill_under_the_pointer(&ctx, &mut app, 1400.0, cell(MailAction::Delete)).is_some(),
+            "Delete is the one left live in select mode"
+        );
+    }
+
+    /// One Delete job per folder: a selection made in a folder is one group, and
+    /// one made over a search's hits is a group for every folder they came from,
+    /// each in uid order so the same selection is always the same jobs.
+    #[test]
+    fn the_delete_groups_the_selection_by_folder() {
+        let mails: HashSet<MailKey> = [
+            MailKey::new("work", "INBOX", "9"),
+            MailKey::new("work", "INBOX", "2"),
+            MailKey::new("work", "Sent", "5"),
+            MailKey::new("home", "INBOX", "1"),
+        ]
+        .into_iter()
+        .collect();
+
+        let batches = delete_batches(&mails);
+        assert_eq!(batches.len(), 3, "one job per folder: {batches:?}");
+        assert_eq!(
+            batches[&("work".to_string(), "INBOX".to_string())],
+            vec!["2", "9"]
+        );
+        assert_eq!(
+            batches[&("work".to_string(), "Sent".to_string())],
+            vec!["5"]
+        );
+        assert_eq!(
+            batches[&("home".to_string(), "INBOX".to_string())],
+            vec!["1"]
+        );
+    }
+
+    /// A mail the server agreed to delete leaves the selection with its row; the
+    /// mode stays, because the next mail is picked from the same list.
+    #[test]
+    fn a_deleted_mail_leaves_the_selection() {
+        let ctx = egui::Context::default();
+        crate::fonts::install(&ctx, None, None);
+        let mut app = app_with_messages(&ctx, 2);
+        app.select_mode = true;
+        app.selected_mails
+            .insert(MailKey::new("acct", "INBOX", "0"));
+
+        app.apply_event(Event::MessageDeleted {
+            account_id: "acct".to_string(),
+            folder: "INBOX".to_string(),
+            uid: "0".to_string(),
+        });
+
+        assert!(
+            app.selected_mails.is_empty(),
+            "the checked mail went with the row"
+        );
+        assert!(app.select_mode, "select mode is not what a deletion ends");
+    }
+
+    /// A search's hits are selectable too, and a hit names the folder it lives
+    /// in: the key its box makes is the hit's own account and folder, not the
+    /// column's — the column is not on a folder at all while it shows hits.
+    #[test]
+    fn a_search_hit_checks_its_own_folder() {
+        let ctx = egui::Context::default();
+        crate::fonts::install(&ctx, None, None);
+        let mut app = app_with_messages(&ctx, 1);
+        app.search.text = "report".to_string();
+        app.search_hits = vec![SearchHit {
+            account_id: "acct".to_string(),
+            folder: "Archive".to_string(),
+            uid: "7".to_string(),
+            subject: "Subject 7".to_string(),
+            from: "Ada <ada@example.com>".to_string(),
+            date: "2026-01-01".to_string(),
+            timestamp: Some(1_700_000_000),
+            seen: false,
+            attachments: 0,
+            snippet: "a line with report in it".to_string(),
+        }];
+        let _ = frame_shapes_at(&ctx, &mut app, 1400.0);
+
+        let at = checkbox_center(&app, 0, false);
+        click_at(&ctx, &mut app, at);
+        assert!(
+            app.selected_mails
+                .contains(&MailKey::new("acct", "Archive", "7")),
+            "the hit's box checks it where it lives: {:?}",
+            app.selected_mails
+        );
+    }
+
+    /// The column moves to another list — another folder, another query — and a
+    /// selection is a selection *of* one list: the checks go with it rather than
+    /// staying behind for rows that are not on screen any more.
+    #[test]
+    fn another_folder_or_query_leaves_select_mode() {
+        let ctx = egui::Context::default();
+        crate::fonts::install(&ctx, None, None);
+        let mut app = app_with_folders(&ctx, &[("INBOX", true, 1), ("Archive", true, 1)]);
+        app.select_mode = true;
+        app.selected_mails
+            .insert(MailKey::new("acct", "INBOX", "INBOX-0"));
+
+        app.select_folder(
+            "acct".to_string(),
+            "Archive".to_string(),
+            crate::models::Protocol::Imap,
+        );
+        assert!(!app.select_mode, "the column shows another folder now");
+        assert!(app.selected_mails.is_empty());
+
+        // And the search popup's Clear: the column is the folder again, which is
+        // another list than the hits were.
+        app.select_mode = true;
+        app.selected_mails
+            .insert(MailKey::new("acct", "INBOX", "INBOX-0"));
+        app.search.text = String::new();
+        app.search_applied = None;
+        app.pump_search(true);
+        assert!(!app.select_mode, "the column shows the folder again");
+        assert!(app.selected_mails.is_empty());
     }
 
     /// The floating `Load older mail` button: drawn only while the folder's

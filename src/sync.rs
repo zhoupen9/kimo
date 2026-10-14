@@ -110,13 +110,15 @@ pub enum Job {
         folder: String,
         uid: String,
     },
-    /// Delete one message. The server is told first and the database row goes
-    /// only once it has agreed (see `delete_message`), so nothing is ever
-    /// dropped here while the server still has it.
+    /// Delete messages of one folder — the title bar's Delete, which takes the
+    /// mail the reading pane shows or, in select mode, every mail the list has
+    /// checked. The server is told first and each database row goes only once
+    /// it has agreed (see `delete_messages`), so nothing is ever dropped here
+    /// while the server still has it.
     DeleteMessage {
         account: Account,
         folder: String,
-        uid: String,
+        uids: Vec<String>,
     },
     /// Fetch one message's original RFC 5322 source and write it into `dir` as
     /// `<subject>.eml` — the title bar's Export. The server's copy is the
@@ -410,7 +412,7 @@ pub fn spawn(job: Job, ctx: egui::Context, tx: Sender<Event>) {
         Job::DeleteMessage {
             account,
             folder,
-            uid,
+            uids,
         } => {
             // Not a sync, but it is a round trip: the account's spinner is
             // what says the mail is on its way out while the server is asked.
@@ -418,24 +420,29 @@ pub fn spawn(job: Job, ctx: egui::Context, tx: Sender<Event>) {
             let _ = tx.send(Event::SyncStarted {
                 account_id: account_id.clone(),
             });
-            match delete_message(&account, &folder, &uid) {
-                Ok(()) => {
-                    // The row leaves the list only now, with the database
-                    // already short of it.
-                    let _ = tx.send(Event::MessageDeleted {
-                        account_id: account_id.clone(),
-                        folder,
-                        uid,
-                    });
-                    let _ = tx.send(Event::SyncDone { account_id });
-                }
-                // The local copy is still there — that is the point of the
-                // order above — and the account carries the reason.
-                Err(error) => {
+            let (deleted, error) = delete_messages(&account, &folder, &uids);
+            // The rows leave the list only now, with the database already
+            // short of them. Each one is its own event: a batch that went
+            // halfway is a batch that went halfway.
+            for uid in deleted {
+                let _ = tx.send(Event::MessageDeleted {
+                    account_id: account_id.clone(),
+                    folder: folder.clone(),
+                    uid,
+                });
+            }
+            match error {
+                // The local copy of a mail the server refused is still there —
+                // that is the point of the order above — and the account
+                // carries the first reason.
+                Some(error) => {
                     let _ = tx.send(Event::SyncFailed {
                         account_id,
                         error: format!("delete: {error}"),
                     });
+                }
+                None => {
+                    let _ = tx.send(Event::SyncDone { account_id });
                 }
             }
             ctx.request_repaint();
@@ -913,40 +920,115 @@ fn imap_mark_seen(account: &Account, folder: &str, uid: u32) -> MailResult<()> {
     })
 }
 
-/// Delete one message. The remote half goes first and the database row only
-/// after it: mail that is still on the server must not vanish from here, or
-/// the next sync would bring it back and the deletion would look like it
-/// never happened. Mail the server no longer has is dropped locally — there
-/// is nothing remote to delete, and the local copy is the only one left.
-fn delete_message(account: &Account, folder: &str, uid: &str) -> MailResult<()> {
+/// Delete messages of one folder: the remote half goes first and each database
+/// row only after it, so mail that is still on the server never vanishes from
+/// here — the next sync would bring it back and the deletion would look like it
+/// never happened. Mail the server no longer has is dropped locally: there is
+/// nothing remote to delete, and the local copy is the only one left.
+///
+/// The rule is applied one mail at a time, and the two answers are what came of
+/// it: the uids whose local rows are gone (their remote copies are too), and
+/// the first refusal. The rest of the run is asked anyway — a batch that
+/// stopped at the first failure would leave mail checked on screen with
+/// nothing said about the mails it never got to — and one connection carries
+/// the whole batch, because a click that picked twenty mails should not be
+/// twenty logins.
+fn delete_messages(
+    account: &Account,
+    folder: &str,
+    uids: &[String],
+) -> (Vec<String>, Option<MailError>) {
     match account.protocol {
-        Protocol::Imap => imap_delete(account, folder, uid)?,
-        Protocol::Pop3 => pop3_delete(account, uid)?,
+        Protocol::Imap => imap_delete_many(account, folder, uids),
+        Protocol::Pop3 => pop3_delete_many(account, folder, uids),
     }
-    db::delete_message(&account.id, folder, uid)
 }
 
-fn imap_delete(account: &Account, folder: &str, uid: &str) -> MailResult<()> {
-    let number = uid
-        .parse::<u32>()
-        .map_err(|_| MailError::Protocol(format!("not an IMAP UID: {uid}")))?;
-    with_imap(account, |client| {
+/// The IMAP half of `delete_messages`: one login, one LIST and one SELECT, and
+/// each uid then takes the probe, flag and expunge
+/// `ImapClient::delete_messages` gives it.
+fn imap_delete_many(
+    account: &Account,
+    folder: &str,
+    uids: &[String],
+) -> (Vec<String>, Option<MailError>) {
+    let mut numbers = Vec::with_capacity(uids.len());
+    let mut first_error = None;
+    for uid in uids {
+        match uid.parse::<u32>() {
+            Ok(number) => numbers.push((uid.as_str(), number)),
+            // A uid the protocol cannot address is a mail that cannot go, and
+            // its local copy stays with it.
+            Err(_) => {
+                first_error = first_error
+                    .or_else(|| Some(MailError::Protocol(format!("not an IMAP UID: {uid}"))))
+            }
+        }
+    }
+    if numbers.is_empty() {
+        return (Vec::new(), first_error);
+    }
+    let asked: Vec<u32> = numbers.iter().map(|(_, number)| *number).collect();
+    let (gone, error) = match with_imap(account, |client| {
         client.login(&account.username, &account.password)?;
-        client.delete_message(folder, number)
-    })
+        Ok(client.delete_messages(folder, &asked))
+    }) {
+        Ok(answer) => answer,
+        // The connection itself failed, so the server was never asked: no mail
+        // went, and every local copy stays where it is.
+        Err(error) => (Vec::new(), Some(error)),
+    };
+    let mut first_error = first_error.or(error);
+    let mut deleted = Vec::new();
+    for (uid, number) in numbers {
+        if !gone.contains(&number) {
+            continue;
+        }
+        match db::delete_message(&account.id, folder, uid) {
+            Ok(()) => deleted.push(uid.to_string()),
+            Err(error) => first_error = first_error.or(Some(error)),
+        }
+    }
+    (deleted, first_error)
 }
 
-/// POP3 has no folders, so the UIDL is the whole address of the message. The
-/// deletion is committed by `QUIT`, which `quit` sends whatever happened above
-/// it — a session that ends any other way leaves the mail on the server.
-fn pop3_delete(account: &Account, uid: &str) -> MailResult<()> {
-    let mut client = Pop3Client::connect(account)?;
-    let result = (|| -> MailResult<()> {
-        client.login(&account.username, &account.password)?;
-        client.delete_by_uidl(uid)
-    })();
+/// The POP3 half of `delete_messages`. POP3 has no folders, so the UIDL is the
+/// whole address of a message, and the deletion is committed by `QUIT`: every
+/// local row goes once the session has ended, never before, because a session
+/// that ends any other way leaves the mail on the server (`quit` sends `QUIT`
+/// whatever happened above it).
+fn pop3_delete_many(
+    account: &Account,
+    folder: &str,
+    uids: &[String],
+) -> (Vec<String>, Option<MailError>) {
+    let mut client = match Pop3Client::connect(account) {
+        Ok(client) => client,
+        Err(error) => return (Vec::new(), Some(error)),
+    };
+    if let Err(error) = client.login(&account.username, &account.password) {
+        // Nothing can be deleted in a session the server did not open; it is
+        // still ended the polite way.
+        client.quit();
+        return (Vec::new(), Some(error));
+    }
+    let mut marked = Vec::new();
+    let mut first_error = None;
+    for uid in uids {
+        match client.delete_by_uidl(uid) {
+            Ok(()) => marked.push(uid.clone()),
+            Err(error) => first_error = first_error.or(Some(error)),
+        }
+    }
     client.quit();
-    result
+    let mut deleted = Vec::new();
+    for uid in marked {
+        match db::delete_message(&account.id, folder, &uid) {
+            Ok(()) => deleted.push(uid),
+            Err(error) => first_error = first_error.or(Some(error)),
+        }
+    }
+    (deleted, first_error)
 }
 
 /// Export one message: its original source, as the server has it, written into

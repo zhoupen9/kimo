@@ -313,7 +313,8 @@ Event (mpsc) ──► drain_events() at frame start ──► merge into Accoun
 - Remote mutations are `UID STORE +FLAGS.SILENT (\Seen)` (IMAP) and, behind
   the title bar's Delete button, `\Deleted` + `UID EXPUNGE` (IMAP) or `DELE`
   (POP3). A delete tells the server first and deletes locally after; a message
-  the server no longer has is deleted locally only. See the deletion bullet
+  the server no longer has is deleted locally only, and a select-mode selection
+  is one connection carrying every mail of one folder. See the deletion bullet
   under Conventions for the whole rule.
 
 ### Storage layout
@@ -652,11 +653,12 @@ Event (mpsc) ──► drain_events() at frame start ──► merge into Accoun
   it always has. **Every row is inset by that column**, conversation or not
   (`RowPlace::indent`): the avatars line up down the whole list, and a mail with
   nothing to open leaves the column as the placeholder it is rather than starting
-  a step further left than its neighbours. The one exception is a mail of an
-  *open* conversation: it steps in `THREAD_STEP` further and draws a smaller
-  avatar (`THREAD_AVATAR_DIAMETER`, `RowPlace::avatar`), which — with the
-  chevron's column left empty above it — is what says at a glance that the mail
-  belongs to the conversation over it. **There is no guide line**: no line is
+  a step further left than its neighbours. Select mode puts a checkbox in each
+  of those slots instead of the circle — see the select-mode bullet below. The
+  one exception is a mail of an *open* conversation: it steps in `THREAD_STEP`
+  further and draws a smaller avatar (`THREAD_AVATAR_DIAMETER`,
+  `RowPlace::avatar`), which — with the chevron's column left empty above it — is
+  what says at a glance that the mail belongs to the conversation over it. **There is no guide line**: no line is
   drawn down that column for a thread's mails, and the step and the smaller
   circle are the whole of the mark.
   **The row and the chevron do different things.** The *chevron* opens and closes
@@ -699,6 +701,53 @@ Event (mpsc) ──► drain_events() at frame start ──► merge into Accoun
   and where a hit sits among its own folder's conversations is not what was
   asked for. Threading is a preference (`threaded` in settings.json,
   Preferences → General) and per folder, like the rest of the list.
+- The message list has **two modes**, and which one it is in is what a click on
+  a row means. **View mode** is the list as it always was: the row opens the mail
+  — or the conversation — in the reading pane, and the avatar stands at its left.
+  **Select mode** is the list as a checklist: every row draws a checkbox in the
+  avatar's slot instead, the box takes checks, and a click anywhere else on the
+  row leaves the mode instead of opening a mail — the way out sits beside the way
+  in, because the mode is a temporary errand rather than a place to be.
+  The way *in* is the pointer: in view mode the row under it trades its avatar
+  for an empty box — `CHECKBOX_SIZE` (18 pt) in the 32 pt slot the circle fills,
+  since a box that size reads as a control while the circle's size would read as
+  a button — and a click on that box is what turns the mode on and checks the
+  mail the row stands for. The box is a click target on **every** row whether or
+  not it is drawn (`ui.interact` over the avatar's slot, registered after the row
+  so it is the topmost of the two), because egui hit-tests a pass against the
+  widget rects of the previous one: a target that only appears once the pointer
+  is already on it is a target a click can miss. Hovering the box is hovering the
+  row — the row's fill follows `resp.hovered() || checkbox.hovered()` — so the
+  box is a control inside the row and not a hole in it, and a click on it is
+  never a click on the row: the row's own `clicked()` is false when the box was.
+  The box is drawn by `paint_checkbox`: off is a `text_weak` outline that takes
+  the accent under the pointer, on is an accent fill with the scheme's `on_accent`
+  check on it, and a conversation with only part of its mail checked is the same
+  fill with a dash rather than the check. A checked row takes the whole-row
+  `selection` fill the mail open in the pane already has, so what is checked is
+  visible past the 18 pt box; a partly checked conversation's own row does not,
+  and says what it is with the dash alone.
+  What is checked is a `MailKey` — account, folder and uid — and not a uid, since
+  a search lists hits from every folder and account at once. `select_mode` and
+  `selected_mails` are in memory only, the way the open conversations are, and
+  the column is a list *of* something: whatever moves it to another list — the
+  navigation's folder click, the search popup applying a different query or
+  Clearing it, an account added, edited onto another endpoint or removed — ends
+  the mode and drops the checks (`cancel_select`), so nothing is ever checked
+  that is not on screen. A conversation's own row stands for every mail it holds,
+  so its box takes the whole thread in or out at once; checking a mail in the
+  list *under* it is still one mail at a time, and the conversation's box then
+  says `Partial` rather than lying about what is in.
+  In select mode the mail actions' Delete is the only live cell
+  (`mail_action_enabled`): reply, reply all, forward, label, flag and export are
+  all about the one mail the reading pane shows, which is not what the click was
+  about, so they are drawn dimmed with a tooltip saying so. Delete takes the
+  selection — `delete_batches` groups the checked mail by account and folder,
+  since a selection made over a search's hits spans folders, and each group is
+  one `Job::DeleteMessage` on one connection — the rows go as the events come
+  back, and a mail the server refused keeps both its copies and its check.
+  Nothing about the mode is persisted, and there is no select-all, no shift-click
+  range and no Delete-key shortcut: a selection is made one checkbox at a time.
 - The window is undecorated on purpose (`with_decorations(false)` in
   `main.rs`): `titlebar_area()` in `app.rs` draws the custom title bar — an
   `egui::Area` fixed to the window's top edge and shown *after* the panels, not
@@ -783,9 +832,11 @@ Event (mpsc) ──► drain_events() at frame start ──► merge into Accoun
   the bar stays chrome plus flat icons, and the seven are held together by the
   clear chrome that sets them apart from the search box
   (`MAIL_ACTION_PADDING`) rather than by a pill. The seven enable and disable
-  together, on `has_selected_message` — the reading pane's own lookup, so a uid
-  the pane no
-  longer shows counts as no mail: a disabled cell drops its glyph to
+  together, on `mail_action_enabled`: in view mode that is
+  `has_selected_message` — the reading pane's own lookup, so a uid the pane no
+  longer shows counts as no mail — while select mode leaves Delete alone live
+  (see the select-mode bullet below), the one of the seven that has something to
+  do with more than one mail. A disabled cell drops its glyph to
   `weak_text_color`, stops sensing clicks and never fills. Export and Delete
   are wired — they are the actions whose jobs exist so far — and the other four
   still run nothing, so a click on one of them is not even read.
@@ -872,13 +923,21 @@ Event (mpsc) ──► drain_events() at frame start ──► merge into Accoun
   sets `failed`, and leaves the bar translucent over the crisp content. There
   is no multisampling to fight here — this integration asks for none — which is
   what the copy wants anyway.
-- Deleting a mail (the title bar's Delete → `KimoApp::delete_selected_message` →
-  `Job::DeleteMessage`) is **remote first, local after**: the worker asks the
-  server to drop the message and only then deletes the database row
-  (`db::delete_message`), so mail that is still on the server never disappears
-  from here and a deletion that fails — no connection, a read-only mailbox —
-  leaves both copies alone and reports why on the account (`Event::SyncFailed`,
-  prefixed "delete:"). The reverse case is the other half of the rule: a mail
+- Deleting mail (the title bar's Delete → `KimoApp::delete_selected_message` →
+  `Job::DeleteMessage { uids }`) is **remote first, local after**, one mail at a
+  time: the worker asks the server to drop each message and only then deletes
+  that database row (`db::delete_message`), so mail that is still on the server
+  never disappears from here and a deletion that fails — no connection, a
+  read-only mailbox — leaves that mail's copies alone and reports why on the
+  account (`Event::SyncFailed`, prefixed "delete:"). The list of uids is what the
+  button was about: one mail from the reading pane, or every mail checked in
+  select mode. A run is one connection, not one per mail — IMAP checks LIST and
+  SELECTs once and then probes, flags and expunges each uid
+  (`ImapClient::delete_messages`), POP3 is one session whose `QUIT` commits every
+  `DELE` — and a uid the server refuses is that uid's alone: the rest of the run
+  is still asked, each mail that went comes back as its own
+  `Event::MessageDeleted`, and the first refusal is what the account carries.
+  The reverse case is the other half of the rule: a mail
   the server no longer has is deleted **locally only**, without a command that
   could touch anything else. IMAP asks before it flags — the mailbox has to
   still be in LIST (a mailbox that *is* listed but refuses SELECT is an error,
@@ -1217,10 +1276,12 @@ Do not "fix" these casually — they are known:
   `src/protocol/ffdhe.rs` and nothing else. A server whose DHE group is
   another size, or yet another custom prime, still fails the handshake with
   `SelectedUnofferedKxGroup`; see the FFDHE convention above for what to add.
-- Deleting is permanent: there is no Trash folder and no undo, a click on the
-  title bar's Delete expunges the mail on the server without asking first, and
-  it acts on the one mail the reading pane shows — no multi-select, no
-  Delete-key shortcut.
+- Deleting is permanent: there is no Trash folder and no undo, and a click on
+  the title bar's Delete expunges the mail on the server without asking first —
+  the one the reading pane shows, or a whole select-mode selection, which is
+  just as final. There is no Delete-key shortcut, no select-all and no
+  shift-click range: a selection is made one checkbox at a time (see the
+  select-mode bullet under Conventions).
 - A written mail goes out over SMTP and no further: no attachments (there is
   nothing to pick a file with — a native dialog is a dependency, and a portal on
   Wayland), no HTML body (the card is a text box, so the mail is `text/plain;

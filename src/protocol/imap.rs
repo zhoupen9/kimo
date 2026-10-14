@@ -236,24 +236,54 @@ impl ImapClient {
         Ok(())
     }
 
-    /// Delete one message from `folder`, if the server still has it.
+    /// Delete messages from `folder`, if the server still has them, and report
+    /// what became of every uid.
     ///
     /// The mailbox is checked against LIST first: one the server no longer
     /// lists is gone, and its mail with it — there is nothing remote left to
-    /// delete, and the caller is free to drop its local copy. A mailbox that
+    /// delete, and the caller is free to drop its local copies. A mailbox that
     /// *is* listed but refuses SELECT is an error instead: the server may
     /// simply be unwilling to open it right now, and mail that is still on
     /// the server must not disappear here.
     ///
-    /// The UID is then probed before anything is flagged, so a message
+    /// Each UID is then probed before anything is flagged, so a message
     /// another client has already removed takes the same local-only path.
-    /// Only a message the server still answers for is flagged `\Deleted`
-    /// and expunged, which is what keeps the two copies from disagreeing.
-    pub fn delete_message(&mut self, folder: &str, uid: u32) -> MailResult<()> {
-        if !self.list_folders()?.iter().any(|listed| listed == folder) {
-            return Ok(());
+    /// Only a message the server still answers for is flagged `\Deleted` and
+    /// expunged, which is what keeps the two copies from disagreeing.
+    ///
+    /// The mailbox is checked and opened **once** for the whole run: it is one
+    /// click, so it is one login, one LIST and one SELECT. Each uid's answer is
+    /// its own, though — a mail the server refuses does not stop the one after
+    /// it — which is what lets the caller drop exactly the local copies the
+    /// server agreed to.
+    pub fn delete_messages(&mut self, folder: &str, uids: &[u32]) -> (Vec<u32>, Option<MailError>) {
+        let listed = match self.list_folders() {
+            Ok(listed) => listed.iter().any(|listed| listed == folder),
+            Err(error) => return (Vec::new(), Some(error)),
+        };
+        if !listed {
+            return (uids.to_vec(), None);
         }
-        self.select(folder)?;
+        if let Err(error) = self.select(folder) {
+            return (Vec::new(), Some(error));
+        }
+        let mut done = Vec::with_capacity(uids.len());
+        let mut first_error = None;
+        for &uid in uids {
+            match self.delete_selected(uid) {
+                Ok(()) => done.push(uid),
+                // The next uid gets its own chance: a command the server
+                // refused is about that mail, not about the ones after it.
+                Err(error) => first_error = first_error.or(Some(error)),
+            }
+        }
+        (done, first_error)
+    }
+
+    /// One message of the mailbox that is already selected: a UID the server
+    /// still answers for is flagged `\Deleted` and expunged, and one it does
+    /// not is nothing left to do.
+    fn delete_selected(&mut self, uid: u32) -> MailResult<()> {
         if !self.uid_exists(uid)? {
             return Ok(());
         }
@@ -660,6 +690,16 @@ mod tests {
         ]
     }
 
+    /// One uid through `delete_messages` — what a single-mail delete is
+    /// underneath — as `(what went, the refusal)`.
+    fn delete_one(
+        client: &mut ImapClient,
+        folder: &str,
+        uid: u32,
+    ) -> (Vec<u32>, Option<MailError>) {
+        client.delete_messages(folder, &[uid])
+    }
+
     #[test]
     fn deleting_a_message_flags_the_uid_and_expunges_it() {
         let mut script = incipit();
@@ -674,8 +714,87 @@ mod tests {
         let (account, server) = one_shot_server(script);
         let mut client = ImapClient::connect(&account).unwrap();
 
-        client.delete_message("INBOX", 45).unwrap();
+        let (done, error) = delete_one(&mut client, "INBOX", 45);
+        assert_eq!(done, vec![45]);
+        assert!(error.is_none(), "{:?}", error.map(|e| e.to_string()));
         assert_eq!(server.join().unwrap().len(), 5);
+    }
+
+    /// A run of uids is one connection: the mailbox is listed and opened once
+    /// and each uid then takes the same probe, flag and expunge. The whole run
+    /// is what the message list's Delete sends when several mails are checked,
+    /// and one connection is the point of it — twenty mails must not be twenty
+    /// logins.
+    #[test]
+    fn deleting_a_run_of_uids_opens_the_mailbox_once() {
+        let mut script = vec![incipit()[0].clone(), incipit()[1].clone()];
+        for (uid, fetch, store, expunge) in [
+            (
+                45,
+                "UID FETCH 45 (UID)",
+                "UID STORE 45 +FLAGS.SILENT (\\Deleted)",
+                "UID EXPUNGE 45",
+            ),
+            (
+                46,
+                "UID FETCH 46 (UID)",
+                "UID STORE 46 +FLAGS.SILENT (\\Deleted)",
+                "UID EXPUNGE 46",
+            ),
+        ] {
+            script.push((
+                fetch,
+                format!("* 3 FETCH (UID {uid})\r\n{{tag}} OK FETCH completed\r\n"),
+            ));
+            script.push((store, "{tag} OK STORE completed\r\n".to_string()));
+            script.push((expunge, "{tag} OK EXPUNGE completed\r\n".to_string()));
+        }
+        let (account, server) = one_shot_server(script);
+        let mut client = ImapClient::connect(&account).unwrap();
+
+        let (done, error) = client.delete_messages("INBOX", &[45, 46]);
+        assert_eq!(done, vec![45, 46]);
+        assert!(error.is_none(), "{:?}", error.map(|e| e.to_string()));
+        // LIST, SELECT and six commands for the two uids: the mailbox was not
+        // opened a second time.
+        assert_eq!(server.join().unwrap().len(), 8);
+    }
+
+    /// One uid's refusal is that uid's: the rest of the run is still asked, and
+    /// the answer says which of them the server agreed to.
+    #[test]
+    fn a_refused_uid_does_not_stop_the_rest_of_the_run() {
+        let mut script = vec![incipit()[0].clone(), incipit()[1].clone()];
+        script.push((
+            "UID FETCH 45 (UID)",
+            "* 3 FETCH (UID 45)\r\n{tag} OK FETCH completed\r\n".to_string(),
+        ));
+        script.push((
+            "UID STORE 45 +FLAGS.SILENT (\\Deleted)",
+            "{tag} NO mailbox is read-only\r\n".to_string(),
+        ));
+        script.push((
+            "UID FETCH 46 (UID)",
+            "* 3 FETCH (UID 46)\r\n{tag} OK FETCH completed\r\n".to_string(),
+        ));
+        script.push((
+            "UID STORE 46 +FLAGS.SILENT (\\Deleted)",
+            "{tag} OK STORE completed\r\n".to_string(),
+        ));
+        script.push((
+            "UID EXPUNGE 46",
+            "{tag} OK EXPUNGE completed\r\n".to_string(),
+        ));
+        let (account, server) = one_shot_server(script);
+        let mut client = ImapClient::connect(&account).unwrap();
+
+        let (done, error) = client.delete_messages("INBOX", &[45, 46]);
+        assert_eq!(done, vec![46], "only the uid the server agreed to");
+        assert!(
+            matches!(error, Some(MailError::Refused(_))),
+            "the refusal is the batch's answer: {error:?}"
+        );
+        assert_eq!(server.join().unwrap().len(), 7);
     }
 
     /// The oldest message is asked for by *sequence* number — `FETCH 1 (UID)`,
@@ -745,7 +864,9 @@ mod tests {
         let (account, server) = one_shot_server(script);
         let mut client = ImapClient::connect(&account).unwrap();
 
-        client.delete_message("INBOX", 45).unwrap();
+        let (done, error) = delete_one(&mut client, "INBOX", 45);
+        assert_eq!(done, vec![45]);
+        assert!(error.is_none(), "{:?}", error.map(|e| e.to_string()));
         assert_eq!(server.join().unwrap().len(), 6);
     }
 
@@ -762,7 +883,9 @@ mod tests {
         let (account, server) = one_shot_server(script);
         let mut client = ImapClient::connect(&account).unwrap();
 
-        client.delete_message("INBOX", 45).unwrap();
+        let (done, error) = delete_one(&mut client, "INBOX", 45);
+        assert_eq!(done, vec![45]);
+        assert!(error.is_none(), "{:?}", error.map(|e| e.to_string()));
         assert_eq!(server.join().unwrap().len(), 3);
     }
 
@@ -776,7 +899,13 @@ mod tests {
 
         // The server lists INBOX alone: a mail cached under Archive has no
         // mailbox left to be deleted from.
-        client.delete_message("Archive", 45).unwrap();
+        let (done, error) = delete_one(&mut client, "Archive", 45);
+        assert_eq!(
+            done,
+            vec![45],
+            "a mailbox that is gone takes its mail with it"
+        );
+        assert!(error.is_none(), "{:?}", error.map(|e| e.to_string()));
         assert_eq!(server.join().unwrap().len(), 1);
     }
 
@@ -795,8 +924,9 @@ mod tests {
         let (account, server) = one_shot_server(script);
         let mut client = ImapClient::connect(&account).unwrap();
 
-        let error = client.delete_message("INBOX", 45).unwrap_err();
-        assert!(matches!(error, MailError::Refused(_)), "{error}");
+        let (done, error) = delete_one(&mut client, "INBOX", 45);
+        assert!(done.is_empty(), "nothing may be dropped: {done:?}");
+        assert!(matches!(error, Some(MailError::Refused(_))), "{error:?}");
         assert_eq!(server.join().unwrap().len(), 2);
     }
 

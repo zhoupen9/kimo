@@ -130,6 +130,9 @@ pub struct ColorScheme {
     // --- accents ---
     /// Interactive highlight: focus rings and the busy spinner.
     pub accent: Color32,
+    /// The mark drawn *on* [`ColorScheme::accent`]: the check in a checked
+    /// box. Like the avatar palette it is white in both schemes.
+    pub on_accent: Color32,
     /// Fill of selected rows, selected text and the active preferences tab.
     pub selection: Color32,
     /// Hyperlinks in HTML mail.
@@ -174,6 +177,7 @@ impl ColorScheme {
             text_weak: Color32::from_rgb(95, 102, 115), // #5F6673
             on_danger: Color32::from_rgb(255, 255, 255), // #FFFFFF
             accent: Color32::from_rgb(106, 69, 208),    // #6A45D0
+            on_accent: Color32::from_rgb(255, 255, 255), // #FFFFFF
             selection: Color32::from_rgb(220, 224, 248), // #DCE0F8
             link: Color32::from_rgb(11, 87, 208),       // #0B57D0
             warn: Color32::from_rgb(154, 87, 0),        // #9A5700
@@ -207,6 +211,7 @@ impl ColorScheme {
             text_weak: Color32::from_rgb(154, 161, 172), // #9AA1AC
             on_danger: Color32::from_rgb(255, 255, 255), // #FFFFFF
             accent: Color32::from_rgb(139, 123, 240), // #8B7BF0
+            on_accent: Color32::from_rgb(255, 255, 255), // #FFFFFF
             selection: Color32::from_rgb(58, 53, 104), // #3A3568
             link: Color32::from_rgb(127, 168, 255),  // #7FA8FF
             warn: Color32::from_rgb(224, 163, 58),   // #E0A33A
@@ -272,7 +277,7 @@ impl ColorScheme {
 
     /// Labeled colors for the Appearance page preview, in the order the fields
     /// are declared.
-    pub fn swatches(self) -> [(&'static str, Color32); 18] {
+    pub fn swatches(self) -> [(&'static str, Color32); 19] {
         [
             ("Panel", self.panel),
             ("Content", self.content),
@@ -287,6 +292,7 @@ impl ColorScheme {
             ("Text", self.text),
             ("Text weak", self.text_weak),
             ("Accent", self.accent),
+            ("On accent", self.on_accent),
             ("Selection", self.selection),
             ("Link", self.link),
             ("Warn", self.warn),
@@ -492,6 +498,10 @@ mod tests {
                 glyph >= 4.5,
                 "{name}: on_danger on danger_hover is {glyph:.1}:1"
             );
+            // The check in a checked box is a UI mark rather than text, so it
+            // answers to the graphic floor.
+            let mark = contrast(scheme.on_accent, scheme.accent);
+            assert!(mark >= 3.0, "{name}: on_accent on accent is {mark:.1}:1");
         }
     }
 
