@@ -136,7 +136,7 @@ src/db.rs               the mail database: schema + migrations, accounts, folder
 src/search.rs           mail search: the CJK bigram index, the FTS5 query builder and the filters they run against
 src/theme.rs            theme choice + the light/dark color schemes and their egui Visuals
 src/mail.rs             raw RFC 5322 bytes → MailMessage (mail-parser; HTML kept, attachments
-                        as name/type/size)
+                        as name/type/size, one part back out for a download)
 src/outgoing.rs         the mail being sent: addresses, headers, encoding → RFC 5322 bytes
 src/html.rs             HTML mail → egui widgets (subset: blocks, lists, tables, links, inline styles)
 src/blitz_render.rs     HTML mail → rasterized page via Blitz (headless render, net provider, fonts)
@@ -802,7 +802,8 @@ Event (mpsc) ──► drain_events() at frame start ──► merge into Accoun
   mark it read), POP3 `UIDL` + `RETR` through `Pop3Client::retr_by_uidl` — and
   writes it byte for byte to `$HOME/Downloads/<subject>.eml`
   (`storage::downloads_dir`, made on the first export). There is no file dialog:
-  one destination, and the app says the path it wrote.
+  one destination — the same directory a downloaded attachment goes to, see the
+  attachment-card bullet — and the app says the path it wrote.
   **The original is the point.** What is stored here is the parsed mail, with
   each attachment's name, type and size but never its bytes, so a `.eml`
   rebuilt from the database would not be the message the sender wrote, while
@@ -832,11 +833,28 @@ Event (mpsc) ──► drain_events() at frame start ──► merge into Accoun
   last thing on the reading pane's card whichever renderer drew the body,
   because `mail_card` draws them after `mail_body` rather than inside it: a
   Blitz body is a raster a worker made, and the cards are not part of it.
-  **A card is not clickable.** What the database holds is the name, the type and
-  the size (schema v6), never the bytes, so there is nothing to open or save —
-  and a card that filled under the pointer would promise a file it cannot hand
-  over. The hover text is the whole interaction, and it is what shows a name the
-  column had to elide. A part with no file name is not an attachment at all
+  **The whole card is a link, and the name is drawn as one**: the scheme's link
+  color, a line under it while the pointer is on the card, the card filled with
+  the hover color and the pointer turned into a hand. A click is a download —
+  `KimoApp::download_attachment` → `Job::DownloadAttachment` — and it is the
+  round trip an export makes, one step further: what the database holds is the
+  name, the type and the size (schema v6), never the bytes, so the worker fetches
+  the mail's original source, takes the part out of
+  it (`mail::attachment_bytes`) and writes the file into
+  `storage::downloads_dir` — the same directory, the same one-line
+  `Saved to <path>` notice and the same `create_new` numbering as an export,
+  through the one writer both use (`write_file`; the download's own rules are
+  `download_name`, which keeps the sender's file name, its last path component
+  and a plausible extension, and `safe_stem` behind both).
+  The click carries the mail, the part's *place* in the mail and the name the
+  card showed; the worker re-parses the original and refuses unless both match
+  — handing over the bytes of some other part is worse than refusing — and the
+  refusal is the account's, prefixed "attachment:", the way "export:" and
+  "delete:" are. Nothing is kept afterwards either: the bytes exist in the
+  downloads directory and nowhere else, and mail the server no longer has cannot
+  be downloaded at all, and says so rather than writing something close.
+  The hover text shows the whole name where the column had to elide it, and the
+  type and size under it. A part with no file name is not an attachment at all
   (`mail::collect_attachments`), and a mail cached before v6 is the name alone:
   no second line, rather than a separator with nothing after it.
 - The compose window (`compose_window`, opened by the title bar's pen) is an
@@ -1039,11 +1057,13 @@ Event (mpsc) ──► drain_events() at frame start ──► merge into Accoun
 
 Do not "fix" these casually — they are known:
 
-- An attachment cannot be saved or opened on its own: a card says what the
-  mail came with (the name, the MIME type and the decoded size) and is not
-  clickable, because Kimo stores no attachment bytes — Export writes the whole
-  mail out as one `.eml`, attachments included, and that is the way to get at
-  them.
+- Downloading an attachment is a round trip to the server, never a read of the
+  cache: Kimo keeps the name, the MIME type and the decoded size and never the
+  bytes, so a card's link fetches the mail's original source again and there is
+  nothing to hand over for mail the server no longer has. Nothing is opened
+  afterwards either — the file lands in `~/Downloads` and the desktop's own
+  programs are what open it. Export remains the way to get the whole message,
+  attachments included, as one `.eml`.
 - TLS finite-field DH covers the 2048-bit groups listed in
   `src/protocol/ffdhe.rs` and nothing else. A server whose DHE group is
   another size, or yet another custom prime, still fails the handshake with

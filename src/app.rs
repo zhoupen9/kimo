@@ -1254,11 +1254,12 @@ impl KimoApp {
                     self.spawn_search();
                 }
             }
-            Event::MessageExported { path } => {
-                // The file is on disk. Where it went is the one thing the app
-                // has to say — and the one thing it could not have known when
-                // the export was asked for, since a name that was taken is
-                // numbered.
+            // An export and a downloaded attachment are the same answer to
+            // the same question — a file is on disk, and where it went is the
+            // one thing the app has to say. It is also the one thing it could
+            // not have known when the work was asked for, since a name that was
+            // taken is numbered.
+            Event::MessageExported { path } | Event::AttachmentDownloaded { path } => {
                 self.notice = Some((format!("Saved to {}", path.display()), Instant::now()));
             }
             Event::MessageSent {
@@ -1453,7 +1454,8 @@ impl KimoApp {
     /// `.eml` (`Job::ExportMessage`, `storage::downloads_dir`). The file is
     /// the message whole — every header, every body part, every attachment —
     /// which is why the server is asked rather than the database read: what
-    /// Kimo keeps is the parsed mail, and the attachments by name only.
+    /// Kimo keeps is the parsed mail, with each attachment's name, type and
+    /// size and never its bytes.
     ///
     /// The round trip is the catch: mail the server no longer has cannot be
     /// exported at all, and that comes back on the account (`Event::SyncFailed`,
@@ -3893,13 +3895,60 @@ impl KimoApp {
         if msg.attachments.is_empty() {
             return;
         }
+        // The click is acted on once the cards are drawn, so that the borrow of
+        // the mail the pane is showing is over before the job is started.
+        let mut clicked = None;
         ui.add_space(ATTACHMENT_CARDS_TOP_GAP);
         for (index, attachment) in msg.attachments.iter().enumerate() {
             if index > 0 {
                 ui.add_space(ATTACHMENT_CARD_GAP);
             }
-            attachment_card(ui, attachment, column);
+            if attachment_card(ui, attachment, column).clicked() {
+                clicked = Some(index);
+            }
         }
+        if let Some(index) = clicked {
+            let name = msg.attachments[index].name.clone();
+            self.download_attachment(&msg.uid, index, &name);
+        }
+    }
+
+    /// Download one attachment of the mail the reading pane shows: a worker
+    /// fetches the mail's original source from the server, takes that part out
+    /// of it and writes the file into the downloads directory
+    /// (`Job::DownloadAttachment`, `storage::downloads_dir`).
+    ///
+    /// `ordinal` is the card's position in `msg.attachments`, which is the
+    /// order the parts came in and so the order the database stored them in —
+    /// the worker re-parses the original and finds the part again by it and by
+    /// `name`.
+    ///
+    /// The round trip is the price of never storing the bytes, exactly as it is
+    /// for an export: mail the server no longer has cannot be downloaded, and
+    /// that comes back on the account (`Event::SyncFailed`, prefixed
+    /// "attachment:"). What went right is the same timed line an export uses
+    /// (`Event::AttachmentDownloaded`).
+    fn download_attachment(&mut self, uid: &str, ordinal: usize, name: &str) {
+        let (Some(account_id), Some(folder)) =
+            (self.selected_account.clone(), self.selected_folder.clone())
+        else {
+            return;
+        };
+        let Some(account) = self.accounts.iter().find(|a| a.id == account_id).cloned() else {
+            return;
+        };
+        sync::spawn(
+            Job::DownloadAttachment {
+                account,
+                folder,
+                uid: uid.to_string(),
+                ordinal,
+                name: name.to_string(),
+                dir: storage::downloads_dir(),
+            },
+            self.ctx.clone(),
+            self.tx.clone(),
+        );
     }
 
     /// The mail itself, laid out inside the card's scroll area (`mail_card`),
@@ -5351,27 +5400,35 @@ fn truncate_galley(
     ctx.fonts_mut(|f| f.layout_job(job))
 }
 
-/// One attachment as a card: the file's glyph, its name, and — for mail that
-/// was fetched with them — the type and the size under it.
+/// One attachment as a card: the file's glyph and its name — a link, which
+/// downloads the file when it is clicked (`KimoApp::download_attachment`) —
+/// with the type and the size under the name for mail that was fetched with
+/// them.
 ///
 /// The card is as wide as the mail's own column, so a run of them reads as one
-/// part of the mail rather than as a list of its own. It never senses a click:
-/// what the database holds is the name, the type and the size, never the bytes
-/// (see the export convention in AGENTS.md), so there is nothing to open — and
-/// a card that lit up under the pointer would promise a file it cannot hand
-/// over. The hover text is the whole interaction, and it is what shows a name
-/// the column had to cut.
-fn attachment_card(ui: &mut egui::Ui, attachment: &Attachment, column: f32) {
+/// part of the mail rather than as a list of its own, and the *whole card* is
+/// the link rather than the points of the name: the name is drawn in the
+/// scheme's link color the way an HTML link is, the card fills with the hover
+/// color while the pointer is on it, the name is underlined then, and the
+/// pointer becomes a hand. Those are the four things that say a target is
+/// there — and it is a real one now: the bytes are on the server, and a click
+/// fetches them (see the attachment-card convention in AGENTS.md). The hover
+/// text is what shows a name the column had to cut.
+fn attachment_card(ui: &mut egui::Ui, attachment: &Attachment, column: f32) -> egui::Response {
     let scheme = theme::of(ui.ctx());
     let (rect, response) = ui.allocate_exact_size(
         egui::vec2(column, ATTACHMENT_CARD_HEIGHT),
-        egui::Sense::hover(),
+        egui::Sense::click(),
     );
     if !ui.is_rect_visible(rect) {
-        return;
+        return response;
     }
-    ui.painter()
-        .rect_filled(rect, ATTACHMENT_CARD_CORNER_RADIUS, scheme.card);
+    let hovered = response.hovered();
+    ui.painter().rect_filled(
+        rect,
+        ATTACHMENT_CARD_CORNER_RADIUS,
+        if hovered { scheme.hover } else { scheme.card },
+    );
     ui.painter().rect_stroke(
         rect,
         ATTACHMENT_CARD_CORNER_RADIUS,
@@ -5392,18 +5449,32 @@ fn attachment_card(ui: &mut egui::Ui, attachment: &Attachment, column: f32) {
     let width = (rect.right() - ATTACHMENT_CARD_PADDING - left).max(1.0);
     let body = egui::TextStyle::Body.resolve(ui.style());
     let small = egui::TextStyle::Small.resolve(ui.style());
-    let name = truncate_galley(ui.ctx(), &attachment.name, body.size, scheme.text, width);
+    let name = truncate_galley(ui.ctx(), &attachment.name, body.size, scheme.link, width);
     let meta_text = attachment_meta(attachment);
     let meta = (!meta_text.is_empty())
         .then(|| truncate_galley(ui.ctx(), &meta_text, small.size, scheme.text_weak, width));
 
     // The name and what is under it are one block, centred on the card.
     let name_height = name.size().y;
+    let name_width = name.size().x;
     let meta_height = meta
         .as_ref()
         .map_or(0.0, |meta| ATTACHMENT_LINE_GAP + meta.size().y);
     let mut y = rect.center().y - (name_height + meta_height) / 2.0;
-    ui.painter().galley(egui::pos2(left, y), name, scheme.text);
+    ui.painter().galley(egui::pos2(left, y), name, scheme.link);
+    if hovered {
+        // What a stock link draws while the pointer is on it: a line under the
+        // name's own row rather than under the card, which is also what says
+        // the click lands on the file name and not on some blank part of it.
+        ui.painter().line_segment(
+            [
+                egui::pos2(left, y + name_height - 1.0),
+                egui::pos2(left + name_width, y + name_height - 1.0),
+            ],
+            egui::Stroke::new(1.0_f32, scheme.link),
+        );
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
     if let Some(meta) = meta {
         y += name_height + ATTACHMENT_LINE_GAP;
         ui.painter()
@@ -5415,7 +5486,7 @@ fn attachment_card(ui: &mut egui::Ui, attachment: &Attachment, column: f32) {
     } else {
         format!("{}\n{meta_text}", attachment.name)
     };
-    let _ = response.on_hover_text(hover);
+    response.on_hover_text(hover)
 }
 
 /// A card's second line: the MIME type and the size, whichever of the two the
@@ -6630,6 +6701,78 @@ mod tests {
         }
     }
 
+    /// Every run of text one headless frame drew with the color it was laid out
+    /// in, for the tests that care how something reads and not only what it
+    /// says. The color a run is drawn in is the one its galley was laid out
+    /// with; the color handed to `Painter::galley` is only the fallback.
+    fn frame_text_colors(ctx: &egui::Context, app: &mut KimoApp) -> Vec<(String, egui::Color32)> {
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1400.0, 900.0),
+            )),
+            ..Default::default()
+        };
+        let mut output = ctx.run_ui(input, |ui| app.ui(ui));
+        output.textures_delta.clear();
+        let mut texts = Vec::new();
+        for clipped in &output.shapes {
+            collect_text_color(&clipped.shape, &mut texts);
+        }
+        texts
+    }
+
+    fn collect_text_color(shape: &egui::Shape, out: &mut Vec<(String, egui::Color32)>) {
+        match shape {
+            egui::Shape::Text(text) => {
+                let color = text
+                    .galley
+                    .job
+                    .sections
+                    .first()
+                    .map_or(text.fallback_color, |section| section.format.color);
+                out.push((text.galley.text().to_string(), color));
+            }
+            egui::Shape::Vec(shapes) => {
+                for shape in shapes {
+                    collect_text_color(shape, out);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Every rectangle one headless frame painted, for the tests that click
+    /// something the app drew rather than a position worked out by arithmetic.
+    fn frame_rects(ctx: &egui::Context, app: &mut KimoApp) -> Vec<egui::Rect> {
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1400.0, 900.0),
+            )),
+            ..Default::default()
+        };
+        let mut output = ctx.run_ui(input, |ui| app.ui(ui));
+        output.textures_delta.clear();
+        let mut rects = Vec::new();
+        for clipped in &output.shapes {
+            collect_rects(&clipped.shape, &mut rects);
+        }
+        rects
+    }
+
+    fn collect_rects(shape: &egui::Shape, out: &mut Vec<egui::Rect>) {
+        match shape {
+            egui::Shape::Rect(rect) => out.push(rect.rect),
+            egui::Shape::Vec(shapes) => {
+                for shape in shapes {
+                    collect_rects(shape, out);
+                }
+            }
+            _ => {}
+        }
+    }
+
     /// A folder the account has not fetched yet — INBOX, offered by the
     /// navigation before the first sync — is empty as far as the list is
     /// concerned, and the column has to say which kind of empty it is rather
@@ -6950,6 +7093,85 @@ mod tests {
             !texts.iter().any(|text| text.starts_with('·')),
             "the old row left a separator behind: {texts:?}"
         );
+
+        // The names are links: drawn in the scheme's link color rather than in
+        // the body text's, which is what says a click is offered.
+        let link = theme::of(&ctx).link;
+        let colors = frame_text_colors(&ctx, &mut app);
+        for name in ["report.pdf", "cached-before-v6.png"] {
+            assert!(
+                colors
+                    .iter()
+                    .any(|(drawn, color)| drawn == name && *color == link),
+                "{name} is not drawn as a link: {colors:?}"
+            );
+        }
+    }
+
+    /// Clicking an attachment card starts a download: the app finds the account
+    /// and the mail the pane is showing, and hands the worker the part's place
+    /// and the file's name. What the worker does with them is `sync`'s own
+    /// test — this one is the click reaching it, which the account's spinner
+    /// (`Event::SyncStarted`, the first thing the job sends) is the sign of.
+    #[test]
+    fn clicking_an_attachment_card_starts_a_download() {
+        let ctx = egui::Context::default();
+        crate::fonts::install(&ctx, None, None);
+        let mut app = app_with_messages(&ctx, 1);
+        app.states
+            .get_mut("acct")
+            .expect("the fixture account")
+            .mailbox
+            .folders[0]
+            .messages[0]
+            .attachments = vec![Attachment {
+            name: "report.pdf".to_string(),
+            content_type: "application/pdf".to_string(),
+            size: 68 * 1024,
+        }];
+        // Where the account is does not matter to the click, and the worker's
+        // own failure is its own: a port with nothing on it keeps the job from
+        // reaching off this machine.
+        app.accounts[0].host = "127.0.0.1".to_string();
+        app.accounts[0].port = 1;
+        app.selected_account = Some("acct".to_string());
+        app.selected_folder = Some("INBOX".to_string());
+        app.selected_message = Some("0".to_string());
+
+        let _ = frame_texts(&ctx, &mut app);
+        let card = frame_rects(&ctx, &mut app)
+            .into_iter()
+            .find(|rect| (rect.height() - ATTACHMENT_CARD_HEIGHT).abs() < 0.5)
+            .expect("the attachment card is on screen");
+        let centre = card.center();
+        run_app_frame(&ctx, &mut app, vec![egui::Event::PointerMoved(centre)]);
+        for pressed in [true, false] {
+            run_app_frame(
+                &ctx,
+                &mut app,
+                vec![egui::Event::PointerButton {
+                    pos: centre,
+                    button: egui::PointerButton::Primary,
+                    pressed,
+                    modifiers: egui::Modifiers::default(),
+                }],
+            );
+        }
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut started = false;
+        while Instant::now() < deadline && !started {
+            match app.rx.try_recv() {
+                Ok(Event::SyncStarted { account_id }) => {
+                    assert_eq!(account_id, "acct");
+                    started = true;
+                }
+                Ok(_) => {}
+                Err(mpsc::TryRecvError::Empty) => std::thread::sleep(Duration::from_millis(5)),
+                Err(mpsc::TryRecvError::Disconnected) => break,
+            }
+        }
+        assert!(started, "a click on the card did not start a download");
     }
 
     /// What a card's second line is made of, and the sizes it prints: the type

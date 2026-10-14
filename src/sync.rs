@@ -122,8 +122,8 @@ pub enum Job {
     /// `<subject>.eml` — the title bar's Export. The server's copy is the
     /// message whole (every header, every body part, every attachment), which
     /// is why this is a round trip rather than a rebuild from the database:
-    /// what is stored here is the parsed mail, with the attachments by name
-    /// only.
+    /// what is stored here is the parsed mail, with each attachment's name,
+    /// type and size and never its bytes.
     ExportMessage {
         account: Account,
         folder: String,
@@ -133,6 +133,27 @@ pub enum Job {
         /// What the file is named after: the subject, which the worker turns
         /// into a file name (`export_stem`).
         subject: String,
+    },
+    /// Download one attachment of one message into `dir`: the mail's original
+    /// source is fetched, the part is taken out of it and its bytes are written
+    /// as the file the sender named — the click on an attachment card.
+    ///
+    /// A round trip, like an export's, and for the same reason: what is stored
+    /// here is the parsed mail, with each attachment's name, type and size but
+    /// never its bytes, so the file itself only exists on the server.
+    DownloadAttachment {
+        account: Account,
+        folder: String,
+        uid: String,
+        /// Which attachment, as the reading pane enumerated the mail's parts.
+        /// It is the same order the database stored them in (`ordinal`), and
+        /// the worker re-parses the original to find the part again.
+        ordinal: usize,
+        /// The name the card showed, which is what the part is checked against
+        /// and what the file is named after (`download_name`).
+        name: String,
+        /// The directory the file goes in (`storage::downloads_dir`).
+        dir: PathBuf,
     },
     /// Send one written mail (`crate::outgoing`) through the account's SMTP
     /// server and, when the account has a Sent mailbox to keep it in, put the
@@ -212,6 +233,12 @@ pub enum Event {
     /// one thing about an export the UI cannot know by itself: the name it
     /// asked for may already have been taken, and the file is then numbered.
     MessageExported {
+        path: PathBuf,
+    },
+    /// One attachment was written out, at this path — the notice above the
+    /// message list says where. Like an export's path, this is the one thing
+    /// the UI cannot know by itself: a name that was taken is numbered.
+    AttachmentDownloaded {
         path: PathBuf,
     },
     /// The mail is out. `recipients` is everybody the envelope went to, which
@@ -447,6 +474,36 @@ pub fn spawn(job: Job, ctx: egui::Context, tx: Sender<Event>) {
             }
             ctx.request_repaint();
         }
+        Job::DownloadAttachment {
+            account,
+            folder,
+            uid,
+            ordinal,
+            name,
+            dir,
+        } => {
+            // Bracketed like an export: the account's spinner is what says a
+            // round trip is in flight while the server is asked for the mail.
+            let account_id = account.id.clone();
+            let _ = tx.send(Event::SyncStarted {
+                account_id: account_id.clone(),
+            });
+            match download_attachment(&account, &folder, &uid, ordinal, &name, &dir) {
+                Ok(path) => {
+                    let _ = tx.send(Event::AttachmentDownloaded { path });
+                    let _ = tx.send(Event::SyncDone { account_id });
+                }
+                // Nothing was written, and a write that failed halfway took its
+                // partial file with it.
+                Err(error) => {
+                    let _ = tx.send(Event::SyncFailed {
+                        account_id,
+                        error: format!("attachment: {error}"),
+                    });
+                }
+            }
+            ctx.request_repaint();
+        }
         Job::SendMessage { account, mail } => {
             // Not bracketed with SyncStarted/SyncDone like the other round
             // trips: the card that asked for the send is on screen, cannot be
@@ -475,6 +532,7 @@ pub fn spawn(job: Job, ctx: egui::Context, tx: Sender<Event>) {
                 | Job::MarkSeen { .. }
                 | Job::DeleteMessage { .. }
                 | Job::ExportMessage { .. }
+                | Job::DownloadAttachment { .. }
                 | Job::SendMessage { .. }
                 | Job::LoadOlder { .. }
                 | Job::DeleteAccount { .. } => unreachable!(),
@@ -511,6 +569,7 @@ pub fn spawn(job: Job, ctx: egui::Context, tx: Sender<Event>) {
                 | Job::MarkSeen { .. }
                 | Job::DeleteMessage { .. }
                 | Job::ExportMessage { .. }
+                | Job::DownloadAttachment { .. }
                 | Job::SendMessage { .. }
                 | Job::LoadOlder { .. }
                 | Job::DeleteAccount { .. } => unreachable!(),
@@ -892,7 +951,8 @@ fn pop3_delete(account: &Account, uid: &str) -> MailResult<()> {
 
 /// Export one message: its original source, as the server has it, written into
 /// `dir` as `<subject>.eml`. The fetch is the whole job — what Kimo stores is
-/// the parsed mail, with the attachments by name only, so an `.eml` rebuilt
+/// the parsed mail, with each attachment's name, type and size and never its
+/// bytes, so an `.eml` rebuilt
 /// from the database would not be the message the sender wrote. The other side
 /// of that: mail the server no longer has cannot be exported at all, and says
 /// so rather than writing something close.
@@ -903,11 +963,44 @@ fn export_message(
     dir: &Path,
     subject: &str,
 ) -> MailResult<PathBuf> {
-    let raw = match account.protocol {
-        Protocol::Imap => imap_body(account, folder, uid)?,
-        Protocol::Pop3 => pop3_body(account, uid)?,
-    };
-    write_export(dir, &export_stem(subject), &raw)
+    let raw = original_source(account, folder, uid)?;
+    write_file(dir, &export_stem(subject), ".eml", &raw)
+}
+
+/// Download one attachment: the mail's original source, the part the card
+/// named, and the file it becomes, written into `dir`.
+///
+/// Both halves can refuse, and each says which half it was. The server may no
+/// longer have the mail at all (`original_source`), and the part may no longer
+/// be where the card said it was — a different mail under the same uid, a
+/// re-parse that counts the parts differently — in which case there is no file
+/// to hand over and saying so beats writing whatever part *is* there.
+fn download_attachment(
+    account: &Account,
+    folder: &str,
+    uid: &str,
+    ordinal: usize,
+    name: &str,
+    dir: &Path,
+) -> MailResult<PathBuf> {
+    let raw = original_source(account, folder, uid)?;
+    let bytes = mail::attachment_bytes(&raw, ordinal, name).ok_or_else(|| {
+        MailError::Protocol(format!("the server's copy of this mail has no {name}"))
+    })?;
+    let (stem, extension) = download_name(name);
+    write_file(dir, &stem, &extension, &bytes)
+}
+
+/// One message's original RFC 5322 source, as the server has it — the fetch an
+/// export and a download both start with. What Kimo stores is the parsed mail,
+/// with each attachment's name, type and size but never its bytes, so this is
+/// the only way back to what the sender sent; the other side of it is that mail
+/// the server no longer has cannot be exported or downloaded at all.
+fn original_source(account: &Account, folder: &str, uid: &str) -> MailResult<Vec<u8>> {
+    match account.protocol {
+        Protocol::Imap => imap_body(account, folder, uid),
+        Protocol::Pop3 => pop3_body(account, uid),
+    }
 }
 
 fn imap_body(account: &Account, folder: &str, uid: &str) -> MailResult<Vec<u8>> {
@@ -1050,21 +1143,56 @@ fn imap_save_to_sent(
 /// have to fit in that with it.
 const EXPORT_STEM_BYTES: usize = 100;
 
-/// How many names one export tries before giving up: `<stem>.eml`, then
-/// `<stem>-2.eml` and on. Nobody has a thousand mails with one subject, and the
-/// search has to end somewhere.
+/// How many names one write tries before giving up: `<stem>.eml`, then
+/// `<stem>-2.eml` and on (or the same for a downloaded file's own extension).
+/// Nobody has a thousand mails with one subject, or a thousand downloads of one
+/// attachment, and the search has to end somewhere.
 const EXPORT_NAME_TRIES: u32 = 1000;
 
-/// A subject as a file name: what a file name cannot carry — the two path
+/// The longest tail a downloaded attachment keeps as its extension. Anything
+/// longer is not an extension but the rest of the name, and it is safer inside
+/// the stem, where it is cleaned like the rest of the text.
+const DOWNLOAD_EXTENSION_BYTES: usize = 12;
+
+/// The name a downloaded attachment gets, as `(stem, extension)`: the last
+/// path component of the name the sender gave it — `../../.bashrc` and
+/// `C:\Users\ada\report.pdf` both have to land *in* `dir` and not outside it —
+/// with the stem cleaned the way an export's is. The extension is kept, because
+/// it is what says which program opens the file, but it has to look like one:
+/// ASCII alphanumerics, no longer than `DOWNLOAD_EXTENSION_BYTES`, after a stem
+/// that is not empty. Anything else is part of the stem, dots and all.
+fn download_name(name: &str) -> (String, String) {
+    let base = name.rsplit(['/', '\\']).next().unwrap_or(name);
+    match base.rsplit_once('.') {
+        Some((stem, extension))
+            if !stem.is_empty()
+                && !extension.is_empty()
+                && extension.len() <= DOWNLOAD_EXTENSION_BYTES
+                && extension.chars().all(|c| c.is_ascii_alphanumeric()) =>
+        {
+            (safe_stem(stem, "attachment"), format!(".{extension}"))
+        }
+        _ => (safe_stem(base, "attachment"), String::new()),
+    }
+}
+
+/// A subject as a file name (see `safe_stem`): an export is named after the
+/// mail, and "mail" is what a subject that is nothing but punctuation becomes.
+fn export_stem(subject: &str) -> String {
+    safe_stem(subject, "mail")
+}
+
+/// `text` as a file name stem: what a file name cannot carry — the two path
 /// separators, the characters Windows forbids, control characters — becomes a
 /// space, runs of them collapse into one, and the ends lose their dots and
 /// spaces. `slug` is the wrong tool here: it lowercases and ASCII-fies, which
-/// would throw away every non-Latin subject ("发票号码 12345" is a file the user
-/// recognises; "account" is not). A subject with no usable character left still
-/// needs a name, and the numbering tells one such mail from the next.
-fn export_stem(subject: &str) -> String {
+/// would throw away every non-Latin name ("发票号码 12345" is a file the user
+/// recognises; "account" is not). A text with no usable character left still
+/// needs a name, and `fallback` is it — the numbering tells one such file from
+/// the next.
+fn safe_stem(text: &str, fallback: &str) -> String {
     let mut stem = String::new();
-    for c in subject.chars() {
+    for c in text.chars() {
         let c = if c.is_control()
             || matches!(c, '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|')
         {
@@ -1082,25 +1210,27 @@ fn export_stem(subject: &str) -> String {
     }
     let stem = stem.trim_matches(|c: char| c == '.' || c.is_whitespace());
     if stem.is_empty() {
-        "mail".to_string()
+        fallback.to_string()
     } else {
         stem.to_string()
     }
 }
 
-/// Write `raw` into `dir` as `<stem>.eml`, numbered if that name is taken, and
-/// answer with the path it went to. The file is *created* rather than merely
-/// asked about, so two exports of the same mail cannot land on one name: the
-/// loser of that race moves to the next number instead of overwriting the
-/// winner. A write that fails halfway takes its partial file with it — a
-/// half-written file with a `.eml` suffix looks like a mail and is not one.
-fn write_export(dir: &Path, stem: &str, raw: &[u8]) -> MailResult<PathBuf> {
+/// Write `bytes` into `dir` as `<stem><extension>`, numbered before the
+/// extension if that name is taken, and answer with the path it went to — the
+/// one writer an exported `.eml` and a downloaded attachment share. The file is
+/// *created* rather than merely asked about, so two exports of one mail, or two
+/// clicks on one attachment card, cannot land on one name: the loser of that
+/// race moves to the next number instead of overwriting the winner. A write that
+/// fails halfway takes its partial file with it — a half-written file with a
+/// `.eml` or `.pdf` suffix looks like a document and is not one.
+fn write_file(dir: &Path, stem: &str, extension: &str, bytes: &[u8]) -> MailResult<PathBuf> {
     fs::create_dir_all(dir)?;
     for n in 1..=EXPORT_NAME_TRIES {
         let name = if n == 1 {
-            format!("{stem}.eml")
+            format!("{stem}{extension}")
         } else {
-            format!("{stem}-{n}.eml")
+            format!("{stem}-{n}{extension}")
         };
         let path = dir.join(name);
         let mut file = match fs::OpenOptions::new()
@@ -1112,7 +1242,7 @@ fn write_export(dir: &Path, stem: &str, raw: &[u8]) -> MailResult<PathBuf> {
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
             Err(error) => return Err(error.into()),
         };
-        if let Err(error) = file.write_all(raw) {
+        if let Err(error) = file.write_all(bytes) {
             drop(file);
             let _ = fs::remove_file(&path);
             return Err(error.into());
@@ -1120,7 +1250,7 @@ fn write_export(dir: &Path, stem: &str, raw: &[u8]) -> MailResult<PathBuf> {
         return Ok(path);
     }
     Err(MailError::Storage(format!(
-        "no free file name for {stem}.eml in {}",
+        "no free file name for {stem}{extension} in {}",
         dir.display()
     )))
 }
@@ -1548,15 +1678,16 @@ mod tests {
     }
 
     /// The bytes go to disk as they came off the server, and a name that is
-    /// taken is numbered rather than overwritten: exporting the same mail twice
-    /// is two files, not one that replaced the other.
+    /// taken is numbered rather than overwritten: exporting the same mail twice —
+    /// or downloading one attachment twice — is two files, not one that
+    /// replaced the other.
     #[test]
-    fn writing_an_export_numbers_a_name_that_is_taken() {
+    fn writing_a_file_out_numbers_a_name_that_is_taken() {
         let dir = std::env::temp_dir().join(format!("kimo-export-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
 
-        let first = write_export(&dir, "Invoice 42", b"one").unwrap();
-        let second = write_export(&dir, "Invoice 42", b"two").unwrap();
+        let first = write_file(&dir, "Invoice 42", ".eml", b"one").unwrap();
+        let second = write_file(&dir, "Invoice 42", ".eml", b"two").unwrap();
         assert_eq!(first, dir.join("Invoice 42.eml"));
         assert_eq!(second, dir.join("Invoice 42-2.eml"));
         assert_eq!(fs::read(&first).unwrap(), b"one");
@@ -1564,6 +1695,184 @@ mod tests {
         // The directory is made rather than refused when it is not there yet.
         assert!(dir.is_dir());
 
+        // A downloaded attachment numbers the same way, before its own
+        // extension rather than after it.
+        let chart = write_file(&dir, "chart", ".png", b"png").unwrap();
+        let chart_again = write_file(&dir, "chart", ".png", b"png").unwrap();
+        assert_eq!(chart, dir.join("chart.png"));
+        assert_eq!(chart_again, dir.join("chart-2.png"));
+
         fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A click on an attachment card, end to end: the drop is asked for the
+    /// mail by UIDL, the part the card named is taken out of the original, and
+    /// the file lands in the directory under the sender's own name. The part is
+    /// the *second* attachment, so which file came out is the ordinal's doing
+    /// and not the only choice there was.
+    #[test]
+    fn a_download_writes_the_part_the_card_named() {
+        use std::io::BufRead;
+
+        // A text body and two files: a text one first, the PDF second.
+        let raw = "From: Ada <ada@example.com>\r\n\
+                   To: me@example.com\r\n\
+                   Subject: Quarterly report\r\n\
+                   MIME-Version: 1.0\r\n\
+                   Content-Type: multipart/mixed; boundary=\"B\"\r\n\
+                   \r\n\
+                   --B\r\n\
+                   Content-Type: text/plain; charset=utf-8\r\n\
+                   \r\n\
+                   See attached.\r\n\
+                   --B\r\n\
+                   Content-Type: text/plain; name=\"notes.txt\"\r\n\
+                   Content-Disposition: attachment; filename=\"notes.txt\"\r\n\
+                   \r\n\
+                   the first file\r\n\
+                   --B\r\n\
+                   Content-Type: application/pdf; name=\"report.pdf\"\r\n\
+                   Content-Transfer-Encoding: base64\r\n\
+                   Content-Disposition: attachment; filename=\"report.pdf\"\r\n\
+                   \r\n\
+                   aGVsbG8gd29ybGQ=\r\n\
+                   --B--\r\n";
+
+        // Three sessions reach this drop: a successful download and the two
+        // refusals below, which fetch the mail *before* they find out that the
+        // part is not the one the card named.
+        const SESSIONS: usize = 3;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let served = raw.to_string();
+        let server = std::thread::spawn(move || {
+            let mut commands = Vec::new();
+            for _ in 0..SESSIONS {
+                let (mut socket, _) = listener.accept().unwrap();
+                socket.write_all(b"+OK canned ready\r\n").unwrap();
+                let mut reader = std::io::BufReader::new(socket.try_clone().unwrap());
+                loop {
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).unwrap() == 0 {
+                        break;
+                    }
+                    let command = line.trim_end().to_string();
+                    let verb = command.split(' ').next().unwrap_or_default().to_uppercase();
+                    commands.push(command);
+                    match verb.as_str() {
+                        "USER" | "PASS" => socket.write_all(b"+OK\r\n").unwrap(),
+                        "UIDL" => socket.write_all(b"+OK\r\n1 the-uidl\r\n.\r\n").unwrap(),
+                        "RETR" => {
+                            socket
+                                .write_all(format!("+OK {} octets\r\n", served.len()).as_bytes())
+                                .unwrap();
+                            socket.write_all(served.as_bytes()).unwrap();
+                            socket.write_all(b".\r\n").unwrap();
+                        }
+                        "QUIT" => {
+                            socket.write_all(b"+OK bye\r\n").unwrap();
+                            break;
+                        }
+                        _ => socket.write_all(b"-ERR unknown command\r\n").unwrap(),
+                    }
+                }
+            }
+            commands
+        });
+
+        let account = Account {
+            id: "drop".to_string(),
+            name: "Ada Lovelace".to_string(),
+            protocol: Protocol::Pop3,
+            host: "127.0.0.1".to_string(),
+            port,
+            username: "me@example.com".to_string(),
+            password: "secret".to_string(),
+            tls: crate::models::TlsMode::Plain,
+            smtp: None,
+        };
+        let dir = std::env::temp_dir().join(format!("kimo-download-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+
+        let path =
+            download_attachment(&account, "INBOX", "the-uidl", 1, "report.pdf", &dir).unwrap();
+        assert_eq!(path, dir.join("report.pdf"));
+        assert_eq!(fs::read(&path).unwrap(), b"hello world");
+
+        // The part is checked against the name the card showed, and the ordinal
+        // against the parts the mail really has: neither a name that lands on
+        // another file nor an ordinal that lands past the end writes anything.
+        for (ordinal, name) in [(1, "notes.txt"), (7, "report.pdf")] {
+            let error = download_attachment(&account, "INBOX", "the-uidl", ordinal, name, &dir)
+                .unwrap_err();
+            assert!(error.to_string().contains(name), "{error}");
+        }
+        assert_eq!(
+            fs::read_dir(&dir).unwrap().count(),
+            1,
+            "one file, not three"
+        );
+
+        let commands = server.join().unwrap();
+        assert_eq!(
+            commands.iter().filter(|c| *c == "RETR 1").count(),
+            SESSIONS,
+            "every download fetched the mail itself: {commands:?}"
+        );
+
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A downloaded attachment is named after the file the sender sent, and
+    /// only ever *inside* the downloads directory: a name that arrives as a path
+    /// — a Windows one, or one reaching for a home directory — keeps its last
+    /// component, and a file name is not allowed to grow past what a filesystem
+    /// takes.
+    #[test]
+    fn a_download_is_named_for_the_file_and_never_for_a_path() {
+        assert_eq!(
+            download_name("report-q3.pdf"),
+            ("report-q3".to_string(), ".pdf".to_string())
+        );
+        assert_eq!(
+            download_name("C:\\Users\\ada\\report.pdf"),
+            ("report".to_string(), ".pdf".to_string())
+        );
+        assert_eq!(
+            download_name("../../.bashrc"),
+            ("bashrc".to_string(), String::new()),
+            "a dot file is all name, and the path is gone"
+        );
+        // A dot with nothing before it is not an extension, and neither is a
+        // tail no program would open by.
+        assert_eq!(
+            download_name(".hidden"),
+            ("hidden".to_string(), String::new())
+        );
+        assert_eq!(
+            download_name("archive.tar.gz"),
+            ("archive.tar".to_string(), ".gz".to_string())
+        );
+        // A tail that is not one — too long, or not made of the characters an
+        // extension is — stays part of the stem, where it is cleaned like the
+        // rest of the name rather than trusted after a dot.
+        assert_eq!(
+            download_name("report.verylongextension"),
+            ("report.verylongextension".to_string(), String::new())
+        );
+        assert_eq!(
+            download_name("notes.this-is-not-an-extension"),
+            ("notes.this-is-not-an-extension".to_string(), String::new())
+        );
+        // Nothing usable is still a name: the numbering tells one such file
+        // from the next.
+        assert_eq!(
+            download_name("/"),
+            ("attachment".to_string(), String::new())
+        );
+        assert_eq!(
+            download_name("invoice:2026/01.pdf"),
+            ("01".to_string(), ".pdf".to_string())
+        );
     }
 }

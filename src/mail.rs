@@ -105,6 +105,23 @@ fn collect_attachments(m: &mail_parser::Message<'_>) -> Vec<crate::models::Attac
         .collect()
 }
 
+/// One attachment's bytes out of the mail's original source, decoded — what a
+/// click on its card hands to the downloads directory.
+///
+/// `ordinal` is the position the attachment had when the mail was parsed and
+/// stored (the database's `ordinal`), and `name` the name that was stored with
+/// it. Both have to match the part this parse finds: the bytes of *some* part
+/// are not the file the card promised, so a mail whose parts no longer line up
+/// answers `None` and the caller reports it rather than writing the wrong file.
+pub fn attachment_bytes(raw: &[u8], ordinal: usize, name: &str) -> Option<Vec<u8>> {
+    let parsed = MessageParser::default().parse(raw)?;
+    let part = parsed.attachments().nth(ordinal)?;
+    if part.attachment_name()? != name {
+        return None;
+    }
+    Some(part.contents().to_vec())
+}
+
 /// A part's MIME type as `type/subtype`. `ctype()` never fails — RFC 5322
 /// mail may carry no `Content-Type` at all, which mail-parser answers with
 /// `text/plain` — while a bare type with no subtype (a hand-written header)
@@ -374,6 +391,48 @@ mod tests {
         assert_eq!(attachment.name, "report.pdf");
         assert_eq!(attachment.content_type, "application/pdf");
         assert_eq!(attachment.size, 11);
+    }
+
+    /// One part out of the original: the card's own ordinal and name are what
+    /// says *which* part, and a mail whose parts are not what the card said —
+    /// another ordinal, another name — answers nothing rather than some other
+    /// file's bytes.
+    #[test]
+    fn one_attachment_comes_back_out_of_the_original() {
+        let raw = b"From: Alice <alice@example.com>\r\n\
+                    Subject: With two files\r\n\
+                    MIME-Version: 1.0\r\n\
+                    Content-Type: multipart/mixed; boundary=\"B\"\r\n\
+                    \r\n\
+                    --B\r\n\
+                    Content-Type: text/plain; charset=utf-8\r\n\
+                    \r\n\
+                    Two of them.\r\n\
+                    --B\r\n\
+                    Content-Type: text/plain; name=\"notes.txt\"\r\n\
+                    Content-Disposition: attachment; filename=\"notes.txt\"\r\n\
+                    \r\n\
+                    the first file\r\n\
+                    --B\r\n\
+                    Content-Type: application/pdf; name=\"report.pdf\"\r\n\
+                    Content-Transfer-Encoding: base64\r\n\
+                    Content-Disposition: attachment; filename=\"report.pdf\"\r\n\
+                    \r\n\
+                    aGVsbG8gd29ybGQ=\r\n\
+                    --B--\r\n";
+        assert_eq!(
+            attachment_bytes(raw, 1, "report.pdf").expect("the second part"),
+            b"hello world",
+            "the base64 is decoded on the way out"
+        );
+        assert_eq!(
+            attachment_bytes(raw, 0, "notes.txt").expect("the first part"),
+            b"the first file"
+        );
+        // The name the card showed is part of the question: the same ordinal
+        // under another name is not the file that was clicked.
+        assert_eq!(attachment_bytes(raw, 1, "notes.txt"), None);
+        assert_eq!(attachment_bytes(raw, 9, "report.pdf"), None);
     }
 
     #[test]
