@@ -290,7 +290,9 @@ Event (mpsc) ──► drain_events() at frame start ──► merge into Accoun
   popup waits for the typing to stop (`SEARCH_SETTLE`, `search_settle`) — the
   title-bar box only displays the query — and Enter skips the wait;
   `search_applied` is the query the results on screen already answer, which is
-  what keeps an unchanged query from searching again every frame. The request
+  what keeps an unchanged query from searching again every frame; the empty
+  query the column opens on is the applied one from the start, so the first
+  frame of the process is not a change of list either. The request
   is pumped from `KimoApp::ui`, not from the message list: the popup that
   edits the query sits outside every column.
 - Sending is a job like any other, with two differences. `Job::SendMessage`
@@ -594,10 +596,11 @@ Event (mpsc) ──► drain_events() at frame start ──► merge into Accoun
   cancel. Nothing else about a search is drawn: the message list starts
   straight at the rows — the folder's mail or the hits — because a header over
   them was noise the project owner asked to drop, and the magnifier is the only
-  sign left. It is grey while the box is empty — `visuals.weak_text_color()`,
-  the color of the hint text it sits next to, so the box reads as an empty
-  placeholder rather than a live control — and accent-colored once a query is
-  what the column shows.
+  sign left. (Select mode's select-all row is not that header: it is there only
+  while the mode is.) It is grey while the box is empty —
+  `visuals.weak_text_color()`, the color of the hint text it sits next to, so
+  the box reads as an empty placeholder rather than a live control — and
+  accent-colored once a query is what the column shows.
   Nothing about a query is persisted.
 - A message row (`message_card`; the folder list and the search results share
   it, only the third line differs — the preview, or *account · folder — match*)
@@ -727,6 +730,34 @@ Event (mpsc) ──► drain_events() at frame start ──► merge into Accoun
   `selection` fill the mail open in the pane already has, so what is checked is
   visible past the 18 pt box; a partly checked conversation's own row does not,
   and says what it is with the dash alone.
+  **Select mode also has a select-all row**, pinned under the title bar over the
+  top of the list: the same box in the same column, a label that says what a
+  click would do (`Select all` / `Clear selection`), and a hairline under it. It
+  is a band of its own height (`SELECT_ALL_HEIGHT`, 32 pt), drawn *after* the
+  rows the way the floating `Load older mail` button is (`select_all_band`, off
+  the scroll area's own viewport): the list scrolls **under** it, so the one
+  control that is about the whole list never scrolls out of reach. It is opaque
+  — the list's own surface, filled edge to edge like a row — which is what the
+  rows sliding under it need. The frame's top margin grows by its height while
+  the mode is on, so at rest the first row
+  starts below it and `virtual_rows` keeps its uniform-row arithmetic — the title
+  bar's own padding stays, so mail still passes under the glass above the band.
+  It is not the list header the column deliberately has none of — it exists only
+  while the mode does. The whole band is one click target, unlike a mail row's
+  box: there is nothing else a click on it could mean, so a mis-aimed click on
+  the label must not be what leaves the mode. Its box says `CheckState` the way a
+  conversation's does — off, the dash for part of the list, the check for all of
+  it — and the label turns into the way out when the click would clear.
+  **It is about the list and not about the rows**: the keys are every mail the
+  folder holds — closed conversations included — or every search hit, built on
+  the click and never per frame. The drawn state is one comparison, the
+  selection's size against the list's, and that is exact only because the
+  selection is always a subset of the list on screen: `cancel_select` on every
+  list change as before, and two guards for the ways a checked key could leave
+  the list without one — a fresh search answer drops the keys it no longer names
+  (`Event::SearchResults`), and a UIDVALIDITY rotation drops its folder's
+  (`Event::Messages`), since those UIDs are meaningless with the mail they
+  named.
   What is checked is a `MailKey` — account, folder and uid — and not a uid, since
   a search lists hits from every folder and account at once. `select_mode` and
   `selected_mails` are in memory only, the way the open conversations are, and
@@ -746,8 +777,9 @@ Event (mpsc) ──► drain_events() at frame start ──► merge into Accoun
   since a selection made over a search's hits spans folders, and each group is
   one `Job::DeleteMessage` on one connection — the rows go as the events come
   back, and a mail the server refused keeps both its copies and its check.
-  Nothing about the mode is persisted, and there is no select-all, no shift-click
-  range and no Delete-key shortcut: a selection is made one checkbox at a time.
+  Nothing about the mode is persisted, and there is no shift-click range and no
+  Delete-key shortcut: a selection is made one checkbox at a time, or all at once
+  with the select-all row.
 - The window is undecorated on purpose (`with_decorations(false)` in
   `main.rs`): `titlebar_area()` in `app.rs` draws the custom title bar — an
   `egui::Area` fixed to the window's top edge and shown *after* the panels, not
@@ -1279,9 +1311,10 @@ Do not "fix" these casually — they are known:
 - Deleting is permanent: there is no Trash folder and no undo, and a click on
   the title bar's Delete expunges the mail on the server without asking first —
   the one the reading pane shows, or a whole select-mode selection, which is
-  just as final. There is no Delete-key shortcut, no select-all and no
-  shift-click range: a selection is made one checkbox at a time (see the
-  select-mode bullet under Conventions).
+  just as final. There is no Delete-key shortcut and no shift-click range: a
+  selection is made one checkbox at a time, or every mail of the list at once
+  (see the select-mode bullet under Conventions) — and that click is just as
+  final.
 - A written mail goes out over SMTP and no further: no attachments (there is
   nothing to pick a file with — a native dialog is a dependency, and a portal on
   Wayland), no HTML body (the card is a text box, so the mail is `text/plain;

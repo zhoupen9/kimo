@@ -251,6 +251,54 @@ fn delete_selection_tooltip(count: usize) -> String {
     }
 }
 
+/// What the message list's select-all box says: nothing checked is off,
+/// everything the list holds is on, anything between is partial. The two
+/// numbers are the whole selection's size and the list's own — comparable
+/// because the selection is always a subset of the list on screen, which is
+/// what cancel_select on every list change and the two guards in apply_event
+/// keep true.
+fn select_all_state(checked: usize, listed: usize) -> CheckState {
+    match checked {
+        0 => CheckState::Off,
+        n if n >= listed => CheckState::On,
+        _ => CheckState::Partial,
+    }
+}
+
+/// The select-all row's label: the action a click would take, so the row says
+/// what it is for without a tooltip having to be found.
+fn select_all_label(state: CheckState) -> &'static str {
+    match state {
+        CheckState::On => "Clear selection",
+        CheckState::Off | CheckState::Partial => "Select all",
+    }
+}
+
+/// Where the select-all row sits while select mode is on: pinned under the
+/// title bar, over the top of the list's own viewport — the list scrolls *under*
+/// it, so the one control that is about the whole list never scrolls out of
+/// reach. The frame's top padding is what keeps the first row out from under it
+/// at rest.
+fn select_all_band(viewport: egui::Rect) -> egui::Rect {
+    egui::Rect::from_min_size(
+        egui::pos2(viewport.left(), viewport.top() + TITLEBAR_HEIGHT),
+        egui::vec2(viewport.width(), SELECT_ALL_HEIGHT),
+    )
+}
+
+/// The select-all row's hover text, which is where the count lives — the row
+/// itself is one line of chrome and stays one line whatever the list holds.
+fn select_all_tooltip(state: CheckState, listed: usize) -> String {
+    match (state, listed) {
+        (CheckState::On, 1) => "Clear the selection — the mail in this list is checked".to_string(),
+        (CheckState::On, n) => {
+            format!("Clear the selection — all {n} mails in this list are checked")
+        }
+        (CheckState::Off | CheckState::Partial, 1) => "Select the mail in this list".to_string(),
+        (CheckState::Off | CheckState::Partial, n) => format!("Select all {n} mails in this list"),
+    }
+}
+
 /// A mail being written in the compose window.
 ///
 /// Nothing about it is persisted: the draft is exactly as long-lived as the
@@ -1260,7 +1308,11 @@ impl KimoApp {
             search: SearchQuery::default(),
             search_seq: 0,
             search_pending: None,
-            search_applied: None,
+            // The column opens on the folder list, which is what an empty query
+            // answers: the initial query counts as the applied one, so the first
+            // frame is not a query *change* — nothing to search, and nothing to
+            // drop a selection over.
+            search_applied: Some(SearchQuery::default()),
             search_hits: Vec::new(),
             search_running: false,
             search_error: None,
@@ -1379,6 +1431,10 @@ impl KimoApp {
             } => {
                 // The worker has already stored this batch; what follows is
                 // the in-memory copy the list and the reading pane draw from.
+                // Whether the batch moved the folder onto a new UIDVALIDITY
+                // generation is remembered for the selection below: the two
+                // cannot be touched in the same borrow of the state.
+                let mut rotated = false;
                 if let Some(state) = self.states.get_mut(&account_id) {
                     if state.mailbox.folders.iter().all(|f| f.name != folder) {
                         state.mailbox.folders.push(storage::Folder {
@@ -1409,6 +1465,7 @@ impl KimoApp {
                     if let Some(uv) = uidvalidity {
                         if fc.uidvalidity.is_some() && fc.uidvalidity != Some(uv) {
                             fc.messages.clear(); // new UIDVALIDITY generation: old UIDs are meaningless
+                            rotated = true;
                         }
                         fc.uidvalidity = Some(uv);
                     }
@@ -1431,6 +1488,14 @@ impl KimoApp {
                     fc.listed = true;
                     // New mail, and with it a count the column shows.
                     state.folders_changed();
+                }
+                // The UIDs of the old generation are meaningless, and so is a
+                // check made of one: the select-all box counts the selection
+                // against the list, so it must never hold a mail the list no
+                // longer has.
+                if rotated {
+                    self.selected_mails
+                        .retain(|key| !(key.account == account_id && key.folder == folder));
                 }
             }
             Event::SyncDone { account_id } => {
@@ -1540,6 +1605,33 @@ impl KimoApp {
                     self.search_hits = hits;
                     self.search_running = false;
                     self.search_error = None;
+                    // A fresh answer is the whole of what the column shows, so
+                    // a checked hit this one no longer names is not on screen
+                    // any more — and the select-all box counts the selection
+                    // against the hits, so it must not be able to count a mail
+                    // that is not one. Only while a search is what the column
+                    // shows: an answer for a query already cleared says nothing
+                    // about a folder's selection.
+                    if self.search.is_active() {
+                        let live: HashSet<(&str, &str, &str)> = self
+                            .search_hits
+                            .iter()
+                            .map(|hit| {
+                                (
+                                    hit.account_id.as_str(),
+                                    hit.folder.as_str(),
+                                    hit.uid.as_str(),
+                                )
+                            })
+                            .collect();
+                        self.selected_mails.retain(|key| {
+                            live.contains(&(
+                                key.account.as_str(),
+                                key.folder.as_str(),
+                                key.uid.as_str(),
+                            ))
+                        });
+                    }
                 }
             }
             Event::SearchFailed { seq, error } => {
@@ -3648,105 +3740,128 @@ impl KimoApp {
         // A click on a row in select mode is the way out of it, and nothing
         // else: it does not open the mail under the pointer.
         let mut leave_select = false;
+        // The select-all row was clicked: every mail the folder holds is
+        // checked — or the selection is cleared — once the borrow is over.
+        let mut select_all_clicked: Option<Vec<MailKey>> = None;
+        // Select mode pins the select-all row over the top of the list — see
+        // `select_all_band` — so the frame's top margin grows by its height and
+        // the rows start below it: `pad_top` is what `virtual_rows` measures the
+        // viewport against.
+        let select_all = self.select_mode;
+        let margin = egui::Margin {
+            top: LIST_PADDING.top + if select_all { SELECT_ALL_HEIGHT_I8 } else { 0 },
+            ..LIST_PADDING
+        };
+        let rows_top = LIST_PADDING.top as f32 + if select_all { SELECT_ALL_HEIGHT } else { 0.0 };
+        let select_all_id = checkbox_id("select-all", account, folder, "");
         let list = egui::ScrollArea::vertical()
             .auto_shrink([false, false])
             .show_viewport(ui, |ui, viewport| {
-                egui::Frame::new()
-                    .inner_margin(LIST_PADDING)
-                    .show(ui, |ui| {
-                        // No gap between rows: the two pixels that separate two
-                        // mails are the rows' own edges, so the layout must not
-                        // add space of its own between them.
-                        ui.spacing_mut().item_spacing.y = 0.0;
-                        let count = rows.rows.len();
-                        virtual_rows(
-                            ui,
-                            viewport,
-                            LIST_PADDING.top as f32,
-                            MESSAGE_ROW_HEIGHT,
-                            count,
-                            |ui, drawn| {
-                                for index in drawn {
-                                    let first = index == 0;
-                                    match rows.rows[index] {
-                                        ListRow::Thread { thread } => {
-                                            let conversation = &rows.threads[thread];
-                                            let open =
-                                                self.open_threads.contains(&conversation.key);
-                                            let drawn = self.thread_row(
-                                                ui,
-                                                conversation,
-                                                messages,
-                                                open,
-                                                first,
+                egui::Frame::new().inner_margin(margin).show(ui, |ui| {
+                    // No gap between rows: the two pixels that separate two
+                    // mails are the rows' own edges, so the layout must not
+                    // add space of its own between them.
+                    ui.spacing_mut().item_spacing.y = 0.0;
+                    let count = rows.rows.len();
+                    virtual_rows(
+                        ui,
+                        viewport,
+                        rows_top,
+                        MESSAGE_ROW_HEIGHT,
+                        count,
+                        |ui, drawn| {
+                            for index in drawn {
+                                let first = index == 0;
+                                match rows.rows[index] {
+                                    ListRow::Thread { thread } => {
+                                        let conversation = &rows.threads[thread];
+                                        let open = self.open_threads.contains(&conversation.key);
+                                        let drawn = self.thread_row(
+                                            ui,
+                                            conversation,
+                                            messages,
+                                            open,
+                                            first,
+                                        );
+                                        // The box checks every mail the
+                                        // conversation holds, the chevron
+                                        // opens and closes them in the
+                                        // list, and the row opens the
+                                        // conversation in the pane — or, in
+                                        // select mode, leaves it. A click on
+                                        // one is not a click on another.
+                                        if drawn.checkbox.clicked() {
+                                            checked = Some(
+                                                conversation
+                                                    .messages
+                                                    .iter()
+                                                    .map(|&index| {
+                                                        MailKey::new(
+                                                            account,
+                                                            folder,
+                                                            &messages[index].uid,
+                                                        )
+                                                    })
+                                                    .collect(),
                                             );
-                                            // The box checks every mail the
-                                            // conversation holds, the chevron
-                                            // opens and closes them in the
-                                            // list, and the row opens the
-                                            // conversation in the pane — or, in
-                                            // select mode, leaves it. A click on
-                                            // one is not a click on another.
-                                            if drawn.checkbox.clicked() {
-                                                checked = Some(
-                                                    conversation
-                                                        .messages
-                                                        .iter()
-                                                        .map(|&index| {
-                                                            MailKey::new(
-                                                                account,
-                                                                folder,
-                                                                &messages[index].uid,
-                                                            )
-                                                        })
-                                                        .collect(),
-                                                );
-                                            } else if drawn
-                                                .chevron
-                                                .is_some_and(|chevron| chevron.clicked())
-                                            {
-                                                toggled = Some(conversation.key.clone());
-                                            } else if drawn.row.clicked() {
-                                                if self.select_mode {
-                                                    leave_select = true;
-                                                } else {
-                                                    clicked =
-                                                        Some(messages[conversation.newest].clone());
-                                                }
+                                        } else if drawn
+                                            .chevron
+                                            .is_some_and(|chevron| chevron.clicked())
+                                        {
+                                            toggled = Some(conversation.key.clone());
+                                        } else if drawn.row.clicked() {
+                                            if self.select_mode {
+                                                leave_select = true;
+                                            } else {
+                                                clicked =
+                                                    Some(messages[conversation.newest].clone());
                                             }
                                         }
-                                        ListRow::Message { index, in_thread } => {
-                                            let place = if in_thread {
-                                                RowPlace::InThread
+                                    }
+                                    ListRow::Message { index, in_thread } => {
+                                        let place = if in_thread {
+                                            RowPlace::InThread
+                                        } else {
+                                            RowPlace::Plain
+                                        };
+                                        let drawn =
+                                            self.message_row(ui, &messages[index], first, place);
+                                        if drawn.checkbox.clicked() {
+                                            checked = Some(vec![MailKey::new(
+                                                account,
+                                                folder,
+                                                &messages[index].uid,
+                                            )]);
+                                        } else if drawn.row.clicked() {
+                                            if self.select_mode {
+                                                leave_select = true;
                                             } else {
-                                                RowPlace::Plain
-                                            };
-                                            let drawn = self.message_row(
-                                                ui,
-                                                &messages[index],
-                                                first,
-                                                place,
-                                            );
-                                            if drawn.checkbox.clicked() {
-                                                checked = Some(vec![MailKey::new(
-                                                    account,
-                                                    folder,
-                                                    &messages[index].uid,
-                                                )]);
-                                            } else if drawn.row.clicked() {
-                                                if self.select_mode {
-                                                    leave_select = true;
-                                                } else {
-                                                    clicked = Some(messages[index].clone());
-                                                }
+                                                clicked = Some(messages[index].clone());
                                             }
                                         }
                                     }
                                 }
-                            },
-                        );
-                    });
+                            }
+                        },
+                    );
+                });
             });
+        // The select-all row is drawn after the rows, over the top of the
+        // viewport: the list scrolls under it, so the one control that is about
+        // the whole list is there whether the list is at its top or its foot.
+        // Its keys are the folder's mail and not the rows the viewport shows.
+        if select_all {
+            let band = select_all_band(list.inner_rect);
+            let state = select_all_state(self.selected_mails.len(), messages.len());
+            if self.select_all_row(ui, band, state, messages.len(), select_all_id) {
+                select_all_clicked = Some(
+                    messages
+                        .iter()
+                        .map(|msg| MailKey::new(account, folder, &msg.uid))
+                        .collect(),
+                );
+            }
+        }
         // Scrolled away from the top, the bar floats over this list.
         self.list_scroll = list.state.offset.y;
         // The bottom of the list is the one place where "older" is what the eye
@@ -3767,11 +3882,15 @@ impl KimoApp {
             self.open_rev += 1;
             self.ctx.request_repaint();
         }
-        // A checked row and the way out of select mode. Like the chevron, what
-        // the click made is what the next frame draws, so the frame is asked
-        // for here rather than waited for.
+        // A checked row, the select-all row, and the way out of select mode.
+        // Like the chevron, what the click made is what the next frame draws,
+        // so the frame is asked for here rather than waited for.
         if let Some(keys) = checked {
             self.toggle_check(keys);
+            self.ctx.request_repaint();
+        }
+        if let Some(keys) = select_all_clicked {
+            self.toggle_all(keys);
             self.ctx.request_repaint();
         }
         if leave_select {
@@ -3928,6 +4047,107 @@ impl KimoApp {
         self.selected_mails.clear();
     }
 
+    /// Check every mail of the list, or clear the selection when it is all in:
+    /// the select-all row's click. Clearing is the one answer that can never
+    /// leave a key behind for a row that is not on screen — and the mode stays
+    /// on, exactly as it does when the last box is unchecked by hand.
+    fn toggle_all(&mut self, keys: Vec<MailKey>) {
+        if keys.is_empty() {
+            return;
+        }
+        if keys.iter().all(|key| self.selected_mails.contains(key)) {
+            self.selected_mails.clear();
+        } else {
+            self.selected_mails.extend(keys);
+        }
+    }
+
+    /// The list's select-all row: the checkbox in the rows' own column, the
+    /// label that says what a click would do, and the hairline under it. It is
+    /// the header of the checkbox column while select mode is on, and nothing
+    /// outside the mode — not the list header the column deliberately has none
+    /// of.
+    ///
+    /// The whole band is the click target, unlike a mail row's box: there is
+    /// nothing else a click on it could mean, so a slightly mis-aimed click on
+    /// the label must not be what leaves the mode. Returns whether the row was
+    /// clicked; the caller checks or clears the list once it has stopped
+    /// borrowing it.
+    fn select_all_row(
+        &self,
+        ui: &mut egui::Ui,
+        band: egui::Rect,
+        state: CheckState,
+        listed: usize,
+        id: egui::Id,
+    ) -> bool {
+        let scheme = theme::of(ui.ctx());
+        let column = self.list_column;
+        let response = ui.interact(band, id, egui::Sense::click());
+        let hovered = response.hovered();
+        let painter = ui.painter();
+        let fill = egui::Rect::from_x_y_ranges(column.x_range(), band.y_range());
+        // The rows scroll under the band — it is the one control of the column
+        // that does not scroll away — so it is opaque: the surface it sits on is
+        // the list's own, filled edge to edge like a row.
+        painter
+            .with_clip_rect(column)
+            .rect_filled(fill, 0.0, scheme.content);
+        // The same whole-column hover fill a row draws, and the pointer a
+        // control takes: the band is a row of the list, not a label on it.
+        if hovered {
+            painter
+                .with_clip_rect(column)
+                .rect_filled(fill, 0.0, scheme.hover);
+            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+        }
+        // The box sits where a mail row's does — the plain-row slot, since the
+        // band is not a mail of an open conversation — so the column of boxes
+        // runs through it. The band spans the whole column, so the slot is
+        // taken from the column and the rows' own margin, not from the band's
+        // left edge.
+        let centre = egui::pos2(
+            column.left() + LIST_MARGIN as f32 + 8.0 + THREAD_INDENT + AVATAR_DIAMETER / 2.0,
+            band.center().y,
+        );
+        paint_checkbox(
+            painter,
+            egui::Rect::from_center_size(centre, egui::Vec2::splat(CHECKBOX_SIZE)),
+            state,
+            hovered,
+            scheme,
+        );
+        // The label takes the rows' own text left, so it reads as a line of the
+        // list rather than as something floating beside it.
+        let text_left = centre.x + AVATAR_DIAMETER / 2.0 + 10.0;
+        let label = select_all_label(state);
+        let galley = truncate_galley(
+            ui.ctx(),
+            label,
+            ROW_PREVIEW_FONT_SIZE,
+            scheme.text_weak,
+            (band.right() - 10.0 - text_left).max(40.0),
+        );
+        painter.galley(
+            egui::pos2(text_left, band.center().y - galley.size().y * 0.5),
+            galley,
+            scheme.text_weak,
+        );
+        // The hairline that separates it from the first mail: the rows draw
+        // their own edges, and the band's bottom one is why the first mail still
+        // draws no top edge of its own.
+        painter.with_clip_rect(column).line_segment(
+            [
+                egui::pos2(column.left(), band.bottom() - 0.5),
+                egui::pos2(column.right(), band.bottom() - 0.5),
+            ],
+            egui::Stroke::new(1.0_f32, scheme.row_edge),
+        );
+        response
+            .on_hover_text(select_all_tooltip(state, listed))
+            .clicked()
+    }
+
     /// `Load older mail`, floating over the bottom of the message list: the
     /// folder's marks say the server has mail below everything this machine
     /// holds, and the list has nothing left below the fold. A click hands the
@@ -4059,46 +4279,74 @@ impl KimoApp {
         let mut clicked: Option<SearchHit> = None;
         let mut checked: Option<Vec<MailKey>> = None;
         let mut leave_select = false;
+        // The select-all row was clicked: every hit is checked — or the
+        // selection is cleared — once the borrow of the hits is over.
+        let mut select_all_clicked: Option<Vec<MailKey>> = None;
+        // The same band the folder's list draws, about the hits instead: one
+        // hit is one mail, and each names the folder it lives in.
+        let select_all = self.select_mode;
+        let margin = egui::Margin {
+            top: LIST_PADDING.top + if select_all { SELECT_ALL_HEIGHT_I8 } else { 0 },
+            ..LIST_PADDING
+        };
+        let rows_top = LIST_PADDING.top as f32 + if select_all { SELECT_ALL_HEIGHT } else { 0.0 };
+        let select_all_id = checkbox_id("select-all", "search", "", "");
         let hits = &self.search_hits;
         let list = egui::ScrollArea::vertical()
             .auto_shrink([false, false])
             .show_viewport(ui, |ui, viewport| {
-                egui::Frame::new()
-                    .inner_margin(LIST_PADDING)
-                    .show(ui, |ui| {
-                        ui.spacing_mut().item_spacing.y = 0.0;
-                        virtual_rows(
-                            ui,
-                            viewport,
-                            LIST_PADDING.top as f32,
-                            MESSAGE_ROW_HEIGHT,
-                            hits.len(),
-                            |ui, rows| {
-                                for index in rows {
-                                    let hit = &hits[index];
-                                    let drawn = self.search_row(ui, hit, index == 0);
-                                    if drawn.checkbox.clicked() {
-                                        checked = Some(vec![MailKey::new(
-                                            &hit.account_id,
-                                            &hit.folder,
-                                            &hit.uid,
-                                        )]);
-                                    } else if drawn.row.clicked() {
-                                        if self.select_mode {
-                                            leave_select = true;
-                                        } else {
-                                            clicked = Some(hit.clone());
-                                        }
+                egui::Frame::new().inner_margin(margin).show(ui, |ui| {
+                    ui.spacing_mut().item_spacing.y = 0.0;
+                    virtual_rows(
+                        ui,
+                        viewport,
+                        rows_top,
+                        MESSAGE_ROW_HEIGHT,
+                        hits.len(),
+                        |ui, rows| {
+                            for index in rows {
+                                let hit = &hits[index];
+                                let drawn = self.search_row(ui, hit, index == 0);
+                                if drawn.checkbox.clicked() {
+                                    checked = Some(vec![MailKey::new(
+                                        &hit.account_id,
+                                        &hit.folder,
+                                        &hit.uid,
+                                    )]);
+                                } else if drawn.row.clicked() {
+                                    if self.select_mode {
+                                        leave_select = true;
+                                    } else {
+                                        clicked = Some(hit.clone());
                                     }
                                 }
-                            },
-                        );
-                    });
+                            }
+                        },
+                    );
+                });
             });
+        // The same pinned select-all row the folder's list draws, about the
+        // hits instead: one hit is one mail, and each names the folder it lives
+        // in.
+        if select_all {
+            let band = select_all_band(list.inner_rect);
+            let state = select_all_state(self.selected_mails.len(), hits.len());
+            if self.select_all_row(ui, band, state, hits.len(), select_all_id) {
+                select_all_clicked = Some(
+                    hits.iter()
+                        .map(|hit| MailKey::new(&hit.account_id, &hit.folder, &hit.uid))
+                        .collect(),
+                );
+            }
+        }
         // A scrolled result list floats the bar exactly like the folder's does.
         self.list_scroll = list.state.offset.y;
         if let Some(keys) = checked {
             self.toggle_check(keys);
+            self.ctx.request_repaint();
+        }
+        if let Some(keys) = select_all_clicked {
+            self.toggle_all(keys);
             self.ctx.request_repaint();
         }
         if leave_select {
@@ -6547,6 +6795,12 @@ struct RowResponse {
 }
 
 const MESSAGE_ROW_HEIGHT: f32 = 68.0;
+/// The select-all row at the top of the list in select mode: its own height,
+/// not a mail row's — it is one line of chrome with a box on it — as the
+/// frame margin wants it (whole points, like `LIST_PADDING`) and as the
+/// drawing wants it.
+const SELECT_ALL_HEIGHT_I8: i8 = 32;
+const SELECT_ALL_HEIGHT: f32 = SELECT_ALL_HEIGHT_I8 as f32;
 const AVATAR_DIAMETER: f32 = 32.0;
 /// The checkbox a row draws where its avatar would be — select mode's control,
 /// and the way into the mode — with the room its click target keeps around the
@@ -9764,17 +10018,59 @@ mod tests {
 
     /// Where a row's checkbox sits: the avatar's slot, `row` rows down the
     /// list. A mail of an open conversation is a step further in with a smaller
-    /// circle, and the box follows the slot the circle is in.
+    /// circle, and the box follows the slot the circle is in. Select mode's
+    /// select-all row takes the top of the list, so every mail row sits one
+    /// band lower while the mode is on.
     fn checkbox_center(app: &KimoApp, row: usize, in_thread: bool) -> egui::Pos2 {
         let (indent, diameter) = if in_thread {
             (THREAD_INDENT + THREAD_STEP, THREAD_AVATAR_DIAMETER)
         } else {
             (THREAD_INDENT, AVATAR_DIAMETER)
         };
+        let select_all = if app.select_mode {
+            SELECT_ALL_HEIGHT
+        } else {
+            0.0
+        };
         egui::pos2(
             app.list_column.left() + LIST_MARGIN as f32 + indent + 8.0 + diameter / 2.0,
-            TITLEBAR_HEIGHT + MESSAGE_ROW_HEIGHT * (row as f32 + 0.5),
+            TITLEBAR_HEIGHT + select_all + MESSAGE_ROW_HEIGHT * (row as f32 + 0.5),
         )
+    }
+
+    /// Where the select-all row's own checkbox sits: the plain-row slot in the
+    /// band above the first row.
+    fn select_all_center(app: &KimoApp) -> egui::Pos2 {
+        egui::pos2(
+            checkbox_center(app, 0, false).x,
+            TITLEBAR_HEIGHT + SELECT_ALL_HEIGHT / 2.0,
+        )
+    }
+
+    /// The boxes a frame drew in the message list's rows, top to bottom — the
+    /// select-all row's own box, if it is there, left out.
+    fn row_boxes_in(shapes: &[egui::epaint::ClippedShape], column: egui::Rect) -> Vec<egui::Rect> {
+        let mut boxes: Vec<egui::Rect> = checkboxes_in(shapes, column)
+            .into_iter()
+            .filter(|rect| rect.bottom() > TITLEBAR_HEIGHT + SELECT_ALL_HEIGHT)
+            .collect();
+        boxes.sort_by(|a, b| a.top().total_cmp(&b.top()));
+        boxes
+    }
+
+    /// The select-all row's own box, if the frame drew the band: the box the
+    /// band puts in the rows' column, in the band's own slot under the title
+    /// bar. The band is drawn after the rows and never scrolls, so a box a row
+    /// happens to land on that line is the one before it — the last match is the
+    /// band's.
+    fn select_all_box_in(
+        shapes: &[egui::epaint::ClippedShape],
+        column: egui::Rect,
+    ) -> Option<egui::Rect> {
+        let slot = TITLEBAR_HEIGHT + SELECT_ALL_HEIGHT / 2.0;
+        checkboxes_in(shapes, column)
+            .into_iter()
+            .rfind(|rect| (rect.center().y - slot).abs() < 1.0)
     }
 
     /// The checkboxes a frame drew in the message list, top to bottom: a
@@ -9899,15 +10195,17 @@ mod tests {
             vec![egui::Event::PointerMoved(egui::pos2(1000.0, 500.0))],
         );
         let shapes = frame_shapes_at(&ctx, &mut app, 1400.0);
-        assert_eq!(checkboxes_in(&shapes, column).len(), 3, "one box per row");
+        assert_eq!(row_boxes_in(&shapes, column).len(), 3, "one box per row");
         assert!(
             avatars_in(&shapes, column).is_empty(),
             "select mode has no avatars at all"
         );
+        // Two filled boxes: the checked mail's, and the select-all row's, which
+        // stands for the one mail of three that is in.
         assert_eq!(
             fills_in_color(&shapes, theme::of(&ctx).accent).len(),
-            1,
-            "the checked mail is the one filled box"
+            2,
+            "the checked mail's box and the band's"
         );
     }
 
@@ -9927,11 +10225,10 @@ mod tests {
         assert!(app.select_mode);
         assert!(!app.selected_mails.is_empty());
 
-        click_at(
-            &ctx,
-            &mut app,
-            egui::pos2(320.0, TITLEBAR_HEIGHT + MESSAGE_ROW_HEIGHT * 1.5),
-        );
+        // The row beside the box — the mail's text, well clear of both the box
+        // and the select-all row the mode put above it.
+        let row = checkbox_center(&app, 1, false);
+        click_at(&ctx, &mut app, egui::pos2(320.0, row.y));
         assert!(!app.select_mode, "a click beside the box is the way out");
         assert!(app.selected_mails.is_empty(), "and the checks go with it");
         assert_eq!(
@@ -10007,26 +10304,34 @@ mod tests {
         boxes.sort_by(|a, b| a.top().total_cmp(&b.top()));
         assert_eq!(
             boxes.len(),
-            3,
-            "the conversation and its two mails: {boxes:?}"
+            4,
+            "the select-all row, the conversation and its two mails: {boxes:?}"
         );
 
-        let conversation = strokes_in(&shapes, boxes[0]);
+        // The band is the first box, and it is partial for the same reason the
+        // conversation's is: one mail of the two is checked.
+        let band = strokes_in(&shapes, boxes[0]);
+        assert_eq!(
+            band,
+            vec![2],
+            "the select-all row says some of the list is in: {band:?}"
+        );
+        let conversation = strokes_in(&shapes, boxes[1]);
         assert_eq!(
             conversation,
             vec![2],
             "a partly checked conversation draws the dash: {conversation:?}"
         );
-        let checked = strokes_in(&shapes, boxes[1]);
+        let checked = strokes_in(&shapes, boxes[2]);
         assert_eq!(
             checked,
             vec![3],
             "a checked mail draws the check: {checked:?}"
         );
         assert!(
-            strokes_in(&shapes, boxes[2]).is_empty(),
+            strokes_in(&shapes, boxes[3]).is_empty(),
             "and an unchecked one draws nothing: {:?}",
-            strokes_in(&shapes, boxes[2])
+            strokes_in(&shapes, boxes[3])
         );
     }
 
@@ -10053,7 +10358,7 @@ mod tests {
         let row = filled[0];
         assert_eq!(
             row.top(),
-            TITLEBAR_HEIGHT + MESSAGE_ROW_HEIGHT,
+            TITLEBAR_HEIGHT + SELECT_ALL_HEIGHT + MESSAGE_ROW_HEIGHT,
             "the filled row is the second one — the mail that is checked"
         );
     }
@@ -10313,6 +10618,485 @@ mod tests {
         app.pump_search(true);
         assert!(!app.select_mode, "the column shows the folder again");
         assert!(app.selected_mails.is_empty());
+    }
+
+    /// The select-all box checks every mail the list holds, not only the rows a
+    /// viewport shows: three mails, one click, three checks — and the mode is
+    /// still on afterwards.
+    #[test]
+    fn the_select_all_box_checks_every_mail_in_the_list() {
+        let ctx = egui::Context::default();
+        crate::fonts::install(&ctx, None, None);
+        let mut app = app_with_messages(&ctx, 3);
+        let _ = frame_shapes_at(&ctx, &mut app, 1400.0);
+
+        // Into the mode through a row's box, then the band's.
+        let at = checkbox_center(&app, 1, false);
+        click_at(&ctx, &mut app, at);
+        let at = select_all_center(&app);
+        click_at(&ctx, &mut app, at);
+
+        assert_eq!(app.selected_mails.len(), 3, "every mail of the folder");
+        for uid in ["0", "1", "2"] {
+            assert!(
+                app.selected_mails
+                    .contains(&MailKey::new("acct", "INBOX", uid)),
+                "mail {uid} is checked"
+            );
+        }
+        assert!(app.select_mode, "the band is not the way out of the mode");
+        assert!(
+            app.mail_action_enabled(MailAction::Delete),
+            "a select-all is exactly what Delete is for"
+        );
+        assert_eq!(
+            app.folder_checkbox(&["0", "1", "2"]),
+            Some(CheckState::On),
+            "every row's box says so too"
+        );
+    }
+
+    /// A second click takes a full selection out again — the label has said
+    /// Clear selection — and the mode stays where it is, the way unchecking the
+    /// last mail by hand does.
+    #[test]
+    fn the_select_all_box_clears_the_whole_selection() {
+        let ctx = egui::Context::default();
+        crate::fonts::install(&ctx, None, None);
+        let mut app = app_with_messages(&ctx, 3);
+        app.select_mode = true;
+        for uid in ["0", "1", "2"] {
+            app.selected_mails
+                .insert(MailKey::new("acct", "INBOX", uid));
+        }
+        let _ = frame_shapes_at(&ctx, &mut app, 1400.0);
+
+        let at = select_all_center(&app);
+        click_at(&ctx, &mut app, at);
+        assert!(app.selected_mails.is_empty(), "nothing is checked any more");
+        assert!(app.select_mode, "clearing is not leaving");
+        assert!(!app.mail_action_enabled(MailAction::Delete));
+
+        // The band's box is an outline again, and no box is filled.
+        let shapes = frame_shapes_at(&ctx, &mut app, 1400.0);
+        let band = select_all_box_in(&shapes, app.list_column).expect("the band's box");
+        assert!(
+            strokes_in(&shapes, band).is_empty(),
+            "an empty box has no mark"
+        );
+        assert!(
+            fills_in_color(&shapes, theme::of(&ctx).accent).is_empty(),
+            "and nothing in the list is filled"
+        );
+    }
+
+    /// The band says what is in and what a click would do: an outline with
+    /// Select all while nothing is checked, the dash while some of it is, and
+    /// the check with Clear selection once it all is.
+    #[test]
+    fn the_select_all_box_shows_off_partial_and_on() {
+        let ctx = egui::Context::default();
+        crate::fonts::install(&ctx, None, None);
+        let mut app = app_with_messages(&ctx, 3);
+        app.select_mode = true;
+
+        let shapes = frame_shapes_at(&ctx, &mut app, 1400.0);
+        let band = select_all_box_in(&shapes, app.list_column).expect("the band's box");
+        assert!(
+            strokes_in(&shapes, band).is_empty(),
+            "nothing checked, no mark"
+        );
+        assert!(fills_in_color(&shapes, theme::of(&ctx).accent).is_empty());
+        assert!(frame_texts(&ctx, &mut app)
+            .iter()
+            .any(|text| text == "Select all"));
+
+        app.selected_mails
+            .insert(MailKey::new("acct", "INBOX", "1"));
+        let shapes = frame_shapes_at(&ctx, &mut app, 1400.0);
+        let band = select_all_box_in(&shapes, app.list_column).expect("the band's box");
+        assert_eq!(
+            strokes_in(&shapes, band),
+            vec![2],
+            "one mail of three is in, so the band draws the dash"
+        );
+
+        for uid in ["0", "2"] {
+            app.selected_mails
+                .insert(MailKey::new("acct", "INBOX", uid));
+        }
+        let shapes = frame_shapes_at(&ctx, &mut app, 1400.0);
+        let band = select_all_box_in(&shapes, app.list_column).expect("the band's box");
+        assert_eq!(
+            strokes_in(&shapes, band),
+            vec![3],
+            "all of them in, so the band draws the check"
+        );
+        let texts = frame_texts(&ctx, &mut app);
+        assert!(
+            texts.iter().any(|text| text == "Clear selection"),
+            "the label turned into the way out: {texts:?}"
+        );
+        assert!(
+            !texts.iter().any(|text| text == "Select all"),
+            "and it no longer offers to select what is already in: {texts:?}"
+        );
+    }
+
+    /// A conversation's row stands for every mail it holds, and the list draws
+    /// one row for a closed one — but the select-all box is about the list, not
+    /// about the rows, so both mails of the thread are checked by it.
+    #[test]
+    fn select_all_reaches_mail_inside_a_closed_conversation() {
+        let ctx = egui::Context::default();
+        crate::fonts::install(&ctx, None, None);
+        let mut app = app_with_one_conversation(&ctx);
+        app.select_mode = true;
+        let _ = frame_shapes_at(&ctx, &mut app, 1400.0);
+        assert_eq!(
+            app.list_rows.as_ref().expect("rows").rows.len(),
+            1,
+            "the conversation is one row while it is closed"
+        );
+
+        let at = select_all_center(&app);
+        click_at(&ctx, &mut app, at);
+        assert_eq!(app.selected_mails.len(), 2, "both mails of the thread");
+        for uid in ["3", "1"] {
+            assert!(
+                app.selected_mails
+                    .contains(&MailKey::new("acct", "INBOX", uid)),
+                "mail {uid} is checked"
+            );
+        }
+    }
+
+    /// The search results have the row too, and a hit names the folder it lives
+    /// in: selecting them all keys them where they live, not in the column.
+    #[test]
+    fn select_all_in_the_search_results_checks_every_hit() {
+        let ctx = egui::Context::default();
+        crate::fonts::install(&ctx, None, None);
+        let mut app = app_with_messages(&ctx, 1);
+        app.search.text = "report".to_string();
+        app.search_hits = vec![
+            SearchHit {
+                account_id: "acct".to_string(),
+                folder: "INBOX".to_string(),
+                uid: "0".to_string(),
+                subject: "Subject 0".to_string(),
+                from: "Ada <ada@example.com>".to_string(),
+                date: "2026-01-01".to_string(),
+                timestamp: Some(1_700_000_000),
+                seen: false,
+                attachments: 0,
+                snippet: "a line with report in it".to_string(),
+            },
+            SearchHit {
+                account_id: "acct".to_string(),
+                folder: "Archive".to_string(),
+                uid: "7".to_string(),
+                subject: "Subject 7".to_string(),
+                from: "Ada <ada@example.com>".to_string(),
+                date: "2026-01-01".to_string(),
+                timestamp: Some(1_700_000_000),
+                seen: false,
+                attachments: 0,
+                snippet: "another line with report in it".to_string(),
+            },
+            SearchHit {
+                account_id: "home".to_string(),
+                folder: "INBOX".to_string(),
+                uid: "2".to_string(),
+                subject: "Subject 2".to_string(),
+                from: "Ada <ada@example.com>".to_string(),
+                date: "2026-01-01".to_string(),
+                timestamp: Some(1_700_000_000),
+                seen: false,
+                attachments: 0,
+                snippet: "a third line with report in it".to_string(),
+            },
+        ];
+        app.select_mode = true;
+        let _ = frame_shapes_at(&ctx, &mut app, 1400.0);
+
+        let at = select_all_center(&app);
+        click_at(&ctx, &mut app, at);
+        assert_eq!(app.selected_mails.len(), 3, "every hit, across folders");
+        for (account, folder, uid) in [
+            ("acct", "INBOX", "0"),
+            ("acct", "Archive", "7"),
+            ("home", "INBOX", "2"),
+        ] {
+            assert!(
+                app.selected_mails
+                    .contains(&MailKey::new(account, folder, uid)),
+                "{account}/{folder}/{uid} is checked"
+            );
+        }
+    }
+
+    /// The band is the mode's own row, not the list header the column
+    /// deliberately has none of: view mode draws no box and no label for it,
+    /// and select mode draws exactly one more box than the rows have.
+    #[test]
+    fn the_select_all_row_is_only_drawn_in_select_mode() {
+        let ctx = egui::Context::default();
+        crate::fonts::install(&ctx, None, None);
+        let mut app = app_with_messages(&ctx, 3);
+        let shapes = frame_shapes_at(&ctx, &mut app, 1400.0);
+        let column = app.list_column;
+        assert!(
+            select_all_box_in(&shapes, column).is_none(),
+            "view mode has no select-all row"
+        );
+        assert_eq!(
+            avatars_in(&shapes, column).len(),
+            3,
+            "and the avatars stand"
+        );
+        assert!(!frame_texts(&ctx, &mut app)
+            .iter()
+            .any(|text| text == "Select all"));
+
+        app.select_mode = true;
+        let shapes = frame_shapes_at(&ctx, &mut app, 1400.0);
+        assert!(
+            select_all_box_in(&shapes, column).is_some(),
+            "the band's box"
+        );
+        assert_eq!(row_boxes_in(&shapes, column).len(), 3, "one per row, still");
+        assert!(
+            avatars_in(&shapes, column).is_empty(),
+            "and the avatars are gone with the mode"
+        );
+    }
+
+    /// The band's box is the rows' box: the same column, one line above the
+    /// first mail — which is what makes it read as the header of that column
+    /// rather than as a control beside it.
+    #[test]
+    fn the_select_all_box_lines_up_with_the_row_boxes() {
+        let ctx = egui::Context::default();
+        crate::fonts::install(&ctx, None, None);
+        let mut app = app_with_messages(&ctx, 2);
+        app.select_mode = true;
+
+        let shapes = frame_shapes_at(&ctx, &mut app, 1400.0);
+        let column = app.list_column;
+        let band = select_all_box_in(&shapes, column).expect("the band's box");
+        let rows = row_boxes_in(&shapes, column);
+        assert_eq!(rows.len(), 2, "one box per mail: {rows:?}");
+        assert_eq!(band.center().x, rows[0].center().x, "one column of boxes");
+        assert_eq!(
+            band.center(),
+            select_all_center(&app),
+            "the band's own slot"
+        );
+    }
+
+    /// Checking everything and then unchecking one mail by hand leaves the band
+    /// saying *some* of the list is in — the same dash a half-checked
+    /// conversation gets.
+    #[test]
+    fn unchecking_one_mail_leaves_the_select_all_box_partial() {
+        let ctx = egui::Context::default();
+        crate::fonts::install(&ctx, None, None);
+        let mut app = app_with_messages(&ctx, 3);
+        app.select_mode = true;
+        let _ = frame_shapes_at(&ctx, &mut app, 1400.0);
+
+        let at = select_all_center(&app);
+        click_at(&ctx, &mut app, at);
+        assert_eq!(app.selected_mails.len(), 3);
+
+        let at = checkbox_center(&app, 1, false);
+        click_at(&ctx, &mut app, at);
+        assert_eq!(app.selected_mails.len(), 2, "one mail was taken out");
+        assert_eq!(
+            app.folder_checkbox(&["0", "1", "2"]),
+            Some(CheckState::Partial),
+            "the row's box still says so, and"
+        );
+        let shapes = frame_shapes_at(&ctx, &mut app, 1400.0);
+        let band = select_all_box_in(&shapes, app.list_column).expect("the band's box");
+        assert_eq!(
+            strokes_in(&shapes, band),
+            vec![2],
+            "the band draws the dash for the rest"
+        );
+    }
+
+    /// What the band's box says about the selection and the list, on its own:
+    /// nothing in is off, everything in is on, and the size comparison is the
+    /// whole of it.
+    #[test]
+    fn the_select_all_state_compares_the_selection_with_the_list() {
+        assert_eq!(select_all_state(0, 0), CheckState::Off, "an empty list");
+        assert_eq!(select_all_state(0, 3), CheckState::Off);
+        assert_eq!(select_all_state(1, 3), CheckState::Partial);
+        assert_eq!(select_all_state(3, 3), CheckState::On);
+    }
+
+    /// The label is the action a click would take, and the count — the one
+    /// thing a one-line row cannot show — is in the hover text.
+    #[test]
+    fn the_select_all_tooltip_counts_the_mails() {
+        assert_eq!(select_all_label(CheckState::Off), "Select all");
+        assert_eq!(select_all_label(CheckState::Partial), "Select all");
+        assert_eq!(select_all_label(CheckState::On), "Clear selection");
+
+        assert_eq!(
+            select_all_tooltip(CheckState::Off, 1),
+            "Select the mail in this list"
+        );
+        assert_eq!(
+            select_all_tooltip(CheckState::Partial, 3),
+            "Select all 3 mails in this list"
+        );
+        assert_eq!(
+            select_all_tooltip(CheckState::On, 1),
+            "Clear the selection — the mail in this list is checked"
+        );
+        assert_eq!(
+            select_all_tooltip(CheckState::On, 3),
+            "Clear the selection — all 3 mails in this list are checked"
+        );
+    }
+
+    /// A fresh answer is the whole of what the column shows, so a checked hit
+    /// the answer no longer names is dropped with it — the band counts the
+    /// selection against the hits and must not be able to count a mail that is
+    /// not there. An answer for a query already cleared says nothing about a
+    /// folder's checks.
+    #[test]
+    fn a_new_search_drops_checks_the_hits_no_longer_hold() {
+        let ctx = egui::Context::default();
+        crate::fonts::install(&ctx, None, None);
+        let mut app = app_with_messages(&ctx, 2);
+        app.search.text = "report".to_string();
+        app.select_mode = true;
+        for uid in ["0", "1"] {
+            app.selected_mails
+                .insert(MailKey::new("acct", "INBOX", uid));
+        }
+
+        // An answer that names one of the two: the other is not a hit any more.
+        app.apply_event(Event::SearchResults {
+            seq: app.search_seq,
+            hits: vec![SearchHit {
+                account_id: "acct".to_string(),
+                folder: "INBOX".to_string(),
+                uid: "0".to_string(),
+                subject: "Subject 0".to_string(),
+                from: "Ada <ada@example.com>".to_string(),
+                date: "2026-01-01".to_string(),
+                timestamp: Some(1_700_000_000),
+                seen: false,
+                attachments: 0,
+                snippet: "a line with report in it".to_string(),
+            }],
+        });
+        assert_eq!(app.selected_mails.len(), 1, "the answer's own hit");
+        assert!(app
+            .selected_mails
+            .contains(&MailKey::new("acct", "INBOX", "0")));
+
+        // Cleared query: the same event describes hits nobody is looking at.
+        app.search = SearchQuery::default();
+        app.selected_mails
+            .insert(MailKey::new("acct", "INBOX", "1"));
+        app.apply_event(Event::SearchResults {
+            seq: app.search_seq,
+            hits: Vec::new(),
+        });
+        assert_eq!(
+            app.selected_mails.len(),
+            2,
+            "the folder's checks are not the answer's to drop"
+        );
+    }
+
+    /// A UIDVALIDITY rotation clears the folder's mail because the UIDs are
+    /// meaningless; a check made of one is meaningless with it, and the band
+    /// counts the selection against the list.
+    #[test]
+    fn a_rotated_uidvalidity_drops_its_folder_from_the_selection() {
+        let ctx = egui::Context::default();
+        crate::fonts::install(&ctx, None, None);
+        let mut app = app_with_messages(&ctx, 1);
+        app.select_mode = true;
+        app.selected_mails
+            .insert(MailKey::new("acct", "INBOX", "0"));
+
+        app.apply_event(Event::Messages {
+            account_id: "acct".to_string(),
+            folder: "INBOX".to_string(),
+            // The fixture's folder is generation 1: this is a new one.
+            uidvalidity: Some(2),
+            messages: Vec::new(),
+        });
+
+        assert!(
+            app.states["acct"].mailbox.folders[0].messages.is_empty(),
+            "the folder was cleared"
+        );
+        assert!(
+            app.selected_mails.is_empty(),
+            "and the checks of the old UIDs went with it"
+        );
+    }
+
+    /// The select-all row is the one thing in the column that does not scroll
+    /// away: however far down the list is, the box is still under the title bar —
+    /// and still the whole list's, not the viewport's.
+    #[test]
+    fn the_select_all_row_stays_while_the_list_scrolls() {
+        let ctx = egui::Context::default();
+        crate::fonts::install(&ctx, None, None);
+        let mut app = app_with_messages(&ctx, 60);
+        app.select_mode = true;
+        run_app_frame(&ctx, &mut app, Vec::new());
+
+        // Down the list: the pointer over it, the wheel, then the frames the
+        // scroll area's animation needs to come to rest.
+        run_app_frame(
+            &ctx,
+            &mut app,
+            vec![egui::Event::PointerMoved(egui::pos2(300.0, 400.0))],
+        );
+        run_app_frame(
+            &ctx,
+            &mut app,
+            vec![egui::Event::MouseWheel {
+                unit: egui::MouseWheelUnit::Point,
+                delta: egui::vec2(0.0, -600.0),
+                phase: egui::TouchPhase::Move,
+                modifiers: egui::Modifiers::default(),
+            }],
+        );
+        for _ in 0..30 {
+            run_app_frame(&ctx, &mut app, Vec::new());
+        }
+        assert!(app.list_scroll > 0.0, "the list did not scroll");
+
+        // The band is where it was: pinned under the title bar, over the rows.
+        let shapes = frame_shapes_at(&ctx, &mut app, 1400.0);
+        let band = select_all_box_in(&shapes, app.list_column).expect("the band's box");
+        assert_eq!(
+            band.center(),
+            select_all_center(&app),
+            "the band scrolled away with the list"
+        );
+
+        // And it is still the control it was: a click checks the whole list.
+        let at = select_all_center(&app);
+        click_at(&ctx, &mut app, at);
+        assert_eq!(
+            app.selected_mails.len(),
+            60,
+            "the band checks the folder, not the rows a viewport shows"
+        );
     }
 
     /// The floating `Load older mail` button: drawn only while the folder's
