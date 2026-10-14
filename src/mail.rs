@@ -156,9 +156,75 @@ fn address_to_string(addr: Option<&mail_parser::Address<'_>>) -> String {
     }
 }
 
+/// A unix timestamp as an RFC 5322 `Date:` header value — `Fri, 09 Oct 2026
+/// 00:00:00 +0000` — which is what a written mail carries.
+///
+/// Always UTC: Kimo has no zone database and no time crate, and a mail that
+/// says an absolute time in UTC is one every reader shows correctly. A guessed
+/// local offset is the one thing that would *not* be.
+pub fn rfc5322_date(secs: i64) -> String {
+    /// 1970-01-01 was a Thursday, so the rotation starts there.
+    const WEEKDAYS: [&str; 7] = ["Thu", "Fri", "Sat", "Sun", "Mon", "Tue", "Wed"];
+    const MONTHS: [&str; 12] = [
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    ];
+    let days = secs.div_euclid(86_400);
+    let rest = secs.rem_euclid(86_400);
+    let (year, month, day) = civil_from_days(days);
+    let weekday = WEEKDAYS[days.rem_euclid(7) as usize];
+    let month = MONTHS[(month - 1) as usize];
+    format!(
+        "{weekday}, {day:02} {month} {year:04} {:02}:{:02}:{:02} +0000",
+        rest / 3600,
+        (rest % 3600) / 60,
+        rest % 60
+    )
+}
+
+/// Days-since-epoch → (year, month, day), Howard Hinnant's civil_from_days.
+///
+/// The one piece of calendar arithmetic the app and the message builder share:
+/// `app::format_timestamp` prints it for the reading pane,
+/// `rfc5322_date` writes it into a header.
+pub(crate) fn civil_from_days(z: i64) -> (i64, u32, u32) {
+    let z = z + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
+    (if m <= 2 { y + 1 } else { y }, m, d)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The date a written mail carries: named, zero-padded, and in UTC —
+    /// including the two cases a hand-rolled calendar gets wrong, the epoch and
+    /// a leap day.
+    #[test]
+    fn a_date_header_is_utc_and_named() {
+        assert_eq!(
+            rfc5322_date(1_791_504_000),
+            "Fri, 09 Oct 2026 00:00:00 +0000"
+        );
+        assert_eq!(rfc5322_date(0), "Thu, 01 Jan 1970 00:00:00 +0000");
+        assert_eq!(
+            rfc5322_date(1_709_164_800),
+            "Thu, 29 Feb 2024 00:00:00 +0000"
+        );
+        // Hours, minutes and seconds come out of the remainder, and a time
+        // before the epoch still has a weekday.
+        assert_eq!(
+            rfc5322_date(1_791_504_000 + 3_661),
+            "Fri, 09 Oct 2026 01:01:01 +0000"
+        );
+        assert_eq!(rfc5322_date(-1), "Wed, 31 Dec 1969 23:59:59 +0000");
+    }
 
     #[test]
     fn parses_a_minimal_message() {

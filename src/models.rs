@@ -81,6 +81,38 @@ impl TlsMode {
     }
 }
 
+/// Where a written mail goes out: SMTP submission. An account without one
+/// cannot send — the compose card says so instead of failing at a socket.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SmtpSettings {
+    pub host: String,
+    pub port: u16,
+    pub tls: TlsMode,
+    /// The login to submit with; `None` is the account's own
+    /// credentials, which is what most providers expect on submission.
+    pub login: Option<SmtpLogin>,
+}
+
+impl SmtpSettings {
+    /// The submission ports — 465 implicit TLS, 587 STARTTLS, 25 plain — not
+    /// the ports mail is *received* on.
+    pub fn default_port(tls: TlsMode) -> u16 {
+        match tls {
+            TlsMode::Implicit => 465,
+            TlsMode::StartTls => 587,
+            TlsMode::Plain => 25,
+        }
+    }
+}
+
+/// Credentials for a submission server that is not the account itself: an
+/// authorization code, or a smarthost with its own login.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SmtpLogin {
+    pub username: String,
+    pub password: String,
+}
+
 /// A user-configured mail account.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Account {
@@ -92,6 +124,31 @@ pub struct Account {
     pub username: String,
     pub password: String,
     pub tls: TlsMode,
+    /// The outgoing server, when the account has one. `None` is an
+    /// account that reads mail only: nothing it writes can leave it, and the
+    /// compose card's Send says why rather than failing at a socket.
+    pub smtp: Option<SmtpSettings>,
+}
+
+impl Account {
+    /// Whether this account can send mail at all.
+    pub fn can_send(&self) -> bool {
+        self.smtp.is_some()
+    }
+
+    /// The credentials to submit with: the outgoing server's own pair when it
+    /// names one, the account's own otherwise. The pair may hold an empty
+    /// username — a submission server that wants no login, like a local relay
+    /// — which is for the caller to notice.
+    pub fn smtp_login(&self) -> Option<(&str, &str)> {
+        match &self.smtp {
+            Some(SmtpSettings {
+                login: Some(login), ..
+            }) => Some((login.username.as_str(), login.password.as_str())),
+            Some(_) => Some((self.username.as_str(), self.password.as_str())),
+            None => None,
+        }
+    }
 }
 
 /// An inline image attachment, referenced from HTML mail via `cid:`.
@@ -157,5 +214,52 @@ mod tests {
         assert_eq!(Protocol::parse("smtp"), None);
         assert_eq!(Protocol::parse("IMAP"), None);
         assert_eq!(TlsMode::parse("starttls"), None);
+    }
+
+    #[test]
+    fn submission_ports_are_the_ones_mail_clients_use() {
+        assert_eq!(SmtpSettings::default_port(TlsMode::Implicit), 465);
+        assert_eq!(SmtpSettings::default_port(TlsMode::StartTls), 587);
+        assert_eq!(SmtpSettings::default_port(TlsMode::Plain), 25);
+    }
+
+    /// An account submits with its own credentials unless its outgoing server
+    /// names a different pair; an account with no outgoing server at all has
+    /// nothing to submit with, which is what leaves Send disabled.
+    #[test]
+    fn an_account_submits_with_its_own_credentials_unless_it_names_others() {
+        let mut account = Account {
+            id: "work".into(),
+            name: "Work".into(),
+            protocol: Protocol::Imap,
+            host: "imap.example.com".into(),
+            port: 993,
+            username: "me@example.com".into(),
+            password: "secret".into(),
+            tls: TlsMode::Implicit,
+            smtp: None,
+        };
+        assert!(!account.can_send());
+        assert_eq!(account.smtp_login(), None);
+
+        account.smtp = Some(SmtpSettings {
+            host: "smtp.example.com".into(),
+            port: 587,
+            tls: TlsMode::StartTls,
+            login: None,
+        });
+        assert!(account.can_send());
+        assert_eq!(account.smtp_login(), Some(("me@example.com", "secret")));
+
+        account.smtp = Some(SmtpSettings {
+            host: "smtp.example.com".into(),
+            port: 465,
+            tls: TlsMode::Implicit,
+            login: Some(SmtpLogin {
+                username: "code".into(),
+                password: "abcd efgh".into(),
+            }),
+        });
+        assert_eq!(account.smtp_login(), Some(("code", "abcd efgh")));
     }
 }

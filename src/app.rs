@@ -18,8 +18,10 @@
 //! Appearance page the theme (which resolves to a `theme::ColorScheme`), the
 //! HTML renderer and the fonts. That renderer draws the mail either as egui
 //! widgets (`crate::html`) or rasterized by Blitz (`crate::blitz_render`) on a
-//! worker thread. The pen is the compose card, which holds a draft and
-//! nothing else — Kimo has no SMTP, so there is nowhere for it to go.
+//! worker thread. The pen is the compose card: a draft, and the Send button
+//! that hands it to a worker (`Job::SendMessage`) — the one modal that can put
+//! a mail on the wire, and the one that says what the server said when it did
+//! not.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::mpsc;
@@ -28,10 +30,11 @@ use std::time::{Duration, Instant};
 use crate::folders::{self, FolderKind};
 use crate::fonts::FontFamily;
 use crate::glass::Glass;
-use crate::models::{Account, MailMessage, Protocol, TlsMode};
+use crate::models::{Account, MailMessage, Protocol, SmtpLogin, SmtpSettings, TlsMode};
+use crate::outgoing::{self, Outgoing};
 use crate::search::{Scope, SearchHit, SearchQuery, SEARCH_LIMIT};
 use crate::storage::{self, Settings};
-use crate::sync::{self, Event, Job};
+use crate::sync::{self, Event, Job, SentCopy};
 use crate::theme::{self, ColorScheme, Theme};
 
 /// Below this window width the navigation bar collapses automatically.
@@ -239,11 +242,12 @@ impl MailAction {
 
 /// A mail being written in the compose window.
 ///
-/// Nothing about it is persisted and nothing is sent: Kimo speaks IMAP and
-/// POP3 only, so the draft is exactly as long-lived as the window holding it,
-/// and closing the window — by its ✕ or by Discard — drops it. The fields are
-/// here rather than in widgets' own state because a window that is closed and
-/// opened again must start empty.
+/// Nothing about it is persisted: the draft is exactly as long-lived as the
+/// window holding it, and closing the window — by its ✕ or by Discard — drops
+/// it. Sending is what the window's Send does (`send_draft`): the mail goes to
+/// a worker as a `Job::SendMessage`, and the draft stays right here until the
+/// server has it. The fields are here rather than in widgets' own state because
+/// a window that is closed and opened again must start empty.
 struct ComposeDraft {
     /// The account the mail would go out from, as the window's From list has
     /// it. `None`, with no account configured, is the one case the window
@@ -251,11 +255,18 @@ struct ComposeDraft {
     from: Option<String>,
     to: String,
     cc: String,
+    bcc: String,
     subject: String,
     body: String,
     /// Set on the first frame the window is shown, so the To field takes the
     /// keyboard without a click.
     focus: bool,
+    /// True while a worker is talking to the submission server: the card's
+    /// boxes and buttons are disabled, and Send says `Sending…`.
+    sending: bool,
+    /// What the server said when the mail did not go out. The card keeps it —
+    /// and keeps the draft — until Send is pressed again.
+    error: Option<String>,
 }
 
 impl ComposeDraft {
@@ -265,10 +276,23 @@ impl ComposeDraft {
             from,
             to: String::new(),
             cc: String::new(),
+            bcc: String::new(),
             subject: String::new(),
             body: String::new(),
             focus: true,
+            sending: false,
+            error: None,
         }
+    }
+
+    /// What the three address fields hold, parsed: what the mail's envelope is
+    /// made of, and what `send_blocker` judges.
+    fn recipients(&self) -> (Vec<String>, Vec<String>, Vec<String>) {
+        (
+            outgoing::parse_addresses(&self.to),
+            outgoing::parse_addresses(&self.cc),
+            outgoing::parse_addresses(&self.bcc),
+        )
     }
 }
 
@@ -281,6 +305,63 @@ fn compose_from(accounts: &[Account], selected: Option<&str>) -> Option<String> 
         .filter(|id| accounts.iter().any(|account| account.id == *id))
         .map(str::to_string)
         .or_else(|| accounts.first().map(|account| account.id.clone()))
+}
+
+/// Why the compose window's Send cannot be pressed, or `None` when it can.
+///
+/// One place decides, and the worker checks the same rules again
+/// (`sync::send_message`): a card that says "ready" about a mail that cannot
+/// leave would fail at the socket instead of saying so.
+fn send_blocker(
+    account: Option<&Account>,
+    to: &[String],
+    cc: &[String],
+    bcc: &[String],
+) -> Option<String> {
+    let Some(account) = account else {
+        return Some("No account yet — add one in Preferences → Accounts.".to_string());
+    };
+    if !account.can_send() {
+        return Some(
+            "This account has no outgoing server — set one in Preferences → Accounts.".to_string(),
+        );
+    }
+    // The account's username is what the mail would be sent *as*, so an
+    // account whose username is not an address is one that cannot send.
+    if !outgoing::is_address(&account.username) {
+        return Some(format!(
+            "{} is not an email address, so it cannot be the sender.",
+            account.username
+        ));
+    }
+    let invalid = to
+        .iter()
+        .chain(cc)
+        .chain(bcc)
+        .find(|addr| !outgoing::is_address(addr));
+    if let Some(address) = invalid {
+        return Some(format!("Not an address: {address}"));
+    }
+    if to.is_empty() && cc.is_empty() && bcc.is_empty() {
+        return Some("Add at least one recipient.".to_string());
+    }
+    None
+}
+
+/// What the timed line above the message list says about a mail that went out:
+/// who it went to, and what became of the copy in the Sent mailbox.
+fn sent_notice(recipients: &[String], copy: &SentCopy) -> String {
+    let who = recipients.join(", ");
+    match copy {
+        SentCopy::None => format!("Sent to {who}"),
+        SentCopy::Saved { mailbox } => format!(
+            "Sent to {who} · a copy is in {}",
+            crate::protocol::imap::decode_mailbox_name(mailbox)
+        ),
+        SentCopy::Failed(reason) => {
+            format!("Sent to {who} · the copy could not be saved: {reason}")
+        }
+    }
 }
 
 pub struct KimoApp {
@@ -312,8 +393,9 @@ pub struct KimoApp {
     /// next frame instead of waiting for a click.
     search_focus: bool,
     /// The draft the compose window holds, or `None` when it is closed. One
-    /// window at a time, and the draft is the only place the mail exists —
-    /// nothing is persisted, and nothing is sent (Kimo has no SMTP).
+    /// window at a time, and the draft is the only place the mail exists until
+    /// Send hands it to a worker (`send_draft`): nothing about it is persisted,
+    /// so a card that is closed is a mail that was never written.
     compose: Option<ComposeDraft>,
     /// Whether the preferences modal is open.
     show_preferences: bool,
@@ -350,11 +432,13 @@ pub struct KimoApp {
     /// Why the mail database is not being written to disk, when that is the
     /// case; drawn as a one-line banner above the message list.
     storage_warning: Option<String>,
-    /// What the last export wrote, and when it said so: one line above the
-    /// message list for `EXPORT_NOTICE_TIME`. A file that lands in a directory
-    /// the user was not watching is a file they cannot find, and the numbered
-    /// name it ended up under is the worker's to know — hence the event.
-    export_notice: Option<(String, Instant)>,
+    /// What the last export wrote — or that a mail was sent — and when it said
+    /// so: one line above the message list for `NOTICE_TIME`. A file that lands
+    /// in a directory the user was not watching is a file they cannot find, and
+    /// the numbered name it ended up under is the worker's to know; a sent mail
+    /// has left the machine entirely, which is the other thing worth saying out
+    /// loud. Hence the events.
+    notice: Option<(String, Instant)>,
     /// Remote images for HTML mail, keyed by URL; fetched on worker threads
     /// and cached in memory as egui textures (disk cache in storage).
     images: HashMap<String, ImageStatus>,
@@ -709,6 +793,18 @@ struct AccountForm {
     username: String,
     password: String,
     tls: TlsMode,
+    /// The Sending group: off is an account that only reads mail
+    /// (`Account.smtp = None`), which is what every account was before the
+    /// group existed.
+    smtp_enabled: bool,
+    smtp_host: String,
+    smtp_port_str: String,
+    smtp_tls: TlsMode,
+    /// Whether the submission logs in as the account itself, which is what
+    /// most providers expect. Off reveals the pair below.
+    smtp_own_login: bool,
+    smtp_username: String,
+    smtp_password: String,
 }
 
 impl Default for AccountForm {
@@ -724,6 +820,13 @@ impl Default for AccountForm {
             username: String::new(),
             password: String::new(),
             tls: TlsMode::Implicit,
+            smtp_enabled: false,
+            smtp_host: String::new(),
+            smtp_port_str: SmtpSettings::default_port(TlsMode::Implicit).to_string(),
+            smtp_tls: TlsMode::Implicit,
+            smtp_own_login: true,
+            smtp_username: String::new(),
+            smtp_password: String::new(),
         }
     }
 }
@@ -741,15 +844,51 @@ impl AccountForm {
             username: account.username.clone(),
             password: account.password.clone(),
             tls: account.tls,
+            smtp_enabled: account.smtp.is_some(),
+            smtp_host: account
+                .smtp
+                .as_ref()
+                .map(|smtp| smtp.host.clone())
+                .unwrap_or_default(),
+            smtp_port_str: account
+                .smtp
+                .as_ref()
+                .map(|smtp| smtp.port.to_string())
+                .unwrap_or_else(|| SmtpSettings::default_port(TlsMode::Implicit).to_string()),
+            smtp_tls: account
+                .smtp
+                .as_ref()
+                .map(|smtp| smtp.tls)
+                .unwrap_or(TlsMode::Implicit),
+            smtp_own_login: account
+                .smtp
+                .as_ref()
+                .is_none_or(|smtp| smtp.login.is_none()),
+            smtp_username: account
+                .smtp
+                .as_ref()
+                .and_then(|smtp| smtp.login.as_ref())
+                .map(|login| login.username.clone())
+                .unwrap_or_default(),
+            smtp_password: account
+                .smtp
+                .as_ref()
+                .and_then(|smtp| smtp.login.as_ref())
+                .map(|login| login.password.clone())
+                .unwrap_or_default(),
         }
     }
 
-    /// Every required field is filled in (and the port is a port).
+    /// Every required field is filled in (and the ports are ports). The
+    /// outgoing server is required only while the account is meant to send.
     fn is_valid(&self) -> bool {
         !self.name.trim().is_empty()
             && !self.host.trim().is_empty()
             && !self.username.trim().is_empty()
             && self.port_str.trim().parse::<u16>().is_ok()
+            && (!self.smtp_enabled
+                || (!self.smtp_host.trim().is_empty()
+                    && self.smtp_port_str.trim().parse::<u16>().is_ok()))
     }
 
     /// The port to save: what was typed, or the protocol/TLS default when
@@ -759,6 +898,28 @@ impl AccountForm {
             .trim()
             .parse()
             .unwrap_or_else(|_| self.protocol.default_port(self.tls))
+    }
+
+    /// The outgoing server the form describes, or ${BT}None${BT} while the Sending
+    /// group is off. A port that is not a number falls back to the one the
+    /// security choice normally uses, the same way the incoming port does.
+    fn smtp(&self) -> Option<SmtpSettings> {
+        if !self.smtp_enabled {
+            return None;
+        }
+        Some(SmtpSettings {
+            host: self.smtp_host.trim().to_string(),
+            port: self
+                .smtp_port_str
+                .trim()
+                .parse()
+                .unwrap_or_else(|_| SmtpSettings::default_port(self.smtp_tls)),
+            tls: self.smtp_tls,
+            login: (!self.smtp_own_login).then(|| SmtpLogin {
+                username: self.smtp_username.trim().to_string(),
+                password: self.smtp_password.clone(),
+            }),
+        })
     }
 
     /// The account this form describes, under an id the caller picks — the
@@ -773,6 +934,7 @@ impl AccountForm {
             username: self.username.trim().to_string(),
             password: self.password.clone(),
             tls: self.tls,
+            smtp: self.smtp(),
         }
     }
 
@@ -915,7 +1077,7 @@ impl KimoApp {
             theme: Theme::parse(&settings.theme),
             system_dark: system_prefers_dark(),
             storage_warning: crate::db::warning(),
-            export_notice: None,
+            notice: None,
             images: HashMap::new(),
             stylesheets: HashMap::new(),
             inline_textures: HashMap::new(),
@@ -1097,7 +1259,26 @@ impl KimoApp {
                 // has to say — and the one thing it could not have known when
                 // the export was asked for, since a name that was taken is
                 // numbered.
-                self.export_notice = Some((format!("Saved to {}", path.display()), Instant::now()));
+                self.notice = Some((format!("Saved to {}", path.display()), Instant::now()));
+            }
+            Event::MessageSent {
+                recipients, copy, ..
+            } => {
+                // The server has the mail, so the card has nothing left to
+                // hold: the draft goes with it, and the one line above the
+                // message list says where the mail went.
+                self.compose = None;
+                self.notice = Some((sent_notice(&recipients, &copy), Instant::now()));
+            }
+            Event::MessageSendFailed { error, .. } => {
+                // The draft is still the only copy of the mail, so the card
+                // stays open with the server's own words in it — "550 5.1.1 no
+                // such user" is the whole answer to why nothing went out — and
+                // Send is enabled again.
+                if let Some(draft) = self.compose.as_mut() {
+                    draft.sending = false;
+                    draft.error = Some(error);
+                }
             }
             Event::ImageLoaded {
                 url,
@@ -2555,16 +2736,15 @@ impl KimoApp {
         // say once it has been read. The repaint request is what takes it away
         // when nothing else is drawing a frame.
         if self
-            .export_notice
+            .notice
             .as_ref()
-            .is_some_and(|(_, at)| at.elapsed() >= EXPORT_NOTICE_TIME)
+            .is_some_and(|(_, at)| at.elapsed() >= NOTICE_TIME)
         {
-            self.export_notice = None;
-        } else if let Some((_, at)) = &self.export_notice {
-            ui.ctx()
-                .request_repaint_after(EXPORT_NOTICE_TIME - at.elapsed());
+            self.notice = None;
+        } else if let Some((_, at)) = &self.notice {
+            ui.ctx().request_repaint_after(NOTICE_TIME - at.elapsed());
         }
-        if let Some((notice, _)) = &self.export_notice {
+        if let Some((notice, _)) = &self.notice {
             list_banner(ui, banner_top, notice, None);
         }
         if self.accounts.is_empty() || self.selected_account.is_none() {
@@ -2770,13 +2950,64 @@ impl KimoApp {
         run_now
     }
 
+    /// Send the draft the compose card holds: the mail goes to a worker as a
+    /// `Job::SendMessage`, and the card waits for the answer with its boxes and
+    /// buttons disabled (`ComposeDraft::sending`).
+    ///
+    /// What closes the card is `Event::MessageSent`, not this: what has been sent
+    /// is the mail the server accepted, and until it says so the draft is the
+    /// only copy of it.
+    fn send_draft(&mut self) {
+        let Some(draft) = self.compose.as_ref() else {
+            return;
+        };
+        let account = self
+            .accounts
+            .iter()
+            .find(|account| Some(&account.id) == draft.from.as_ref())
+            .cloned();
+        let (to, cc, bcc) = draft.recipients();
+        // The button is drawn disabled in exactly this case; a frame drawn
+        // before the last keystroke must not turn that into a send the worker
+        // would refuse anyway.
+        if send_blocker(account.as_ref(), &to, &cc, &bcc).is_some() {
+            return;
+        }
+        let Some(account) = account else {
+            return;
+        };
+        // The account's display name is the sender's name and its username the
+        // address: the same pair the From list shows.
+        let mail = Box::new(Outgoing {
+            from_name: account.name.clone(),
+            from_addr: account.username.clone(),
+            to,
+            cc,
+            bcc,
+            subject: draft.subject.clone(),
+            body: draft.body.clone(),
+        });
+        if let Some(draft) = self.compose.as_mut() {
+            draft.sending = true;
+            draft.error = None;
+        }
+        sync::spawn(
+            Job::SendMessage { account, mail },
+            self.ctx.clone(),
+            self.tx.clone(),
+        );
+    }
+
     /// The compose window, opened from the title bar: an `egui::Modal`, so the
     /// columns behind it are covered by a backdrop and cannot be used while a
     /// mail is being written.
     ///
-    /// It edits a draft and nothing else. Kimo speaks IMAP and POP3, with no
-    /// SMTP, so Send is drawn disabled and says why; the draft lives in this
-    /// card, and Discard drops it.
+    /// It edits a draft and sends it. Send hands the draft to a worker
+    /// (`send_draft`, `Job::SendMessage`) and the card waits for the answer
+    /// with its boxes and buttons disabled: `Event::MessageSent` is what closes
+    /// it — the mail is out, and the draft has no other home — while
+    /// `Event::MessageSendFailed` puts the server's own words in the card and lets
+    /// the draft be sent again.
     ///
     /// The backdrop click and Escape deliberately do not close it: the draft is
     /// the only copy of the mail, and a click beside the card must not be what
@@ -2784,7 +3015,8 @@ impl KimoApp {
     /// is the way out.
     fn compose_window(&mut self, ctx: &egui::Context) {
         // Taken out for the closure, which edits the draft while reading the
-        // account list, and put back unless the draft was discarded.
+        // account list, and put back unless the draft was discarded — or taken
+        // away by the send that went out (see `send_draft`).
         let Some(mut draft) = self.compose.take() else {
             return;
         };
@@ -2799,8 +3031,19 @@ impl KimoApp {
                 )
             })
             .collect();
+        // The account the mail would go out from, whole: whether it *can* send
+        // is a question about the account, not about the list of them.
+        let sender = draft
+            .from
+            .as_ref()
+            .and_then(|id| self.accounts.iter().find(|account| account.id == *id))
+            .cloned();
+        // A draft is edited freely; one that is already on its way out is not
+        // touched at all.
+        let sending = draft.sending;
 
         let mut discard = false;
+        let mut send = false;
         let _ = egui::Modal::new(egui::Id::new("compose")).show(ctx, |ui| {
             ui.set_width(COMPOSE_WIDTH);
             ui.heading("New mail");
@@ -2815,7 +3058,8 @@ impl KimoApp {
                         [COMPOSE_LABEL_WIDTH, COMPOSE_FIELD_HEIGHT],
                         egui::Label::new(label).halign(egui::Align::RIGHT),
                     );
-                    ui.add(
+                    ui.add_enabled(
+                        !sending,
                         egui::TextEdit::singleline(value)
                             .hint_text(hint)
                             .desired_width(field_width),
@@ -2844,18 +3088,20 @@ impl KimoApp {
                         );
                     }
                     (false, Some(label)) => {
-                        egui::ComboBox::from_id_salt("compose-from")
-                            .selected_text(label)
-                            .width(field_width)
-                            .show_ui(ui, |ui| {
-                                for (id, name, address) in &accounts {
-                                    ui.selectable_value(
-                                        &mut draft.from,
-                                        Some(id.clone()),
-                                        format!("{name} <{address}>"),
-                                    );
-                                }
-                            });
+                        ui.add_enabled_ui(!sending, |ui| {
+                            egui::ComboBox::from_id_salt("compose-from")
+                                .selected_text(label)
+                                .width(field_width)
+                                .show_ui(ui, |ui| {
+                                    for (id, name, address) in &accounts {
+                                        ui.selectable_value(
+                                            &mut draft.from,
+                                            Some(id.clone()),
+                                            format!("{name} <{address}>"),
+                                        );
+                                    }
+                                });
+                        });
                     }
                     // Only reachable if the From account vanished between
                     // two frames; pick the fallback rather than showing a
@@ -2871,6 +3117,7 @@ impl KimoApp {
                 to.request_focus();
             }
             field(ui, "Cc", &mut draft.cc, "name@example.com");
+            field(ui, "Bcc", &mut draft.bcc, "name@example.com");
             field(ui, "Subject", &mut draft.subject, "Subject");
 
             ui.add_space(6.0);
@@ -2881,7 +3128,8 @@ impl KimoApp {
                 .max_height(COMPOSE_BODY_HEIGHT)
                 .auto_shrink([false, false])
                 .show(ui, |ui| {
-                    ui.add(
+                    ui.add_enabled(
+                        !sending,
                         egui::TextEdit::multiline(&mut draft.body)
                             .hint_text("Write your message…")
                             .desired_width(field_width)
@@ -2891,18 +3139,43 @@ impl KimoApp {
 
             ui.add_space(6.0);
             ui.separator();
+            // The footer says one of three things — the server's refusal after
+            // a try, that the mail is on its way, why Send cannot be pressed —
+            // and nothing at all when the draft is ready to go.
+            let (to_addresses, cc_addresses, bcc_addresses) = draft.recipients();
+            let blocker = send_blocker(
+                sender.as_ref(),
+                &to_addresses,
+                &cc_addresses,
+                &bcc_addresses,
+            );
             ui.horizontal(|ui| {
-                ui.label(
-                    egui::RichText::new(
-                        "Kimo cannot send mail: it speaks IMAP and POP3 only, with no SMTP.",
-                    )
-                    .small()
-                    .weak(),
-                );
+                if let Some(error) = &draft.error {
+                    ui.label(
+                        egui::RichText::new(error)
+                            .small()
+                            .color(theme::of(ui.ctx()).danger),
+                    );
+                } else if sending {
+                    ui.label(egui::RichText::new("Sending…").small().weak());
+                } else if let Some(reason) = &blocker {
+                    ui.label(egui::RichText::new(reason.as_str()).small().weak());
+                }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    ui.add_enabled(false, egui::Button::new("Send"))
-                        .on_disabled_hover_text("Sending is not implemented — Kimo has no SMTP.");
-                    if ui.button("Discard").clicked() {
+                    let response = ui.add_enabled(
+                        !sending && blocker.is_none(),
+                        egui::Button::new(if sending { "Sending…" } else { "Send" }),
+                    );
+                    if response.clicked() {
+                        send = true;
+                    }
+                    if let Some(reason) = &blocker {
+                        response.on_disabled_hover_text(reason.as_str());
+                    }
+                    if ui
+                        .add_enabled(!sending, egui::Button::new("Discard"))
+                        .clicked()
+                    {
                         discard = true;
                     }
                 });
@@ -2910,9 +3183,14 @@ impl KimoApp {
         });
 
         // Discarded: the draft goes with the card. There is no other copy of it
-        // and nowhere it could have been saved to.
+        // and nowhere it could have been saved to. A discarded card cannot be a
+        // sending one — Discard is drawn disabled while a mail is in flight —
+        // and the draft is put back for any other frame.
         if !discard {
             self.compose = Some(draft);
+        }
+        if send {
+            self.send_draft();
         }
     }
 
@@ -3804,17 +4082,19 @@ impl KimoApp {
                         }
                     });
                 });
-                ui.label(
-                    egui::RichText::new(format!(
-                        "{} · {}:{} · {}",
-                        account.protocol.label(),
-                        account.host,
-                        account.port,
-                        account.username
-                    ))
-                    .small()
-                    .weak(),
+                // Where it reads from, and where it sends through when it can
+                // send at all.
+                let mut line = format!(
+                    "{} · {}:{} · {}",
+                    account.protocol.label(),
+                    account.host,
+                    account.port,
+                    account.username
                 );
+                if let Some(smtp) = &account.smtp {
+                    line.push_str(&format!(" · sends via {}:{}", smtp.host, smtp.port));
+                }
+                ui.label(egui::RichText::new(line).small().weak());
             });
             ui.add_space(2.0);
         }
@@ -3929,11 +4209,94 @@ impl KimoApp {
                 ui.label("Username");
                 ui.add(egui::TextEdit::singleline(&mut f.username).hint_text("you@example.com"));
                 ui.end_row();
-
-                ui.label("Password");
-                ui.add(egui::TextEdit::singleline(&mut f.password).password(true));
-                ui.end_row();
             });
+
+        ui.add_space(8.0);
+        // Sending is its own group, and off is a real answer: an account that
+        // only reads mail is what every account was before this existed.
+        ui.checkbox(&mut f.smtp_enabled, "Send mail (SMTP)");
+        ui.label(
+            egui::RichText::new(
+                "Mail is sent through the server below. Without one, this account can only receive.",
+            )
+            .small()
+            .weak(),
+        );
+        ui.add_space(4.0);
+        ui.add_enabled_ui(f.smtp_enabled, |ui| {
+            egui::Grid::new("account_smtp_grid")
+                .num_columns(2)
+                .spacing([10.0, 6.0])
+                .show(ui, |ui| {
+                    ui.label("Outgoing server");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut f.smtp_host).hint_text("smtp.example.com"),
+                    );
+                    ui.end_row();
+
+                    ui.label("Security");
+                    ui.horizontal(|ui| {
+                        let mut changed = false;
+                        if ui
+                            .radio_value(&mut f.smtp_tls, TlsMode::Implicit, "TLS")
+                            .changed()
+                        {
+                            changed = true;
+                        }
+                        if ui
+                            .radio_value(&mut f.smtp_tls, TlsMode::StartTls, "STARTTLS")
+                            .changed()
+                        {
+                            changed = true;
+                        }
+                        if ui
+                            .radio_value(&mut f.smtp_tls, TlsMode::Plain, "None")
+                            .changed()
+                        {
+                            changed = true;
+                        }
+                        if changed {
+                            f.smtp_port_str = SmtpSettings::default_port(f.smtp_tls).to_string();
+                        }
+                    });
+                    ui.end_row();
+
+                    ui.label("Port");
+                    ui.add(egui::TextEdit::singleline(&mut f.smtp_port_str).hint_text("587"));
+                    ui.end_row();
+
+                    ui.label("Login");
+                    ui.vertical(|ui| {
+                        ui.checkbox(
+                            &mut f.smtp_own_login,
+                            "Use this account's username and password",
+                        );
+                        if !f.smtp_own_login {
+                            ui.horizontal(|ui| {
+                                ui.add(
+                                    egui::TextEdit::singleline(&mut f.smtp_username)
+                                        .hint_text("Username")
+                                        .desired_width(150.0),
+                                );
+                                ui.add(
+                                    egui::TextEdit::singleline(&mut f.smtp_password)
+                                        .hint_text("Password")
+                                        .password(true)
+                                        .desired_width(150.0),
+                                );
+                            });
+                        }
+                    });
+                    ui.end_row();
+                });
+            if f.smtp_tls == TlsMode::Plain {
+                ui.label(
+                    egui::RichText::new("A plain connection sends the password in the clear.")
+                        .small()
+                        .weak(),
+                );
+            }
+        });
 
         ui.add_space(6.0);
         ui.label(
@@ -4366,10 +4729,10 @@ const MAIL_ACTION_MIN_PADDING: f32 = 16.0;
 /// a 24×24 box, which `glyph_point` scales to this.
 const MAIL_ACTION_GLYPH: f32 = 18.0;
 
-/// How long the line an export leaves above the message list stays there: long
-/// enough to read a path and go looking for the file, short enough not to
-/// become furniture. The file does not go anywhere when the line does.
-const EXPORT_NOTICE_TIME: Duration = Duration::from_secs(8);
+/// How long the line above the message list stays there: long enough to read a
+/// path — or that a mail went out — and act on it, short enough not to become
+/// furniture. Whatever it says does not change when the line goes.
+const NOTICE_TIME: Duration = Duration::from_secs(8);
 
 /// Padding on the sides of the message list's rows: the hairlines `mail_list`
 /// draws down the column's sides sit just outside it.
@@ -5608,26 +5971,12 @@ fn date_label(timestamp: Option<i64>, date: &str) -> String {
 fn format_timestamp(ts: i64) -> String {
     let days = ts.div_euclid(86_400);
     let secs = ts.rem_euclid(86_400);
-    let (y, m, d) = civil_from_days(days);
+    let (y, m, d) = crate::mail::civil_from_days(days);
     format!(
         "{y:04}-{m:02}-{d:02} {:02}:{:02}",
         secs / 3600,
         (secs % 3600) / 60
     )
-}
-
-/// Days-since-epoch → (year, month, day), Howard Hinnant's civil_from_days.
-fn civil_from_days(z: i64) -> (i64, u32, u32) {
-    let z = z + 719_468;
-    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
-    let doe = z - era * 146_097;
-    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
-    let y = yoe + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
-    let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
-    (if m <= 2 { y + 1 } else { y }, m, d)
 }
 
 #[cfg(test)]
@@ -6013,6 +6362,7 @@ mod tests {
             username: "ada".to_string(),
             password: "secret".to_string(),
             tls: TlsMode::Implicit,
+            smtp: None,
         };
         let messages = (0..count)
             .map(|index| test_message(&index.to_string(), false))
@@ -6129,6 +6479,7 @@ mod tests {
             username: "ada".to_string(),
             password: "secret".to_string(),
             tls: TlsMode::Implicit,
+            smtp: None,
         };
         // No folders at all: the account has never synced.
         let mut app = KimoApp::assemble(
@@ -6364,11 +6715,11 @@ mod tests {
         // Past its time the line is gone, and the app has stopped asking to be
         // repainted for it.
         let stale = Instant::now()
-            .checked_sub(EXPORT_NOTICE_TIME + Duration::from_millis(1))
+            .checked_sub(NOTICE_TIME + Duration::from_millis(1))
             .expect("the machine has been up longer than the notice lasts");
-        app.export_notice = app.export_notice.take().map(|(text, _)| (text, stale));
+        app.notice = app.notice.take().map(|(text, _)| (text, stale));
         let texts = frame_texts(&ctx, &mut app);
-        assert!(app.export_notice.is_none(), "the notice outlived its time");
+        assert!(app.notice.is_none(), "the notice outlived its time");
         assert!(
             !texts.iter().any(|text| text.starts_with("Saved to")),
             "{texts:?}"
@@ -7437,6 +7788,7 @@ mod tests {
             username: "me@example.com".to_string(),
             password: "hunter2".to_string(),
             tls: TlsMode::Implicit,
+            smtp: None,
         }
     }
 
@@ -7535,6 +7887,207 @@ mod tests {
         ];
         sort_messages(&mut msgs);
         assert_eq!(msgs[0].uid, "2");
+    }
+
+    /// The Send button is enabled by one rule (`send_blocker`) — and the worker
+    /// checks the same one again. No account, an account with no outgoing
+    /// server, a sender that is not an address, an entry that is not one, and a
+    /// mail with nobody to go to are the reasons a draft cannot leave.
+    #[test]
+    fn the_send_button_waits_for_an_account_a_sender_and_a_recipient() {
+        let can_send = |account: &Account| {
+            let mut account = account.clone();
+            account.smtp = Some(SmtpSettings {
+                host: "smtp.example.com".to_string(),
+                port: 587,
+                tls: TlsMode::StartTls,
+                login: None,
+            });
+            account
+        };
+        let bob = ["bob@example.com".to_string()];
+        let nobody: [String; 0] = [];
+        let junk = ["not an address".to_string()];
+
+        // No account configured at all.
+        assert!(send_blocker(None, &bob, &nobody, &nobody).is_some());
+        // An account that only reads mail.
+        let reading = test_account("imap.example.com");
+        assert!(!reading.can_send());
+        assert!(send_blocker(Some(&reading), &bob, &nobody, &nobody).is_some());
+        // The same account with a way to send, and somebody to send to.
+        let ready = can_send(&reading);
+        assert_eq!(send_blocker(Some(&ready), &bob, &nobody, &nobody), None);
+        // Nobody to send to.
+        assert!(send_blocker(Some(&ready), &nobody, &nobody, &nobody).is_some());
+        // An entry that is not an address, in any of the three fields.
+        assert!(send_blocker(Some(&ready), &junk, &nobody, &nobody).is_some());
+        assert!(send_blocker(Some(&ready), &bob, &junk, &nobody).is_some());
+        assert!(send_blocker(Some(&ready), &bob, &nobody, &junk).is_some());
+        // A username that is not an address cannot be the sender: the From
+        // list shows it as one, so the card must not pretend otherwise.
+        let mut odd = ready.clone();
+        odd.username = "ada".to_string();
+        assert!(send_blocker(Some(&odd), &bob, &nobody, &nobody).is_some());
+        // The reason names what is wrong: the card shows it verbatim.
+        let reason = send_blocker(Some(&ready), &junk, &nobody, &nobody).unwrap();
+        assert!(reason.contains("not an address"), "{reason}");
+        let unreadable = send_blocker(Some(&reading), &bob, &nobody, &nobody).unwrap();
+        assert!(unreadable.contains("outgoing server"), "{unreadable}");
+    }
+
+    /// What the notice says about a mail that went out: who it went to, and
+    /// what became of the copy in Sent — with the mailbox name decoded for the
+    /// reader rather than left in the wire's modified UTF-7.
+    #[test]
+    fn a_sent_notice_names_the_recipients_and_the_copy() {
+        let recipients = [
+            "bob@example.com".to_string(),
+            "carol@example.com".to_string(),
+        ];
+        assert_eq!(
+            sent_notice(&recipients, &SentCopy::None),
+            "Sent to bob@example.com, carol@example.com"
+        );
+        assert_eq!(
+            sent_notice(
+                &recipients,
+                &SentCopy::Saved {
+                    mailbox: "&XfJT0ZAB-".to_string(),
+                }
+            ),
+            "Sent to bob@example.com, carol@example.com · a copy is in 已发送"
+        );
+        let failed = sent_notice(
+            &recipients,
+            &SentCopy::Failed("no such mailbox".to_string()),
+        );
+        assert!(
+            failed.ends_with("the copy could not be saved: no such mailbox"),
+            "{failed}"
+        );
+    }
+
+    /// The draft is the only copy of the mail, so the server saying it has the
+    /// mail is what closes the card — and a refusal keeps it, with the server's
+    /// own words in it, ready to be sent again.
+    #[test]
+    fn a_sent_mail_closes_the_card_and_a_refusal_keeps_it() {
+        let ctx = egui::Context::default();
+        crate::fonts::install(&ctx, None, None);
+        let mut app = app_with_messages(&ctx, 1);
+        app.compose = Some(ComposeDraft::new(Some("acct".to_string())));
+        if let Some(draft) = app.compose.as_mut() {
+            draft.to = "bob@example.com".to_string();
+            draft.subject = "Hello".to_string();
+            draft.body = "Body".to_string();
+            draft.sending = true;
+        }
+        // A send in flight: the card says so and its boxes are disabled. The
+        // first frame is what sizes a modal's area — the card is drawn from the
+        // second one on, which is what the app does live too.
+        let _ = frame_texts(&ctx, &mut app);
+        let texts = frame_texts(&ctx, &mut app);
+        assert!(texts.iter().any(|text| text == "Sending…"), "{texts:?}");
+
+        // The server refused it: the draft stays, the reason is in the card,
+        // and Send is enabled again.
+        app.apply_event(Event::MessageSendFailed {
+            error: "550 5.1.1 no such user".to_string(),
+        });
+        let draft = app.compose.as_ref().expect("the draft is still there");
+        assert!(!draft.sending);
+        assert_eq!(draft.error.as_deref(), Some("550 5.1.1 no such user"));
+        assert_eq!(draft.to, "bob@example.com", "the draft is untouched");
+        let _ = frame_texts(&ctx, &mut app);
+        let texts = frame_texts(&ctx, &mut app);
+        assert!(
+            texts.iter().any(|text| text.contains("no such user")),
+            "{texts:?}"
+        );
+
+        // The server has it now: the card goes with the draft, and the line
+        // above the message list says where the mail went.
+        app.apply_event(Event::MessageSent {
+            recipients: vec!["bob@example.com".to_string()],
+            copy: SentCopy::Saved {
+                mailbox: "Sent".to_string(),
+            },
+        });
+        assert!(app.compose.is_none(), "a sent card is a closed card");
+        let texts = frame_texts(&ctx, &mut app);
+        assert!(
+            texts
+                .iter()
+                .any(|text| text == "Sent to bob@example.com · a copy is in Sent"),
+            "{texts:?}"
+        );
+    }
+
+    /// The account form's Sending group: off is an account that only reads
+    /// mail, on needs a server and a port, and what it builds is what the
+    /// account gets — credentials it does not name included.
+    #[test]
+    fn the_account_form_builds_the_outgoing_server_it_describes() {
+        let mut form = AccountForm::default();
+        assert!(!form.is_valid(), "a new form has nothing in it");
+        form.name = "Work".to_string();
+        form.host = "imap.example.com".to_string();
+        form.username = "me@example.com".to_string();
+        assert!(form.is_valid(), "reading mail needs no outgoing server");
+        assert_eq!(form.to_account("work".to_string()).smtp, None);
+
+        // Switched on with nothing to reach, and then with something.
+        form.smtp_enabled = true;
+        assert!(!form.is_valid());
+        form.smtp_host = "smtp.example.com".to_string();
+        assert!(form.is_valid());
+        assert_eq!(
+            form.to_account("work".to_string()).smtp,
+            Some(SmtpSettings {
+                host: "smtp.example.com".to_string(),
+                port: 465,
+                tls: TlsMode::Implicit,
+                login: None,
+            })
+        );
+
+        // A login of its own is the pair below the checkbox, and the security
+        // choice is what moves the port.
+        form.smtp_tls = TlsMode::StartTls;
+        form.smtp_port_str = SmtpSettings::default_port(form.smtp_tls).to_string();
+        form.smtp_own_login = false;
+        form.smtp_username = "code".to_string();
+        form.smtp_password = "abcd efgh".to_string();
+        let account = form.to_account("work".to_string());
+        assert_eq!(
+            account.smtp.as_ref().map(|smtp| smtp.port),
+            Some(587),
+            "STARTTLS is the submission port"
+        );
+        assert_eq!(account.smtp_login(), Some(("code", "abcd efgh")));
+
+        // Editing an account fills the group in from what it already has.
+        let edit = AccountForm::edit(&account);
+        assert!(edit.smtp_enabled);
+        assert_eq!(edit.smtp_host, "smtp.example.com");
+        assert!(!edit.smtp_own_login);
+        assert_eq!(edit.smtp_username, "code");
+        assert_eq!(
+            edit.smtp(),
+            account.smtp,
+            "the form describes what the account has"
+        );
+
+        // An outgoing server is not part of what makes the cached mail describe
+        // another mailbox: moving it must not purge what is stored.
+        let mut moved = edit.clone();
+        moved.smtp_host = "smtp.other.example".to_string();
+        assert!(!moved.points_elsewhere(&account));
+        // The incoming endpoint still is.
+        let mut elsewhere = edit.clone();
+        elsewhere.host = "imap.other.example".to_string();
+        assert!(elsewhere.points_elsewhere(&account));
     }
 
     #[test]

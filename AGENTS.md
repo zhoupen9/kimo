@@ -11,8 +11,9 @@ Kimo is a desktop **email client** GUI written in pure Rust:
   through winit + `egui-winit` + `egui-wgpu` instead of through eframe, because
   the floating title bar's blur needs the frame split in two — see the
   renderer convention below.
-- **Protocols:** IMAP4rev1 and POP3 **only**, implemented by hand in
-  `src/protocol/` — no `imap`/`async-imap`/`pop` crates.
+- **Protocols:** IMAP4rev1 and POP3 for reading, SMTP submission for
+  sending, all implemented by hand in `src/protocol/` — no `imap`/`async-imap`/
+  `pop`/`lettre` crates.
 - **TLS:** rustls with the pure-Rust `ring` crypto provider + webpki-roots.
   `src/protocol/ffdhe.rs` adds the finite-field DH rustls does not ship (an
   FFDHE group and the two GCM `DHE-RSA` suites, the modular exponentiation
@@ -32,10 +33,12 @@ Kimo is a desktop **email client** GUI written in pure Rust:
 - **Charsets:** mail-parser is built with the `full_encoding` feature
   (pulling in `encoding_rs`, pure Rust) so GB2312/GBK/GB18030/Big5/
   Shift-JIS/… mail decodes to proper UTF-8 instead of Latin-1 mojibake.
-- **Receive-only by design.** There is no SMTP and nothing is ever sent:
-  composing exists as a modal card that holds a draft in memory
-  (`ComposeDraft`), with its Send button disabled — see the compose-window
-  convention below.
+- **Sending is SMTP submission.** The compose card's Send hands its draft to
+  a worker (`Job::SendMessage`), which speaks `EHLO`/`STARTTLS`/`AUTH`/`MAIL
+  FROM`/`RCPT TO`/`DATA` through `src/protocol/smtp.rs`, and the message itself
+  is built by `src/outgoing.rs`. A copy goes into the account's Sent mailbox
+  over IMAP when the server has one. There is no drafts folder, no outbox and
+  no attachments — see hard rule 4 and the compose-window convention below.
 - **Tray icon:** `src/tray.rs` implements StatusNotifierItem by speaking the
   D-Bus wire protocol directly on a `std::thread` — deliberately not zbus
   (async executor, rule 2) or the GTK tray crates (C, rule 1). The icon is
@@ -92,10 +95,14 @@ Kimo is a desktop **email client** GUI written in pure Rust:
    event channel and draws. Any socket I/O, file scan or other potentially
    slow work must be a `sync::Job` on a worker thread. Workers call
    `ctx.request_repaint()` when they emit.
-4. **No SMTP.** Nothing is sent and no sending code exists: the compose window
-   is an editor whose Send button is drawn disabled. Wiring it to a server —
-   SMTP, a drafts folder on IMAP, anything that puts a written mail somewhere —
-   is out of scope unless the project owner explicitly reopens that decision.
+4. **Sending is SMTP submission and nothing else.** The compose card's Send is
+   wired (`Job::SendMessage` → `protocol::smtp` → `outgoing::render`), and the
+   one thing it writes besides the mail itself is the copy in the account's
+   Sent mailbox (`APPEND`, IMAP accounts only). Deliberately still out of
+   scope, each its own decision by the project owner: drafts of any kind
+   (nothing about a draft is persisted), an outbox/queue or any retry, file
+   attachments, HTML bodies, DKIM or any signing, and OAuth2/XOAUTH2 — SMTP
+   authentication is `AUTH PLAIN`/`AUTH LOGIN` over TLS.
 5. **Keep the dependency tree small.** Every new crate needs a concrete
    justification; prefer std where reasonable.
 6. **UI strings are English.** CJK rendering is handled by the best-effort
@@ -129,6 +136,7 @@ src/db.rs               the mail database: schema + migrations, accounts, folder
 src/search.rs           mail search: the CJK bigram index, the FTS5 query builder and the filters they run against
 src/theme.rs            theme choice + the light/dark color schemes and their egui Visuals
 src/mail.rs             raw RFC 5322 bytes → MailMessage (mail-parser; HTML kept for rendering)
+src/outgoing.rs         the mail being sent: addresses, headers, encoding → RFC 5322 bytes
 src/html.rs             HTML mail → egui widgets (subset: blocks, lists, tables, links, inline styles)
 src/blitz_render.rs     HTML mail → rasterized page via Blitz (headless render, net provider, fonts)
 src/css.rs              tiny CSS subset (decls, tag/class/id selectors) for HTML mail
@@ -141,8 +149,10 @@ src/protocol/mod.rs     protocol modules
 src/protocol/stream.rs  TcpStream/TLS transport (MailStream, STARTTLS upgrade, buffered Conn)
 src/protocol/ffdhe.rs   FFDHE kx group + DHE-RSA suites, which rustls does not ship
 src/protocol/imap.rs    minimal IMAP4rev1 client (LOGIN, LIST, SELECT, FETCH w/ literals,
-                        UID STORE, delete: UID FETCH probe + UID EXPUNGE)
+                        UID STORE, APPEND, delete: UID FETCH probe + UID EXPUNGE)
 src/protocol/pop3.rs    minimal POP3 client (USER/PASS, STAT, UIDL, RETR w/ de-stuffing, DELE, QUIT)
+src/protocol/smtp.rs    minimal SMTP submission client (EHLO capabilities, STARTTLS,
+                        AUTH PLAIN/LOGIN, MAIL/RCPT/DATA w/ dot-stuffing)
 ```
 
 ### Data flow
@@ -152,7 +162,7 @@ UI (app.rs ui)
    │  spawn(Job)                                   UI thread — no sockets, no DB writes
    ▼
 worker thread (sync.rs)
-   │  ImapClient / Pop3Client over MailStream      blocking I/O is fine here
+   │  ImapClient / Pop3Client / SmtpClient         blocking I/O is fine here
    │  db::save_messages / db::set_seen             the only place the DB is written
    ▼
 Event (mpsc) ──► drain_events() at frame start ──► merge into AccountUiState
@@ -278,6 +288,23 @@ Event (mpsc) ──► drain_events() at frame start ──► merge into Accoun
   what keeps an unchanged query from searching again every frame. The request
   is pumped from `KimoApp::ui`, not from the message list: the popup that
   edits the query sits outside every column.
+- Sending is a job like any other, with two differences. `Job::SendMessage`
+  renders the draft (`outgoing::render`), connects, authenticates when the
+  server advertises a mechanism this client speaks, and hands the message to
+  `DATA`; the outcome comes back as `Event::MessageSent { recipients, copy }` or
+  `Event::MessageSendFailed { error }`. The first difference: it is *not*
+  bracketed with `SyncStarted`/`SyncDone` — the compose card that asked is on
+  screen, cannot be closed while the mail is in flight, and says `Sending…` —
+  and a failure is the card's error, not the account row's warning. The second:
+  `Event::MessageSent` is what closes the card, because until the server says it
+  has the mail the draft is the only copy of it. `SentCopy` is what became of
+  the copy in Sent: `None` for a POP3 account or a server that lists no Sent
+  mailbox (`folders::kind_of` is the table that recognizes `Sent`, `Sent
+  Items` or 已发送邮件, whatever wire form the name arrived in), `Saved {
+  mailbox }` after an `APPEND` and the incremental fetch of that folder on the
+  same connection — so what was sent is in Kimo's Sent when the user opens it,
+  not at the next sync — or `Failed`, which un-sends nothing and is what the
+  notice says.
 - Remote mutations are `UID STORE +FLAGS.SILENT (\Seen)` (IMAP) and, behind
   the title bar's Delete button, `\Deleted` + `UID EXPUNGE` (IMAP) or `DELE`
   (POP3). A delete tells the server first and deletes locally after; a message
@@ -288,7 +315,8 @@ Event (mpsc) ──► drain_events() at frame start ──► merge into Accoun
 
 - `~/.local/share/kimo/mail.db` — the one database (SQLite, WAL, mode 0600
   because it holds the passwords). `accounts` (id, name, protocol, host,
-  port, username, password, tls, position), `folders` (account_id, name,
+  port, username, password, tls, smtp_host, smtp_port, smtp_tls, smtp_username,
+  smtp_password, position), `folders` (account_id, name,
   uidvalidity, uid_next, first_num, oldest_uid, synced, listed — the fetch
   marks of the bullets above, then `listed`, what the last `LIST` named),
   `messages` keyed by `(account_id, folder, uid)` with
@@ -307,7 +335,10 @@ Event (mpsc) ──► drain_events() at frame start ──► merge into Accoun
   marks and derives `uid_next` from the UIDs the database already holds
   (`derive_imap_marks`, sharing `DERIVE_UID_NEXT_SQL` with `save_messages`, so
   the two can never disagree), which is what keeps an upgrade from refetching a
-  batch it has.
+  batch it has. The version-5 step is its opposite: it adds the five `smtp_*`
+  columns and derives nothing, because a database from before it has no
+  outgoing server to move over — every account it holds starts as one that only
+  reads mail, and Preferences → Accounts is where it gets a way to send.
 - The account list is **in the database, passwords in plain text**. That is a
   documented, accepted limitation; do not add a secrets daemon (rule 1). An
   account's `id` is minted once (the slug of its name, numbered if taken) and
@@ -318,7 +349,15 @@ Event (mpsc) ──► drain_events() at frame start ──► merge into Accoun
   purged only when the form's endpoint (protocol, host, port, username)
   changed, because only then can it describe somebody else's mailbox
   (`AccountForm::points_elsewhere` — the purge runs inside the same sync job,
-  `Job::Sync { purge }`, so nothing can reorder those two steps).
+  `Job::Sync { purge }`, so nothing can reorder those two steps). An account's
+  outgoing server is `Account.smtp` (`None` is an account that cannot send,
+  which is what leaves the compose card's Send disabled): five columns written
+  together by `save_account_on` and read by `smtp_from_row`, where a NULL host
+  is "no outgoing server" and a NULL username is "submit as the account
+  itself" (`Account::smtp_login`; a row naming a host with no usable port or
+  TLS mode fails the load the way an unknown protocol does). Editing the SMTP
+  settings is *not* a change of mailbox — `points_elsewhere` ignores them — so
+  moving an outgoing server never purges the cached mail.
 - `~/.config/kimo/settings.json` — UI settings: the theme
   (`system`/`light`/`dark`; "system" resolves via GTK/KDE config files, no
   subprocesses or D-Bus), `html_renderer` (`egui`/`blitz`, absent means
@@ -356,7 +395,12 @@ Event (mpsc) ──► drain_events() at frame start ──► merge into Accoun
   a reply we cannot parse — so a command with a fallback (the mailbox-wide
   `EXPUNGE` for a server without UIDPLUS) can tell the two apart.
 - Protocol clients are synchronous and single-purpose; add a method only
-  when a sync job actually needs it.
+  when a sync job actually needs it. The three of them map a server's own
+  refusal the way the first two always have: a 4xx/5xx (SMTP) or a `-ERR`
+  (POP3) the server was asked for is `MailError::Refused`, one for a command it
+  never got is `Protocol`, and credentials the server said no to are
+  `MailError::Auth` — `smtp::login` rewrites its refusals into that, the way
+  `imap::login` does.
 - Finite-field DH lives in `src/protocol/ffdhe.rs` and is deliberately narrow:
   2048-bit groups only, and the `DHE-RSA` suites are appended *behind*
   *ring*'s, so any server offering TLS 1.3 or ECDHE still gets that — DHE is a
@@ -765,8 +809,9 @@ Event (mpsc) ──► drain_events() at frame start ──► merge into Accoun
   brackets its round trip with `SyncStarted`/`SyncDone` like a delete, and
   answers `Event::MessageExported { path }` — with the path, because a name that
   was taken is numbered and only the worker knows what it got. The app shows it
-  as one line above the message list for `EXPORT_NOTICE_TIME` (`list_banner`,
-  the place the storage warning stands).
+  as one line above the message list for `NOTICE_TIME` (`list_banner`, the
+  place the storage warning stands) — the same line a finished send uses, which
+  is why it is named for what it is rather than for the export.
 - The compose window (`compose_window`, opened by the title bar's pen) is an
   `egui::Modal`, like the search popup and Preferences: a card `COMPOSE_WIDTH`
   wide in the foreground layer, whose backdrop dims the columns and the bar and
@@ -774,9 +819,9 @@ Event (mpsc) ──► drain_events() at frame start ──► merge into Accoun
   way. There is one of it — `KimoApp::compose` holds the draft, and the button
   leaves an open card alone rather than resetting what has been typed into it.
   From is the configured accounts, defaulting to the one whose mail is open and
-  falling back to the first (`compose_from`); To, Cc, Subject and the body are
-  plain strings in `ComposeDraft`, deliberately not widget state: a card opened
-  again must start empty. The boxes are a fixed label column plus what
+  falling back to the first (`compose_from`); To, Cc, Bcc, Subject and the body
+  are plain strings in `ComposeDraft`, deliberately not widget state: a card
+  opened again must start empty. The boxes are a fixed label column plus what
   `COMPOSE_WIDTH` leaves, the body is `COMPOSE_BODY_HEIGHT` tall and scrolls
   inside that rather than growing the card, and the first frame puts the
   keyboard in To.
@@ -785,12 +830,23 @@ Event (mpsc) ──► drain_events() at frame start ──► merge into Accoun
   copy of the mail, and neither should be what throws it away. Discard is the
   way out. The app's other two modals do close on the backdrop; the difference
   here is the draft.
-  **Nothing is sent and nothing is persisted.** Kimo speaks IMAP and POP3 only
-  (hard rule 4), so Send is drawn disabled with the reason on its tooltip and
-  the footer says so in words; there is no drafts folder, so Discard is the end
-  of the mail, which is the only copy of it.
-  Wiring any of that up is a decision for the project owner, not an oversight
-  to fix in passing.
+  **Send is wired, and the card owns everything about it.** One rule decides
+  whether the mail can go out — `send_blocker`: an account, one that has an
+  outgoing server, a username that is an address, at least one recipient, and
+  every entry in To/Cc/Bcc an address (`outgoing::parse_addresses` is what
+  unwraps a `Name <addr>` and refuses a typed CR/LF before it could become a
+  header of its own). The footer shows that reason, the `Sending…` state while
+  a worker has the mail, or the server's own refusal — and the worker checks
+  the same rules again in `sync::send_message`, because nothing leaves the
+  machine as mail on the strength of a frame having said it could. While a send
+  is in flight the whole card is disabled, Discard included: a draft that is
+  already on its way out is not one to edit or drop.
+  **Nothing is persisted.** There is no drafts folder and no outbox, so Discard
+  is the end of the mail — and until `Event::MessageSent` arrives, the card is
+  the only copy of it, which is exactly why that event is what closes it. A
+  refusal keeps the card (and the draft) with the server's words in it, ready
+  to be sent again. Adding a way to keep a draft, attach a file or queue a send
+  is a decision for the project owner, not an oversight to fix in passing.
 - `preferences_modal()` is the one place to configure Kimo: an
   `egui::Modal` (backdrop click or Escape closes it) with a sidebar of
   pages — **General** (the working mode), **Accounts** (account list with
@@ -966,12 +1022,16 @@ Do not "fix" these casually — they are known:
   title bar's Delete expunges the mail on the server without asking first, and
   it acts on the one mail the reading pane shows — no multi-select, no
   Delete-key shortcut.
-- Nothing a mail is *written into* can leave the machine: the compose window's
-  draft cannot be sent (no SMTP), saved, or reopened once its window is
-  closed, and the title bar's reply / reply all / forward / label / flag
-  buttons are drawn but not wired to anything yet (export and delete are wired;
-  see those bullets above). Export is the other direction — the received mail
-  leaving as a file — and it does not touch the draft.
+- A written mail goes out over SMTP and no further: no attachments (there is
+  nothing to pick a file with — a native dialog is a dependency, and a portal on
+  Wayland), no HTML body (the card is a text box, so the mail is `text/plain;
+  charset=utf-8`, base64-encoded), no drafts — closing the card is the end of
+  the mail, and a failed send keeps the draft in the card but nowhere else — no
+  outbox, queue or retry, no DKIM, and no OAuth2: submission authenticates with
+  `AUTH PLAIN`/`AUTH LOGIN` over TLS, or not at all when the server asks for no
+  login. The title bar's reply / reply all / forward / label / flag buttons are
+  still drawn but not wired to anything (export, delete and the compose pen are
+  wired; see those bullets above).
 - Credentials in plain text in `mail.db` (mode 0600, see above); no
   OAuth2/XOAUTH2. The database is not encrypted, and the app never renames or
   deletes it on its own: a corrupt file is the user's to move aside.

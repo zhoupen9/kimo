@@ -2,8 +2,8 @@
 //! results stream back as `Event`s over an mpsc channel and the egui context
 //! is nudged to repaint. The UI thread itself never touches a socket, and it
 //! never writes to the database either: these jobs do that (see `crate::db`).
-//! Besides mail sync, jobs also fetch remote HTML-mail resources (images,
-//! stylesheets) over HTTPS.
+//! Besides mail sync, jobs also send written mail over SMTP (`Job::SendMessage`)
+//! and fetch remote HTML-mail resources (images, stylesheets) over HTTPS.
 
 use std::fs;
 use std::io::{Read, Write};
@@ -13,10 +13,13 @@ use std::time::Duration;
 
 use crate::db;
 use crate::error::{MailError, MailResult};
+use crate::folders::{self, FolderKind};
 use crate::mail;
 use crate::models::{Account, MailMessage, Protocol};
-use crate::protocol::imap::ImapClient;
+use crate::outgoing::Outgoing;
+use crate::protocol::imap::{decode_mailbox_name, ImapClient};
 use crate::protocol::pop3::Pop3Client;
+use crate::protocol::smtp::SmtpClient;
 use crate::storage;
 
 /// How many of the newest messages the *first* sync of a folder takes. Later
@@ -131,6 +134,17 @@ pub enum Job {
         /// into a file name (`export_stem`).
         subject: String,
     },
+    /// Send one written mail (`crate::outgoing`) through the account's SMTP
+    /// server and, when the account has a Sent mailbox to keep it in, put the
+    /// copy there too.
+    ///
+    /// The compose card that asked owns the outcome — `Event::MessageSent`, or
+    /// `Event::MessageSendFailed` with the server's own words — so a failed
+    /// send is never reported as a failed *sync* on the account.
+    SendMessage {
+        account: Account,
+        mail: Box<Outgoing>,
+    },
     /// Remove an account: its row, its folders and, through the cascades, every
     /// message cached for it.
     DeleteAccount { account_id: String },
@@ -200,6 +214,20 @@ pub enum Event {
     MessageExported {
         path: PathBuf,
     },
+    /// The mail is out. `recipients` is everybody the envelope went to, which
+    /// is what the notice above the message list names; `copy` is what became
+    /// of the copy in the account's Sent mailbox.
+    MessageSent {
+        recipients: Vec<String>,
+        copy: SentCopy,
+    },
+    /// The mail did not go out, with the server's own words when it was the
+    /// server that said no. Nothing is queued and nothing is retried: the
+    /// draft is still in the compose card, and Send is there to be pressed
+    /// again.
+    MessageSendFailed {
+        error: String,
+    },
     ImageLoaded {
         url: String,
         width: u32,
@@ -238,6 +266,21 @@ pub enum Event {
         seq: u64,
         error: String,
     },
+}
+
+/// What became of the copy of a mail that was just sent.
+#[derive(Debug)]
+pub enum SentCopy {
+    /// Nothing was appended: a POP3 account, which has no folders to append
+    /// to, or an IMAP server whose folder list names no Sent mailbox.
+    None,
+    /// The copy is in this mailbox (IMAP wire form; the UI decodes it for
+    /// display) and has been fetched back into the database.
+    Saved { mailbox: String },
+    /// The mail went out but the copy could not be stored. The notice says so —
+    /// a sent mail whose copy is missing is worth knowing about, and there is
+    /// nothing to do about it here.
+    Failed(String),
 }
 
 pub fn spawn(job: Job, ctx: egui::Context, tx: Sender<Event>) {
@@ -404,6 +447,23 @@ pub fn spawn(job: Job, ctx: egui::Context, tx: Sender<Event>) {
             }
             ctx.request_repaint();
         }
+        Job::SendMessage { account, mail } => {
+            // Not bracketed with SyncStarted/SyncDone like the other round
+            // trips: the card that asked for the send is on screen, cannot be
+            // closed while the mail is in flight, and says "Sending…" itself.
+            // A failure is that card's to show, not the account row's.
+            match send_message(&account, &mail, &tx) {
+                Ok((recipients, copy)) => {
+                    let _ = tx.send(Event::MessageSent { recipients, copy });
+                }
+                Err(error) => {
+                    let _ = tx.send(Event::MessageSendFailed {
+                        error: error.to_string(),
+                    });
+                }
+            }
+            ctx.request_repaint();
+        }
         account_job => {
             let account_id = match &account_job {
                 Job::Sync { account, .. } | Job::SyncFolder { account, .. } => account.id.clone(),
@@ -415,6 +475,7 @@ pub fn spawn(job: Job, ctx: egui::Context, tx: Sender<Event>) {
                 | Job::MarkSeen { .. }
                 | Job::DeleteMessage { .. }
                 | Job::ExportMessage { .. }
+                | Job::SendMessage { .. }
                 | Job::LoadOlder { .. }
                 | Job::DeleteAccount { .. } => unreachable!(),
             };
@@ -450,6 +511,7 @@ pub fn spawn(job: Job, ctx: egui::Context, tx: Sender<Event>) {
                 | Job::MarkSeen { .. }
                 | Job::DeleteMessage { .. }
                 | Job::ExportMessage { .. }
+                | Job::SendMessage { .. }
                 | Job::LoadOlder { .. }
                 | Job::DeleteAccount { .. } => unreachable!(),
             };
@@ -878,6 +940,111 @@ fn mail_is_gone() -> MailError {
     MailError::Protocol("the server no longer has this mail".to_string())
 }
 
+/// Send one written mail over SMTP and, when the account can keep a copy, put
+/// it in the server's Sent mailbox.
+///
+/// Answers the recipients the envelope went to and what became of the copy. The
+/// address check here is the card's own rule run again: nothing leaves this
+/// machine as mail on the strength of a caller having checked it.
+fn send_message(
+    account: &Account,
+    mail: &Outgoing,
+    tx: &Sender<Event>,
+) -> MailResult<(Vec<String>, SentCopy)> {
+    let invalid = mail.invalid();
+    if !invalid.is_empty() {
+        return Err(MailError::Protocol(format!(
+            "not an address: {}",
+            invalid.join(", ")
+        )));
+    }
+    let Some(smtp) = &account.smtp else {
+        return Err(MailError::Protocol(
+            "this account has no outgoing server".to_string(),
+        ));
+    };
+    let recipients: Vec<String> = mail.recipients().into_iter().map(str::to_string).collect();
+    // The bytes are built once, and the same ones go to the server and — when
+    // there is somewhere to keep it — into the Sent mailbox: a copy that
+    // differs from what was delivered is worse than no copy at all.
+    let raw = crate::outgoing::render(mail, unix_now());
+    let mut client = SmtpClient::connect(&smtp.host, smtp.port, smtp.tls)?;
+    // No username is a submission server that wants no login — a local relay,
+    // or a server that authenticates by address alone.
+    if let Some((user, pass)) = account.smtp_login() {
+        if !user.is_empty() {
+            client.login(user, pass)?;
+        }
+    }
+    client.send(&mail.from_addr, &recipients, &raw)?;
+    client.quit();
+    let copy = append_to_sent(account, &raw, tx);
+    Ok((recipients, copy))
+}
+
+/// The current time in unix seconds: what the `Date:` header says. A clock
+/// before the epoch answers 0, which is the one wrong date a mail can carry
+/// without anybody minding.
+fn unix_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .and_then(|elapsed| i64::try_from(elapsed.as_secs()).ok())
+        .unwrap_or(0)
+}
+
+/// The copy in the account's Sent mailbox, or why there is none.
+///
+/// POP3 has nowhere to put one: the drop is what arrives, not what leaves. An
+/// IMAP server that lists no Sent mailbox gets none either — a copy filed under
+/// a name the user does not recognize is not a copy they will find.
+fn append_to_sent(account: &Account, raw: &[u8], tx: &Sender<Event>) -> SentCopy {
+    if account.protocol != Protocol::Imap {
+        return SentCopy::None;
+    }
+    let mailbox = match db::listed_folders(&account.id).map(|listed| sent_mailbox_in(&listed)) {
+        Ok(Some(mailbox)) => mailbox,
+        // Nothing to append to, and nothing wrong either.
+        Ok(None) => return SentCopy::None,
+        Err(error) => return SentCopy::Failed(error.to_string()),
+    };
+    match imap_save_to_sent(account, &mailbox, raw, tx) {
+        Ok(()) => SentCopy::Saved { mailbox },
+        Err(error) => SentCopy::Failed(error.to_string()),
+    }
+}
+
+/// The mailbox a sent copy belongs in, from the folders the last `LIST` named:
+/// the first name whose *decoded* form classifies as Sent — `crate::folders`
+/// is the table that knows `Sent`, `Sent Items` and 已发送邮件 alike. The
+/// answer is the wire form, which is what `APPEND` has to be given.
+fn sent_mailbox_in(listed: &[String]) -> Option<String> {
+    listed
+        .iter()
+        .find(|name| folders::kind_of(&decode_mailbox_name(name)) == FolderKind::Sent)
+        .cloned()
+}
+
+/// Put the copy in the Sent mailbox and fetch it back: what was sent is in the
+/// folder the user looks in now, not at the next sync.
+///
+/// The fetch is a folder's ordinary one (`fetch_folder_into`), run on the
+/// session that just appended — the appended message is newer than the folder's
+/// mark, so it is exactly what comes down, and the mail arrives as
+/// `Event::Messages` like any other fetch.
+fn imap_save_to_sent(
+    account: &Account,
+    mailbox: &str,
+    raw: &[u8],
+    tx: &Sender<Event>,
+) -> MailResult<()> {
+    with_imap(account, |client| {
+        client.login(&account.username, &account.password)?;
+        client.append(mailbox, raw)?;
+        fetch_folder_into(client, mailbox, account, tx)
+    })
+}
+
 /// How many bytes of a subject a file name keeps. A file name is 255 bytes on
 /// the filesystems Kimo writes to, and the `.eml` suffix and a `-12` counter
 /// have to fit in that with it.
@@ -1066,6 +1233,170 @@ fn sync_pop3(account: &Account, tx: &Sender<Event>) -> MailResult<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A `LIST` answer names the mailbox a copy of a sent mail belongs in: the
+    /// first one that classifies as Sent, whatever the server calls it — and it
+    /// answers the *wire* form, which is what `APPEND` has to be given.
+    #[test]
+    fn the_sent_mailbox_is_the_one_the_server_calls_sent() {
+        let listed = |names: &[&str]| {
+            names
+                .iter()
+                .map(|name| name.to_string())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            sent_mailbox_in(&listed(&["INBOX", "Sent", "Trash"])).as_deref(),
+            Some("Sent")
+        );
+        assert_eq!(
+            sent_mailbox_in(&listed(&["INBOX", "Sent Items"])).as_deref(),
+            Some("Sent Items")
+        );
+        assert_eq!(
+            sent_mailbox_in(&listed(&["INBOX", "[Gmail]/Sent Mail"])).as_deref(),
+            Some("[Gmail]/Sent Mail")
+        );
+        // Modified UTF-7 on the wire, 已发送 on screen.
+        assert_eq!(
+            sent_mailbox_in(&listed(&["INBOX", "&XfJT0ZAB-"])).as_deref(),
+            Some("&XfJT0ZAB-")
+        );
+        // Nothing that classifies as Sent: nowhere to put a copy.
+        assert_eq!(sent_mailbox_in(&listed(&["INBOX", "Archive"])), None);
+        assert_eq!(sent_mailbox_in(&[]), None);
+    }
+
+    /// A mail that goes out: the account is the envelope's sender, its
+    /// credentials are what the submission logs in with, and the message on the
+    /// wire is the one the renderer built. A POP3 account has nowhere to file a
+    /// copy, and says so rather than inventing a folder.
+    #[test]
+    fn a_sent_mail_goes_out_with_the_account_as_its_sender() {
+        use std::io::BufRead;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            socket.write_all(b"220 canned ready\r\n").unwrap();
+            let mut reader = std::io::BufReader::new(socket.try_clone().unwrap());
+            let mut commands = Vec::new();
+            let mut message = String::new();
+            loop {
+                let mut line = String::new();
+                if reader.read_line(&mut line).unwrap() == 0 {
+                    break;
+                }
+                let command = line.trim_end().to_string();
+                let verb = command.split(' ').next().unwrap_or_default().to_uppercase();
+                commands.push(command);
+                match verb.as_str() {
+                    // No AUTH: this is the local-relay case, which must not be
+                    // sent credentials it never asked for.
+                    "EHLO" => socket
+                        .write_all(b"250-localhost\r\n250 SIZE 10240000\r\n")
+                        .unwrap(),
+                    "MAIL" | "RCPT" => socket.write_all(b"250 2.1.0 ok\r\n").unwrap(),
+                    "DATA" => {
+                        socket.write_all(b"354 go ahead\r\n").unwrap();
+                        loop {
+                            let mut body = String::new();
+                            if reader.read_line(&mut body).unwrap() == 0 {
+                                break;
+                            }
+                            if body == ".\r\n" {
+                                break;
+                            }
+                            message.push_str(&body);
+                        }
+                        socket.write_all(b"250 2.0.0 queued\r\n").unwrap();
+                    }
+                    "QUIT" => {
+                        socket.write_all(b"221 2.0.0 bye\r\n").unwrap();
+                        break;
+                    }
+                    _ => socket.write_all(b"250 ok\r\n").unwrap(),
+                }
+            }
+            (commands, message)
+        });
+
+        let mut account = Account {
+            id: "drop".to_string(),
+            name: "Ada Lovelace".to_string(),
+            protocol: Protocol::Pop3,
+            host: "127.0.0.1".to_string(),
+            port: 1,
+            username: "me@example.com".to_string(),
+            password: "secret".to_string(),
+            tls: crate::models::TlsMode::Plain,
+            smtp: Some(crate::models::SmtpSettings {
+                host: "127.0.0.1".to_string(),
+                port,
+                tls: crate::models::TlsMode::Plain,
+                login: None,
+            }),
+        };
+        let mail = Outgoing {
+            from_name: account.name.clone(),
+            from_addr: account.username.clone(),
+            to: vec!["bob@example.com".to_string()],
+            cc: Vec::new(),
+            bcc: Vec::new(),
+            subject: "Invoice 42".to_string(),
+            body: "Please pay it.\n".to_string(),
+        };
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let (recipients, copy) = send_message(&account, &mail, &tx).unwrap();
+        assert_eq!(recipients, ["bob@example.com"]);
+        assert!(
+            matches!(copy, SentCopy::None),
+            "a POP3 drop keeps no copy of what leaves"
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "the outcome is the caller's to send"
+        );
+
+        let (commands, message) = server.join().unwrap();
+        assert!(
+            commands.iter().any(|c| c == "MAIL FROM:<me@example.com>"),
+            "{commands:?}"
+        );
+        assert!(
+            commands.iter().any(|c| c == "RCPT TO:<bob@example.com>"),
+            "{commands:?}"
+        );
+        assert!(
+            !commands.iter().any(|c| c.starts_with("AUTH")),
+            "a server that asks for no login is not sent one: {commands:?}"
+        );
+        assert!(message.contains("Subject: Invoice 42"), "{message}");
+        assert!(
+            message.contains("From: Ada Lovelace <me@example.com>"),
+            "{message}"
+        );
+        assert!(
+            message.contains("Content-Transfer-Encoding: base64"),
+            "{message}"
+        );
+
+        // The two things that stop a send before a socket is opened: an account
+        // with no outgoing server, and a field that is not an address.
+        account.smtp = None;
+        assert!(send_message(&account, &mail, &tx).is_err());
+        account.smtp = Some(crate::models::SmtpSettings {
+            host: "127.0.0.1".to_string(),
+            port,
+            tls: crate::models::TlsMode::Plain,
+            login: None,
+        });
+        let mut junk = mail.clone();
+        junk.to = vec!["not an address".to_string()];
+        let error = send_message(&account, &junk, &tx).unwrap_err();
+        assert!(error.to_string().contains("not an address"), "{error}");
+    }
 
     #[test]
     fn a_first_sync_takes_the_newest_messages() {

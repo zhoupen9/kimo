@@ -196,6 +196,7 @@ mod tests {
             username: "me".to_string(),
             password: "secret".to_string(),
             tls: TlsMode::Plain,
+            smtp: None,
         };
         (account, server)
     }

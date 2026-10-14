@@ -202,6 +202,40 @@ impl ImapClient {
             .map(|fetched| fetched.raw))
     }
 
+    /// Put a message into a mailbox the server keeps: `APPEND`, with the
+    /// message as a synchronizing literal — the copy of a mail that was just
+    /// sent, so the account holds what it sent.
+    ///
+    /// The `+` continuation is what allows the bytes, exactly as in
+    /// `login_with_literal`: nothing has to guess at a size the server would
+    /// accept, and a server that says no says it before any of the message is
+    /// written. The flags are `(\Seen)` — a copy of a sent mail is not
+    /// something to come back to unread.
+    pub fn append(&mut self, mailbox: &str, raw: &[u8]) -> MailResult<()> {
+        let tag = self.next_tag();
+        self.conn.write_line(&format!(
+            "{} APPEND {} (\\Seen) {{{}}}",
+            tag,
+            quote_string(mailbox),
+            raw.len()
+        ))?;
+        let continuation = self.read_text_line()?;
+        if !continuation.starts_with('+') {
+            return Err(MailError::Refused(format!(
+                "APPEND {mailbox}: {continuation}"
+            )));
+        }
+        self.conn.write_raw(raw)?;
+        // The literal's own line ending, which ends the message: what `raw`
+        // carries is the mail, not the transport's terminator.
+        self.conn.write_line("")?;
+        let (answer, _) = self.read_until_tagged(&tag)?;
+        if !answer.starts_with("OK") {
+            return Err(MailError::Refused(format!("APPEND {mailbox}: {answer}")));
+        }
+        Ok(())
+    }
+
     /// Delete one message from `folder`, if the server still has it.
     ///
     /// The mailbox is checked against LIST first: one the server no longer
@@ -457,7 +491,7 @@ fn decode_mutf7_segment(segment: &str) -> Option<String> {
 mod tests {
     use super::*;
     use crate::models::Protocol;
-    use std::io::{BufRead, Write};
+    use std::io::{BufRead, Read, Write};
 
     #[test]
     fn quotes_are_escaped() {
@@ -586,7 +620,13 @@ mod tests {
             }
             commands
         });
-        let account = Account {
+        (local_account(port), server)
+    }
+
+    /// The account the canned servers here listen for: loopback, plain, one
+    /// pair of credentials.
+    fn local_account(port: u16) -> Account {
+        Account {
             id: "local".to_string(),
             name: "Local".to_string(),
             protocol: Protocol::Imap,
@@ -595,8 +635,8 @@ mod tests {
             username: "me".to_string(),
             password: "secret".to_string(),
             tls: TlsMode::Plain,
-        };
-        (account, server)
+            smtp: None,
+        }
     }
 
     /// A canned mailbox: LIST knows INBOX, SELECT opens it, and one message
@@ -818,5 +858,42 @@ mod tests {
         assert_eq!(client.uid_body(45).unwrap().unwrap(), body.as_bytes());
         assert_eq!(client.uid_body(46).unwrap(), None);
         assert_eq!(server.join().unwrap().len(), 3);
+    }
+    /// The copy of a sent mail goes up as an `APPEND` literal: the command names the
+    /// mailbox, the size and the flag, the `+` continuation is what lets the
+    /// bytes through, and the server's tagged `OK` is the answer.
+    #[test]
+    fn a_sent_copy_is_appended_as_a_seen_literal() {
+        const RAW: &[u8] = b"Subject: hi\r\n\r\nhello\r\n";
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            socket.write_all(b"* OK ready\r\n").unwrap();
+            let mut reader = std::io::BufReader::new(socket.try_clone().unwrap());
+            let mut line = String::new();
+            reader.read_line(&mut line).unwrap();
+            let (tag, command) = line.trim_end().split_once(' ').unwrap();
+            assert_eq!(
+                command,
+                format!("APPEND \"INBOX.Sent\" (\\Seen) {{{}}}", RAW.len())
+            );
+            socket.write_all(b"+ Ready for literal data\r\n").unwrap();
+            let mut literal = vec![0_u8; RAW.len()];
+            reader.read_exact(&mut literal).unwrap();
+            // The client's own empty line closes the literal.
+            let mut end = String::new();
+            reader.read_line(&mut end).unwrap();
+            assert_eq!(end, "\r\n");
+            socket
+                .write_all(format!("{tag} OK APPEND completed\r\n").as_bytes())
+                .unwrap();
+            literal
+        });
+
+        let account = local_account(port);
+        let mut client = ImapClient::connect(&account).unwrap();
+        client.append("INBOX.Sent", RAW).unwrap();
+        assert_eq!(server.join().unwrap(), RAW);
     }
 }

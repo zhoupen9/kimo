@@ -46,11 +46,13 @@ use rusqlite::{params, Connection, OptionalExtension};
 use serde::Deserialize;
 
 use crate::error::{MailError, MailResult};
-use crate::models::{Account, InlineImage, MailMessage, Protocol, TlsMode};
+use crate::models::{
+    Account, InlineImage, MailMessage, Protocol, SmtpLogin, SmtpSettings, TlsMode,
+};
 use crate::storage::{self, Folder, Mailbox};
 
 /// The schema version this build writes and understands.
-pub const SCHEMA_VERSION: i64 = 4;
+pub const SCHEMA_VERSION: i64 = 5;
 
 /// How long a statement waits for another writer before giving up. Jobs hold
 /// the connection only around their SQL, so this is a backstop, not a plan.
@@ -72,6 +74,15 @@ CREATE TABLE IF NOT EXISTS accounts (
     -- Plain text, as it always was (see AGENTS.md); the file is mode 0600.
     password TEXT NOT NULL,
     tls      TEXT NOT NULL CHECK (tls IN ('implicit', 'start_tls', 'plain')),
+    -- SMTP submission (schema v5). A NULL smtp_host is an account that cannot
+    -- send at all; a NULL smtp_username means "submit as the account
+    -- itself", which is what most providers expect. All five are written and
+    -- read together (`smtp_from_row`).
+    smtp_host     TEXT,
+    smtp_port     INTEGER,
+    smtp_tls      TEXT CHECK (smtp_tls IN ('implicit', 'start_tls', 'plain')),
+    smtp_username TEXT,
+    smtp_password TEXT,
     -- The navigation column's order. New accounts append; editing one keeps it.
     position INTEGER NOT NULL
 );
@@ -205,6 +216,22 @@ ALTER TABLE folders ADD COLUMN oldest_uid INTEGER;
 
 UPDATE folders SET oldest_uid = 1
  WHERE (SELECT protocol FROM accounts WHERE id = folders.account_id) = 'pop3';
+"#;
+
+/// The step from `user_version` 4 to 5: the outgoing server. There is
+/// nothing to derive — a database from before this step has no SMTP settings
+/// to move over, so every account it holds starts as one that reads mail only,
+/// and Preferences → Accounts is where it gets a way to send.
+///
+/// The `CHECK` is in both this step and `SCHEMA_SQL` so a migrated table and
+/// a fresh one have the same shape; SQLite allows a CHECK on `ADD COLUMN` (the
+/// existing rows hold NULL, which no CHECK rejects).
+const MIGRATE_V5_SQL: &str = r#"
+ALTER TABLE accounts ADD COLUMN smtp_host     TEXT;
+ALTER TABLE accounts ADD COLUMN smtp_port     INTEGER;
+ALTER TABLE accounts ADD COLUMN smtp_tls      TEXT CHECK (smtp_tls IN ('implicit', 'start_tls', 'plain'));
+ALTER TABLE accounts ADD COLUMN smtp_username TEXT;
+ALTER TABLE accounts ADD COLUMN smtp_password TEXT;
 "#;
 
 /// IMAP's floor as the mail a database from before version 4 already implies:
@@ -478,6 +505,12 @@ fn migrate(conn: &mut Connection, legacy: Option<(&Path, &Path)>) -> MailResult<
         tx.pragma_update(None, "user_version", 4)?;
         tx.commit()?;
     }
+    if start < 5 {
+        let tx = conn.transaction()?;
+        tx.execute_batch(MIGRATE_V5_SQL)?;
+        tx.pragma_update(None, "user_version", 5)?;
+        tx.commit()?;
+    }
     Ok(())
 }
 
@@ -521,7 +554,8 @@ pub fn load_accounts() -> MailResult<Vec<Account>> {
 
 fn load_accounts_on(conn: &Connection) -> MailResult<Vec<Account>> {
     let mut stmt = conn.prepare(
-        "SELECT id, name, protocol, host, port, username, password, tls
+        "SELECT id, name, protocol, host, port, username, password, tls,
+                smtp_host, smtp_port, smtp_tls, smtp_username, smtp_password
            FROM accounts ORDER BY position, id",
     )?;
     let rows = stmt.query_map([], |row| {
@@ -534,11 +568,30 @@ fn load_accounts_on(conn: &Connection) -> MailResult<Vec<Account>> {
             row.get::<_, String>(5)?,
             row.get::<_, String>(6)?,
             row.get::<_, String>(7)?,
+            row.get::<_, Option<String>>(8)?,
+            row.get::<_, Option<i64>>(9)?,
+            row.get::<_, Option<String>>(10)?,
+            row.get::<_, Option<String>>(11)?,
+            row.get::<_, Option<String>>(12)?,
         ))
     })?;
     let mut accounts = Vec::new();
     for row in rows {
-        let (id, name, protocol, host, port, username, password, tls) = row?;
+        let (
+            id,
+            name,
+            protocol,
+            host,
+            port,
+            username,
+            password,
+            tls,
+            smtp_host,
+            smtp_port,
+            smtp_tls,
+            smtp_username,
+            smtp_password,
+        ) = row?;
         let protocol = Protocol::parse(&protocol).ok_or_else(|| {
             MailError::Storage(format!("account {id}: unknown protocol {protocol:?}"))
         })?;
@@ -546,6 +599,14 @@ fn load_accounts_on(conn: &Connection) -> MailResult<Vec<Account>> {
             .ok_or_else(|| MailError::Storage(format!("account {id}: unknown TLS mode {tls:?}")))?;
         let port = u16::try_from(port)
             .map_err(|_| MailError::Storage(format!("account {id}: port {port} out of range")))?;
+        let smtp = smtp_from_row(
+            &id,
+            smtp_host,
+            smtp_port,
+            smtp_tls,
+            smtp_username,
+            smtp_password,
+        )?;
         accounts.push(Account {
             id,
             name,
@@ -555,9 +616,52 @@ fn load_accounts_on(conn: &Connection) -> MailResult<Vec<Account>> {
             username,
             password,
             tls,
+            smtp,
         });
     }
     Ok(accounts)
+}
+
+/// The outgoing-server half of an `accounts` row. A NULL (or empty) host is an
+/// account that cannot send, and the rest of the tuple is then meaningless: it
+/// is ignored rather than reported. A row that *names* a host without a usable
+/// port or TLS mode is bad data of the same kind an unknown protocol is, and
+/// fails the load instead of quietly sending through something nobody
+/// configured.
+fn smtp_from_row(
+    id: &str,
+    host: Option<String>,
+    port: Option<i64>,
+    tls: Option<String>,
+    username: Option<String>,
+    password: Option<String>,
+) -> MailResult<Option<SmtpSettings>> {
+    let Some(host) = host.filter(|host| !host.is_empty()) else {
+        return Ok(None);
+    };
+    let port = port
+        .and_then(|port| u16::try_from(port).ok())
+        .ok_or_else(|| {
+            MailError::Storage(format!("account {id}: outgoing server has no usable port"))
+        })?;
+    let tls = tls
+        .as_deref()
+        .and_then(TlsMode::parse)
+        .ok_or_else(|| MailError::Storage(format!("account {id}: unknown outgoing TLS mode")))?;
+    // A username is what makes the pair a login: with none, the account's own
+    // credentials are what the submission logs in with (see `Account::smtp_login`).
+    let login = username
+        .filter(|username| !username.is_empty())
+        .map(|username| SmtpLogin {
+            username,
+            password: password.unwrap_or_default(),
+        });
+    Ok(Some(SmtpSettings {
+        host,
+        port,
+        tls,
+        login,
+    }))
 }
 
 /// Insert an account, or update the one with the same id in place. An edit
@@ -569,18 +673,38 @@ pub fn save_account(account: &Account) -> MailResult<()> {
 }
 
 fn save_account_on(conn: &Connection, account: &Account) -> MailResult<()> {
+    // The outgoing server as five columns, NULLs and all: no settings is five
+    // NULLs, and no login is a NULL username — the same shape `smtp_from_row`
+    // reads back.
+    let (smtp_host, smtp_port, smtp_tls, smtp_username, smtp_password) = match &account.smtp {
+        Some(smtp) => (
+            Some(smtp.host.as_str()),
+            Some(i64::from(smtp.port)),
+            Some(smtp.tls.as_str()),
+            smtp.login.as_ref().map(|login| login.username.as_str()),
+            smtp.login.as_ref().map(|login| login.password.as_str()),
+        ),
+        None => (None, None, None, None, None),
+    };
     conn.execute(
-        "INSERT INTO accounts (id, name, protocol, host, port, username, password, tls, position)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8,
+        "INSERT INTO accounts (id, name, protocol, host, port, username, password, tls,
+                               smtp_host, smtp_port, smtp_tls, smtp_username, smtp_password,
+                               position)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13,
                  (SELECT COALESCE(MAX(position), -1) + 1 FROM accounts))
          ON CONFLICT(id) DO UPDATE SET
-             name     = excluded.name,
-             protocol = excluded.protocol,
-             host     = excluded.host,
-             port     = excluded.port,
-             username = excluded.username,
-             password = excluded.password,
-             tls      = excluded.tls",
+             name          = excluded.name,
+             protocol      = excluded.protocol,
+             host          = excluded.host,
+             port          = excluded.port,
+             username      = excluded.username,
+             password      = excluded.password,
+             tls           = excluded.tls,
+             smtp_host     = excluded.smtp_host,
+             smtp_port     = excluded.smtp_port,
+             smtp_tls      = excluded.smtp_tls,
+             smtp_username = excluded.smtp_username,
+             smtp_password = excluded.smtp_password",
         params![
             account.id,
             account.name,
@@ -590,6 +714,11 @@ fn save_account_on(conn: &Connection, account: &Account) -> MailResult<()> {
             account.username,
             account.password,
             account.tls.as_str(),
+            smtp_host,
+            smtp_port,
+            smtp_tls,
+            smtp_username,
+            smtp_password,
         ],
     )?;
     Ok(())
@@ -1285,6 +1414,8 @@ impl LegacyAccount {
             username: self.username.clone(),
             password: self.password.clone(),
             tls,
+            // The old accounts.json never described an outgoing server.
+            smtp: None,
         })
     }
 }
@@ -1396,6 +1527,37 @@ pub(crate) mod test_support {
         (conn, dir)
     }
 
+    /// Rewind a database to the shape it had *before* the step to `version`: the
+    /// columns every later step adds, dropped again, and the version that says
+    /// so. Without this the table still looks like today's, and the step under
+    /// test collides with columns it is meant to be creating.
+    pub(crate) fn rewind_to(conn: &Connection, version: i64) {
+        let mut sql = String::new();
+        if version < 2 {
+            sql.push_str("ALTER TABLE folders DROP COLUMN uid_next;\n");
+            sql.push_str("ALTER TABLE folders DROP COLUMN first_num;\n");
+        }
+        if version < 3 {
+            sql.push_str("ALTER TABLE folders DROP COLUMN listed;\n");
+        }
+        if version < 4 {
+            sql.push_str("ALTER TABLE folders DROP COLUMN oldest_uid;\n");
+        }
+        if version < 5 {
+            for column in [
+                "smtp_host",
+                "smtp_port",
+                "smtp_tls",
+                "smtp_username",
+                "smtp_password",
+            ] {
+                sql.push_str(&format!("ALTER TABLE accounts DROP COLUMN {column};\n"));
+            }
+        }
+        conn.execute_batch(&sql).unwrap();
+        conn.pragma_update(None, "user_version", version).unwrap();
+    }
+
     /// The account `save` stores into.
     fn account(id: &str) -> Account {
         Account {
@@ -1407,6 +1569,7 @@ pub(crate) mod test_support {
             username: format!("{id}@example.com"),
             password: "secret".to_string(),
             tls: TlsMode::Implicit,
+            smtp: None,
         }
     }
 
@@ -1445,6 +1608,12 @@ mod tests {
         super::test_support::temp_db(name)
     }
 
+    /// Rewind a database to the shape it had before a step of the ladder (see
+    /// `test_support::rewind_to`).
+    fn rewind_to(conn: &Connection, version: i64) {
+        super::test_support::rewind_to(conn, version)
+    }
+
     fn account(id: &str) -> Account {
         Account {
             id: id.to_string(),
@@ -1455,6 +1624,7 @@ mod tests {
             username: format!("{id}@example.com"),
             password: "secret".to_string(),
             tls: TlsMode::Implicit,
+            smtp: None,
         }
     }
 
@@ -2190,16 +2360,9 @@ mod tests {
         save_account_on(&conn, &pop).unwrap();
         save_messages_on(&mut conn, "pop", "INBOX", None, &[message("1", "a", "a")]).unwrap();
 
-        // Rewind to the shape version 1 shipped: no marks, no listedness, and
-        // the version that says so.
-        conn.execute_batch(
-            "ALTER TABLE folders DROP COLUMN uid_next;
-             ALTER TABLE folders DROP COLUMN first_num;
-             ALTER TABLE folders DROP COLUMN listed;
-             ALTER TABLE folders DROP COLUMN oldest_uid;",
-        )
-        .unwrap();
-        conn.pragma_update(None, "user_version", 1).unwrap();
+        // Rewind to the shape version 1 shipped: no marks, no listedness, no
+        // outgoing server, and the version that says so.
+        rewind_to(&conn, 1);
 
         migrate(&mut conn, None).unwrap();
         assert_eq!(
@@ -2263,9 +2426,7 @@ mod tests {
         save_messages_on(&mut conn, "pop", "INBOX", None, &[message("9", "a", "a")]).unwrap();
         set_first_num_on(&conn, "pop", "INBOX", 4951).unwrap();
 
-        conn.execute_batch("ALTER TABLE folders DROP COLUMN oldest_uid;")
-            .unwrap();
-        conn.pragma_update(None, "user_version", 3).unwrap();
+        rewind_to(&conn, 3);
 
         migrate(&mut conn, None).unwrap();
         assert_eq!(
@@ -2285,6 +2446,90 @@ mod tests {
             "4950 messages below the floor, and 1 is where they start"
         );
         integrity_check_on(&conn).unwrap();
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A database from version 4 gains the outgoing server as five empty
+    /// columns: its accounts keep working, none of them can send until the form
+    /// in Preferences → Accounts is filled in, and the migrated table is the
+    /// shape a fresh database is born with.
+    #[test]
+    fn a_version_4_database_gets_an_empty_outgoing_server() {
+        let (mut conn, dir) = test_db("migrate-v5");
+        save_account_on(&conn, &account("work")).unwrap();
+        rewind_to(&conn, 4);
+
+        migrate(&mut conn, None).unwrap();
+        assert_eq!(
+            count(&conn, "SELECT * FROM pragma_user_version"),
+            SCHEMA_VERSION
+        );
+        let accounts = load_accounts_on(&conn).unwrap();
+        assert_eq!(accounts.len(), 1);
+        assert_eq!(accounts[0].name, "Account work");
+        assert_eq!(accounts[0].smtp, None, "nothing to send through yet");
+        // The step's own CHECK is one the table accepts: a mode it does not
+        // name is refused, whatever wrote the row.
+        assert!(conn
+            .execute(
+                "UPDATE accounts SET smtp_host = 'smtp.example.com',
+                                     smtp_port = 587,
+                                     smtp_tls = 'starttls'",
+                [],
+            )
+            .is_err());
+        integrity_check_on(&conn).unwrap();
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The outgoing server is five columns that are written and read together:
+    /// what `save_account` stores is what `load_accounts` hands back, login and all.
+    /// A row that names a host and cannot say how to reach it is refused the way
+    /// an unknown protocol is.
+    #[test]
+    fn an_outgoing_server_round_trips_through_the_account() {
+        let (conn, dir) = test_db("smtp-account");
+        let mut work = account("work");
+        work.smtp = Some(SmtpSettings {
+            host: "smtp.example.com".to_string(),
+            port: 587,
+            tls: TlsMode::StartTls,
+            login: None,
+        });
+        save_account_on(&conn, &work).unwrap();
+        let mut other = account("other");
+        other.smtp = Some(SmtpSettings {
+            host: "smtp.invalid".to_string(),
+            port: 465,
+            tls: TlsMode::Implicit,
+            login: Some(SmtpLogin {
+                username: "code".to_string(),
+                password: "abcd".to_string(),
+            }),
+        });
+        save_account_on(&conn, &other).unwrap();
+
+        let accounts = load_accounts_on(&conn).unwrap();
+        assert_eq!(accounts[0].smtp, work.smtp);
+        assert_eq!(accounts[1].smtp, other.smtp);
+        assert_eq!(
+            accounts[0].smtp_login(),
+            Some(("work@example.com", "secret")),
+            "no login of its own: the account's credentials"
+        );
+        assert_eq!(accounts[1].smtp_login(), Some(("code", "abcd")));
+
+        // Editing the account keeps the outgoing server, the way it keeps
+        // everything else about the row.
+        let mut edited = work.clone();
+        edited.name = "Renamed".to_string();
+        save_account_on(&conn, &edited).unwrap();
+        assert_eq!(load_accounts_on(&conn).unwrap()[0].smtp, work.smtp);
+
+        // A host with no port is not a half-configured account to guess at.
+        conn.execute("UPDATE accounts SET smtp_port = NULL WHERE id = 'work'", [])
+            .unwrap();
+        assert!(load_accounts_on(&conn).is_err());
         let _ = fs::remove_dir_all(&dir);
     }
 

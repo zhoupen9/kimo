@@ -1,24 +1,32 @@
 # Kimo
 
 A desktop email client written in **pure Rust**, with an immediate-mode GUI
-built on [eframe/egui](https://github.com/emilk/egui). Kimo speaks exactly
-two mail retrieval protocols: **IMAP4rev1** and **POP3** — both implemented
-by hand in `src/protocol/` on top of `std::net::TcpStream` + rustls. There is
-no C library in the dependency tree: TLS uses rustls with the `ring` crypto
-provider and Mozilla's root certificates.
+built on [egui](https://github.com/emilk/egui) — driven directly through winit,
+`egui-winit` and `egui-wgpu`. Kimo speaks **IMAP4rev1** and **POP3** for
+reading mail and **SMTP** (submission) for sending it, all implemented by hand
+in `src/protocol/` on top of `std::net::TcpStream` + rustls. The dependency
+tree has no C library beyond the bundled SQLite the mail database is: TLS uses
+rustls with the `ring` crypto provider and Mozilla's root certificates.
 
-> Kimo is receive-only by design: there is no SMTP, so composing or sending
-> mail is out of scope.
+> Sending is text-only submission: no attachments, no drafts, no outbox and no
+> HTML bodies. The compose card writes a plain-text mail, sends it over the
+> account's SMTP server and files a copy in the account's Sent mailbox when the
+> server has one.
 
 ## Features
 
 - Multiple accounts, IMAP and POP3
-- Implicit TLS, STARTTLS, and plain connections
+- Implicit TLS, STARTTLS and plain connections, for reading and for sending
 - Folder listing (IMAP), folder selection and per-folder caches
-- Message list with unread markers, text preview, attachment names
+- Message list with unread markers, text preview and attachment names
 - `\Seen` flag synchronization (IMAP server-side, POP3 local-only)
-- Offline-first: messages are cached as JSON under
-  `~/.local/share/kimo/cache/`; accounts live in `~/.config/kimo/accounts.json`
+- Compose and send over SMTP, with the copy filed in Sent (IMAP `APPEND`)
+- Export the open mail as the server's original `.eml`
+- Search over the cached mail (SQLite FTS5 with a CJK bigram index), and two
+  HTML renderers: native egui widgets, or a Blitz-rasterized page
+- Offline-first: accounts and messages live in one SQLite database,
+  `~/.local/share/kimo/mail.db`; UI preferences in
+  `~/.config/kimo/settings.json`
 - CJK font fallback when a system Noto/WenQuanYi font is installed
 
 ## Build & run
@@ -29,12 +37,13 @@ cargo run --release  # release
 ```
 
 Linux users need the usual GUI stack headers available at runtime
-(libxkbcommon, Wayland/X11 client libraries); eframe pulls everything else.
+(libxkbcommon, Wayland/X11 client libraries).
 
 ## Security note
 
-Account credentials are currently stored in **plain text** in
-`~/.config/kimo/accounts.json`. Treat that file accordingly.
+Account passwords — the incoming one and the outgoing one — are stored in
+**plain text** in `~/.local/share/kimo/mail.db` (mode 0600). Treat that file
+accordingly.
 
 ## Development
 

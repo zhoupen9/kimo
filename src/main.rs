@@ -1,4 +1,5 @@
-//! Kimo — a pure-Rust email client (IMAP & POP3) with an egui interface.
+//! Kimo — a pure-Rust email client (IMAP & POP3 in, SMTP out) with an egui
+//! interface.
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
@@ -14,6 +15,7 @@ mod gpu;
 mod html;
 mod mail;
 mod models;
+mod outgoing;
 mod protocol;
 // Test-only measurement harness for the two HTML renderers; see the file.
 #[cfg(test)]
