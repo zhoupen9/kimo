@@ -3526,6 +3526,7 @@ impl KimoApp {
             third: &preview,
             unread: !msg.seen,
             selected,
+            has_attachments: !msg.attachments.is_empty(),
         };
         self.message_card(ui, &card, first)
     }
@@ -3542,9 +3543,7 @@ impl KimoApp {
             .map(|account| account.name.as_str())
             .unwrap_or(hit.account_id.as_str());
         let folder = crate::protocol::imap::decode_mailbox_name(&hit.folder);
-        // The paperclip the reading pane uses, so a hit says when it has parts.
-        let clip = if hit.attachments > 0 { "📎 " } else { "" };
-        let third = format!("{clip}{account} · {folder} — {}", hit.snippet);
+        let third = format!("{account} · {folder} — {}", hit.snippet);
         let card = CardText {
             from: &hit.from,
             title: &hit.subject,
@@ -3552,6 +3551,9 @@ impl KimoApp {
             third: &third,
             unread: !hit.seen,
             selected,
+            // The row draws the same paperclip a folder row does, so a hit says
+            // what the mail carries the one way the whole list says it.
+            has_attachments: hit.attachments > 0,
         };
         self.message_card(ui, &card, first)
     }
@@ -3679,13 +3681,20 @@ impl KimoApp {
             card.unread,
         );
 
-        // Second row: subject.
+        // Second row: subject. A mail with parts gives the end of this line to
+        // the clip, so the title is elided a glyph earlier rather than drawn
+        // under it.
+        let title_right = if card.has_attachments {
+            text_right - ROW_CLIP_WIDTH - ROW_CLIP_GAP
+        } else {
+            text_right
+        };
         let subject = truncate_galley(
             ui.ctx(),
             card.title,
             ROW_TITLE_FONT_SIZE,
             title_color,
-            text_right - text_left,
+            (title_right - text_left).max(40.0),
         );
         paint_row_text(
             painter,
@@ -3694,6 +3703,18 @@ impl KimoApp {
             title_color,
             card.unread,
         );
+        if card.has_attachments {
+            // Always muted, and independent of the unread weight: what the mail
+            // carries is not part of its title.
+            paint_clip_icon(
+                painter,
+                egui::Rect::from_center_size(
+                    egui::pos2(text_right - ROW_CLIP_WIDTH / 2.0, rect.top() + 40.0),
+                    egui::vec2(ROW_CLIP_SIZE, ROW_CLIP_SIZE),
+                ),
+                scheme.text_weak,
+            );
+        }
 
         // Third row: the preview — or, for a search result, where the mail
         // lives and the line that matched — always muted.
@@ -5315,6 +5336,10 @@ struct CardText<'a> {
     /// for bold, see the message-row convention in AGENTS.md.
     unread: bool,
     selected: bool,
+    /// The mail has parts, so the row draws a paperclip at the end of its
+    /// title line. Both lists can answer it: a folder's mail from what was
+    /// stored with it, a search hit from what the query counted.
+    has_attachments: bool,
 }
 
 const MESSAGE_ROW_HEIGHT: f32 = 68.0;
@@ -5327,6 +5352,15 @@ const AVATAR_FONT_SIZE: f32 = 14.0;
 const ROW_DATE_FONT_SIZE: f32 = 11.0;
 const ROW_TITLE_FONT_SIZE: f32 = 12.0;
 const ROW_PREVIEW_FONT_SIZE: f32 = 11.0;
+/// The paperclip a row draws when the mail has parts: the box its outline is
+/// drawn in (`paint_clip_icon` maps the glyph's 24-unit design onto it), the
+/// width the clip actually comes out at — a clip is taller than it is wide, so
+/// the box is square and the drawn glyph is not — and the room it keeps in
+/// front of itself. The title line gives up the width and that room; the box's
+/// own height is what keeps the glyph on the line.
+const ROW_CLIP_SIZE: f32 = 14.0;
+const ROW_CLIP_WIDTH: f32 = 8.5;
+const ROW_CLIP_GAP: f32 = 7.0;
 
 /// Decode a stored inline image into an egui texture. Runs on the UI thread
 /// but only once per message/cid; inline mail images are small.
@@ -5961,10 +5995,61 @@ fn paint_cog_icon(p: &egui::Painter, rect: egui::Rect, color: egui::Color32) {
 // box the icon set the folder icons come from is drawn in), so they render
 // identically regardless of which fonts are installed.
 
+/// Map a point of a 24×24 outline onto a box of `size` centred on `center`.
+fn outline_point(center: egui::Pos2, x: f32, y: f32, size: f32) -> egui::Pos2 {
+    center + egui::vec2(x - 12.0, y - 12.0) * (size / 24.0)
+}
+
 /// Map a point of one of those 24×24 outlines onto a title-bar cell, centred
 /// on `center` and drawn at `MAIL_ACTION_GLYPH`.
 fn glyph_point(center: egui::Pos2, x: f32, y: f32) -> egui::Pos2 {
-    center + egui::vec2(x - 12.0, y - 12.0) * (MAIL_ACTION_GLYPH / 24.0)
+    outline_point(center, x, y, MAIL_ACTION_GLYPH)
+}
+
+/// The paperclip a message row draws when the mail has parts: the wire of a
+/// clip, drawn as the one path it is — down, a half turn, up, over the top,
+/// down, and a wide half turn back up — the way the title bar's outlines are
+/// drawn, at `rect`'s size and in the caller's color.
+fn paint_clip_icon(p: &egui::Painter, rect: egui::Rect, color: egui::Color32) {
+    let scale = rect.width() / 24.0;
+    let g = |x: f32, y: f32| outline_point(rect.center(), x, y, rect.width());
+    let stroke = egui::Stroke::new(2.0_f32 * scale, color);
+    let up = egui::vec2(0.0, -1.0);
+    let down = egui::vec2(0.0, 1.0);
+    let left = egui::vec2(-1.0, 0.0);
+    let right = egui::vec2(1.0, 0.0);
+
+    // The inner loop, from its free end at the top: down, round the bottom and
+    // up the other side.
+    p.add(egui::Shape::line(vec![g(9.6, 8.5), g(9.6, 15.5)], stroke));
+    wire_turn(p, g(9.6, 15.5), down, right, 2.4 * scale, stroke);
+    p.add(egui::Shape::line(vec![g(14.4, 15.5), g(14.4, 6.0)], stroke));
+    // Over the top and down the outside.
+    wire_turn(p, g(14.4, 6.0), up, right, 2.05 * scale, stroke);
+    p.add(egui::Shape::line(vec![g(18.5, 6.0), g(18.5, 13.5)], stroke));
+    // The wide turn under the whole clip, and back up to the last free end.
+    wire_turn(p, g(18.5, 13.5), down, left, 6.5 * scale, stroke);
+    p.add(egui::Shape::line(vec![g(5.5, 13.5), g(5.5, 7.0)], stroke));
+}
+
+/// A half turn of a wire, drawn the way the icon set draws a corner: two quarter
+/// turns, each a quadratic whose control is the corner its own tangents meet at
+/// (`glyph_tail`), which is what makes one quadratic read as an arc at glyph
+/// sizes. The wire arrives at `from` travelling along `dir` — a unit vector —
+/// and leaves `2 * radius` away along `normal`, travelling the opposite way,
+/// `normal` being the side the turn bulges toward.
+fn wire_turn(
+    p: &egui::Painter,
+    from: egui::Pos2,
+    dir: egui::Vec2,
+    normal: egui::Vec2,
+    radius: f32,
+    stroke: egui::Stroke,
+) {
+    let middle = from + radius * (dir + normal);
+    let end = from + 2.0 * radius * normal;
+    glyph_tail(p, from, from + radius * dir, middle, stroke);
+    glyph_tail(p, middle, end + radius * dir, end, stroke);
 }
 
 /// The tail of the reply and forward arrows: a quarter turn rather than a
@@ -7174,6 +7259,93 @@ mod tests {
         assert!(started, "a click on the card did not start a download");
     }
 
+    /// A mail that came with parts says so in the list: a paperclip at the end
+    /// of its title line, drawn the same way for a folder row and for a search
+    /// hit. A mail with none draws none — and the search row says it with the
+    /// clip rather than with a second, textual paperclip in its third line.
+    #[test]
+    fn a_mail_with_attachments_carries_a_clip_in_the_list() {
+        let ctx = egui::Context::default();
+        crate::fonts::install(&ctx, None, None);
+        let mut app = app_with_messages(&ctx, 1);
+
+        let with_parts = |app: &mut KimoApp, count: usize| {
+            app.states
+                .get_mut("acct")
+                .expect("the fixture account")
+                .mailbox
+                .folders[0]
+                .messages[0]
+                .attachments = (0..count)
+                .map(|index| Attachment {
+                    name: format!("file-{index}.pdf"),
+                    content_type: "application/pdf".to_string(),
+                    size: 1024,
+                })
+                .collect();
+        };
+
+        // A frame first: the list records its own rect as it draws.
+        let _ = frame_texts(&ctx, &mut app);
+        let mut column = app.list_column;
+        let strokes = list_glyph_strokes(&frame_shapes_at(&ctx, &mut app, 1400.0), column);
+        assert!(strokes.is_empty(), "an empty mail drew a clip: {strokes:?}");
+
+        // One file: one clip, at the end of the title line — right of the
+        // subject and inside the row's own text column.
+        with_parts(&mut app, 1);
+        column = app.list_column;
+        let strokes = list_glyph_strokes(&frame_shapes_at(&ctx, &mut app, 1400.0), column);
+        let clip = strokes
+            .iter()
+            .fold(None::<egui::Rect>, |bounds, rect| {
+                Some(bounds.map_or(*rect, |b| b.union(*rect)))
+            })
+            .expect("the row of a mail with a file draws a clip");
+        assert!(
+            clip.width() > ROW_CLIP_WIDTH - 2.0
+                && clip.width() <= ROW_CLIP_SIZE
+                && clip.height() > ROW_CLIP_SIZE - 6.0
+                && clip.height() <= ROW_CLIP_SIZE,
+            "the clip fills the box the row reserves for it: {clip:?}"
+        );
+        assert!(
+            clip.right() > column.right() - 30.0 && clip.right() <= column.right(),
+            "the clip sits at the end of the title line: {clip:?} in {column:?}"
+        );
+        assert!(
+            clip.center().y > column.top() + TITLEBAR_HEIGHT
+                && clip.center().y < column.top() + TITLEBAR_HEIGHT + MESSAGE_ROW_HEIGHT,
+            "and on the row itself rather than above or below it: {clip:?}"
+        );
+
+        // The search row draws the same clip and no longer spells it out.
+        app.search.text = "report".to_string();
+        app.search_hits = vec![SearchHit {
+            account_id: "acct".to_string(),
+            folder: "INBOX".to_string(),
+            uid: "0".to_string(),
+            subject: "Subject 0".to_string(),
+            from: "Ada <ada@example.com>".to_string(),
+            date: "2026-01-01".to_string(),
+            timestamp: Some(1_700_000_000),
+            seen: false,
+            attachments: 1,
+            snippet: "a line with report in it".to_string(),
+        }];
+        let texts = frame_texts(&ctx, &mut app);
+        assert!(
+            !texts.iter().any(|text| text.contains('📎')),
+            "the search row still spells the paperclip out: {texts:?}"
+        );
+        let column = app.list_column;
+        let strokes = list_glyph_strokes(&frame_shapes_at(&ctx, &mut app, 1400.0), column);
+        assert!(
+            !strokes.is_empty(),
+            "a search hit with a file draws no clip: {strokes:?}"
+        );
+    }
+
     /// What a card's second line is made of, and the sizes it prints: the type
     /// and the size each appear when the mail was stored with them and are
     /// simply absent when it was not.
@@ -7445,6 +7617,57 @@ mod tests {
         let mut output = ctx.run_ui(input, |ui| app.ui(ui));
         output.textures_delta.clear();
         output.shapes
+    }
+
+    /// The box one painted stroke covers, for the tests that look for a glyph
+    /// rather than for text. `None` for everything a glyph is not: text, fills,
+    /// images, meshes, and nested shape lists, which the caller walks itself.
+    fn stroke_bounds(shape: &egui::Shape) -> Option<egui::Rect> {
+        match shape {
+            egui::Shape::LineSegment { points, .. } => {
+                Some(egui::Rect::from_two_pos(points[0], points[1]))
+            }
+            egui::Shape::QuadraticBezier(quad) => Some(egui::Rect::from_points(&quad.points)),
+            egui::Shape::Path(path) => Some(egui::Rect::from_points(&path.points)),
+            _ => None,
+        }
+    }
+
+    /// Every stroke of a frame that is small enough to be a glyph and lands in
+    /// the message list — the column's own width, below the floating title bar,
+    /// which is where its rows are. In the list that is the paperclip and
+    /// nothing else: a row's edges span the column, and the title bar's own
+    /// glyphs are above it.
+    fn list_glyph_strokes(
+        shapes: &[egui::epaint::ClippedShape],
+        column: egui::Rect,
+    ) -> Vec<egui::Rect> {
+        let mut out = Vec::new();
+        for clipped in shapes {
+            collect_glyph_strokes(&clipped.shape, column, &mut out);
+        }
+        out
+    }
+
+    fn collect_glyph_strokes(shape: &egui::Shape, column: egui::Rect, out: &mut Vec<egui::Rect>) {
+        if let egui::Shape::Vec(shapes) = shape {
+            for shape in shapes {
+                collect_glyph_strokes(shape, column, out);
+            }
+            return;
+        }
+        let Some(bounds) = stroke_bounds(shape) else {
+            return;
+        };
+        let centre = bounds.center();
+        if bounds.width() <= ROW_CLIP_SIZE + 2.0
+            && bounds.height() <= ROW_CLIP_SIZE + 2.0
+            && centre.x > column.left()
+            && centre.x < column.right()
+            && centre.y > TITLEBAR_HEIGHT
+        {
+            out.push(bounds);
+        }
     }
 
     /// Every filled rectangle of a frame that is exactly this size, however

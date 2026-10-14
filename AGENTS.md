@@ -587,7 +587,15 @@ Event (mpsc) ──► drain_events() at frame start ──► merge into Accoun
   that costs (`bench_nav_slide` measures it). A search's probes are largely
   cache-warm from the width of the frame before, but the frames where they are
   not pay `log2(chars)` shapings apiece — its worst frames cost about three
-  times what the elision's do.
+  times what the elision's do. A mail with parts gives the end of its title line
+  to a paperclip (`paint_clip_icon`, one stroked path in the title bar's own
+  24×24 outline style, drawn in the row's `text_weak` however unread it is),
+  and the title is elided `ROW_CLIP_WIDTH` + `ROW_CLIP_GAP` earlier for it;
+  `ROW_CLIP_SIZE` is the box the glyph is drawn in, which is taller than it is
+  wide because a clip is. Both lists answer the same question — a folder row
+  from `MailMessage.attachments`, a search hit from the count the query
+  returned — so a hit no longer spells the paperclip out in its third line: the
+  glyph is the one way the list says it.
 - The window is undecorated on purpose (`with_decorations(false)` in
   `main.rs`): `titlebar_area()` in `app.rs` draws the custom title bar — an
   `egui::Area` fixed to the window's top edge and shown *after* the panels, not
