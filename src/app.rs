@@ -30,7 +30,7 @@ use std::time::{Duration, Instant};
 use crate::folders::{self, FolderKind};
 use crate::fonts::FontFamily;
 use crate::glass::Glass;
-use crate::models::{Account, MailMessage, Protocol, SmtpLogin, SmtpSettings, TlsMode};
+use crate::models::{Account, Attachment, MailMessage, Protocol, SmtpLogin, SmtpSettings, TlsMode};
 use crate::outgoing::{self, Outgoing};
 use crate::search::{Scope, SearchHit, SearchQuery, SEARCH_LIMIT};
 use crate::storage::{self, Settings};
@@ -3845,6 +3845,12 @@ impl KimoApp {
             })
             .show(ui, |ui| {
                 ui.set_min_width(ui.available_width());
+                // The mail's own column: the headers draw across it and so do
+                // the attachment cards at the foot. Taken before anything is
+                // laid out, because a body wider than the pane — a fixed-width
+                // HTML table — widens the ui as it is drawn, and the cards
+                // belong to the mail, not to what the mail overflowed by.
+                let column = ui.available_width();
                 ui.heading(msg.subject.as_str());
                 ui.label(
                     egui::RichText::new(format!("From: {}", msg.from))
@@ -3865,17 +3871,35 @@ impl KimoApp {
                             .weak(),
                     );
                 }
-                if !msg.attachment_names.is_empty() {
-                    ui.label(
-                        egui::RichText::new(format!("📎 {}", msg.attachment_names.join(", ")))
-                            .small(),
-                    );
-                }
                 // The rule between the headers and the body spans the card, not
                 // just the mail's text column.
                 ui.add(egui::Separator::default().grow(CONTENT_PADDING.x));
                 self.mail_body(ui, msg);
+                self.attachment_cards(ui, msg, column);
             });
+    }
+
+    /// What the mail came with: one card per attachment, under the body.
+    ///
+    /// The cards live here rather than in `mail_body` because both renderers
+    /// have to have them — a Blitz body is a raster that a worker made, and the
+    /// cards are not part of it — and because they are the last thing on the
+    /// card, below the body whichever way the body was drawn. Nothing about a
+    /// card is clickable yet: what is stored here is the name, the type and the
+    /// size, never the bytes (see the export convention in AGENTS.md) — so the
+    /// tooltip is the whole interaction, and it is what shows a name the column
+    /// had to cut.
+    fn attachment_cards(&mut self, ui: &mut egui::Ui, msg: &MailMessage, column: f32) {
+        if msg.attachments.is_empty() {
+            return;
+        }
+        ui.add_space(ATTACHMENT_CARDS_TOP_GAP);
+        for (index, attachment) in msg.attachments.iter().enumerate() {
+            if index > 0 {
+                ui.add_space(ATTACHMENT_CARD_GAP);
+            }
+            attachment_card(ui, attachment, column);
+        }
     }
 
     /// The mail itself, laid out inside the card's scroll area (`mail_card`),
@@ -4772,6 +4796,19 @@ const CONTENT_PADDING: egui::Vec2 =
     egui::vec2(CONTENT_PADDING_I8 as f32, CONTENT_PADDING_I8 as f32);
 /// Corner radius of the reading pane's card.
 const CONTENT_CARD_CORNER_RADIUS: u8 = 8;
+/// The attachment cards under a mail's body: one card per file, as tall as a
+/// line of the list, with the gap between two of them and the room the section
+/// keeps between itself and the body above it. The card's own paddings are the
+/// glyph's inset, its size, the gap it leaves the text and the text's own right
+/// inset — one card is one file name and, under it, what the mail said about
+/// it.
+const ATTACHMENT_CARD_HEIGHT: f32 = 52.0;
+const ATTACHMENT_CARD_GAP: f32 = 8.0;
+const ATTACHMENT_CARDS_TOP_GAP: f32 = 18.0;
+const ATTACHMENT_CARD_CORNER_RADIUS: u8 = 6;
+const ATTACHMENT_CARD_PADDING: f32 = 12.0;
+const ATTACHMENT_GLYPH: f32 = 22.0;
+const ATTACHMENT_LINE_GAP: f32 = 2.0;
 /// Room the magnifier takes inside the search box, and the glyph's size. The
 /// inset is the field's left margin, so the text begins after the icon.
 const SEARCH_ICON_INSET: i8 = 22;
@@ -5312,6 +5349,138 @@ fn truncate_galley(
     // the row ends.
     job.wrap.break_anywhere = true;
     ctx.fonts_mut(|f| f.layout_job(job))
+}
+
+/// One attachment as a card: the file's glyph, its name, and — for mail that
+/// was fetched with them — the type and the size under it.
+///
+/// The card is as wide as the mail's own column, so a run of them reads as one
+/// part of the mail rather than as a list of its own. It never senses a click:
+/// what the database holds is the name, the type and the size, never the bytes
+/// (see the export convention in AGENTS.md), so there is nothing to open — and
+/// a card that lit up under the pointer would promise a file it cannot hand
+/// over. The hover text is the whole interaction, and it is what shows a name
+/// the column had to cut.
+fn attachment_card(ui: &mut egui::Ui, attachment: &Attachment, column: f32) {
+    let scheme = theme::of(ui.ctx());
+    let (rect, response) = ui.allocate_exact_size(
+        egui::vec2(column, ATTACHMENT_CARD_HEIGHT),
+        egui::Sense::hover(),
+    );
+    if !ui.is_rect_visible(rect) {
+        return;
+    }
+    ui.painter()
+        .rect_filled(rect, ATTACHMENT_CARD_CORNER_RADIUS, scheme.card);
+    ui.painter().rect_stroke(
+        rect,
+        ATTACHMENT_CARD_CORNER_RADIUS,
+        egui::Stroke::new(1.0_f32, scheme.border),
+        egui::StrokeKind::Inside,
+    );
+
+    let glyph = egui::Rect::from_min_size(
+        egui::pos2(
+            rect.left() + ATTACHMENT_CARD_PADDING,
+            rect.center().y - ATTACHMENT_GLYPH / 2.0,
+        ),
+        egui::vec2(ATTACHMENT_GLYPH, ATTACHMENT_GLYPH),
+    );
+    paint_file_icon(ui.painter(), glyph, scheme.text_weak);
+
+    let left = glyph.right() + ATTACHMENT_CARD_PADDING;
+    let width = (rect.right() - ATTACHMENT_CARD_PADDING - left).max(1.0);
+    let body = egui::TextStyle::Body.resolve(ui.style());
+    let small = egui::TextStyle::Small.resolve(ui.style());
+    let name = truncate_galley(ui.ctx(), &attachment.name, body.size, scheme.text, width);
+    let meta_text = attachment_meta(attachment);
+    let meta = (!meta_text.is_empty())
+        .then(|| truncate_galley(ui.ctx(), &meta_text, small.size, scheme.text_weak, width));
+
+    // The name and what is under it are one block, centred on the card.
+    let name_height = name.size().y;
+    let meta_height = meta
+        .as_ref()
+        .map_or(0.0, |meta| ATTACHMENT_LINE_GAP + meta.size().y);
+    let mut y = rect.center().y - (name_height + meta_height) / 2.0;
+    ui.painter().galley(egui::pos2(left, y), name, scheme.text);
+    if let Some(meta) = meta {
+        y += name_height + ATTACHMENT_LINE_GAP;
+        ui.painter()
+            .galley(egui::pos2(left, y), meta, scheme.text_weak);
+    }
+
+    let hover = if meta_text.is_empty() {
+        attachment.name.clone()
+    } else {
+        format!("{}\n{meta_text}", attachment.name)
+    };
+    let _ = response.on_hover_text(hover);
+}
+
+/// A card's second line: the MIME type and the size, whichever of the two the
+/// mail was stored with. Mail cached before schema v6 has neither — the part it
+/// arrived in is not kept, and a sync never refetches a mail the database has —
+/// so its card is the file name alone.
+fn attachment_meta(attachment: &Attachment) -> String {
+    let mut parts = Vec::new();
+    if !attachment.content_type.is_empty() {
+        parts.push(attachment.content_type.clone());
+    }
+    if attachment.size > 0 {
+        parts.push(human_size(attachment.size));
+    }
+    parts.join(" · ")
+}
+
+/// A size as a card shows it: whole bytes below a kibibyte, then one decimal
+/// and the unit — binary ones, the way a file manager on this desktop counts.
+/// A trailing `.0` is dropped, so a round size reads as `68 KB`.
+fn human_size(bytes: u64) -> String {
+    const UNITS: [&str; 4] = ["KB", "MB", "GB", "TB"];
+    if bytes < 1024 {
+        return format!("{bytes} B");
+    }
+    let mut value = bytes as f64 / 1024.0;
+    let mut unit = 0;
+    while value >= 1024.0 && unit + 1 < UNITS.len() {
+        value /= 1024.0;
+        unit += 1;
+    }
+    let rounded = format!("{value:.1}");
+    format!(
+        "{} {}",
+        rounded.strip_suffix(".0").unwrap_or(&rounded),
+        UNITS[unit]
+    )
+}
+
+/// The attachment glyph: a page with the top-right corner folded over. One
+/// drawing for every kind of file — what a card says about the kind is the MIME
+/// type on its second line, which is the sender's own word for it.
+fn paint_file_icon(p: &egui::Painter, rect: egui::Rect, color: egui::Color32) {
+    let stroke = egui::Stroke::new(1.3_f32, color);
+    let fold = rect.width() * 0.36;
+    let (l, t, r, b) = (rect.left(), rect.top(), rect.right(), rect.bottom());
+    p.add(egui::Shape::line(
+        vec![
+            egui::pos2(l, t),
+            egui::pos2(r - fold, t),
+            egui::pos2(r, t + fold),
+            egui::pos2(r, b),
+            egui::pos2(l, b),
+            egui::pos2(l, t),
+        ],
+        stroke,
+    ));
+    p.add(egui::Shape::line(
+        vec![
+            egui::pos2(r - fold, t),
+            egui::pos2(r - fold, t + fold),
+            egui::pos2(r, t + fold),
+        ],
+        stroke,
+    ));
 }
 
 /// How far the second strike of bold text sits from the first, in points.
@@ -6345,7 +6514,7 @@ mod tests {
             body_text: "body".to_string(),
             body_html: None,
             preview: "preview".to_string(),
-            attachment_names: Vec::new(),
+            attachments: Vec::new(),
             inline_images: Vec::new(),
         }
     }
@@ -6724,6 +6893,108 @@ mod tests {
             !texts.iter().any(|text| text.starts_with("Saved to")),
             "{texts:?}"
         );
+    }
+
+    /// Every attachment is a card under the body: the file's name, and the type
+    /// and size the mail was fetched with under it. A mail cached before the
+    /// database kept those two is the name alone — no second line, and no
+    /// separator left standing on its own.
+    #[test]
+    fn every_attachment_is_a_card_under_the_body() {
+        let ctx = egui::Context::default();
+        crate::fonts::install(&ctx, None, None);
+        let mut app = app_with_messages(&ctx, 1);
+        app.states
+            .get_mut("acct")
+            .expect("the fixture account")
+            .mailbox
+            .folders[0]
+            .messages[0]
+            .attachments = vec![
+            Attachment {
+                name: "report.pdf".to_string(),
+                content_type: "application/pdf".to_string(),
+                size: 68 * 1024,
+            },
+            Attachment {
+                name: "cached-before-v6.png".to_string(),
+                content_type: String::new(),
+                size: 0,
+            },
+        ];
+        app.selected_account = Some("acct".to_string());
+        app.selected_folder = Some("INBOX".to_string());
+        app.selected_message = Some("0".to_string());
+
+        // The first frame is what sizes the pane; the mail is drawn from the
+        // second one on, the way the app draws it live.
+        let _ = frame_texts(&ctx, &mut app);
+        let texts = frame_texts(&ctx, &mut app);
+
+        let position = |text: &str| {
+            texts
+                .iter()
+                .position(|drawn| drawn == text)
+                .unwrap_or_else(|| panic!("{text:?} is not on the card: {texts:?}"))
+        };
+        let body = position("body");
+        assert!(
+            body < position("report.pdf"),
+            "the cards come after the body: {texts:?}"
+        );
+        assert!(
+            position("application/pdf · 68 KB") < position("cached-before-v6.png"),
+            "the cards keep the order the parts had: {texts:?}"
+        );
+        assert!(
+            !texts.iter().any(|text| text.starts_with('·')),
+            "the old row left a separator behind: {texts:?}"
+        );
+    }
+
+    /// What a card's second line is made of, and the sizes it prints: the type
+    /// and the size each appear when the mail was stored with them and are
+    /// simply absent when it was not.
+    #[test]
+    fn a_card_says_what_the_mail_was_stored_with() {
+        let full = Attachment {
+            name: "report.pdf".to_string(),
+            content_type: "application/pdf".to_string(),
+            size: 68 * 1024,
+        };
+        assert_eq!(attachment_meta(&full), "application/pdf · 68 KB");
+        assert_eq!(
+            attachment_meta(&Attachment {
+                content_type: String::new(),
+                ..full.clone()
+            }),
+            "68 KB",
+            "a size with no type still says something"
+        );
+        assert_eq!(
+            attachment_meta(&Attachment {
+                size: 0,
+                ..full.clone()
+            }),
+            "application/pdf"
+        );
+        assert_eq!(
+            attachment_meta(&Attachment {
+                name: "old.pdf".to_string(),
+                content_type: String::new(),
+                size: 0,
+            }),
+            "",
+            "a row from before v6 has nothing to say about itself"
+        );
+
+        assert_eq!(human_size(0), "0 B");
+        assert_eq!(human_size(1023), "1023 B");
+        assert_eq!(human_size(1024), "1 KB", "a round size loses its .0");
+        assert_eq!(human_size(1536), "1.5 KB");
+        assert_eq!(human_size(5 * 1024 * 1024), "5 MB");
+        assert_eq!(human_size(3 * 1024 * 1024 * 1024), "3 GB");
+        assert_eq!(human_size(u64::MAX), "16777216 TB", "and it stops at TB");
     }
 
     /// Clicking a row opens that mail: the list draws itself from the account
@@ -7867,8 +8138,8 @@ mod tests {
                 body_text: String::new(),
                 body_html: None,
                 preview: String::new(),
+                attachments: vec![],
                 inline_images: vec![],
-                attachment_names: vec![],
             },
             MailMessage {
                 uid: "2".into(),
@@ -7881,8 +8152,8 @@ mod tests {
                 body_text: String::new(),
                 body_html: None,
                 preview: String::new(),
+                attachments: vec![],
                 inline_images: vec![],
-                attachment_names: vec![],
             },
         ];
         sort_messages(&mut msgs);

@@ -162,6 +162,23 @@ pub struct InlineImage {
     pub data: Vec<u8>,
 }
 
+/// One file attached to a mail.
+///
+/// Only what a card can be drawn from is kept: the name, the type and the
+/// decoded size. The bytes themselves stay on the server — what is stored here
+/// is the parsed mail, and Export fetches the original whole (see AGENTS.md).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Attachment {
+    /// File name as the sender wrote it (RFC 2231 is decoded by mail-parser).
+    pub name: String,
+    /// MIME type, e.g. `application/pdf`. Empty for mail cached before the
+    /// database recorded it (schema v6).
+    pub content_type: String,
+    /// Decoded size in bytes, 0 when unknown — the same "cached before v6"
+    /// case, since nothing can derive it from a name.
+    pub size: u64,
+}
+
 /// A single message as stored locally. `uid` is the IMAP UID (within a
 /// UIDVALIDITY generation) or the POP3 UIDL string.
 #[derive(Clone, Debug)]
@@ -181,7 +198,9 @@ pub struct MailMessage {
     pub body_html: Option<String>,
     /// One-line plain-text snippet for the message list.
     pub preview: String,
-    pub attachment_names: Vec<String>,
+    /// The mail's attachments, in the order the parts appear in it. Draws
+    /// one card each at the end of the body.
+    pub attachments: Vec<Attachment>,
     /// Inline images (attachments with a Content-ID), rendered for `cid:`
     /// references in the HTML body.
     pub inline_images: Vec<InlineImage>,

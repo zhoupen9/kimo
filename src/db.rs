@@ -47,12 +47,12 @@ use serde::Deserialize;
 
 use crate::error::{MailError, MailResult};
 use crate::models::{
-    Account, InlineImage, MailMessage, Protocol, SmtpLogin, SmtpSettings, TlsMode,
+    Account, Attachment, InlineImage, MailMessage, Protocol, SmtpLogin, SmtpSettings, TlsMode,
 };
 use crate::storage::{self, Folder, Mailbox};
 
 /// The schema version this build writes and understands.
-pub const SCHEMA_VERSION: i64 = 5;
+pub const SCHEMA_VERSION: i64 = 6;
 
 /// How long a statement waits for another writer before giving up. Jobs hold
 /// the connection only around their SQL, so this is a backstop, not a plan.
@@ -140,6 +140,12 @@ CREATE TABLE IF NOT EXISTS attachments (
     message_id INTEGER NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
     ordinal    INTEGER NOT NULL,
     name       TEXT NOT NULL,
+    -- The MIME type and the size of the file the part carried (schema v6),
+    -- which is what an attachment card is drawn from. Empty and 0 mean the row
+    -- predates them: mail cached before v6 keeps the name it was stored with,
+    -- because a re-sync never refetches a mail the database already has.
+    content_type TEXT NOT NULL DEFAULT '',
+    size         INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (message_id, ordinal)
 );
 
@@ -232,6 +238,16 @@ ALTER TABLE accounts ADD COLUMN smtp_port     INTEGER;
 ALTER TABLE accounts ADD COLUMN smtp_tls      TEXT CHECK (smtp_tls IN ('implicit', 'start_tls', 'plain'));
 ALTER TABLE accounts ADD COLUMN smtp_username TEXT;
 ALTER TABLE accounts ADD COLUMN smtp_password TEXT;
+"#;
+
+/// The step from `user_version` 5 to 6: what an attachment is, beyond its
+/// name. Nothing can be derived here — a database from before this step holds
+/// the names alone, and the type and the size live in the part the mail
+/// arrived in, which is not stored — so the rows it has keep an empty type and
+/// a zero size, and every mail fetched after this step carries both.
+const MIGRATE_V6_SQL: &str = r#"
+ALTER TABLE attachments ADD COLUMN content_type TEXT NOT NULL DEFAULT '';
+ALTER TABLE attachments ADD COLUMN size INTEGER NOT NULL DEFAULT 0;
 "#;
 
 /// IMAP's floor as the mail a database from before version 4 already implies:
@@ -509,6 +525,12 @@ fn migrate(conn: &mut Connection, legacy: Option<(&Path, &Path)>) -> MailResult<
         let tx = conn.transaction()?;
         tx.execute_batch(MIGRATE_V5_SQL)?;
         tx.pragma_update(None, "user_version", 5)?;
+        tx.commit()?;
+    }
+    if start < 6 {
+        let tx = conn.transaction()?;
+        tx.execute_batch(MIGRATE_V6_SQL)?;
+        tx.pragma_update(None, "user_version", 6)?;
         tx.commit()?;
     }
     Ok(())
@@ -995,7 +1017,7 @@ fn load_mailboxes_on(
                     body_text: row.get(10)?,
                     body_html: row.get(11)?,
                     preview: row.get(12)?,
-                    attachment_names: Vec::new(),
+                    attachments: Vec::new(),
                     inline_images: Vec::new(),
                 },
             ))
@@ -1010,15 +1032,24 @@ fn load_mailboxes_on(
         .map(|(index, (id, _, _, _))| (*id, index))
         .collect();
     {
-        let mut stmt =
-            conn.prepare("SELECT message_id, name FROM attachments ORDER BY message_id, ordinal")?;
+        let mut stmt = conn.prepare(
+            "SELECT message_id, name, content_type, size FROM attachments
+              ORDER BY message_id, ordinal",
+        )?;
         let rows = stmt.query_map([], |row| {
-            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+            Ok((
+                row.get::<_, i64>(0)?,
+                Attachment {
+                    name: row.get(1)?,
+                    content_type: row.get(2)?,
+                    size: row.get::<_, i64>(3)?.max(0) as u64,
+                },
+            ))
         })?;
         for row in rows {
-            let (message_id, name) = row?;
+            let (message_id, attachment) = row?;
             if let Some(&index) = positions.get(&message_id) {
-                loaded[index].3.attachment_names.push(name);
+                loaded[index].3.attachments.push(attachment);
             }
         }
     }
@@ -1176,8 +1207,10 @@ fn save_messages_on(
     {
         let mut upsert = tx.prepare(MESSAGE_UPSERT)?;
         let mut clear_attachments = tx.prepare("DELETE FROM attachments WHERE message_id = ?1")?;
-        let mut add_attachment =
-            tx.prepare("INSERT INTO attachments (message_id, ordinal, name) VALUES (?1, ?2, ?3)")?;
+        let mut add_attachment = tx.prepare(
+            "INSERT INTO attachments (message_id, ordinal, name, content_type, size)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+        )?;
         let mut clear_images = tx.prepare("DELETE FROM inline_images WHERE message_id = ?1")?;
         let mut add_image = tx.prepare(
             "INSERT INTO inline_images (message_id, cid, content_type, data)
@@ -1212,8 +1245,14 @@ fn save_messages_on(
                 continue;
             };
             clear_attachments.execute([id])?;
-            for (ordinal, name) in message.attachment_names.iter().enumerate() {
-                add_attachment.execute(params![id, ordinal as i64, name])?;
+            for (ordinal, attachment) in message.attachments.iter().enumerate() {
+                add_attachment.execute(params![
+                    id,
+                    ordinal as i64,
+                    attachment.name,
+                    attachment.content_type,
+                    attachment.size as i64,
+                ])?;
             }
             clear_images.execute([id])?;
             for image in &message.inline_images {
@@ -1492,7 +1531,17 @@ impl LegacyMessage {
             body_text: self.body_text,
             body_html: self.body_html,
             preview: self.preview,
-            attachment_names: self.attachment_names,
+            attachments: self
+                .attachment_names
+                .into_iter()
+                .map(|name| Attachment {
+                    name,
+                    // The old JSON kept the names and nothing else: the type
+                    // and the size were never in it to move over.
+                    content_type: String::new(),
+                    size: 0,
+                })
+                .collect(),
             inline_images,
         })
     }
@@ -1553,6 +1602,10 @@ pub(crate) mod test_support {
             ] {
                 sql.push_str(&format!("ALTER TABLE accounts DROP COLUMN {column};\n"));
             }
+        }
+        if version < 6 {
+            sql.push_str("ALTER TABLE attachments DROP COLUMN content_type;\n");
+            sql.push_str("ALTER TABLE attachments DROP COLUMN size;\n");
         }
         conn.execute_batch(&sql).unwrap();
         conn.pragma_update(None, "user_version", version).unwrap();
@@ -1640,8 +1693,18 @@ mod tests {
             body_text: body.to_string(),
             body_html: None,
             preview: body.chars().take(20).collect(),
-            attachment_names: Vec::new(),
+            attachments: Vec::new(),
             inline_images: Vec::new(),
+        }
+    }
+
+    /// An attachment with a plausible type and size, for the tests that only
+    /// care that attachments survive a round trip.
+    fn attachment(name: &str) -> Attachment {
+        Attachment {
+            name: name.to_string(),
+            content_type: "application/pdf".to_string(),
+            size: 68_000,
         }
     }
 
@@ -1783,7 +1846,7 @@ mod tests {
         save_account_on(&conn, &account("work")).unwrap();
         save_account_on(&conn, &account("other")).unwrap();
         let mut mail = message("1", "Hello", "body of the mail");
-        mail.attachment_names = vec!["report.pdf".to_string()];
+        mail.attachments = vec![attachment("report.pdf")];
         mail.inline_images = vec![InlineImage {
             cid: "logo".to_string(),
             content_type: "image/png".to_string(),
@@ -1825,7 +1888,7 @@ mod tests {
         let (mut conn, dir) = test_db("delete-message");
         save_account_on(&conn, &account("work")).unwrap();
         let mut mail = message("1", "Hello", "body of the mail");
-        mail.attachment_names = vec!["report.pdf".to_string()];
+        mail.attachments = vec![attachment("report.pdf")];
         mail.inline_images = vec![InlineImage {
             cid: "logo".to_string(),
             content_type: "image/png".to_string(),
@@ -1898,7 +1961,7 @@ mod tests {
         let (mut conn, dir) = test_db("upsert");
         save_account_on(&conn, &account("work")).unwrap();
         let mut first = message("1", "Hello", "first body");
-        first.attachment_names = vec!["one.pdf".to_string()];
+        first.attachments = vec![attachment("one.pdf")];
         save_messages_on(&mut conn, "work", "INBOX", Some(4), &[first]).unwrap();
 
         // The server reports the same UID as read, with different content.
@@ -2449,6 +2512,33 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
+    /// A database from version 5 gains the two columns an attachment card is
+    /// drawn from. The mail it holds keeps the names it was stored with:
+    /// nothing can recover the type or the size of a part that was never
+    /// written down, and a sync never refetches a mail the database has.
+    #[test]
+    fn a_version_5_database_keeps_its_attachments_without_a_type() {
+        let (mut conn, dir) = test_db("migrate-v6");
+        save_account_on(&conn, &account("work")).unwrap();
+        let mut mail = message("1", "With a part", "body");
+        mail.attachments = vec![attachment("report.pdf")];
+        save_messages_on(&mut conn, "work", "INBOX", Some(1), &[mail]).unwrap();
+        rewind_to(&conn, 5);
+
+        migrate(&mut conn, None).unwrap();
+        assert_eq!(
+            count(&conn, "SELECT * FROM pragma_user_version"),
+            SCHEMA_VERSION
+        );
+        let mailboxes = load_mailboxes_on(&conn, &["work".to_string()]).unwrap();
+        let kept = &mailboxes["work"].folders[0].messages[0].attachments[0];
+        assert_eq!(kept.name, "report.pdf");
+        assert_eq!(kept.content_type, "", "there was no type to move over");
+        assert_eq!(kept.size, 0, "and no size either");
+        integrity_check_on(&conn).unwrap();
+        let _ = fs::remove_dir_all(&dir);
+    }
+
     /// A database from version 4 gains the outgoing server as five empty
     /// columns: its accounts keep working, none of them can send until the form
     /// in Preferences → Accounts is filled in, and the migrated table is the
@@ -2558,7 +2648,18 @@ mod tests {
         let (mut conn, dir) = test_db("children");
         save_account_on(&conn, &account("work")).unwrap();
         let mut mail = message("1", "With parts", "body");
-        mail.attachment_names = vec!["report.pdf".to_string(), "photo.png".to_string()];
+        mail.attachments = vec![
+            Attachment {
+                name: "report.pdf".to_string(),
+                content_type: "application/pdf".to_string(),
+                size: 12_345,
+            },
+            Attachment {
+                name: "photo.png".to_string(),
+                content_type: "image/png".to_string(),
+                size: 678,
+            },
+        ];
         mail.inline_images = vec![
             InlineImage {
                 cid: "logo@example.com".to_string(),
@@ -2575,7 +2676,14 @@ mod tests {
 
         let mailboxes = load_mailboxes_on(&conn, &["work".to_string()]).unwrap();
         let loaded = &mailboxes["work"].folders[0].messages[0];
-        assert_eq!(loaded.attachment_names, ["report.pdf", "photo.png"]);
+        // The name, the type and the size all come back: the card is drawn
+        // from these three and nothing else.
+        assert_eq!(loaded.attachments[0].name, "report.pdf");
+        assert_eq!(loaded.attachments[0].content_type, "application/pdf");
+        assert_eq!(loaded.attachments[0].size, 12_345);
+        assert_eq!(loaded.attachments[1].name, "photo.png");
+        assert_eq!(loaded.attachments[1].content_type, "image/png");
+        assert_eq!(loaded.attachments[1].size, 678);
         assert_eq!(loaded.inline_images.len(), 2);
         assert_eq!(loaded.inline_images[0].cid, "logo@example.com");
         assert_eq!(loaded.inline_images[0].content_type, "image/png");
@@ -2694,7 +2802,10 @@ mod tests {
         assert!(folder.synced);
         let migrated = &folder.messages[0];
         assert_eq!(migrated.subject, "发票号码");
-        assert_eq!(migrated.attachment_names, ["a.pdf"]);
+        assert_eq!(migrated.attachments[0].name, "a.pdf");
+        // The JSON kept names alone: the import moves over what there is.
+        assert_eq!(migrated.attachments[0].content_type, "");
+        assert_eq!(migrated.attachments[0].size, 0);
         assert_eq!(migrated.inline_images[0].data, b"hello");
         assert_eq!(
             hits(&conn, "{cjk} : \"发票\""),

@@ -599,7 +599,7 @@ mod tests {
             body_text: body.to_string(),
             body_html: None,
             preview: body.chars().take(20).collect(),
-            attachment_names: Vec::new(),
+            attachments: Vec::new(),
             inline_images: Vec::new(),
         }
     }
@@ -743,7 +743,11 @@ mod tests {
         let mut new = message("2", "Weekly report", "the newest report");
         new.timestamp = Some(200_000); // 1970-01-03, two days after the other one
         new.seen = true;
-        new.attachment_names = vec!["report.pdf".to_string()];
+        new.attachments = vec![crate::models::Attachment {
+            name: "report.pdf".to_string(),
+            content_type: "application/pdf".to_string(),
+            size: 4_096,
+        }];
         save(&mut conn, "INBOX", Some(1), &[old, new]).unwrap();
 
         let by_sender = SearchQuery {
@@ -969,7 +973,7 @@ mod tests {
             body_text: "请确认号码".to_string(),
             body_html: None,
             preview: String::new(),
-            attachment_names: Vec::new(),
+            attachments: Vec::new(),
             inline_images: Vec::new(),
         };
         let column = cjk_column(&message);

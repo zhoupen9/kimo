@@ -398,7 +398,7 @@ mod tests {
         assert!(parsed.from.contains("ada@example.com"));
         assert!(parsed.to.contains("bob@example.com"));
         assert_eq!(parsed.timestamp, Some(1_791_504_000), "the Date header");
-        assert_eq!(parsed.attachment_names, Vec::<String>::new());
+        assert!(parsed.attachments.is_empty(), "nothing is attached yet");
     }
 
     #[test]

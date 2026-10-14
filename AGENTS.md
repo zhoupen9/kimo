@@ -135,7 +135,8 @@ src/storage.rs          XDG paths, settings.json, remote-resource cache, Mailbox
 src/db.rs               the mail database: schema + migrations, accounts, folders, messages, the old-JSON import
 src/search.rs           mail search: the CJK bigram index, the FTS5 query builder and the filters they run against
 src/theme.rs            theme choice + the light/dark color schemes and their egui Visuals
-src/mail.rs             raw RFC 5322 bytes → MailMessage (mail-parser; HTML kept for rendering)
+src/mail.rs             raw RFC 5322 bytes → MailMessage (mail-parser; HTML kept, attachments
+                        as name/type/size)
 src/outgoing.rs         the mail being sent: addresses, headers, encoding → RFC 5322 bytes
 src/html.rs             HTML mail → egui widgets (subset: blocks, lists, tables, links, inline styles)
 src/blitz_render.rs     HTML mail → rasterized page via Blitz (headless render, net provider, fonts)
@@ -321,8 +322,10 @@ Event (mpsc) ──► drain_events() at frame start ──► merge into Accoun
   marks of the bullets above, then `listed`, what the last `LIST` named),
   `messages` keyed by `(account_id, folder, uid)` with
   the subject, addresses, both bodies, the preview and the bigram column,
-  `attachments` and `inline_images` (raw bytes, not base64) as children of a
-  message, and the external-content FTS5 table `messages_fts`, which only the
+  `attachments` (the name, the MIME type and the decoded size — never the
+  bytes; see the attachment-card convention) and `inline_images` (raw bytes,
+  not base64) as children of a message, and the external-content FTS5 table
+  `messages_fts`, which only the
   three triggers in `db::SCHEMA_SQL` ever write. `PRAGMA foreign_keys = ON`
   per connection and `ON DELETE CASCADE` all the way down, so
   `Job::DeleteAccount` is one `DELETE FROM accounts`. `PRAGMA user_version`
@@ -338,7 +341,11 @@ Event (mpsc) ──► drain_events() at frame start ──► merge into Accoun
   batch it has. The version-5 step is its opposite: it adds the five `smtp_*`
   columns and derives nothing, because a database from before it has no
   outgoing server to move over — every account it holds starts as one that only
-  reads mail, and Preferences → Accounts is where it gets a way to send.
+  reads mail, and Preferences → Accounts is where it gets a way to send. The
+  version-6 step is that kind of step too: it adds an attachment's `content_type`
+  and `size`, and derives nothing, because the part a mail arrived in is not
+  stored — the rows it holds keep an empty type and a zero size, and only mail
+  fetched after the step carries them.
 - The account list is **in the database, passwords in plain text**. That is a
   documented, accepted limitation; do not add a secrets daemon (rule 1). An
   account's `id` is minted once (the slug of its name, numbered if taken) and
@@ -490,10 +497,11 @@ Event (mpsc) ──► drain_events() at frame start ──► merge into Accoun
   rect), and the reading pane is a card of `content`
   (`CONTENT_CARD_CORNER_RADIUS`) inset by `CONTENT_GUTTER` into the chrome,
   whose left side doubles as the splitter; with nothing selected there is no
-  card at all. The card is the pane's own scroll container — headers, rule and
-  body scroll together, and the scroll bar runs down the card's edge rather
-  than down the body's — and it still hugs a short mail: it is exactly as tall
-  as the mail until the mail outgrows the pane. It scrolls *both* ways, which is
+  card at all. The card is the pane's own scroll container — headers, rule,
+  body and the attachment cards at the foot scroll together, and the scroll bar
+  runs down the card's edge rather than down the body's — and it still hugs a
+  short mail: it is exactly as tall as the mail until the mail outgrows the
+  pane. It scrolls *both* ways, which is
   what keeps the splitter honest: with horizontal scrolling off, a mail whose
   layout cannot be narrower than the pane (a fixed-width table — most HTML
   mail) widened this scroll area, and through it the panel's *content* rect,
@@ -795,10 +803,10 @@ Event (mpsc) ──► drain_events() at frame start ──► merge into Accoun
   writes it byte for byte to `$HOME/Downloads/<subject>.eml`
   (`storage::downloads_dir`, made on the first export). There is no file dialog:
   one destination, and the app says the path it wrote.
-  **The original is the point.** What is stored here is the parsed mail, with the
-  attachments by name only, so a `.eml` rebuilt from the database would not be
-  the message the sender wrote, while this one is the message whole, attachments
-  and all. The price is that mail the server no longer has cannot be exported at
+  **The original is the point.** What is stored here is the parsed mail, with
+  each attachment's name, type and size but never its bytes, so a `.eml`
+  rebuilt from the database would not be the message the sender wrote, while
+  this one is the message whole, attachments and all. The price is that mail the server no longer has cannot be exported at
   all, and says so rather than writing something close (`Event::SyncFailed`,
   prefixed "export:" — the local copy is not a substitute for the original).
   The file is named after the subject, with what a file name cannot carry
@@ -812,6 +820,25 @@ Event (mpsc) ──► drain_events() at frame start ──► merge into Accoun
   as one line above the message list for `NOTICE_TIME` (`list_banner`, the
   place the storage warning stands) — the same line a finished send uses, which
   is why it is named for what it is rather than for the export.
+- Attachments are cards under the body (`attachment_card`), one per part the
+  mail named a file for, in the order the parts appear in it: the page glyph,
+  the file name, and — under the name — the MIME type and the size, whichever
+  of the two the mail was fetched with (`attachment_meta`; `human_size` counts
+  in binary units, the way a file manager on this desktop does, and drops a
+  `.0`). The card spans the mail's own column, the width the headers were laid
+  out across, taken from the pane *before* the body is drawn — a body wider than
+  the column (a fixed-width HTML table) widens the ui as it lays itself out, and
+  the cards belong to the mail, not to what the mail overflowed by. They are the
+  last thing on the reading pane's card whichever renderer drew the body,
+  because `mail_card` draws them after `mail_body` rather than inside it: a
+  Blitz body is a raster a worker made, and the cards are not part of it.
+  **A card is not clickable.** What the database holds is the name, the type and
+  the size (schema v6), never the bytes, so there is nothing to open or save —
+  and a card that filled under the pointer would promise a file it cannot hand
+  over. The hover text is the whole interaction, and it is what shows a name the
+  column had to elide. A part with no file name is not an attachment at all
+  (`mail::collect_attachments`), and a mail cached before v6 is the name alone:
+  no second line, rather than a separator with nothing after it.
 - The compose window (`compose_window`, opened by the title bar's pen) is an
   `egui::Modal`, like the search popup and Preferences: a card `COMPOSE_WIDTH`
   wide in the foreground layer, whose backdrop dims the columns and the bar and
@@ -1012,8 +1039,11 @@ Event (mpsc) ──► drain_events() at frame start ──► merge into Accoun
 
 Do not "fix" these casually — they are known:
 
-- Attachments are listed by name but cannot be saved or opened on their own
-  yet; Export writes the whole mail out as one `.eml`, attachments included.
+- An attachment cannot be saved or opened on its own: a card says what the
+  mail came with (the name, the MIME type and the decoded size) and is not
+  clickable, because Kimo stores no attachment bytes — Export writes the whole
+  mail out as one `.eml`, attachments included, and that is the way to get at
+  them.
 - TLS finite-field DH covers the 2048-bit groups listed in
   `src/protocol/ffdhe.rs` and nothing else. A server whose DHE group is
   another size, or yet another custom prime, still fails the handshake with

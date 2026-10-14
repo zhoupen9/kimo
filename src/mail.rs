@@ -31,9 +31,7 @@ pub fn parse(raw: &[u8], uid: &str, seen: bool) -> MailMessage {
                     } else {
                         None
                     },
-                    m.attachments()
-                        .filter_map(|part| part.attachment_name().map(|n| n.to_string()))
-                        .collect(),
+                    collect_attachments(&m),
                     collect_inline_images(&m),
                 )
             }
@@ -81,8 +79,40 @@ pub fn parse(raw: &[u8], uid: &str, seen: bool) -> MailMessage {
         body_text,
         body_html,
         preview,
-        attachment_names: attachments,
+        attachments,
         inline_images,
+    }
+}
+
+/// The mail's attachments, in the order their parts appear in it.
+///
+/// A part with no file name is not one: without a name there is nothing a card
+/// could be titled with, and a part the sender left unnamed is usually a
+/// structure of its own (a nested message, an HTML body part) rather than a
+/// file somebody meant to send. The size is the *decoded* one — `contents()`
+/// is the part after its transfer encoding has been undone, which is the size
+/// the file would have on disk, not the base64 that carried it.
+fn collect_attachments(m: &mail_parser::Message<'_>) -> Vec<crate::models::Attachment> {
+    m.attachments()
+        .filter_map(|part| {
+            let name = part.attachment_name()?.to_string();
+            Some(crate::models::Attachment {
+                name,
+                content_type: part.content_type().map(mime_type).unwrap_or_default(),
+                size: part.contents().len() as u64,
+            })
+        })
+        .collect()
+}
+
+/// A part's MIME type as `type/subtype`. `ctype()` never fails — RFC 5322
+/// mail may carry no `Content-Type` at all, which mail-parser answers with
+/// `text/plain` — while a bare type with no subtype (a hand-written header)
+/// keeps the type alone rather than inventing a `/`.
+fn mime_type(content_type: &mail_parser::ContentType) -> String {
+    match content_type.subtype() {
+        Some(sub) => format!("{}/{}", content_type.ctype(), sub),
+        None => content_type.ctype().to_string(),
     }
 }
 
@@ -96,13 +126,9 @@ fn collect_inline_images(m: &mail_parser::Message<'_>) -> Vec<crate::models::Inl
             if cid.is_empty() || !content_type.ctype().eq_ignore_ascii_case("image") {
                 return None;
             }
-            let mime = match content_type.subtype() {
-                Some(sub) => format!("{}/{}", content_type.ctype(), sub),
-                None => content_type.ctype().to_string(),
-            };
             Some(crate::models::InlineImage {
                 cid,
-                content_type: mime,
+                content_type: mime_type(content_type),
                 data: part.contents().to_vec(),
             })
         })
@@ -306,12 +332,48 @@ mod tests {
                     --XYZ--\r\n";
         let msg = parse(raw, "12", false);
         assert!(msg.body_html.is_some());
-        assert!(msg.attachment_names.iter().any(|n| n.contains("logo.png")));
+        assert!(msg.attachments.iter().any(|a| a.name.contains("logo.png")));
         let inline = msg.inline_images.first().expect("inline image captured");
         assert_eq!(inline.cid, "logo@example.com");
         assert_eq!(inline.content_type, "image/png");
         // The part's base64 ("aGVsbG8gaW5saW5lIQ==") is already decoded here.
         assert_eq!(inline.data, b"hello inline!");
+        // The image is an attachment as well, and its card says what it is.
+        let card = msg
+            .attachments
+            .first()
+            .expect("the part is an attachment too");
+        assert_eq!(card.content_type, "image/png");
+        assert_eq!(card.size, 13, "the decoded size of \"hello inline!\"");
+    }
+
+    #[test]
+    fn an_attachment_keeps_its_name_type_and_decoded_size() {
+        // multipart/mixed as almost every attachment arrives in: the body, then
+        // a base64 file part. "hello world" is eleven bytes once decoded, which
+        // is the size the card shows — not the sixteen base64 carried.
+        let raw = b"From: Alice <alice@example.com>\r\n\
+                    Subject: With a file\r\n\
+                    MIME-Version: 1.0\r\n\
+                    Content-Type: multipart/mixed; boundary=\"B\"\r\n\
+                    \r\n\
+                    --B\r\n\
+                    Content-Type: text/plain; charset=utf-8\r\n\
+                    \r\n\
+                    See attached.\r\n\
+                    --B\r\n\
+                    Content-Type: application/pdf; name=\"report.pdf\"\r\n\
+                    Content-Transfer-Encoding: base64\r\n\
+                    Content-Disposition: attachment; filename=\"report.pdf\"\r\n\
+                    \r\n\
+                    aGVsbG8gd29ybGQ=\r\n\
+                    --B--\r\n";
+        let msg = parse(raw, "13", false);
+        assert_eq!(msg.attachments.len(), 1);
+        let attachment = &msg.attachments[0];
+        assert_eq!(attachment.name, "report.pdf");
+        assert_eq!(attachment.content_type, "application/pdf");
+        assert_eq!(attachment.size, 11);
     }
 
     #[test]

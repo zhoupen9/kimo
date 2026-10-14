@@ -18,7 +18,10 @@ rustls with the `ring` crypto provider and Mozilla's root certificates.
 - Multiple accounts, IMAP and POP3
 - Implicit TLS, STARTTLS and plain connections, for reading and for sending
 - Folder listing (IMAP), folder selection and per-folder caches
-- Message list with unread markers, text preview and attachment names
+- Message list with unread markers and text preview
+- Attachments shown as a card each under the mail: the file name, its type and
+  its size (the bytes themselves stay on the server — Export writes the whole
+  mail out as an `.eml`)
 - `\Seen` flag synchronization (IMAP server-side, POP3 local-only)
 - Compose and send over SMTP, with the copy filed in Sent (IMAP `APPEND`)
 - Export the open mail as the server's original `.eml`
