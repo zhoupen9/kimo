@@ -502,9 +502,18 @@ Event (mpsc) ──► drain_events() at frame start ──► merge into Accoun
   under it, while the two content columns keep clear of the bar with padding
   *inside* their scroll areas, which scrolls away with what they hold — the
   list's rows, and the reading pane's cards, their headers included, which
-  is why mail passes under the glass there too. The list column is
-  framed by a hairline down each side (`mail_list`, drawn at the column's own
-  rect), and the reading pane is a card of `content`
+  is why mail passes under the glass there too. **The list column is a card
+  too** (`list_card`): the panel behind it is chrome, and the card is as tall as
+  the list's own content — the rows and `LIST_PADDING` — so a folder with three
+  mails leaves the chrome below them instead of a column of empty surface, a
+  list that outgrows the window fills the column as it always did, and a column
+  with nothing to list (no account, an empty folder, a search with no hits) has
+  no card at all, the way the reading pane has none with no mail open. Its height
+  is known only once the list has been laid out, so `mail_list` reserves the
+  shape and fills it in at the foot of the frame — under the rows, which is
+  where it has to be drawn. The card is framed by a hairline down each side,
+  drawn for the card's own height rather than the column's, and the reading pane
+  is a card of `content`
   (`CONTENT_CARD_CORNER_RADIUS`) inset by `CONTENT_GUTTER` into the chrome,
   whose left side doubles as the splitter; with nothing selected there is no
   card at all. **A conversation is that card once per mail** — not a card

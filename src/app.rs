@@ -2894,26 +2894,26 @@ impl KimoApp {
         ui.add_space(8.0);
     }
 
-    /// Middle column: the search strip, then the search results or the selected
-    /// folder's mail — the lighter content surface, framed by a hairline down
-    /// each side.
+    /// Middle column: the search results or the selected folder's mail, on the
+    /// card the column is — the lighter content surface, framed by a hairline
+    /// down each side.
+    ///
+    /// The card is as tall as what the list holds and no taller, so a folder
+    /// with three mails leaves the chrome below them instead of a column of
+    /// empty surface. A column with nothing to show — no account, an empty
+    /// folder, a search with no hits — has no card at all, the way the reading
+    /// pane has none with no mail open. How tall the card is is the list's own
+    /// content, which is known only once the list has been laid out: the shape
+    /// is reserved here, drawn before the rows, and filled in at the foot of
+    /// this function.
     fn mail_list(&mut self, ui: &mut egui::Ui) {
         let scheme = theme::of(ui.ctx());
         // The column's own rect is the whole ui the frame hands over — the
         // padding moved inside the scroll area. The rows' rules span it (see
-        // message_card), and a hairline down each side frames it.
+        // message_card), and the card's hairlines frame it.
         let column = ui.max_rect();
         self.list_column = column;
-        // The mails' own left and right edges, drawn down the whole column so
-        // that it stays framed above and below the rows too: the chrome is the
-        // step outside the column and the card's gutter the step outside that,
-        // and this line is what keeps either from touching the rows. Every row
-        // paints it again over its own fill (see message_card).
-        let stroke = egui::Stroke::new(1.0_f32, scheme.row_edge);
-        ui.painter()
-            .vline(column.left() + 0.5, column.y_range(), stroke);
-        ui.painter()
-            .vline(column.right() - 0.5, column.y_range(), stroke);
+        let where_to_put_card = ui.painter().add(egui::Shape::Noop);
         // Two things can stand where the first row would: the database could
         // not be opened (the session works, nothing is saved, and this is the
         // one place that says so), and an export that has just finished (its
@@ -2959,11 +2959,16 @@ impl KimoApp {
         // emptied box ends the search). Running the search — and the settle
         // clock — is the frame's business, since the popup can be open over
         // any of this.
-        if self.search.is_active() {
-            self.search_results(ui);
+        let listed = if self.search.is_active() {
+            self.search_results(ui)
         } else {
-            self.folder_messages(ui);
-        }
+            self.folder_messages(ui)
+        };
+        // The card goes in where it was reserved: under the rows, as tall as
+        // they turned out to be. Nothing listed leaves the reserved shape a
+        // `Noop`, which is the bare chrome the placeholders stand on.
+        ui.painter()
+            .set(where_to_put_card, list_card(column, listed, scheme));
     }
 
     /// Open the search popup with the keyboard already in its text field.
@@ -3398,7 +3403,11 @@ impl KimoApp {
     /// shows are laid out at all (see `virtual_rows`). A click is remembered as
     /// the mail it landed on and opened after the list has been drawn, when the
     /// borrow of the state it came from is over.
-    fn folder_messages(&mut self, ui: &mut egui::Ui) {
+    ///
+    /// Returns the height of what it drew — the rows and the list's own padding
+    /// — which is the height of the column's card, or `None` when the folder has
+    /// nothing to sit on (see `mail_list`).
+    fn folder_messages(&mut self, ui: &mut egui::Ui) -> Option<f32> {
         self.refresh_list_rows();
         // A folder the account does not have yet — INBOX before the first
         // sync, which the navigation offers because clicking it is what starts
@@ -3426,7 +3435,7 @@ impl KimoApp {
             // Nothing to scroll: whatever the folder holds, this *is* the
             // bottom of the list.
             self.load_older_button(ui);
-            return;
+            return None;
         }
         // The rows are the list's model and the mail they name lives in the
         // account state: both are read here, and only read.
@@ -3534,6 +3543,7 @@ impl KimoApp {
         if let Some(msg) = clicked {
             self.open_message(&msg);
         }
+        Some(list.content_size.y)
     }
 
     /// The list's model, brought up to date when anything it is derived from
@@ -3692,7 +3702,10 @@ impl KimoApp {
     }
 
     /// The middle column while a search is active: one card per hit.
-    fn search_results(&mut self, ui: &mut egui::Ui) {
+    ///
+    /// Returns the height of the hits it drew, which is the height of the
+    /// column's card, or `None` when there is nothing on it (see `mail_list`).
+    fn search_results(&mut self, ui: &mut egui::Ui) -> Option<f32> {
         if let Some(error) = &self.search_error {
             ui.label(
                 egui::RichText::new(error.as_str())
@@ -3709,7 +3722,7 @@ impl KimoApp {
                 };
                 ui.label(egui::RichText::new(text).weak().heading());
             });
-            return;
+            return None;
         }
         // A hit is what a click landed on, opened once the list has been drawn:
         // `open_hit` walks the account state, which the rows are borrowing.
@@ -3743,6 +3756,7 @@ impl KimoApp {
         if let Some(hit) = clicked {
             self.open_hit(&hit);
         }
+        Some(list.content_size.y)
     }
 
     /// Ask for what the search popup is showing, once the query has held still;
@@ -5195,8 +5209,12 @@ impl KimoApp {
         // edge instead of on the padding. The column's own rect — what the two
         // side panels leave — is recorded by `mail_list` for the splitter
         // repaint below.
+        //
+        // The column's surface is the card `mail_list` paints, as tall as the
+        // list it holds, so the panel behind it is the chrome: that is what
+        // shows below a folder that does not fill the window.
         egui::CentralPanel::default()
-            .frame(egui::Frame::new().fill(scheme.content))
+            .frame(egui::Frame::new().fill(scheme.panel))
             .show(ui, |ui| self.mail_list(ui));
         let list_column = self.list_column;
 
@@ -5635,6 +5653,35 @@ const BLITZ_REUSE_RATIO: f32 = 1.25;
 
 /// Lay out the rows a vertical scroll area actually shows, and nothing else.
 ///
+/// The card the message list sits on: the column's own surface, as tall as the
+/// list's content — the rows and the list's padding — and never taller than the
+/// column, with a hairline down each side. Those are the mails' own left and
+/// right edges: they run the card's whole height so the column stays framed
+/// above and below the rows, and every row paints them again over its own fill
+/// (see `message_card`).
+///
+/// `height` is what the list reported; `None` — and a height of nothing —
+/// leaves the shape a `Noop`, which is the bare chrome a placeholder stands on.
+fn list_card(
+    column: egui::Rect,
+    height: Option<f32>,
+    scheme: crate::theme::ColorScheme,
+) -> egui::Shape {
+    let Some(height) = height.filter(|height| *height > 0.0) else {
+        return egui::Shape::Noop;
+    };
+    let card = egui::Rect::from_x_y_ranges(
+        column.x_range(),
+        column.top()..=(column.top() + height).min(column.bottom()),
+    );
+    let stroke = egui::Stroke::new(1.0_f32, scheme.row_edge);
+    egui::Shape::Vec(vec![
+        egui::Shape::rect_filled(card, 0.0, scheme.content),
+        egui::Shape::vline(card.left() + 0.5, card.y_range(), stroke),
+        egui::Shape::vline(card.right() - 0.5, card.y_range(), stroke),
+    ])
+}
+
 /// `egui::ScrollArea::show_rows` is this, for a list whose first row starts at
 /// the top of the content. This column's does not: the title bar's height is
 /// padding *above* the first row, inside the scroll area (`LIST_PADDING`), so
@@ -8060,6 +8107,50 @@ mod tests {
         );
     }
 
+    /// The list's card is as tall as what the folder holds, not as tall as the
+    /// window: three mails leave the chrome showing below them, a folder that
+    /// outgrows the window fills the column as it always did, and a folder with
+    /// nothing in it has no card at all.
+    #[test]
+    fn the_lists_card_is_as_tall_as_the_mail_it_holds() {
+        let ctx = egui::Context::default();
+        crate::fonts::install(&ctx, None, None);
+        let content = theme::of(&ctx).content;
+
+        let mut app = app_with_messages(&ctx, 3);
+        let shapes = frame_shapes_at(&ctx, &mut app, 1400.0);
+        let column = app.list_column;
+        let card = list_card_in(&shapes, column, content).expect("the list sits on a card");
+        let expected = TITLEBAR_HEIGHT + 3.0 * MESSAGE_ROW_HEIGHT + LIST_PADDING.bottom as f32;
+        assert!(
+            (card.height() - expected).abs() < 1.0,
+            "the card is {} tall, expected {expected}: {card:?}",
+            card.height()
+        );
+        assert!(
+            card.bottom() < column.bottom() - 1.0,
+            "the chrome shows below the last mail: {card:?}"
+        );
+
+        // A folder that outgrows the window: the card fills the column.
+        let mut app = app_with_messages(&ctx, 40);
+        let shapes = frame_shapes_at(&ctx, &mut app, 1400.0);
+        let column = app.list_column;
+        let card = list_card_in(&shapes, column, content).expect("the list sits on a card");
+        assert!(
+            (card.bottom() - column.bottom()).abs() < 1.0,
+            "a list taller than the column fills it: {card:?} in {column:?}"
+        );
+
+        // Nothing to list: no card, just the chrome the placeholder stands on.
+        let mut app = app_with_messages(&ctx, 0);
+        let shapes = frame_shapes_at(&ctx, &mut app, 1400.0);
+        let column = app.list_column;
+        assert!(
+            list_card_in(&shapes, column, content).is_none(),
+            "an empty folder leaves the chrome alone"
+        );
+    }
     /// Every row is inset by the chevron's column, a mail with nothing to open
     /// included: the avatars line up down the whole list, and the mail that has
     /// nothing to expand simply leaves the column empty.
@@ -8930,6 +9021,18 @@ mod tests {
         }
     }
 
+    /// The card the message list drew: the content surface inside the list
+    /// column. The pane's card is the same surface on the other side of the
+    /// splitter, which is what the column test tells the two apart by.
+    fn list_card_in(
+        shapes: &[egui::epaint::ClippedShape],
+        column: egui::Rect,
+        content: egui::Color32,
+    ) -> Option<egui::Rect> {
+        fills_in_color(shapes, content)
+            .into_iter()
+            .find(|rect| column.contains(rect.center()))
+    }
     /// Every filled rectangle of a frame that is exactly this size, however
     /// deeply egui nested it. A button's hover fill is what the cell test below
     /// looks for: a `TITLEBAR_BUTTON_SIZE` square.
