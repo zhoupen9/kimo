@@ -21,10 +21,10 @@ rustls with the `ring` crypto provider and Mozilla's root certificates.
 - Message list with unread markers and text preview, grouped into
   conversations: one row per thread — its newest mail, how many it holds and a
   paperclip — with the chevron at its left opening the thread's mails in the
-  list and a click on the row showing the whole conversation in the reading
-  pane as one card per mail, each the card a mail on its own gets (grouped by
-  `References` and `In-Reply-To`, or by subject for mail cached before Kimo
-  kept those)
+  list, each drawn a step in with a smaller avatar, and a click on the row
+  showing the whole conversation in the reading pane as one card per mail, each
+  the card a mail on its own gets (grouped by `References` and `In-Reply-To`,
+  or by subject for mail cached before Kimo kept those)
 - A paperclip in the message list for mail that has attachments, and a card
   each under the mail itself: the file name (a link that downloads the file into
   `~/Downloads`), its MIME type and its size — the bytes themselves stay on the

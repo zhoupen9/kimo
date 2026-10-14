@@ -631,7 +631,13 @@ Event (mpsc) ──► drain_events() at frame start ──► merge into Accoun
   it always has. **Every row is inset by that column**, conversation or not
   (`RowPlace::indent`): the avatars line up down the whole list, and a mail with
   nothing to open leaves the column as the placeholder it is rather than starting
-  a step further left than its neighbours.
+  a step further left than its neighbours. The one exception is a mail of an
+  *open* conversation: it steps in `THREAD_STEP` further and draws a smaller
+  avatar (`THREAD_AVATAR_DIAMETER`, `RowPlace::avatar`), which — with the
+  chevron's column left empty above it — is what says at a glance that the mail
+  belongs to the conversation over it. **There is no guide line**: no line is
+  drawn down that column for a thread's mails, and the step and the smaller
+  circle are the whole of the mark.
   **The row and the chevron do different things.** The *chevron* opens and closes
   the thread's mails under it in the list — and does nothing else, so the list's
   shape only ever changes when the user asks for it. The *row* opens the
@@ -657,8 +663,9 @@ Event (mpsc) ──► drain_events() at frame start ──► merge into Accoun
   pointer that stops moving asks for no frame of its own, and the list would sit
   there looking as if the click was lost.
   An open conversation's mails are rows of their own under it, oldest first,
-  with the thread's spine down that same left column — `RowPlace` is what a row
-  draws in it: its chevron, its spine, or nothing. Every row is
+  each a step in with a smaller avatar and nothing drawn down that left column —
+  `RowPlace` is what a row draws there, and only a conversation's own row draws
+  anything in it: its chevron. Every row is
   `MESSAGE_ROW_HEIGHT` tall whatever it is, which is what keeps `virtual_rows`
   honest: threading changes *which* rows there are, not how tall one is. The rows
   are derived rather than built in the drawing: `KimoApp::list_rows` (`ListRows`)

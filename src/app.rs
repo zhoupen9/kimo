@@ -4003,7 +4003,7 @@ impl KimoApp {
 
         // Where the row sits in the list: a conversation's own row and the
         // mails it holds are inset, and the room that leaves at the left is
-        // where the chevron — or the thread's guide line — is drawn.
+        // where the chevron is drawn.
         let indent = card.place.indent();
         let mut chevron = None;
         match card.place {
@@ -4039,37 +4039,33 @@ impl KimoApp {
                 paint_chevron(painter, centre, THREAD_CHEVRON, open, color);
                 chevron = Some(response);
             }
-            RowPlace::InThread => {
-                // The thread's spine, row by row: each of its mails draws its
-                // own segment, and the segments meet because the rows do.
-                let x = rect.left() + (THREAD_INDENT - THREAD_CHEVRON) / 2.0;
-                painter.with_clip_rect(column).line_segment(
-                    [egui::pos2(x, rect.top()), egui::pos2(x, rect.bottom())],
-                    egui::Stroke::new(1.0_f32, scheme.row_edge),
-                );
-            }
-            RowPlace::Plain => {}
+            // A mail of an open conversation draws nothing in that column: it
+            // says which conversation it belongs to with the step in and the
+            // smaller avatar below, not with a line.
+            RowPlace::InThread | RowPlace::Plain => {}
         }
 
-        // Avatar: deterministic color per sender, initial centered in it.
-        let avatar_center = egui::pos2(
-            rect.left() + 8.0 + indent + AVATAR_DIAMETER / 2.0,
-            rect.center().y,
-        );
+        // Avatar: deterministic color per sender, initial centered in it — a
+        // smaller one for a mail of an open conversation, which with the step
+        // the row is inset by is what says at a glance that the mail belongs to
+        // the conversation above it.
+        let (diameter, initial) = card.place.avatar();
+        let avatar_center =
+            egui::pos2(rect.left() + 8.0 + indent + diameter / 2.0, rect.center().y);
         painter.circle_filled(
             avatar_center,
-            AVATAR_DIAMETER / 2.0,
+            diameter / 2.0,
             sender_color(scheme, card.from),
         );
         painter.text(
             avatar_center,
             egui::Align2::CENTER_CENTER,
             sender_initial(card.from),
-            egui::FontId::proportional(AVATAR_FONT_SIZE),
+            egui::FontId::proportional(initial),
             scheme.avatar_text,
         );
 
-        let text_left = avatar_center.x + AVATAR_DIAMETER / 2.0 + 10.0;
+        let text_left = avatar_center.x + diameter / 2.0 + 10.0;
         let text_right = rect.right() - 10.0;
         // Sender and subject always take the body color — read mail is not
         // muted — and unread mail is set heavier instead, so the two states
@@ -5863,7 +5859,8 @@ struct CardText<'a> {
 /// Where a card sits in the message list, which is what it draws around
 /// itself: a mail on its own, a conversation's own row (inset, with the chevron
 /// that opens it and the count of what it holds), or one mail of an open
-/// conversation (inset under it, with the thread's guide line at the left).
+/// conversation (a step further in, with a smaller avatar, and nothing drawn
+/// down the chevron's column).
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum RowPlace<'a> {
     Plain,
@@ -5883,9 +5880,25 @@ impl RowPlace<'_> {
     /// row is inset, a conversation's and a mail's alike: the chevron's column
     /// is reserved on all of them, so the avatars line up down the whole list,
     /// and a mail with nothing to open leaves that column empty rather than
-    /// starting a step further left than its neighbours.
+    /// starting a step further left than its neighbours. A mail of an *open*
+    /// conversation steps in one more (`THREAD_STEP`): the step, with the
+    /// smaller avatar it draws, is what says the mail belongs to the
+    /// conversation above it — there is no guide line to say it.
     fn indent(self) -> f32 {
-        THREAD_INDENT
+        match self {
+            RowPlace::InThread => THREAD_INDENT + THREAD_STEP,
+            _ => THREAD_INDENT,
+        }
+    }
+
+    /// The avatar the row draws its sender in — the diameter of the circle and
+    /// the size of the initial on it — a smaller one for a mail of an open
+    /// conversation (see `indent`).
+    fn avatar(self) -> (f32, f32) {
+        match self {
+            RowPlace::InThread => (THREAD_AVATAR_DIAMETER, THREAD_AVATAR_FONT_SIZE),
+            _ => (AVATAR_DIAMETER, AVATAR_FONT_SIZE),
+        }
     }
 }
 
@@ -5917,6 +5930,18 @@ const ROW_PREVIEW_FONT_SIZE: f32 = 11.0;
 /// down the whole list.
 const THREAD_INDENT: f32 = 18.0;
 const THREAD_CHEVRON: f32 = 10.0;
+/// How much further in a mail of an *open* conversation is drawn, on top of
+/// `THREAD_INDENT`, and the avatar it is drawn with: a step and a smaller
+/// circle instead of the guide line such a mail used to draw down the chevron's
+/// column. The circle starts exactly `THREAD_STEP` further in, and the mail's
+/// text `THREAD_STEP` + `THREAD_AVATAR_DIAMETER` - `AVATAR_DIAMETER` — the
+/// run between the two circles, which is 12 pt: the smaller avatar gives part of
+/// the step back. The step is the whole of the mark, so it has to be visible
+/// without reading as a misalignment.
+const THREAD_STEP: f32 = 20.0;
+const THREAD_AVATAR_DIAMETER: f32 = 24.0;
+/// Font size of that avatar's initial — a bit under half the diameter.
+const THREAD_AVATAR_FONT_SIZE: f32 = 11.0;
 /// How much of the row's own weak color the chevron keeps at rest. It is a
 /// quiet control at the edge of a row, and it comes up to the full color under
 /// the pointer, which is what says it can be clicked.
@@ -7979,21 +8004,123 @@ mod tests {
             "a conversation's row and a mail's, one avatar each: {avatars:?}"
         );
         assert_eq!(
-            avatars[0].x, avatars[1].x,
+            avatars[0].0.x, avatars[1].0.x,
             "the two rows start at the same x: {avatars:?}"
         );
+        for (_, diameter) in &avatars {
+            assert_eq!(
+                *diameter, AVATAR_DIAMETER,
+                "a row that is not one mail of an open conversation draws the full avatar"
+            );
+        }
         let expected =
             column.left() + LIST_PADDING.left as f32 + THREAD_INDENT + 8.0 + AVATAR_DIAMETER / 2.0;
         assert!(
-            (avatars[0].x - expected).abs() < 0.5,
+            (avatars[0].0.x - expected).abs() < 0.5,
             "the avatar is at {}, expected {expected}",
-            avatars[0].x
+            avatars[0].0.x
         );
     }
 
-    /// The avatars a frame drew in the message list: the filled circles the rows
-    /// put their sender's initial on.
-    fn avatars_in(shapes: &[egui::epaint::ClippedShape], column: egui::Rect) -> Vec<egui::Pos2> {
+    /// A mail of an open conversation is drawn as one of the conversation's
+    /// own: a step further in than the rows around it, with a smaller avatar,
+    /// and no guide line down the chevron's column — the step and the smaller
+    /// circle are what say, at a glance, that it belongs to the conversation
+    /// above it.
+    #[test]
+    fn the_mails_of_an_open_conversation_step_in_with_a_smaller_avatar() {
+        let ctx = egui::Context::default();
+        crate::fonts::install(&ctx, None, None);
+        let mut app = app_with_one_conversation(&ctx);
+        // A frame to derive the rows, then the conversation is opened the way
+        // the chevron opens it.
+        let _ = frame_shapes_at(&ctx, &mut app, 1400.0);
+        let key = app
+            .list_rows
+            .as_ref()
+            .expect("the list derived its rows")
+            .threads[0]
+            .key
+            .clone();
+        app.open_threads.insert(key);
+        app.open_rev += 1;
+
+        let shapes = frame_shapes_at(&ctx, &mut app, 1400.0);
+        let column = app.list_column;
+        let avatars = avatars_in(&shapes, column);
+        assert_eq!(
+            avatars.len(),
+            3,
+            "the conversation's row and the two mails under it: {avatars:?}"
+        );
+        let (row, mails) = (avatars[0], &avatars[1..]);
+        assert_eq!(
+            row.1, AVATAR_DIAMETER,
+            "the conversation's own row keeps the full avatar"
+        );
+        for (centre, diameter) in mails {
+            assert_eq!(
+                *diameter, THREAD_AVATAR_DIAMETER,
+                "a mail of the conversation draws the smaller avatar: {avatars:?}"
+            );
+            assert!(
+                centre.x > row.0.x + 8.0,
+                "the mail steps in past the conversation's row: {avatars:?}"
+            );
+        }
+
+        // Nothing is drawn down the chevron's column: what marks the mails as
+        // the conversation's is the step and the smaller avatar, not a line.
+        let lines = vertical_lines_in(&shapes, column);
+        assert!(
+            lines.is_empty(),
+            "a mail of an open conversation still draws a line down the column: {lines:?}"
+        );
+    }
+
+    /// Every vertical line a frame drew inside the list column, away from the
+    /// column's own sides — where the rows' hairlines run from the top of the
+    /// list to the bottom of it. The guide line the mails of a thread used to
+    /// draw down the chevron's column was one of these.
+    fn vertical_lines_in(
+        shapes: &[egui::epaint::ClippedShape],
+        column: egui::Rect,
+    ) -> Vec<egui::Rect> {
+        let mut out = Vec::new();
+        for clipped in shapes {
+            collect_vertical_lines(&clipped.shape, column, &mut out);
+        }
+        out
+    }
+
+    fn collect_vertical_lines(shape: &egui::Shape, column: egui::Rect, out: &mut Vec<egui::Rect>) {
+        match shape {
+            egui::Shape::LineSegment { points, .. } => {
+                let bounds = egui::Rect::from_two_pos(points[0], points[1]);
+                if bounds.width() < 0.6
+                    && bounds.height() > MESSAGE_ROW_HEIGHT / 2.0
+                    && bounds.center().x > column.left() + 2.0
+                    && bounds.center().x < column.right() - 2.0
+                {
+                    out.push(bounds);
+                }
+            }
+            egui::Shape::Vec(shapes) => {
+                for shape in shapes {
+                    collect_vertical_lines(shape, column, out);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// The avatars a frame drew in the message list — each with its diameter,
+    /// since a mail of an open conversation draws a smaller one — the filled
+    /// circles the rows put their sender's initial on.
+    fn avatars_in(
+        shapes: &[egui::epaint::ClippedShape],
+        column: egui::Rect,
+    ) -> Vec<(egui::Pos2, f32)> {
         let mut out = Vec::new();
         for clipped in shapes {
             collect_avatars(&clipped.shape, column, &mut out);
@@ -8001,14 +8128,16 @@ mod tests {
         out
     }
 
-    fn collect_avatars(shape: &egui::Shape, column: egui::Rect, out: &mut Vec<egui::Pos2>) {
+    fn collect_avatars(shape: &egui::Shape, column: egui::Rect, out: &mut Vec<(egui::Pos2, f32)>) {
         match shape {
-            egui::Shape::Circle(circle)
-                if (circle.radius * 2.0 - AVATAR_DIAMETER).abs() < 0.5
-                    && circle.center.y > TITLEBAR_HEIGHT
-                    && column.contains(circle.center) =>
-            {
-                out.push(circle.center);
+            egui::Shape::Circle(circle) => {
+                let diameter = circle.radius * 2.0;
+                let drawn = [AVATAR_DIAMETER, THREAD_AVATAR_DIAMETER]
+                    .into_iter()
+                    .any(|size| (diameter - size).abs() < 0.5);
+                if drawn && circle.center.y > TITLEBAR_HEIGHT && column.contains(circle.center) {
+                    out.push((circle.center, diameter));
+                }
             }
             egui::Shape::Vec(shapes) => {
                 for shape in shapes {
