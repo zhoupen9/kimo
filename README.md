@@ -28,7 +28,8 @@ rustls with the `ring` crypto provider and Mozilla's root certificates.
   the card a mail on its own gets (grouped by `References` and `In-Reply-To`,
   or by subject for mail cached before Kimo kept those)
 - A paperclip in the message list for mail that has attachments, and a card
-  each under the mail itself: the file name (a link that downloads the file into
+  each under the mail itself — as many to a row as fit, wrapped when the pane is
+  narrow — the file name (a link that downloads the file into
   `~/Downloads`), its MIME type and its size — the bytes themselves stay on the
   server, so a download fetches the mail again, and Export writes the whole
   message out as one `.eml`

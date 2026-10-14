@@ -4464,11 +4464,11 @@ impl KimoApp {
     /// The cards live here rather than in `mail_body` because both renderers
     /// have to have them — a Blitz body is a raster that a worker made, and the
     /// cards are not part of it — and because they are the last thing on the
-    /// card, below the body whichever way the body was drawn. Nothing about a
-    /// card is clickable yet: what is stored here is the name, the type and the
-    /// size, never the bytes (see the export convention in AGENTS.md) — so the
-    /// tooltip is the whole interaction, and it is what shows a name the column
-    /// had to cut.
+    /// card, below the body whichever way the body was drawn. They are one run
+    /// across the mail's own column, wrapped where the next card does not fit: a
+    /// fixed width each (`ATTACHMENT_CARD_WIDTH`), so what a mail came with
+    /// reads as a row of parts rather than as one card per line, and a pane too
+    /// narrow for the whole run wraps instead of cutting it.
     fn attachment_cards(&mut self, ui: &mut egui::Ui, msg: &MailMessage, column: f32) {
         if msg.attachments.is_empty() {
             return;
@@ -4477,14 +4477,25 @@ impl KimoApp {
         // the mail the pane is showing is over before the job is started.
         let mut clicked = None;
         ui.add_space(ATTACHMENT_CARDS_TOP_GAP);
-        for (index, attachment) in msg.attachments.iter().enumerate() {
-            if index > 0 {
-                ui.add_space(ATTACHMENT_CARD_GAP);
-            }
-            if attachment_card(ui, attachment, column).clicked() {
-                clicked = Some(index);
-            }
-        }
+        // The run is laid out in a scope of its own, which is what holds its
+        // width to the column the headers were drawn across: a body wider than
+        // that column (a fixed-width HTML table) widens this ui as it lays
+        // itself out, and the cards belong to the mail, not to what the mail
+        // overflowed by (see `mail_body`).
+        let start = ui.cursor().min;
+        let run =
+            egui::Rect::from_min_max(start, egui::pos2(start.x + column, ui.max_rect().bottom()));
+        ui.scope_builder(egui::UiBuilder::new().max_rect(run), |ui| {
+            // Between two cards, and between two rows of them.
+            ui.spacing_mut().item_spacing = egui::Vec2::splat(ATTACHMENT_CARD_GAP);
+            ui.horizontal_wrapped(|ui| {
+                for (index, attachment) in msg.attachments.iter().enumerate() {
+                    if attachment_card(ui, attachment).clicked() {
+                        clicked = Some(index);
+                    }
+                }
+            });
+        });
         if let Some(index) = clicked {
             let name = msg.attachments[index].name.clone();
             self.download_attachment(&msg.uid, index, &name);
@@ -5524,12 +5535,15 @@ const CONTENT_CARD_CORNER_RADIUS: u8 = 8;
 /// the chrome showing between them: a conversation is one card per mail
 /// (`mail_card`), each of them the card a mail on its own gets.
 const CONVERSATION_CARD_GAP: f32 = 12.0;
-/// The attachment cards under a mail's body: one card per file, as tall as a
-/// line of the list, with the gap between two of them and the room the section
-/// keeps between itself and the body above it. The card's own paddings are the
-/// glyph's inset, its size, the gap it leaves the text and the text's own right
-/// inset — one card is one file name and, under it, what the mail said about
-/// it.
+/// The attachment cards under a mail's body: one card per file, one fixed width
+/// and the height of a line of the list, laid across the mail's own column and
+/// wrapped onto the next row when the next card does not fit — `ATTACHMENT_CARD_GAP`
+/// between two of them either way, and `ATTACHMENT_CARDS_TOP_GAP` between the
+/// run and the body above it. The width is what a file name and, under it, the
+/// type and the size want; the card's own paddings are the glyph's inset, its
+/// size, the gap it leaves the text and the text's own right inset, and a name
+/// longer than the room it leaves is cut with a tooltip to show it.
+const ATTACHMENT_CARD_WIDTH: f32 = 200.0;
 const ATTACHMENT_CARD_HEIGHT: f32 = 52.0;
 const ATTACHMENT_CARD_GAP: f32 = 8.0;
 const ATTACHMENT_CARDS_TOP_GAP: f32 = 18.0;
@@ -6237,8 +6251,9 @@ fn truncate_galley(
 /// with the type and the size under the name for mail that was fetched with
 /// them.
 ///
-/// The card is as wide as the mail's own column, so a run of them reads as one
-/// part of the mail rather than as a list of its own, and the *whole card* is
+/// The card is a fixed width (`ATTACHMENT_CARD_WIDTH`), so a run of them reads
+/// as the parts of one mail rather than as a column of its own, and the *whole
+/// card* is
 /// the link rather than the points of the name: the name is drawn in the
 /// scheme's link color the way an HTML link is, the card fills with the hover
 /// color while the pointer is on it, the name is underlined then, and the
@@ -6246,10 +6261,10 @@ fn truncate_galley(
 /// there — and it is a real one now: the bytes are on the server, and a click
 /// fetches them (see the attachment-card convention in AGENTS.md). The hover
 /// text is what shows a name the column had to cut.
-fn attachment_card(ui: &mut egui::Ui, attachment: &Attachment, column: f32) -> egui::Response {
+fn attachment_card(ui: &mut egui::Ui, attachment: &Attachment) -> egui::Response {
     let scheme = theme::of(ui.ctx());
     let (rect, response) = ui.allocate_exact_size(
-        egui::vec2(column, ATTACHMENT_CARD_HEIGHT),
+        egui::vec2(ATTACHMENT_CARD_WIDTH, ATTACHMENT_CARD_HEIGHT),
         egui::Sense::click(),
     );
     if !ui.is_rect_visible(rect) {
@@ -8024,6 +8039,19 @@ mod tests {
         );
     }
 
+    /// The attachment cards a frame drew, in the order they were laid out: the
+    /// *filled* rects whose height is a card's — a card is a fill and a stroke,
+    /// and the stroke is a rect of its own — in the reading pane and not in the
+    /// column beside it, where a height of their own says they are cards.
+    fn attachment_cards_in(ctx: &egui::Context, app: &mut KimoApp) -> Vec<egui::Rect> {
+        let pane_left = app.list_column.right();
+        fills_in_color(&frame_shapes_at(ctx, app, 1400.0), theme::of(ctx).card)
+            .into_iter()
+            .filter(|rect| {
+                (rect.height() - ATTACHMENT_CARD_HEIGHT).abs() < 0.5 && rect.center().x > pane_left
+            })
+            .collect()
+    }
     /// Every attachment is a card under the body: the file's name, and the type
     /// and size the mail was fetched with under it. A mail cached before the
     /// database kept those two is the name alone — no second line, and no
@@ -8172,6 +8200,86 @@ mod tests {
             "the working mode keeps Kimo off the network"
         );
     }
+    /// The attachment cards are one run across the mail's column, not one card
+    /// per line: a fixed width each, two to a row where they fit, the third
+    /// wrapped onto the next row at the column's own left edge.
+    #[test]
+    fn the_attachment_cards_wrap_across_the_mails_column() {
+        let ctx = egui::Context::default();
+        crate::fonts::install(&ctx, None, None);
+        let mut app = app_with_messages(&ctx, 1);
+        let part = |name: &str| Attachment {
+            name: name.to_string(),
+            content_type: "application/pdf".to_string(),
+            size: 68 * 1024,
+        };
+        let three = vec![part("one.pdf"), part("two.png"), part("three.pdf")];
+        app.states
+            .get_mut("acct")
+            .expect("the fixture account")
+            .mailbox
+            .folders[0]
+            .messages[0]
+            .attachments = three.clone();
+        app.selected_account = Some("acct".to_string());
+        app.selected_folder = Some("INBOX".to_string());
+        app.selected_message = Some("0".to_string());
+
+        // The pane sizes the first frame; the cards are on screen from the
+        // second one on, the way the app draws them live.
+        let _ = frame_texts(&ctx, &mut app);
+        let cards = attachment_cards_in(&ctx, &mut app);
+        assert_eq!(cards.len(), three.len(), "one card per part: {cards:?}");
+        for card in &cards {
+            assert!(
+                (card.width() - ATTACHMENT_CARD_WIDTH).abs() < 0.5,
+                "every card is the fixed width, whatever it holds: {cards:?}"
+            );
+        }
+        // The cards sharing a top edge are one row, in the order they were laid
+        // out.
+        let mut rows: Vec<Vec<egui::Rect>> = Vec::new();
+        for card in cards {
+            match rows.last_mut() {
+                Some(row) if (row[0].top() - card.top()).abs() < 0.5 => row.push(card),
+                _ => rows.push(vec![card]),
+            }
+        }
+        assert_eq!(rows.len(), 2, "three cards, two rows: {rows:?}");
+        assert_eq!(rows[0].len(), 2, "two of them fit side by side: {rows:?}");
+        assert_eq!(rows[1].len(), 1, "the third one wraps: {rows:?}");
+        let between = rows[0][1].left() - rows[0][0].right();
+        assert!(
+            (between - ATTACHMENT_CARD_GAP).abs() < 0.5,
+            "two cards are {between} pt apart: {rows:?}"
+        );
+        assert!(
+            (rows[1][0].left() - rows[0][0].left()).abs() < 0.5,
+            "the wrapped row starts at the column's own left edge: {rows:?}"
+        );
+        let drop = rows[1][0].top() - rows[0][0].bottom();
+        assert!(
+            (drop - ATTACHMENT_CARD_GAP).abs() < 0.5,
+            "the wrapped row is {drop} pt under the one above: {rows:?}"
+        );
+
+        // Two parts fit on one row: nothing wraps while there is room.
+        app.states
+            .get_mut("acct")
+            .expect("the fixture account")
+            .mailbox
+            .folders[0]
+            .messages[0]
+            .attachments = three[..2].to_vec();
+        let _ = frame_texts(&ctx, &mut app);
+        let cards = attachment_cards_in(&ctx, &mut app);
+        assert_eq!(cards.len(), 2, "{cards:?}");
+        assert!(
+            (cards[0].top() - cards[1].top()).abs() < 0.5,
+            "the two share a row: {cards:?}"
+        );
+    }
+
     /// Clicking an attachment card starts a download: the app finds the account
     /// and the mail the pane is showing, and hands the worker the part's place
     /// and the file's name. What the worker does with them is `sync`'s own

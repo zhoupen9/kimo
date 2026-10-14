@@ -932,10 +932,16 @@ Event (mpsc) ──► drain_events() at frame start ──► merge into Accoun
   the file name, and — under the name — the MIME type and the size, whichever
   of the two the mail was fetched with (`attachment_meta`; `human_size` counts
   in binary units, the way a file manager on this desktop does, and drops a
-  `.0`). The card spans the mail's own column, the width the headers were laid
-  out across, taken from the pane *before* the body is drawn — a body wider than
-  the column (a fixed-width HTML table) widens the ui as it lays itself out, and
-  the cards belong to the mail, not to what the mail overflowed by. They are the
+  `.0`). **The cards are one run, not one per line**: a fixed width each
+  (`ATTACHMENT_CARD_WIDTH`, a name's worth of room and no more) laid across the
+  mail's own column and wrapped onto the next row where the next one does not
+  fit (`horizontal_wrapped`, `ATTACHMENT_CARD_GAP` both ways), so a mail with
+  ten parts is a block of cards rather than ten lines, and a pane too narrow for
+  the run wraps instead of cutting it. The run is laid out in a scope of its own
+  — the column the headers were drawn across, taken from the pane *before* the
+  body is drawn — because a body wider than that column (a fixed-width HTML
+  table) widens the ui as it lays itself out, and the cards belong to the mail,
+  not to what the mail overflowed by. They are the
   last thing on the mail's card whichever renderer drew the body,
   because `mail_card` draws them after `mail_body` rather than inside it: a
   Blitz body is a raster a worker made, and the cards are not part of it.
