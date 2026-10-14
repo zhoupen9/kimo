@@ -7,46 +7,64 @@ use crate::models::MailMessage;
 
 pub fn parse(raw: &[u8], uid: &str, seen: bool) -> MailMessage {
     let parsed = MessageParser::default().parse(raw);
-    let (subject, from, to, date, timestamp, body_text, body_html, attachments, inline_images) =
-        match parsed {
-            Some(m) => {
-                let dt = m.date().copied();
-                // The body accessors convert between flavors, so look at the
-                // real part type to know whether this message is HTML-based.
-                let body_is_html = m
-                    .html_body
-                    .first()
-                    .or_else(|| m.text_body.first())
-                    .and_then(|&i| m.parts.get(i as usize))
-                    .is_some_and(|p| matches!(p.body, mail_parser::PartType::Html(_)));
-                (
-                    m.subject().unwrap_or_default().to_owned(),
-                    address_to_string(m.from()),
-                    address_to_string(m.to()),
-                    dt.map(|d| d.to_string()).unwrap_or_default(),
-                    dt.map(|d| d.to_timestamp()),
-                    m.body_text(0).map(|c| c.into_owned()).unwrap_or_default(),
-                    if body_is_html {
-                        m.body_html(0).map(|c| c.into_owned())
-                    } else {
-                        None
-                    },
-                    collect_attachments(&m),
-                    collect_inline_images(&m),
-                )
-            }
-            None => (
-                String::new(),
-                String::new(),
-                String::new(),
-                String::new(),
-                None,
-                String::from_utf8_lossy(raw).into_owned(),
-                None,
-                Vec::new(),
-                Vec::new(),
-            ),
-        };
+    let (
+        subject,
+        from,
+        to,
+        date,
+        timestamp,
+        message_id,
+        in_reply_to,
+        references,
+        body_text,
+        body_html,
+        attachments,
+        inline_images,
+    ) = match parsed {
+        Some(m) => {
+            let dt = m.date().copied();
+            // The body accessors convert between flavors, so look at the
+            // real part type to know whether this message is HTML-based.
+            let body_is_html = m
+                .html_body
+                .first()
+                .or_else(|| m.text_body.first())
+                .and_then(|&i| m.parts.get(i as usize))
+                .is_some_and(|p| matches!(p.body, mail_parser::PartType::Html(_)));
+            (
+                m.subject().unwrap_or_default().to_owned(),
+                address_to_string(m.from()),
+                address_to_string(m.to()),
+                dt.map(|d| d.to_string()).unwrap_or_default(),
+                dt.map(|d| d.to_timestamp()),
+                m.message_id().unwrap_or_default().to_string(),
+                message_ids(m.in_reply_to()),
+                message_ids(m.references()),
+                m.body_text(0).map(|c| c.into_owned()).unwrap_or_default(),
+                if body_is_html {
+                    m.body_html(0).map(|c| c.into_owned())
+                } else {
+                    None
+                },
+                collect_attachments(&m),
+                collect_inline_images(&m),
+            )
+        }
+        None => (
+            String::new(),
+            String::new(),
+            String::new(),
+            String::new(),
+            None,
+            String::new(),
+            Vec::new(),
+            Vec::new(),
+            String::from_utf8_lossy(raw).into_owned(),
+            None,
+            Vec::new(),
+            Vec::new(),
+        ),
+    };
 
     let preview = {
         let source = if !body_text.trim().is_empty() {
@@ -76,11 +94,31 @@ pub fn parse(raw: &[u8], uid: &str, seen: bool) -> MailMessage {
         date,
         timestamp,
         seen,
+        message_id,
+        in_reply_to,
+        references,
         body_text,
         body_html,
         preview,
         attachments,
         inline_images,
+    }
+}
+
+/// The ids of an `In-Reply-To` or `References` header, angle brackets off and
+/// empties dropped — mail-parser has already taken the brackets off and answers
+/// with `Text` for one id and `TextList` for several. These are the headers a
+/// conversation is stitched from; a mail with none of them is a thread of its
+/// own unless its subject says otherwise (`crate::threads`).
+fn message_ids(value: &mail_parser::HeaderValue<'_>) -> Vec<String> {
+    let one = |text: &str| {
+        let id = text.trim().trim_matches(['<', '>']).trim();
+        (!id.is_empty()).then(|| id.to_string())
+    };
+    match value {
+        mail_parser::HeaderValue::Text(text) => one(text).into_iter().collect(),
+        mail_parser::HeaderValue::TextList(list) => list.iter().filter_map(|t| one(t)).collect(),
+        _ => Vec::new(),
     }
 }
 
@@ -267,6 +305,45 @@ mod tests {
             "Fri, 09 Oct 2026 01:01:01 +0000"
         );
         assert_eq!(rfc5322_date(-1), "Wed, 31 Dec 1969 23:59:59 +0000");
+    }
+
+    /// The headers a conversation is stitched from: the mail's own id, what it
+    /// answers, and the chain its client kept — angle brackets off, in the
+    /// order they were written, with a header that says nothing coming back as
+    /// nothing rather than as an empty id.
+    #[test]
+    fn threading_headers_are_read_into_ids() {
+        let raw = b"From: Alice <alice@example.com>\r\n\
+                    Subject: Re: Hello\r\n\
+                    Message-ID: <reply@example.com>\r\n\
+                    In-Reply-To: <root@example.com>\r\n\
+                    References: <root@example.com> <first@example.com>\r\n\
+                    \r\n\
+                    A reply.\r\n";
+        let msg = parse(raw, "2", false);
+        assert_eq!(msg.message_id, "reply@example.com");
+        assert_eq!(msg.in_reply_to, ["root@example.com"]);
+        assert_eq!(msg.references, ["root@example.com", "first@example.com"]);
+
+        // A mail that threads nothing: no headers, no ids.
+        let plain = parse(
+            b"From: a@b.c\r\nSubject: Alone\r\n\r\nText.\r\n",
+            "3",
+            false,
+        );
+        assert_eq!(plain.message_id, "");
+        assert!(plain.in_reply_to.is_empty() && plain.references.is_empty());
+
+        // A client that wrote several In-Reply-To ids keeps them all, and one
+        // that wrote a broken header is not a mail with a nameless parent.
+        let several = parse(
+            b"Message-ID: <m@example.com>\r\nIn-Reply-To: <a@example.com> <b@example.com>\r\n\
+              References: <>\r\n\r\nText.\r\n",
+            "4",
+            false,
+        );
+        assert_eq!(several.in_reply_to, ["a@example.com", "b@example.com"]);
+        assert!(several.references.is_empty());
     }
 
     #[test]

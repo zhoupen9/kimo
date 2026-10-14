@@ -106,6 +106,11 @@ pub struct Settings {
     /// means egui's built-in monospace font.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mono_font: Option<String>,
+    /// Whether the message list groups mail into conversations
+    /// (`crate::threads`). Absent means the app's own default, which is on:
+    /// threading is what the list does unless it is told otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub threaded: Option<bool>,
 }
 
 pub fn load_settings() -> Settings {
@@ -187,6 +192,7 @@ mod tests {
             html_renderer: Some("blitz".into()),
             working_mode: Some("debug".into()),
             ui_font: Some("DejaVu Sans".into()),
+            threaded: Some(false),
             mono_font: Some("DejaVu Sans Mono".into()),
         };
         let json = serde_json::to_string(&s).unwrap();
@@ -195,6 +201,7 @@ mod tests {
         assert_eq!(back.html_renderer.as_deref(), Some("blitz"));
         assert_eq!(back.working_mode.as_deref(), Some("debug"));
         assert_eq!(back.ui_font.as_deref(), Some("DejaVu Sans"));
+        assert_eq!(back.threaded, Some(false));
         assert_eq!(back.mono_font.as_deref(), Some("DejaVu Sans Mono"));
         // settings.json with missing keys must still load.
         let missing: Settings = serde_json::from_str("{}").unwrap();
@@ -203,6 +210,7 @@ mod tests {
         assert_eq!(missing.working_mode, None);
         assert_eq!(missing.ui_font, None);
         assert_eq!(missing.mono_font, None);
+        assert_eq!(missing.threaded, None, "absent means the app's default");
         // An absent mode is not written back as one: the file stays a file
         // that says nothing, and the build decides what that means.
         let unset = Settings::default();

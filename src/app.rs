@@ -36,6 +36,7 @@ use crate::search::{Scope, SearchHit, SearchQuery, SEARCH_LIMIT};
 use crate::storage::{self, Settings};
 use crate::sync::{self, Event, Job, SentCopy};
 use crate::theme::{self, ColorScheme, Theme};
+use crate::threads::{self, Thread};
 
 /// Below this window width the navigation bar collapses automatically.
 const NAV_AUTO_COLLAPSE_WIDTH: f32 = 640.0;
@@ -487,10 +488,87 @@ pub struct KimoApp {
     /// scroll area at all. The title bar floats over the column once this
     /// leaves the top, and docks again when it comes back.
     list_scroll: f32,
+    /// Whether the list groups the folder's mail into conversations
+    /// (Preferences → General, `crate::threads`).
+    threaded: bool,
+    /// The threads the user has opened, keyed by `Thread::key`. In memory
+    /// only: which conversations are open is a per-session thing, the way the
+    /// collapsed accounts are.
+    open_threads: HashSet<String>,
+    /// Bumped whenever `open_threads` changes, so the derived rows know they
+    /// are stale without comparing the whole set.
+    open_rev: u64,
+    /// The list as it is drawn, derived from the folder's mail rather than
+    /// built on every frame — see [`ListRows`].
+    list_rows: Option<ListRows>,
     /// The same for the reading pane's card, which scrolls the whole mail:
     /// either column scrolled is content under the floating bar. Zero while
     /// no mail is open.
     mail_scroll: f32,
+}
+
+/// The rows a folder's conversations become: one per thread, and — under an
+/// open one — one per mail it holds, oldest first, so a conversation reads the
+/// way it happened. A list that is not threading gets one row per mail, which
+/// is the shape the list had before conversations.
+fn list_rows_of(
+    threads: &[Thread],
+    count: usize,
+    open: &HashSet<String>,
+    threaded: bool,
+) -> Vec<ListRow> {
+    if !threaded {
+        return (0..count)
+            .map(|index| ListRow::Message {
+                index,
+                in_thread: false,
+            })
+            .collect();
+    }
+    let mut rows = Vec::with_capacity(threads.len());
+    for (thread, conversation) in threads.iter().enumerate() {
+        rows.push(ListRow::Thread { thread });
+        if open.contains(&conversation.key) {
+            rows.extend(conversation.messages.iter().map(|&index| ListRow::Message {
+                index,
+                in_thread: true,
+            }));
+        }
+    }
+    rows
+}
+
+/// One row of the message list: a thread's own row, or one mail.
+///
+/// Every row is `MESSAGE_ROW_HEIGHT` tall whatever it is, which is what lets
+/// the list keep laying out only the rows its viewport shows
+/// (`virtual_rows`): what threading changes is which rows there are, not how
+/// tall one is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ListRow {
+    /// A conversation, `thread` indexing `ListRows::threads`.
+    Thread { thread: usize },
+    /// One mail, `index` into the folder's messages. `in_thread` marks the
+    /// ones an open thread holds, which are drawn indented under it.
+    Message { index: usize, in_thread: bool },
+}
+
+/// The message list's model of the folder it is showing: the mail grouped into
+/// conversations (`crate::threads`) and the rows drawn from them.
+///
+/// Grouping is a per-folder cost — a map, a union-find and a sort over every
+/// mail the folder holds — and the list is drawn on every frame, so the answer
+/// is kept until something it depends on moves: the folder's mail
+/// (`AccountUiState::folders_rev`), the threading switch, the folder the pane
+/// is showing, or the set of open threads (`open_rev`).
+struct ListRows {
+    account: String,
+    folder: String,
+    rev: u64,
+    open_rev: u64,
+    threaded: bool,
+    threads: Vec<Thread>,
+    rows: Vec<ListRow>,
 }
 
 /// A Blitz page: rendering, rendered, or failed.
@@ -1095,6 +1173,12 @@ impl KimoApp {
             list_column: egui::Rect::ZERO,
             list_scroll: 0.0,
             mail_scroll: 0.0,
+            // Absent in settings.json means the app's own default: the list
+            // groups mail into conversations.
+            threaded: settings.threaded.unwrap_or(true),
+            open_threads: HashSet::new(),
+            open_rev: 0,
+            list_rows: None,
         };
 
         app.selected_account = app.accounts.first().map(|a| a.id.clone());
@@ -1914,6 +1998,7 @@ impl KimoApp {
             working_mode: Some(self.working_mode.as_str().to_string()),
             ui_font: self.ui_font.clone(),
             mono_font: self.mono_font.clone(),
+            threaded: Some(self.threaded),
         });
     }
 
@@ -3204,16 +3289,21 @@ impl KimoApp {
     /// the mail it landed on and opened after the list has been drawn, when the
     /// borrow of the state it came from is over.
     fn folder_messages(&mut self, ui: &mut egui::Ui) {
+        self.refresh_list_rows();
         // A folder the account does not have yet — INBOX before the first
         // sync, which the navigation offers because clicking it is what starts
-        // the fetch — is an empty one, and gets the same placeholder.
-        let messages = self
+        // the fetch — is an empty one, and gets the same placeholder. The check
+        // stands on its own because what follows holds borrows of the state it
+        // reads, and the placeholder writes back to `self`.
+        let drawable = self
             .selected_account
             .as_deref()
             .zip(self.selected_folder.as_deref())
-            .and_then(|(account_id, folder)| self.folder_messages_of(account_id, folder))
-            .unwrap_or(&[]);
-        if messages.is_empty() {
+            .is_some_and(|(account_id, folder)| {
+                self.folder_messages_of(account_id, folder)
+                    .is_some_and(|messages| !messages.is_empty())
+            });
+        if !drawable {
             self.list_scroll = 0.0;
             ui.centered_and_justified(|ui| {
                 let text = if self.selected_folder_synced() {
@@ -3228,7 +3318,19 @@ impl KimoApp {
             self.load_older_button(ui);
             return;
         }
+        // The rows are the list's model and the mail they name lives in the
+        // account state: both are read here, and only read.
+        let rows = self.list_rows.as_ref().expect("derived just above");
+        let messages = self
+            .selected_account
+            .as_deref()
+            .zip(self.selected_folder.as_deref())
+            .and_then(|(account_id, folder)| self.folder_messages_of(account_id, folder))
+            .expect("checked just above");
         let mut clicked: Option<MailMessage> = None;
+        // A conversation's own row was clicked: what it opens or closes is
+        // applied once the borrow of the state is over.
+        let mut toggled: Option<(String, bool, MailMessage)> = None;
         let list = egui::ScrollArea::vertical()
             .auto_shrink([false, false])
             .show_viewport(ui, |ui, viewport| {
@@ -3239,17 +3341,52 @@ impl KimoApp {
                         // mails are the rows' own edges, so the layout must not
                         // add space of its own between them.
                         ui.spacing_mut().item_spacing.y = 0.0;
+                        let count = rows.rows.len();
                         virtual_rows(
                             ui,
                             viewport,
                             LIST_PADDING.top as f32,
                             MESSAGE_ROW_HEIGHT,
-                            messages.len(),
-                            |ui, rows| {
-                                for index in rows {
-                                    if self.message_row(ui, &messages[index], index == 0).clicked()
-                                    {
-                                        clicked = Some(messages[index].clone());
+                            count,
+                            |ui, drawn| {
+                                for index in drawn {
+                                    let first = index == 0;
+                                    match rows.rows[index] {
+                                        ListRow::Thread { thread } => {
+                                            let conversation = &rows.threads[thread];
+                                            let open =
+                                                self.open_threads.contains(&conversation.key);
+                                            let response = self.thread_row(
+                                                ui,
+                                                conversation,
+                                                messages,
+                                                open,
+                                                first,
+                                            );
+                                            if response.clicked() {
+                                                toggled = Some((
+                                                    conversation.key.clone(),
+                                                    open,
+                                                    messages[conversation.newest].clone(),
+                                                ));
+                                            }
+                                        }
+                                        ListRow::Message { index, in_thread } => {
+                                            let place = if in_thread {
+                                                RowPlace::InThread
+                                            } else {
+                                                RowPlace::Plain
+                                            };
+                                            let response = self.message_row(
+                                                ui,
+                                                &messages[index],
+                                                first,
+                                                place,
+                                            );
+                                            if response.clicked() {
+                                                clicked = Some(messages[index].clone());
+                                            }
+                                        }
                                     }
                                 }
                             },
@@ -3262,12 +3399,98 @@ impl KimoApp {
         // is on, so it is where the button belongs. A list shorter than its
         // viewport is at its bottom by definition.
         let end = (list.content_size.y - list.inner_rect.height()).max(0.0);
-        if list.state.offset.y >= end - 1.0 {
+        let at_end = list.state.offset.y >= end - 1.0;
+        // Opening a conversation shows the mail its row speaks for; closing one
+        // leaves the pane where it is, and either way the list is told to
+        // derive its rows again.
+        if let Some((key, open, newest)) = toggled {
+            if open {
+                self.open_threads.remove(&key);
+            } else {
+                self.open_threads.insert(key);
+                clicked = Some(newest);
+            }
+            self.open_rev += 1;
+        }
+        if at_end {
             self.load_older_button(ui);
         }
         if let Some(msg) = clicked {
             self.open_message(&msg);
         }
+    }
+
+    /// The list's model, brought up to date when anything it is derived from
+    /// has moved: the folder the pane shows and its account, that folder's mail
+    /// (`AccountUiState::folders_rev`), the threading switch, and the
+    /// conversations the user opened.
+    ///
+    /// Grouping a folder is a map, a union-find and a sort over all of its
+    /// mail, and the list is drawn on every frame — which is why the answer is
+    /// kept rather than rebuilt (see [`ListRows`]).
+    fn refresh_list_rows(&mut self) {
+        let (Some(account), Some(folder)) =
+            (self.selected_account.clone(), self.selected_folder.clone())
+        else {
+            self.list_rows = None;
+            return;
+        };
+        let rev = self
+            .states
+            .get(&account)
+            .map_or(0, |state| state.folders_rev);
+        if let Some(rows) = &self.list_rows {
+            let fresh = rows.account == account
+                && rows.folder == folder
+                && rows.rev == rev
+                && rows.open_rev == self.open_rev
+                && rows.threaded == self.threaded;
+            if fresh {
+                return;
+            }
+        }
+
+        // A folder the pane has just moved to — or threading switched on — opens
+        // the conversation of the mail it is showing, so the list and the pane
+        // do not start out disagreeing. Anything else keeps the user's own
+        // open and closed conversations as they are.
+        let reset = self.list_rows.as_ref().is_none_or(|rows| {
+            rows.account != account || rows.folder != folder || rows.threaded != self.threaded
+        });
+        let mut open = self.open_threads.clone();
+        let selected = self.selected_message.clone();
+
+        // The mail is borrowed from the state and the model lives on `self`, so
+        // what is derived is built from its own borrow and handed over once it
+        // is owned.
+        let derived = self.folder_messages_of(&account, &folder).map(|messages| {
+            let threads = threads::group(messages);
+            if reset {
+                if let Some(uid) = selected.as_deref() {
+                    if let Some(thread) = threads
+                        .iter()
+                        .find(|thread| thread.messages.iter().any(|&i| messages[i].uid == uid))
+                    {
+                        open.insert(thread.key.clone());
+                    }
+                }
+            }
+            let rows = list_rows_of(&threads, messages.len(), &open, self.threaded);
+            (threads, rows)
+        });
+        if open != self.open_threads {
+            self.open_threads = open;
+            self.open_rev += 1;
+        }
+        self.list_rows = derived.map(|(threads, rows)| ListRows {
+            account,
+            folder,
+            rev,
+            open_rev: self.open_rev,
+            threaded: self.threaded,
+            threads,
+            rows,
+        });
     }
 
     /// `Load older mail`, floating over the bottom of the message list: the
@@ -3509,10 +3732,17 @@ impl KimoApp {
     }
 
     /// One message card in the folder list. `first` is the list's own first
-    /// card, which is the one that draws no line above itself. The row only
-    /// draws itself — the list it belongs to opens whatever was clicked, once
-    /// it has stopped borrowing the state this was read from.
-    fn message_row(&self, ui: &mut egui::Ui, msg: &MailMessage, first: bool) -> egui::Response {
+    /// card, which is the one that draws no line above itself, and `place` is
+    /// where it sits: on its own, or under the conversation it belongs to. The
+    /// row only draws itself — the list it belongs to opens whatever was
+    /// clicked, once it has stopped borrowing the state this was read from.
+    fn message_row(
+        &self,
+        ui: &mut egui::Ui,
+        msg: &MailMessage,
+        first: bool,
+        place: RowPlace,
+    ) -> egui::Response {
         let selected = self.selected_message.as_deref() == Some(msg.uid.as_str());
         let preview = if msg.preview.is_empty() {
             " ".to_string()
@@ -3527,6 +3757,46 @@ impl KimoApp {
             unread: !msg.seen,
             selected,
             has_attachments: !msg.attachments.is_empty(),
+            place,
+        };
+        self.message_card(ui, &card, first)
+    }
+
+    /// One conversation's own card in the folder list: the newest mail's sender,
+    /// date and preview under the thread's subject, the count of what the thread
+    /// holds beside the date, and the twisty at the left that opens it. It is
+    /// selected — and struck as unread — the way the mail it speaks for is, so
+    /// the row and the pane never disagree about what is open.
+    fn thread_row(
+        &self,
+        ui: &mut egui::Ui,
+        thread: &Thread,
+        messages: &[MailMessage],
+        open: bool,
+        first: bool,
+    ) -> egui::Response {
+        let newest = &messages[thread.newest];
+        let selected = self
+            .selected_message
+            .as_deref()
+            .is_some_and(|uid| thread.holds(messages, uid));
+        let preview = if newest.preview.is_empty() {
+            " ".to_string()
+        } else {
+            newest.preview.clone()
+        };
+        let card = CardText {
+            from: &newest.from,
+            title: &thread.subject,
+            date: &date_label(newest.timestamp, &newest.date),
+            third: &preview,
+            unread: thread.unread > 0,
+            selected,
+            has_attachments: thread.has_attachments,
+            place: RowPlace::Thread {
+                open,
+                count: thread.messages.len(),
+            },
         };
         self.message_card(ui, &card, first)
     }
@@ -3554,6 +3824,9 @@ impl KimoApp {
             // The row draws the same paperclip a folder row does, so a hit says
             // what the mail carries the one way the whole list says it.
             has_attachments: hit.attachments > 0,
+            // Search results are a flat list of hits: where a hit sits in its
+            // own folder's conversations is not what was asked for.
+            place: RowPlace::Plain,
         };
         self.message_card(ui, &card, first)
     }
@@ -3629,8 +3902,55 @@ impl KimoApp {
             edge,
         );
 
+        // Where the row sits in the list: a conversation's own row and the
+        // mails it holds are inset, and the room that leaves at the left is
+        // where the twisty — or the thread's guide line — is drawn.
+        let indent = card.place.indent();
+        match card.place {
+            RowPlace::Thread { open, .. } => {
+                // The twisty a folder section in the navigation column has:
+                // pointing right while the thread is closed, down while open.
+                let centre = egui::pos2(
+                    rect.left() + (THREAD_INDENT - THREAD_TWISTY) / 2.0,
+                    rect.center().y,
+                );
+                let half = THREAD_TWISTY / 2.0;
+                let triangle = if open {
+                    vec![
+                        egui::pos2(centre.x - half, centre.y - 3.0),
+                        egui::pos2(centre.x + half, centre.y - 3.0),
+                        egui::pos2(centre.x, centre.y + 4.0),
+                    ]
+                } else {
+                    vec![
+                        egui::pos2(centre.x - 3.0, centre.y - half),
+                        egui::pos2(centre.x + 4.0, centre.y),
+                        egui::pos2(centre.x - 3.0, centre.y + half),
+                    ]
+                };
+                painter.add(egui::Shape::convex_polygon(
+                    triangle,
+                    scheme.text_weak,
+                    egui::Stroke::NONE,
+                ));
+            }
+            RowPlace::InThread => {
+                // The thread's spine, row by row: each of its mails draws its
+                // own segment, and the segments meet because the rows do.
+                let x = rect.left() + (THREAD_INDENT - THREAD_TWISTY) / 2.0;
+                painter.with_clip_rect(column).line_segment(
+                    [egui::pos2(x, rect.top()), egui::pos2(x, rect.bottom())],
+                    egui::Stroke::new(1.0_f32, scheme.row_edge),
+                );
+            }
+            RowPlace::Plain => {}
+        }
+
         // Avatar: deterministic color per sender, initial centered in it.
-        let avatar_center = egui::pos2(rect.left() + 8.0 + AVATAR_DIAMETER / 2.0, rect.center().y);
+        let avatar_center = egui::pos2(
+            rect.left() + 8.0 + indent + AVATAR_DIAMETER / 2.0,
+            rect.center().y,
+        );
         painter.circle_filled(
             avatar_center,
             AVATAR_DIAMETER / 2.0,
@@ -3652,7 +3972,22 @@ impl KimoApp {
         // muted, always.
         let title_color = scheme.text;
 
-        // First row: timestamp right-aligned, sender truncated before it.
+        // First row: timestamp right-aligned, sender truncated before it — and,
+        // for a conversation, the count of what it holds in front of the date.
+        let mut line_right = text_right;
+        if let RowPlace::Thread { count, .. } = card.place {
+            let small = egui::TextStyle::Small.resolve(ui.style());
+            let badge = ui
+                .ctx()
+                .fonts_mut(|f| f.layout_no_wrap(count.to_string(), small, scheme.text_weak));
+            line_right -= badge.size().x;
+            painter.galley(
+                egui::pos2(line_right, rect.top() + 20.0 - badge.size().y * 0.5),
+                badge,
+                scheme.text_weak,
+            );
+            line_right -= 8.0;
+        }
         let date_galley = ui.ctx().fonts_mut(|f| {
             f.layout_no_wrap(
                 card.date.to_string(),
@@ -3661,7 +3996,7 @@ impl KimoApp {
             )
         });
         let date_pos = egui::pos2(
-            text_right - date_galley.size().x,
+            line_right - date_galley.size().x,
             rect.top() + 20.0 - date_galley.size().y * 0.5,
         );
         painter.galley(date_pos, date_galley, scheme.text_weak);
@@ -4416,8 +4751,31 @@ impl KimoApp {
         });
     }
 
-    /// Preferences → General: the working mode, persisted on change.
+    /// Preferences → General: the working mode and the list's threading, both
+    /// persisted on change.
     fn general_page(&mut self, ui: &mut egui::Ui) {
+        ui.label(egui::RichText::new("Mail list").strong());
+        if ui
+            .checkbox(&mut self.threaded, "Group mail into conversations")
+            .changed()
+        {
+            self.persist_settings();
+        }
+        ui.label(
+            egui::RichText::new(
+                "A conversation is one row, showing its newest mail; click it to open \
+                 the mails it holds. Replies are grouped by their References and \
+                 In-Reply-To headers, and — for mail cached before Kimo kept those — by \
+                 a subject that answers another.",
+            )
+            .small()
+            .weak(),
+        );
+
+        ui.add_space(12.0);
+        ui.separator();
+        ui.add_space(8.0);
+
         ui.label(egui::RichText::new("Working mode").strong());
         ui.horizontal(|ui| {
             for mode in WorkingMode::ALL {
@@ -5340,6 +5698,30 @@ struct CardText<'a> {
     /// title line. Both lists can answer it: a folder's mail from what was
     /// stored with it, a search hit from what the query counted.
     has_attachments: bool,
+    /// Where the row sits in the list: a mail on its own, a conversation's own
+    /// row, or one mail of an open conversation.
+    place: RowPlace,
+}
+
+/// Where a card sits in the message list, which is what it draws around
+/// itself: a plain mail row, a conversation's own row (inset, with the twisty
+/// that opens it and the count of what it holds), or one mail of an open
+/// conversation (inset under it, with the thread's guide line at the left).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RowPlace {
+    Plain,
+    Thread { open: bool, count: usize },
+    InThread,
+}
+
+impl RowPlace {
+    /// How far the row's avatar and text are inset from the column's edge.
+    fn indent(self) -> f32 {
+        match self {
+            Self::Plain => 0.0,
+            Self::Thread { .. } | Self::InThread => THREAD_INDENT,
+        }
+    }
 }
 
 const MESSAGE_ROW_HEIGHT: f32 = 68.0;
@@ -5352,6 +5734,12 @@ const AVATAR_FONT_SIZE: f32 = 14.0;
 const ROW_DATE_FONT_SIZE: f32 = 11.0;
 const ROW_TITLE_FONT_SIZE: f32 = 12.0;
 const ROW_PREVIEW_FONT_SIZE: f32 = 11.0;
+/// How far a conversation's own row — and the mails it holds — are inset from
+/// the column's edge, and the room the twisty is drawn in at the left of that.
+/// The two are one number: what the twisty is drawn in is exactly what the
+/// thread's mails are inset by, so the block reads as one thing.
+const THREAD_INDENT: f32 = 18.0;
+const THREAD_TWISTY: f32 = 10.0;
 /// The paperclip a row draws when the mail has parts: the box its outline is
 /// drawn in (`paint_clip_icon` maps the glyph's 24-unit design onto it), the
 /// width the clip actually comes out at — a clip is taller than it is wide, so
@@ -6667,6 +7055,9 @@ mod tests {
             date: "2026-01-01".to_string(),
             timestamp: Some(1_700_000_000),
             seen,
+            message_id: format!("{uid}@example.com"),
+            in_reply_to: Vec::new(),
+            references: Vec::new(),
             body_text: "body".to_string(),
             body_html: None,
             preview: "preview".to_string(),
@@ -7270,19 +7661,18 @@ mod tests {
         let mut app = app_with_messages(&ctx, 1);
 
         let with_parts = |app: &mut KimoApp, count: usize| {
-            app.states
-                .get_mut("acct")
-                .expect("the fixture account")
-                .mailbox
-                .folders[0]
-                .messages[0]
-                .attachments = (0..count)
+            let state = app.states.get_mut("acct").expect("the fixture account");
+            state.mailbox.folders[0].messages[0].attachments = (0..count)
                 .map(|index| Attachment {
                     name: format!("file-{index}.pdf"),
                     content_type: "application/pdf".to_string(),
                     size: 1024,
                 })
                 .collect();
+            // The list derives its rows from a revision, so a test that changes
+            // a mail behind the app's back has to say so — the way a fetched
+            // batch does (`AccountUiState::folders_changed`).
+            state.folders_changed();
         };
 
         // A frame first: the list records its own rect as it draws.
@@ -7343,6 +7733,225 @@ mod tests {
         assert!(
             !strokes.is_empty(),
             "a search hit with a file draws no clip: {strokes:?}"
+        );
+    }
+
+    /// One mail of a folder the threading tests hand to the list: the headers a
+    /// conversation is stitched from are arguments, and the folder's own order
+    /// is newest first, which is what the timestamp says.
+    fn threaded_mail(
+        uid: &str,
+        subject: &str,
+        id: &str,
+        references: &[&str],
+        ts: i64,
+    ) -> MailMessage {
+        let mut mail = test_message(uid, false);
+        mail.subject = subject.to_string();
+        mail.message_id = id.to_string();
+        mail.in_reply_to = references
+            .iter()
+            .rev()
+            .take(1)
+            .map(|id| id.to_string())
+            .collect();
+        mail.references = references.iter().map(|id| id.to_string()).collect();
+        mail.timestamp = Some(ts);
+        mail.date = String::new();
+        mail.body_text = format!("body of {uid}");
+        mail.preview = format!("body of {uid}");
+        mail
+    }
+
+    /// A folder holding exactly these mails, with the pane on it.
+    fn app_with_threaded_mail(ctx: &egui::Context, mut mails: Vec<MailMessage>) -> KimoApp {
+        mails.sort_by_key(|mail| std::cmp::Reverse(mail.timestamp));
+        let mut app = app_with_messages(ctx, 0);
+        let state = app.states.get_mut("acct").expect("the fixture account");
+        state.mailbox.folders[0].messages = mails;
+        state.folders_changed();
+        app.selected_account = Some("acct".to_string());
+        app.selected_folder = Some("INBOX".to_string());
+        app
+    }
+
+    /// Click at a position the way a user does: the pointer moves there, then
+    /// the button goes down and up.
+    fn click_at(ctx: &egui::Context, app: &mut KimoApp, pos: egui::Pos2) {
+        run_app_frame(ctx, app, vec![egui::Event::PointerMoved(pos)]);
+        for pressed in [true, false] {
+            run_app_frame(
+                ctx,
+                app,
+                vec![egui::Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Primary,
+                    pressed,
+                    modifiers: egui::Modifiers::default(),
+                }],
+            );
+        }
+    }
+
+    /// The rows a folder becomes, without a frame in the way: one per
+    /// conversation, its mails under it once it is open, and one per mail when
+    /// the list is not threading.
+    #[test]
+    fn the_rows_are_one_per_conversation_and_its_mails_once_open() {
+        let mails = vec![
+            threaded_mail("3", "Re: Hello", "c@x", &["a@x", "b@x"], 300),
+            threaded_mail("2", "Re: Hello", "b@x", &["a@x"], 200),
+            threaded_mail("1", "Hello", "a@x", &[], 100),
+            threaded_mail("4", "Groceries", "d@x", &[], 50),
+        ];
+        let threads = threads::group(&mails);
+        assert_eq!(threads.len(), 2);
+
+        let closed: std::collections::HashSet<String> = std::collections::HashSet::new();
+        assert_eq!(
+            list_rows_of(&threads, mails.len(), &closed, true),
+            vec![ListRow::Thread { thread: 0 }, ListRow::Thread { thread: 1 }]
+        );
+
+        // Open: the conversation's own row, then its mails oldest first.
+        let open: std::collections::HashSet<String> =
+            [threads[0].key.clone()].into_iter().collect();
+        assert_eq!(
+            list_rows_of(&threads, mails.len(), &open, true),
+            vec![
+                ListRow::Thread { thread: 0 },
+                ListRow::Message {
+                    index: 2,
+                    in_thread: true
+                },
+                ListRow::Message {
+                    index: 1,
+                    in_thread: true
+                },
+                ListRow::Message {
+                    index: 0,
+                    in_thread: true
+                },
+                ListRow::Thread { thread: 1 },
+            ]
+        );
+
+        // Not threading: every mail is a row of its own.
+        assert_eq!(
+            list_rows_of(&threads, mails.len(), &open, false),
+            (0..mails.len())
+                .map(|index| ListRow::Message {
+                    index,
+                    in_thread: false
+                })
+                .collect::<Vec<_>>()
+        );
+    }
+
+    /// A conversation is one row showing its newest mail under the thread's
+    /// subject, with the count of what it holds — and the mails inside it get no
+    /// rows of their own until it is opened.
+    #[test]
+    fn a_conversation_is_one_row_until_it_is_opened() {
+        let ctx = egui::Context::default();
+        crate::fonts::install(&ctx, None, None);
+        // Read mail, so the row draws each line once: an unread one is struck
+        // through twice (`paint_row_text`), which is another test's subject.
+        let mut newest = threaded_mail("3", "Re: Hello", "c@example.com", &["a@example.com"], 300);
+        newest.seen = true;
+        let mut oldest = threaded_mail("1", "Hello", "a@example.com", &[], 100);
+        oldest.seen = true;
+        let mut app = app_with_threaded_mail(&ctx, vec![newest, oldest]);
+
+        let texts = frame_texts(&ctx, &mut app);
+        assert_eq!(
+            texts.iter().filter(|text| *text == "Hello").count(),
+            1,
+            "one row, under the thread's own subject: {texts:?}"
+        );
+        assert!(
+            !texts.iter().any(|text| text == "Re: Hello"),
+            "the mail it holds has no row of its own: {texts:?}"
+        );
+        assert!(
+            texts.iter().any(|text| text == "2"),
+            "the row says how many mails it holds: {texts:?}"
+        );
+        assert!(
+            texts.iter().any(|text| text == "body of 3"),
+            "and shows what the newest one says: {texts:?}"
+        );
+
+        // Clicking it opens the conversation and the mail its row speaks for.
+        click_at(
+            &ctx,
+            &mut app,
+            egui::pos2(300.0, TITLEBAR_HEIGHT + MESSAGE_ROW_HEIGHT / 2.0),
+        );
+        let texts = frame_texts(&ctx, &mut app);
+        assert!(
+            texts.iter().any(|text| text == "Re: Hello"),
+            "the thread opened: {texts:?}"
+        );
+        assert_eq!(
+            app.selected_message.as_deref(),
+            Some("3"),
+            "the newest mail of the thread is the one that opened"
+        );
+
+        // Clicking the row again closes it, and leaves the pane alone.
+        click_at(
+            &ctx,
+            &mut app,
+            egui::pos2(300.0, TITLEBAR_HEIGHT + MESSAGE_ROW_HEIGHT / 2.0),
+        );
+        let _ = frame_texts(&ctx, &mut app);
+        // The rows are what says the conversation is closed again: the pane is
+        // still showing the mail that was opened, which is where a "Re: Hello"
+        // in the frame comes from now.
+        let rows = app.list_rows.as_ref().expect("the list derived its rows");
+        assert!(
+            rows.rows
+                .iter()
+                .all(|row| matches!(row, ListRow::Thread { .. })),
+            "the thread closed again: {:?}",
+            rows.rows
+        );
+        assert_eq!(app.selected_message.as_deref(), Some("3"));
+    }
+
+    /// Threading is a preference, and it is the list's shape: turned off, every
+    /// mail is a row of its own and nothing is grouped.
+    #[test]
+    fn the_list_threads_only_when_it_is_asked_to() {
+        let ctx = egui::Context::default();
+        crate::fonts::install(&ctx, None, None);
+        let mails = vec![
+            threaded_mail("2", "Re: Hello", "b@example.com", &["a@example.com"], 200),
+            threaded_mail("1", "Hello", "a@example.com", &[], 100),
+        ];
+        let mut app = app_with_threaded_mail(&ctx, mails.clone());
+        app.threaded = false;
+
+        let texts = frame_texts(&ctx, &mut app);
+        for subject in ["Hello", "Re: Hello"] {
+            assert!(
+                texts.iter().any(|text| text == subject),
+                "every mail is a row of its own: {texts:?}"
+            );
+        }
+        let rows = app.list_rows.as_ref().expect("the list derived its rows");
+        assert_eq!(rows.rows.len(), mails.len());
+        assert!(
+            rows.rows.iter().all(|row| matches!(
+                row,
+                ListRow::Message {
+                    in_thread: false,
+                    ..
+                }
+            )),
+            "a flat list has no conversation rows: {:?}",
+            rows.rows
         );
     }
 
@@ -7628,7 +8237,12 @@ mod tests {
                 Some(egui::Rect::from_two_pos(points[0], points[1]))
             }
             egui::Shape::QuadraticBezier(quad) => Some(egui::Rect::from_points(&quad.points)),
-            egui::Shape::Path(path) => Some(egui::Rect::from_points(&path.points)),
+            // A path only counts when it is a line drawing: the twisty that
+            // opens a conversation is a filled polygon, and it is no more a
+            // glyph than the avatar's circle is.
+            egui::Shape::Path(path) if path.fill == egui::Color32::TRANSPARENT => {
+                Some(egui::Rect::from_points(&path.points))
+            }
             _ => None,
         }
     }
@@ -8580,6 +9194,9 @@ mod tests {
                 date: String::new(),
                 timestamp: Some(100),
                 seen: false,
+                message_id: String::new(),
+                in_reply_to: Vec::new(),
+                references: Vec::new(),
                 body_text: String::new(),
                 body_html: None,
                 preview: String::new(),
@@ -8594,6 +9211,9 @@ mod tests {
                 date: String::new(),
                 timestamp: Some(200),
                 seen: false,
+                message_id: String::new(),
+                in_reply_to: Vec::new(),
+                references: Vec::new(),
                 body_text: String::new(),
                 body_html: None,
                 preview: String::new(),

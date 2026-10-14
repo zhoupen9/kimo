@@ -52,7 +52,7 @@ use crate::models::{
 use crate::storage::{self, Folder, Mailbox};
 
 /// The schema version this build writes and understands.
-pub const SCHEMA_VERSION: i64 = 6;
+pub const SCHEMA_VERSION: i64 = 7;
 
 /// How long a statement waits for another writer before giving up. Jobs hold
 /// the connection only around their SQL, so this is a backstop, not a plan.
@@ -126,6 +126,16 @@ CREATE TABLE IF NOT EXISTS messages (
     body_text   TEXT NOT NULL DEFAULT '',
     body_html   TEXT,
     preview     TEXT NOT NULL DEFAULT '',
+    -- The three headers a conversation is stitched from (schema v7), angle
+    -- brackets off: the mail's own id, what it answers, and the chain its
+    -- client kept. `references` is space-joined — an id never holds one — and
+    -- empty means a mail from before the columns existed, which
+    -- `crate::threads` groups by subject instead.
+    message_id  TEXT NOT NULL DEFAULT '',
+    in_reply_to TEXT NOT NULL DEFAULT '',
+    -- The `References` header. Not `references`: that is a SQL keyword, and a
+    -- column named after one is a syntax error wherever it is named.
+    refs        TEXT NOT NULL DEFAULT '',
     cjk         TEXT NOT NULL DEFAULT '',
     UNIQUE (account_id, folder, uid),
     FOREIGN KEY (account_id) REFERENCES accounts(id) ON DELETE CASCADE,
@@ -240,6 +250,18 @@ ALTER TABLE accounts ADD COLUMN smtp_username TEXT;
 ALTER TABLE accounts ADD COLUMN smtp_password TEXT;
 "#;
 
+/// The step from `user_version` 6 to 7: the headers a conversation is stitched
+/// from. Nothing can be derived — `Message-ID`, `In-Reply-To` and `References`
+/// were never stored, and the mail they came in is not kept either — so the
+/// rows it holds keep empty ones, and `crate::threads` groups those by subject
+/// until a sync fetches them again (which a warm sync does not: a mail already
+/// in the database is never refetched).
+const MIGRATE_V7_SQL: &str = r#"
+ALTER TABLE messages ADD COLUMN message_id  TEXT NOT NULL DEFAULT '';
+ALTER TABLE messages ADD COLUMN in_reply_to TEXT NOT NULL DEFAULT '';
+ALTER TABLE messages ADD COLUMN refs        TEXT NOT NULL DEFAULT '';
+"#;
+
 /// The step from `user_version` 5 to 6: what an attachment is, beyond its
 /// name. Nothing can be derived here — a database from before this step holds
 /// the names alone, and the type and the size live in the part the mail
@@ -291,8 +313,8 @@ UPDATE folders SET uid_next = (
 const MESSAGE_UPSERT: &str = r#"
 INSERT INTO messages (
     account_id, folder, uid, subject, from_addr, to_addr, date_header, ts,
-    seen, body_text, body_html, preview, cjk
-) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
+    seen, body_text, body_html, preview, message_id, in_reply_to, refs, cjk
+) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)
 ON CONFLICT(account_id, folder, uid) DO UPDATE SET
     subject     = excluded.subject,
     from_addr   = excluded.from_addr,
@@ -302,6 +324,9 @@ ON CONFLICT(account_id, folder, uid) DO UPDATE SET
     body_text   = excluded.body_text,
     body_html   = excluded.body_html,
     preview     = excluded.preview,
+    message_id  = excluded.message_id,
+    in_reply_to = excluded.in_reply_to,
+    refs        = excluded.refs,
     cjk         = excluded.cjk,
     seen        = max(messages.seen, excluded.seen)
 WHERE messages.seen IS NOT excluded.seen
@@ -313,6 +338,9 @@ WHERE messages.seen IS NOT excluded.seen
    OR messages.body_text IS NOT excluded.body_text
    OR messages.body_html IS NOT excluded.body_html
    OR messages.preview IS NOT excluded.preview
+   OR messages.message_id IS NOT excluded.message_id
+   OR messages.in_reply_to IS NOT excluded.in_reply_to
+   OR messages.refs IS NOT excluded.refs
    OR messages.cjk IS NOT excluded.cjk
 RETURNING id
 "#;
@@ -531,6 +559,12 @@ fn migrate(conn: &mut Connection, legacy: Option<(&Path, &Path)>) -> MailResult<
         let tx = conn.transaction()?;
         tx.execute_batch(MIGRATE_V6_SQL)?;
         tx.pragma_update(None, "user_version", 6)?;
+        tx.commit()?;
+    }
+    if start < 7 {
+        let tx = conn.transaction()?;
+        tx.execute_batch(MIGRATE_V7_SQL)?;
+        tx.pragma_update(None, "user_version", 7)?;
         tx.commit()?;
     }
     Ok(())
@@ -998,7 +1032,8 @@ fn load_mailboxes_on(
     {
         let mut stmt = conn.prepare(
             "SELECT id, account_id, folder, uid, subject, from_addr, to_addr, date_header,
-                    ts, seen, body_text, body_html, preview
+                    ts, seen, body_text, body_html, preview,
+                    message_id, in_reply_to, refs
                FROM messages ORDER BY ts DESC, id DESC",
         )?;
         let rows = stmt.query_map([], |row| {
@@ -1014,6 +1049,9 @@ fn load_mailboxes_on(
                     date: row.get(7)?,
                     timestamp: row.get(8)?,
                     seen: row.get::<_, i64>(9)? != 0,
+                    message_id: row.get(13)?,
+                    in_reply_to: split_ids(&row.get::<_, String>(14)?),
+                    references: split_ids(&row.get::<_, String>(15)?),
                     body_text: row.get(10)?,
                     body_html: row.get(11)?,
                     preview: row.get(12)?,
@@ -1085,6 +1123,18 @@ fn load_mailboxes_on(
         }
     }
     Ok(mailboxes)
+}
+
+/// The ids of an `In-Reply-To` or `References` header as one column value. A
+/// message id is `<something@domain>` with the brackets off, so it cannot hold
+/// a space: the column is the list with single spaces between, and
+/// `split_ids` is its inverse.
+fn join_ids(ids: &[String]) -> String {
+    ids.join(" ")
+}
+
+fn split_ids(value: &str) -> Vec<String> {
+    value.split_whitespace().map(str::to_string).collect()
 }
 
 /// Remember the mailboxes an IMAP `LIST` returned. Folders are not deleted when
@@ -1234,6 +1284,9 @@ fn save_messages_on(
                         message.body_text,
                         message.body_html,
                         message.preview,
+                        message.message_id,
+                        join_ids(&message.in_reply_to),
+                        join_ids(&message.references),
                         cjk,
                     ],
                     |row| row.get(0),
@@ -1528,6 +1581,10 @@ impl LegacyMessage {
             date: self.date,
             timestamp: self.timestamp,
             seen: self.seen,
+            // The old JSON kept no ids: a mail from it threads by subject.
+            message_id: String::new(),
+            in_reply_to: Vec::new(),
+            references: Vec::new(),
             body_text: self.body_text,
             body_html: self.body_html,
             preview: self.preview,
@@ -1606,6 +1663,11 @@ pub(crate) mod test_support {
         if version < 6 {
             sql.push_str("ALTER TABLE attachments DROP COLUMN content_type;\n");
             sql.push_str("ALTER TABLE attachments DROP COLUMN size;\n");
+        }
+        if version < 7 {
+            for column in ["message_id", "in_reply_to", "refs"] {
+                sql.push_str(&format!("ALTER TABLE messages DROP COLUMN {column};\n"));
+            }
         }
         conn.execute_batch(&sql).unwrap();
         conn.pragma_update(None, "user_version", version).unwrap();
@@ -1690,6 +1752,9 @@ mod tests {
             date: "Mon, 1 Jan 2026 00:00:00 +0000".to_string(),
             timestamp: Some(1_767_225_600),
             seen: false,
+            message_id: String::new(),
+            in_reply_to: Vec::new(),
+            references: Vec::new(),
             body_text: body.to_string(),
             body_html: None,
             preview: body.chars().take(20).collect(),
@@ -2508,6 +2573,65 @@ mod tests {
             older_available(pop.first_num, pop.oldest_uid),
             "4950 messages below the floor, and 1 is where they start"
         );
+        integrity_check_on(&conn).unwrap();
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A database from version 6 gains the three threading columns empty: the
+    /// headers were never stored, and nothing local can say what a mail
+    /// answered — its thread falls back to the subject until it is fetched
+    /// again, which a mail already held never is.
+    #[test]
+    fn a_version_6_database_keeps_its_mail_without_ids() {
+        let (mut conn, dir) = test_db("migrate-v7");
+        save_account_on(&conn, &account("work")).unwrap();
+        let mut mail = message("1", "Re: Hello", "a reply");
+        mail.message_id = "reply@example.com".to_string();
+        mail.references = vec!["root@example.com".to_string()];
+        save_messages_on(&mut conn, "work", "INBOX", Some(1), &[mail]).unwrap();
+        rewind_to(&conn, 6);
+
+        migrate(&mut conn, None).unwrap();
+        assert_eq!(
+            count(&conn, "SELECT * FROM pragma_user_version"),
+            SCHEMA_VERSION
+        );
+        let mailboxes = load_mailboxes_on(&conn, &["work".to_string()]).unwrap();
+        let kept = &mailboxes["work"].folders[0].messages[0];
+        assert_eq!(kept.subject, "Re: Hello");
+        assert_eq!(kept.message_id, "", "the header was never stored");
+        assert!(kept.in_reply_to.is_empty());
+        assert!(kept.references.is_empty());
+        integrity_check_on(&conn).unwrap();
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The three headers a conversation is stitched from survive the round
+    /// trip, and a mail with none comes back with empty ones rather than with
+    /// something invented.
+    #[test]
+    fn threading_headers_round_trip_through_the_message() {
+        let (mut conn, dir) = test_db("thread-headers");
+        save_account_on(&conn, &account("work")).unwrap();
+        let mut reply = message("2", "Re: Hello", "a reply");
+        reply.message_id = "reply@example.com".to_string();
+        reply.in_reply_to = vec!["root@example.com".to_string()];
+        reply.references = vec![
+            "root@example.com".to_string(),
+            "first@example.com".to_string(),
+        ];
+        let plain = message("3", "No ids", "old");
+        save_messages_on(&mut conn, "work", "INBOX", Some(1), &[reply, plain]).unwrap();
+
+        let mailboxes = load_mailboxes_on(&conn, &["work".to_string()]).unwrap();
+        let loaded = &mailboxes["work"].folders[0].messages;
+        let reply = loaded.iter().find(|m| m.uid == "2").unwrap();
+        assert_eq!(reply.message_id, "reply@example.com");
+        assert_eq!(reply.in_reply_to, ["root@example.com"]);
+        assert_eq!(reply.references, ["root@example.com", "first@example.com"]);
+        let none = loaded.iter().find(|m| m.uid == "3").unwrap();
+        assert_eq!(none.message_id, "");
+        assert!(none.in_reply_to.is_empty() && none.references.is_empty());
         integrity_check_on(&conn).unwrap();
         let _ = fs::remove_dir_all(&dir);
     }

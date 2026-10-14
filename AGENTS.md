@@ -134,6 +134,7 @@ src/fonts.rs            installed-font discovery (ttf-parser scan) + egui font i
 src/storage.rs          XDG paths, settings.json, remote-resource cache, Mailbox/Folder (in memory)
 src/db.rs               the mail database: schema + migrations, accounts, folders, messages, the old-JSON import
 src/search.rs           mail search: the CJK bigram index, the FTS5 query builder and the filters they run against
+src/threads.rs          mail grouped into conversations: the message list's own model of a folder
 src/theme.rs            theme choice + the light/dark color schemes and their egui Visuals
 src/mail.rs             raw RFC 5322 bytes → MailMessage (mail-parser; HTML kept, attachments
                         as name/type/size, one part back out for a download)
@@ -321,7 +322,9 @@ Event (mpsc) ──► drain_events() at frame start ──► merge into Accoun
   uidvalidity, uid_next, first_num, oldest_uid, synced, listed — the fetch
   marks of the bullets above, then `listed`, what the last `LIST` named),
   `messages` keyed by `(account_id, folder, uid)` with
-  the subject, addresses, both bodies, the preview and the bigram column,
+  the subject, addresses, both bodies, the preview, the bigram column and the
+  three headers a conversation is stitched from (`message_id`, `in_reply_to`,
+  `refs` — the last one is not `references`: that is a SQL keyword),
   `attachments` (the name, the MIME type and the decoded size — never the
   bytes; see the attachment-card convention) and `inline_images` (raw bytes,
   not base64) as children of a message, and the external-content FTS5 table
@@ -345,7 +348,9 @@ Event (mpsc) ──► drain_events() at frame start ──► merge into Accoun
   version-6 step is that kind of step too: it adds an attachment's `content_type`
   and `size`, and derives nothing, because the part a mail arrived in is not
   stored — the rows it holds keep an empty type and a zero size, and only mail
-  fetched after the step carries them.
+  fetched after the step carries them. The version-7 step is the third of that
+  kind: it adds the threading headers, which were never stored either, and a
+  mail from before it threads by subject instead (`crate::threads`).
 - The account list is **in the database, passwords in plain text**. That is a
   documented, accepted limitation; do not add a secrets daemon (rule 1). An
   account's `id` is minted once (the slug of its name, numbered if taken) and
@@ -369,7 +374,9 @@ Event (mpsc) ──► drain_events() at frame start ──► merge into Accoun
   (`system`/`light`/`dark`; "system" resolves via GTK/KDE config files, no
   subprocesses or D-Bus), `html_renderer` (`egui`/`blitz`, absent means
   `egui`), `working_mode` (`debug`/`release`, absent means the build — see the
-  syncing bullet above), and the font families picked in Preferences →
+  syncing bullet above), `threaded` (whether the message list groups mail into
+  conversations; absent means the app's own default, which is on), and the font
+  families picked in Preferences →
   Appearance (`ui_font`, `mono_font`; absent means egui's built-in font plus
   the CJK fallback). Family *names* are stored, not paths, so the file survives font
   updates; a name that no longer resolves is simply ignored. Older files may
@@ -596,6 +603,36 @@ Event (mpsc) ──► drain_events() at frame start ──► merge into Accoun
   from `MailMessage.attachments`, a search hit from the count the query
   returned — so a hit no longer spells the paperclip out in its third line: the
   glyph is the one way the list says it.
+- The message list is a list of **conversations** by default: `crate::threads::group`
+  turns a folder's mail into threads — a reply joins its parent through
+  `References` read from the end (the last id this folder holds is the parent),
+  or through `In-Reply-To` when the client wrote no chain, and a mail whose
+  headers say nothing joins the thread of the subject it answers (a prefix like
+  `Re:` or `答复:` stripped, either colon; two mails that merely share a subject
+  stay apart) — and the list draws one row per thread. A thread's row is its
+  own: the newest mail's sender, date and preview under the thread's subject,
+  the count of what it holds beside the date, a paperclip when any of its mails
+  has one, and the twisty at the left. Clicking it opens or closes the
+  conversation, and opening one opens the mail the row speaks for. An open
+  conversation's mails are rows of their own under it, oldest first, inset by
+  `THREAD_INDENT` with the thread's spine down the left — `RowPlace` is what a
+  row draws around itself: its twisty, its spine, or nothing. Every row is
+  `MESSAGE_ROW_HEIGHT` tall whatever it is, which is what keeps `virtual_rows`
+  honest: threading changes *which* rows there are, not how tall one is. The rows
+  are derived rather than built in the drawing: `KimoApp::list_rows` (`ListRows`)
+  holds the threads and the rows until the folder's mail
+  (`AccountUiState::folders_rev`, which a mail marked read moves too), the
+  account or folder, the threading switch, or the set of open threads
+  (`open_rev`) changes — grouping a folder is a map, a union-find and a sort over
+  all of it, and the list is drawn on every frame. `open_threads` is in memory
+  only, keyed by `Thread::key` (the thread's oldest uid, which is stable while
+  the thread is); a folder the pane has just moved to — or threading switched on
+  — opens the conversation of the mail it is showing, so the list and the pane
+  never start out disagreeing, and nothing else reopens a thread the user closed.
+  **Search results are deliberately not threaded**: they are a flat list of hits,
+  and where a hit sits among its own folder's conversations is not what was
+  asked for. Threading is a preference (`threaded` in settings.json,
+  Preferences → General) and per folder, like the rest of the list.
 - The window is undecorated on purpose (`with_decorations(false)` in
   `main.rs`): `titlebar_area()` in `app.rs` draws the custom title bar — an
   `egui::Area` fixed to the window's top edge and shown *after* the panels, not
@@ -1072,6 +1109,11 @@ Do not "fix" these casually — they are known:
   afterwards either — the file lands in `~/Downloads` and the desktop's own
   programs are what open it. Export remains the way to get the whole message,
   attachments included, as one `.eml`.
+- Threading is per folder and, for mail cached before schema v7 — or mail whose
+  sender wrote no ids at all — by subject: a reply joins the subject it answers,
+  but a conversation whose mails were filed into different folders (or into and
+  out of a Trash) is more than one conversation here. Search results are a flat
+  list of hits and are not grouped at all.
 - TLS finite-field DH covers the 2048-bit groups listed in
   `src/protocol/ffdhe.rs` and nothing else. A server whose DHE group is
   another size, or yet another custom prime, still fails the handshake with

@@ -17,6 +17,7 @@ mod mail;
 mod models;
 mod outgoing;
 mod protocol;
+mod threads;
 // Test-only measurement harness for the two HTML renderers; see the file.
 #[cfg(test)]
 mod render_bench;

@@ -18,7 +18,10 @@ rustls with the `ring` crypto provider and Mozilla's root certificates.
 - Multiple accounts, IMAP and POP3
 - Implicit TLS, STARTTLS and plain connections, for reading and for sending
 - Folder listing (IMAP), folder selection and per-folder caches
-- Message list with unread markers and text preview
+- Message list with unread markers and text preview, grouped into
+  conversations: one row per thread — its newest mail, how many it holds and a
+  paperclip — opening into the mails it has (grouped by `References` and
+  `In-Reply-To`, or by subject for mail cached before Kimo kept those)
 - A paperclip in the message list for mail that has attachments, and a card
   each under the mail itself: the file name (a link that downloads the file into
   `~/Downloads`), its MIME type and its size — the bytes themselves stay on the

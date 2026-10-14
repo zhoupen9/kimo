@@ -192,6 +192,17 @@ pub struct MailMessage {
     /// Unix timestamp (UTC) when the date header could be parsed.
     pub timestamp: Option<i64>,
     pub seen: bool,
+    /// The mail's own `Message-ID`, angle brackets off. Empty for mail cached
+    /// before schema v7 — the header was not stored then — and for the rare
+    /// mail that carries none.
+    pub message_id: String,
+    /// The `In-Reply-To` ids, angle brackets off: what the mail answers when
+    /// its client wrote nothing else. Usually one.
+    pub in_reply_to: Vec<String>,
+    /// The `References` chain, oldest first: the conversation as the sender's
+    /// client kept it. `crate::threads` reads it from the end — the last id
+    /// this mailbox has is the parent.
+    pub references: Vec<String>,
     pub body_text: String,
     /// Raw HTML body part, when the message is HTML-based; rendered by
     /// `crate::html` instead of the plain text.
