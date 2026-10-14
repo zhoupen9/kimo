@@ -550,8 +550,8 @@ Event (mpsc) ──► drain_events() at frame start ──► merge into Accoun
   the bar again rather than snapping it, and a column with nothing to scroll —
   or no list and no mail at all — leaves it docked. Inside
   the bar, left to right: the application icon (the brand, and the leftmost
-  thing in the bar, kept `BRAND_ICON_MARGIN` clear of the window's edge rather
-  than flush against it: the same
+  thing in the bar, kept `TITLEBAR_EDGE_MARGIN` clear of the window's edge
+  rather than flush against it: the same
   embedded PNG the tray serves, downscaled once at startup because egui has
   no mipmaps to filter a 256 px source down to 18 pt), the nav collapse
   toggle, the compose button (the one mail action that needs no mail open, so
@@ -566,14 +566,19 @@ Event (mpsc) ──► drain_events() at frame start ──► merge into Accoun
   and placed `MAIL_ACTION_PADDING` to the right of the search box), the
   preferences cog, drag area,
   double-click maximize, and the
-  minimize/maximize/close buttons sent as `ViewportCommand`s. The nav toggle,
-  the sync button and the cog are one hand-painted icon cell
-  (`titlebar_icon_button` + `titlebar_hover`, the cog positioning its rect
-  itself because it is right-aligned rather than laid out in the row): as wide
-  as a window control and as tall as the bar, flat at rest, and filled under
-  the pointer. They are not `egui::Button`s for that reason — a stock button
-  draws a card-colored frame with a border, which in a title bar reads as a
-  widget among window chrome. Don't re-enable system decorations.
+  minimize/maximize/close buttons sent as `ViewportCommand`s. Every button in
+  the bar is one hand-painted cell (`titlebar_button` + `titlebar_hover`): a
+  `TITLEBAR_BUTTON_SIZE` (32 pt) square, centred in the bar's height,
+  `TITLEBAR_BUTTON_GAP` (6 pt) from the next, flat at rest and filled under the
+  pointer with a small rounded corner (`TITLEBAR_BUTTON_CORNER_RADIUS`, 6 pt)
+  rather than the full-height square the bar's buttons used to fill. The left
+  group, the mail actions and the window controls
+  each set their row's `item_spacing.x` to that gap; the cells the bar places at
+  exact x positions rather than in a row — the cog and the window controls —
+  are filled through `titlebar_fill` instead. They are not `egui::Button`s for
+  that reason — a stock button draws a card-colored frame with a border, which
+  in a title bar reads as a widget among window chrome. Don't re-enable system
+  decorations.
   The window is transparent (`with_transparent(true)` in `main.rs`) and its
   four corners are cut out of the frame by `gpu::CornerMask`: the last draw of
   a frame scales the four corner squares of the surface by the corner's
@@ -587,20 +592,27 @@ Event (mpsc) ──► drain_events() at frame start ──► merge into Accoun
   rule has to agree with (niri's `geometry-corner-radius`): without it the
   compositor still assumes a square window and its shadow shows through the
   cut corners.
-  The mail actions are *flat*, like every other button in the bar — each one is
-  `titlebar_flat_button`, the same window-control-wide, bar-tall cell the nav
-  toggle and the cog use, empty at rest and filled under the pointer. They are
-  deliberately not a framed group: the bar stays chrome plus flat icons, and
-  the run of seven is held together by the gap that sets it apart from the
-  search box rather than by a pill. The seven enable and disable together, on
-  `has_selected_message` — the reading pane's own lookup, so a uid the pane no
+  The mail actions are the bar's own cells, seven of them in a run: the same
+  squares the rest of the bar's buttons are, laid out by a scope of their own
+  whose `item_spacing.x` is `TITLEBAR_BUTTON_GAP`. The run's width is one
+  function, `titlebar_cells_width`, which the fit plans the room with and the
+  bar draws it with — the window controls are measured with the same function,
+  so a cell cannot come out one size in one group and another size in the next.
+  A glyph is `MAIL_ACTION_GLYPH` (18 pt) off its 24×24 outline, which leaves it
+  7 pt of padding inside the cell. The run is deliberately not a framed group:
+  the bar stays chrome plus flat icons, and the seven are held together by the
+  clear chrome that sets them apart from the search box
+  (`MAIL_ACTION_PADDING`) rather than by a pill. The seven enable and disable
+  together, on `has_selected_message` — the reading pane's own lookup, so a uid
+  the pane no
   longer shows counts as no mail: a disabled cell drops its glyph to
   `weak_text_color`, stops sensing clicks and never fills. Export and Delete
   are wired — they are the actions whose jobs exist so far — and the other four
   still run nothing, so a click on one of them is not even read.
-  The bar is `TITLEBAR_HEIGHT` (40 pt) tall and the search box fills all but
-  16 pt of that (`TITLEBAR_SEARCH_HEIGHT`), with a rounder corner than the
-  stock widget radius (`SEARCH_BOX_CORNER_RADIUS`); its frame is stock
+  The bar is `TITLEBAR_HEIGHT` (40 pt) tall, its buttons
+  `TITLEBAR_BUTTON_SIZE` (32 pt) squares centred in that, and the search box
+  fills all but 16 pt of it (`TITLEBAR_SEARCH_HEIGHT`), with a rounder corner
+  than the stock widget radius (`SEARCH_BOX_CORNER_RADIUS`); its frame is stock
   `TextEdit` chrome, so the radius is set on the widget visuals in a scope —
   and because the field is deliberately non-interactive, the slot that matters
   is `noninteractive` (egui picks the visuals by `Sense`, not by hover). Its
@@ -618,9 +630,12 @@ Event (mpsc) ──► drain_events() at frame start ──► merge into Accoun
   the end of the bar, and the search box and the mail cells landed on
   minimize / maximize / close. `titlebar_rects` carves the bar into the room for
   its own content (`content`: everything left of the cog) and the fixed right end
-  — the cog, then the three window controls, placed from the window's own edge,
-  the count coming from `titlebar`'s own button list so the two cannot drift —
-  and `titlebar_fit` decides what the room between them holds. Every group is
+  — the cog, a gap, the three window controls, ending `TITLEBAR_EDGE_MARGIN`
+  short of the window's edge, the count coming from `titlebar`'s own button
+  list so the two cannot drift — and `titlebar_fit` decides what the room
+  between them holds. Those two rects are a cell's own band rather than the
+  bar's full height, since a button is 32 pt in a 40 pt bar; `content` is the
+  one rect that is the bar's own shape. Every group is
   drawn in a rect of its own, its own `UiBuilder::max_rect` and its own
   `clip_to` for the clip, and that is the rule the rest rests on: a group the bar
   cannot fit is cut off at its edge rather than drawn over its neighbour, and,

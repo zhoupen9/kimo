@@ -1934,10 +1934,14 @@ impl KimoApp {
                     .layout(egui::Layout::left_to_right(egui::Align::Center)),
                 |row| {
                     clip_to(row, content);
+                    // The bar's own rhythm: these cells stand
+                    // `TITLEBAR_BUTTON_GAP` apart exactly as the mail actions and
+                    // the window controls do.
+                    row.spacing_mut().item_spacing.x = TITLEBAR_BUTTON_GAP;
                     // Brand first: the application icon is the leftmost
-                    // thing in the bar (the tray embeds the same PNG), a
-                    // little clear of the window's edge.
-                    row.add_space(BRAND_ICON_MARGIN);
+                    // thing in the bar (the tray embeds the same PNG), the
+                    // edge margin clear of the window's frame.
+                    row.add_space(TITLEBAR_EDGE_MARGIN);
                     if let Some(icon) = self.brand_icon.clone() {
                         row.add(
                             egui::Image::from_texture(&icon)
@@ -1948,7 +1952,7 @@ impl KimoApp {
                     // Nav collapse toggle (hamburger, painted as lines). An
                     // icon cell rather than an `egui::Button`, so it carries no
                     // outline: the bar's icons only fill under the pointer.
-                    let toggle = titlebar_icon_button(row, bar.height());
+                    let toggle = titlebar_button(row, true);
                     paint_nav_icon(row.painter(), toggle.rect, visuals.text_color());
                     if toggle.clicked() {
                         self.nav_collapsed = !self.nav_collapsed;
@@ -1964,7 +1968,7 @@ impl KimoApp {
                     // the right, which acts on the mail in the reading pane. It
                     // opens the compose window (empty; a window that is already
                     // open is left as it is, draft and all).
-                    let compose = titlebar_icon_button(row, bar.height());
+                    let compose = titlebar_button(row, true);
                     paint_compose_icon(row.painter(), compose.rect, visuals.text_color());
                     if compose.clicked() {
                         self.open_compose();
@@ -1983,7 +1987,7 @@ impl KimoApp {
                     // automatic syncing, so that is where asking for one has to
                     // be possible.
                     if self.working_mode == WorkingMode::Debug {
-                        let sync = titlebar_icon_button(row, bar.height());
+                        let sync = titlebar_button(row, true);
                         paint_sync_icon(row.painter(), sync.rect, visuals.text_color());
                         if sync.clicked() {
                             self.sync_all();
@@ -2052,10 +2056,9 @@ impl KimoApp {
         // chrome in front of the actions, then the actions themselves as the
         // one group they are, and only then the box's own width.
         //
-        // The six cells are as wide as six window controls and the row's item
-        // spacing apart, which is what the fit has to find room for.
-        let actions_width = MailAction::ALL.len() as f32 * TITLEBAR_BUTTON_WIDTH
-            + (MailAction::ALL.len() - 1) as f32 * ui.spacing().item_spacing.x;
+        // The run is `MailAction::ALL.len()` of the bar's own cells, which is
+        // what the fit has to find room for.
+        let actions_width = titlebar_cells_width(MailAction::ALL.len());
         let mut middle_end = left_end;
         if middle_right > left_end {
             let middle = egui::Rect::from_min_max(
@@ -2203,7 +2206,7 @@ impl KimoApp {
                             .layout(egui::Layout::left_to_right(egui::Align::Center)),
                         |row| {
                             clip_to(row, actions);
-                            self.titlebar_mail_actions(row, &visuals, bar.height());
+                            self.titlebar_mail_actions(row, &visuals);
                         },
                     );
                     middle_end = actions_left + actions_width;
@@ -2262,10 +2265,18 @@ impl KimoApp {
                 cog_resp.on_hover_text("Preferences");
 
                 for (idx, (ctrl, is_max)) in buttons.iter().enumerate() {
-                    let cell = rects.controls.right() - TITLEBAR_BUTTON_WIDTH * idx as f32;
-                    let rect = egui::Rect::from_min_max(
-                        egui::pos2(cell - TITLEBAR_BUTTON_WIDTH, bar.top()),
-                        egui::pos2(cell, bar.bottom()),
+                    // The list reads from the window's right edge inwards, which
+                    // is where the cells are placed from: `buttons[0]` is the
+                    // close button, and the run ends
+                    // `TITLEBAR_EDGE_MARGIN` short of the window's corner.
+                    let rect = egui::Rect::from_min_size(
+                        egui::pos2(
+                            rects.controls.right()
+                                - TITLEBAR_BUTTON_SIZE
+                                - idx as f32 * (TITLEBAR_BUTTON_SIZE + TITLEBAR_BUTTON_GAP),
+                            rects.controls.top(),
+                        ),
+                        egui::Vec2::splat(TITLEBAR_BUTTON_SIZE),
                     );
                     let resp = row.interact(
                         rect,
@@ -2277,7 +2288,7 @@ impl KimoApp {
                             Ctrl::Close => scheme.danger_hover,
                             _ => visuals.widgets.hovered.bg_fill,
                         };
-                        row.painter().rect_filled(rect, 0.0, bg);
+                        titlebar_fill(row, rect, bg);
                         match ctrl {
                             // The scheme's on-danger color reads best on the
                             // close red; elsewhere keep the theme text color so
@@ -2321,9 +2332,14 @@ impl KimoApp {
     /// dimmed, the buttons stop sensing clicks and nothing fills under the
     /// pointer.
     ///
-    /// Every cell is flat, like the rest of the bar's buttons — empty at rest
-    /// and filled under the pointer — which is also what keeps the seven of
-    /// them reading as one group rather than as seven framed widgets.
+    /// Every cell is one of the bar's buttons — `TITLEBAR_BUTTON_SIZE` square,
+    /// `TITLEBAR_BUTTON_GAP` from the next one, empty at rest and filled under
+    /// the pointer with a small rounded corner (`titlebar_button`) — which is
+    /// what keeps the seven of them reading as one group rather than as seven
+    /// framed widgets. They are the same cells the nav toggle, the compose and
+    /// sync buttons, the cog and the window controls are; what makes this run a
+    /// group of its own is the clear chrome in front of it
+    /// (`MAIL_ACTION_PADDING`), not a size or a fill only it has.
     ///
     /// Export and Delete are wired: Export hands the mail to
     /// `export_selected_message`, which has a worker write the server's own
@@ -2331,15 +2347,13 @@ impl KimoApp {
     /// `delete_selected_message`, which takes it off the server before it
     /// leaves the database. The other four are still drawn only — a click on
     /// one runs nothing, so they stay UI until the actions they name exist.
-    fn titlebar_mail_actions(
-        &mut self,
-        row: &mut egui::Ui,
-        visuals: &egui::Visuals,
-        bar_height: f32,
-    ) {
+    fn titlebar_mail_actions(&mut self, row: &mut egui::Ui, visuals: &egui::Visuals) {
+        // The run lays itself out: `TITLEBAR_BUTTON_GAP` between the cells, which
+        // is the gap `titlebar_cells_width` — and through it the fit — assumes.
+        row.spacing_mut().item_spacing.x = TITLEBAR_BUTTON_GAP;
         let enabled = self.has_selected_message();
         for action in MailAction::ALL {
-            let response = titlebar_flat_button(row, bar_height, enabled);
+            let response = titlebar_button(row, enabled);
             let color = if enabled {
                 visuals.text_color()
             } else {
@@ -4285,7 +4299,20 @@ impl KimoApp {
 /// the two could drift apart.
 const TITLEBAR_HEIGHT_I8: i8 = 40;
 const TITLEBAR_HEIGHT: f32 = TITLEBAR_HEIGHT_I8 as f32;
-const TITLEBAR_BUTTON_WIDTH: f32 = 42.0;
+/// Every button in the title bar is a square of this size, centred in the bar's
+/// height: the nav toggle, the compose and sync buttons, the mail actions, the
+/// cog and the three window controls. One size for all of them is what makes
+/// the bar read as one row of the same button, whichever group a cell is in.
+const TITLEBAR_BUTTON_SIZE: f32 = 32.0;
+/// The clear space between two of those cells. Every group in the bar lays
+/// itself out with it, so the same rhythm runs from the brand to the close
+/// button.
+const TITLEBAR_BUTTON_GAP: f32 = 6.0;
+/// The cells' hover fill: a small rounded square, not the full-height block the
+/// bar's buttons used to fill under the pointer. Small, because the cell is —
+/// the search box's 8 pt on a 24 pt tall box would read as a pill on a 32 pt
+/// square.
+const TITLEBAR_BUTTON_CORNER_RADIUS: u8 = 6;
 /// How long the bar takes to turn from docked chrome into glass and back.
 /// Short enough to feel like a state change rather than an animation.
 const TITLEBAR_FLOAT_TIME: f32 = 0.16;
@@ -4326,7 +4353,7 @@ const TITLEBAR_SEARCH_HEIGHT: f32 = TITLEBAR_HEIGHT - 16.0;
 const SEARCH_BOX_CORNER_RADIUS: u8 = 8;
 
 /// Clear chrome between the title bar's search box and the group of mail
-/// actions to its right: what sets the six cells apart from the box as one
+/// actions to its right: what sets the seven cells apart from the box as one
 /// group. It is the bar's first elastic, though — the middle group is laid out
 /// at exact x positions (`titlebar_fit`), not by the row's item spacing, so
 /// the gap is this wide only while there is room for it.
@@ -4388,12 +4415,13 @@ const SEARCH_ICON_INSET: i8 = 22;
 const SEARCH_ICON_SIZE: f32 = 15.0;
 /// Side of the square brand icon at the left of the title bar.
 const BRAND_ICON_SIZE: f32 = 18.0;
-/// Clear space between the window's left edge and the brand icon: the mark is
-/// the first thing in the bar, and flush against the frame it reads as cropped
-/// rather than placed. It is the whole gap — the row's item spacing separates
-/// items that follow one another, and the space added here is the row's first
-/// item.
-const BRAND_ICON_MARGIN: f32 = 10.0;
+/// How far the bar's content stays clear of the window's own left and right
+/// edges: the brand icon starts this far in — as the row's own first item, the
+/// space added before it — and the window controls end this far short of the
+/// right edge, so the rounded fills at either end are not flush against the
+/// frame. Flush, the mark reads as cropped rather than placed and the close
+/// button's fill reaches the window's corner.
+const TITLEBAR_EDGE_MARGIN: f32 = 10.0;
 
 /// The compose modal: the width of its card (what the boxes are laid out for),
 /// the label column of its header fields, the height of one of those one-line
@@ -4430,18 +4458,29 @@ struct TitlebarRects {
 /// Carve the title bar into those rects. `controls` is how many window
 /// controls the bar draws — `titlebar`'s own list, so the two cannot drift.
 fn titlebar_rects(bar: egui::Rect, controls: usize) -> TitlebarRects {
-    let controls_left = bar.right() - TITLEBAR_BUTTON_WIDTH * controls as f32;
-    let cog_left = controls_left - TITLEBAR_BUTTON_WIDTH;
+    // Every cell in the bar is the same square, centred in its height, so the
+    // rects here are a cell's own band rather than the bar's full height: what
+    // is drawn to them — and what a group is clipped to — is the button, not
+    // the column of chrome around it.
+    let top = bar.center().y - TITLEBAR_BUTTON_SIZE / 2.0;
+    let cell = |left: f32, width: f32| {
+        egui::Rect::from_min_size(
+            egui::pos2(left, top),
+            egui::vec2(width, TITLEBAR_BUTTON_SIZE),
+        )
+    };
+    let controls_left = bar.right() - TITLEBAR_EDGE_MARGIN - titlebar_cells_width(controls);
+    let cog_left = controls_left - TITLEBAR_BUTTON_GAP - TITLEBAR_BUTTON_SIZE;
     TitlebarRects {
         content: egui::Rect::from_min_max(
             bar.min,
             egui::pos2(cog_left.clamp(bar.left(), bar.right()), bar.bottom()),
         ),
-        cog: egui::Rect::from_min_max(
-            egui::pos2(cog_left, bar.top()),
-            egui::pos2(controls_left, bar.bottom()),
+        cog: cell(cog_left, TITLEBAR_BUTTON_SIZE),
+        controls: cell(
+            controls_left,
+            bar.right() - TITLEBAR_EDGE_MARGIN - controls_left,
         ),
-        controls: egui::Rect::from_min_max(egui::pos2(controls_left, bar.top()), bar.max),
     }
 }
 
@@ -4474,13 +4513,22 @@ impl TitlebarFit {
     }
 }
 
+/// The width of a run of `count` cells in the title bar: `TITLEBAR_BUTTON_SIZE`
+/// squares, `TITLEBAR_BUTTON_GAP` apart. Every run is measured with this — the
+/// mail actions (which the fit plans the room for) and the window controls
+/// (which are placed from the window's right edge) — so no run can disagree
+/// with the cells it draws.
+fn titlebar_cells_width(count: usize) -> f32 {
+    count as f32 * TITLEBAR_BUTTON_SIZE + count.saturating_sub(1) as f32 * TITLEBAR_BUTTON_GAP
+}
+
 /// Fit the middle group — the search box, the clear chrome and the run of mail
 /// actions — into `room` points.
 ///
 /// The bar gives its room up in one order, so that what it loses is the least
 /// useful thing it can: the clear chrome in front of the actions closes from
 /// `MAIL_ACTION_PADDING` to `MAIL_ACTION_MIN_PADDING` first, then the actions
-/// leave — as the one group they are, because half a run of six reads as a
+/// leave — as the one group they are, because half a run of seven reads as a
 /// mistake rather than as a smaller bar — and only then does the search box
 /// narrow, down to `TITLEBAR_SEARCH_FLOOR` and no further. The box is the last
 /// thing to go, and the one thing the bar keeps to the end is the window's own
@@ -4495,7 +4543,7 @@ fn titlebar_fit(room: f32, actions: f32) -> TitlebarFit {
     let narrowest = TITLEBAR_SEARCH_FLOOR;
     if room >= widest + MAIL_ACTION_MIN_PADDING + actions {
         // Everything fits: the box at its width, the actions a clear gap away.
-        // The gap is what closes first, so the box and the six cells are both
+        // The gap is what closes first, so the box and the seven cells are both
         // still whole when they are at their closest.
         let padding = (room - widest - actions).clamp(MAIL_ACTION_MIN_PADDING, MAIL_ACTION_PADDING);
         return TitlebarFit {
@@ -4533,17 +4581,20 @@ fn clip_to(ui: &mut egui::Ui, rect: egui::Rect) {
     ui.set_clip_rect(clip);
 }
 
-/// The shape every icon in the title bar is drawn in: as wide as a window
-/// control and the full height of the bar, so they all highlight the same way.
-/// `enabled` is the one thing the mail actions vary — a disabled cell neither
-/// senses clicks nor fills under the pointer.
-fn titlebar_flat_button(ui: &mut egui::Ui, height: f32, enabled: bool) -> egui::Response {
+/// One button in the title bar: a `TITLEBAR_BUTTON_SIZE` square, centred in the
+/// bar's height by the row that lays it out, empty at rest and filled with a
+/// rounded corner under the pointer (`titlebar_hover`). Every button in the bar
+/// is this — the nav toggle, compose, sync, the mail actions, the cog and the
+/// window controls — and `enabled` is the one thing a caller varies: the mail
+/// actions' disabled cells neither sense clicks nor fill, while the rest of the
+/// bar is always live.
+fn titlebar_button(ui: &mut egui::Ui, enabled: bool) -> egui::Response {
     let sense = if enabled {
         egui::Sense::click()
     } else {
         egui::Sense::hover()
     };
-    let (_, response) = ui.allocate_exact_size(egui::vec2(TITLEBAR_BUTTON_WIDTH, height), sense);
+    let (_, response) = ui.allocate_exact_size(egui::Vec2::splat(TITLEBAR_BUTTON_SIZE), sense);
     if enabled {
         titlebar_hover(ui, response)
     } else {
@@ -4551,25 +4602,25 @@ fn titlebar_flat_button(ui: &mut egui::Ui, height: f32, enabled: bool) -> egui::
     }
 }
 
-/// One icon cell in the title bar's left row (the nav collapse toggle and the
-/// sync button): `titlebar_flat_button` in the one state those have — always
-/// live.
-fn titlebar_icon_button(ui: &mut egui::Ui, height: f32) -> egui::Response {
-    titlebar_flat_button(ui, height, true)
-}
-
-/// Fill a title-bar icon cell while the pointer is over it. This is the
-/// treatment the nav toggle, the sync button, the cog and the window controls
-/// share, and the reason the bar's buttons are hand-painted rather than
-/// `egui::Button`s: a stock button draws a card-colored frame with a border,
-/// which in a title bar reads as a widget among window chrome. The glyph is
-/// the caller's, painted afterwards so the fill cannot cover it.
+/// Fill a title-bar cell while the pointer is over it. This is the treatment
+/// every button in the bar shares, and the reason they are hand-painted rather
+/// than `egui::Button`s: a stock button draws a card-colored frame with a
+/// border, which in a title bar reads as a widget among window chrome. The
+/// glyph is the caller's, painted afterwards so the fill cannot cover it.
 fn titlebar_hover(ui: &egui::Ui, response: egui::Response) -> egui::Response {
     if response.hovered() {
-        ui.painter()
-            .rect_filled(response.rect, 0.0, ui.visuals().widgets.hovered.bg_fill);
+        titlebar_fill(ui, response.rect, ui.visuals().widgets.hovered.bg_fill);
     }
     response
+}
+
+/// The rounded fill itself, for the cells the bar places at exact x positions
+/// rather than in a row (`titlebar_rects`): the cog and the window controls.
+/// The close button passes the scheme's danger colour; everything else takes
+/// the hover fill `titlebar_hover` does.
+fn titlebar_fill(ui: &egui::Ui, rect: egui::Rect, fill: egui::Color32) {
+    ui.painter()
+        .rect_filled(rect, TITLEBAR_BUTTON_CORNER_RADIUS, fill);
 }
 
 /// Blitz reading pane: page margin, width quantization for renders, and how
@@ -5277,8 +5328,8 @@ fn paint_search_icon(p: &egui::Painter, rect: egui::Rect, color: egui::Color32) 
 }
 
 /// Nav collapse glyph for the title-bar toggle: three stacked lines, drawn at
-/// the size of the window controls' glyphs rather than of the cell they sit
-/// in, which is as wide as a window control.
+/// the size of the window controls' glyphs rather than of the cell they sit in
+/// (`TITLEBAR_BUTTON_SIZE`), which every button in the bar shares.
 fn paint_nav_icon(p: &egui::Painter, rect: egui::Rect, color: egui::Color32) {
     let c = rect.center();
     let stroke = egui::Stroke::new(1.5_f32, color);
@@ -6527,16 +6578,75 @@ mod tests {
         app: &mut KimoApp,
         width: f32,
     ) -> Vec<egui::epaint::ClippedShape> {
+        frame_shapes_with(ctx, app, width, Vec::new())
+    }
+
+    /// `frame_shapes_at` with input events — the pointer moved over a cell,
+    /// say — for the tests that read what a hover drew.
+    fn frame_shapes_with(
+        ctx: &egui::Context,
+        app: &mut KimoApp,
+        width: f32,
+        events: Vec<egui::Event>,
+    ) -> Vec<egui::epaint::ClippedShape> {
         let input = egui::RawInput {
             screen_rect: Some(egui::Rect::from_min_size(
                 egui::Pos2::ZERO,
                 egui::vec2(width, 900.0),
             )),
+            events,
             ..Default::default()
         };
         let mut output = ctx.run_ui(input, |ui| app.ui(ui));
         output.textures_delta.clear();
         output.shapes
+    }
+
+    /// Every filled rectangle of a frame that is exactly this size, however
+    /// deeply egui nested it. A button's hover fill is what the cell test below
+    /// looks for: a `TITLEBAR_BUTTON_SIZE` square.
+    fn fills_of_size(
+        shapes: &[egui::epaint::ClippedShape],
+        size: egui::Vec2,
+    ) -> Vec<egui::epaint::RectShape> {
+        let mut out = Vec::new();
+        for clipped in shapes {
+            collect_fills(&clipped.shape, size, &mut out);
+        }
+        out
+    }
+
+    fn collect_fills(
+        shape: &egui::Shape,
+        size: egui::Vec2,
+        out: &mut Vec<egui::epaint::RectShape>,
+    ) {
+        match shape {
+            egui::Shape::Rect(rect) if rect.rect.size() == size => out.push(rect.clone()),
+            egui::Shape::Vec(shapes) => {
+                for shape in shapes {
+                    collect_fills(shape, size, out);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// What the pointer fills when it is put at `center`: the cell under it, if
+    /// the bar drew one. The pointer is moved in one frame and the shapes are
+    /// read from the next — egui hit-tests against the last frame's rects, so a
+    /// single frame would still be filling the cell the pointer left.
+    fn fill_under_the_pointer(
+        ctx: &egui::Context,
+        app: &mut KimoApp,
+        width: f32,
+        center: egui::Pos2,
+    ) -> Option<egui::epaint::RectShape> {
+        frame_shapes_with(ctx, app, width, vec![egui::Event::PointerMoved(center)]);
+        let shapes = frame_shapes_with(ctx, app, width, Vec::new());
+        fills_of_size(&shapes, egui::Vec2::splat(TITLEBAR_BUTTON_SIZE))
+            .into_iter()
+            .find(|fill| fill.rect.center() == center)
     }
 
     /// The title bar is laid out as groups, and no group's rect crosses
@@ -6575,8 +6685,14 @@ mod tests {
                     "{width} pt: {a:?} overlaps {b:?}"
                 );
             }
-            // And while there is room for them, they are in that order.
-            if bar(width).width() >= 4.0 * TITLEBAR_BUTTON_WIDTH {
+            // And while there is room for them, they are in that order: what
+            // the right end needs is the cog, the gap, the three controls and
+            // the margin from the window's edge.
+            let right_end = TITLEBAR_EDGE_MARGIN
+                + TITLEBAR_BUTTON_SIZE
+                + TITLEBAR_BUTTON_GAP
+                + titlebar_cells_width(3);
+            if bar(width).width() >= right_end {
                 assert!(
                     rects.content.right() <= rects.cog.left()
                         && rects.cog.right() <= rects.controls.left(),
@@ -6586,13 +6702,20 @@ mod tests {
             // The cells keep their size whatever the bar does: a window too
             // narrow to show them all cuts the ones at its edge off rather
             // than shrinking every control into an unclickable sliver.
-            assert_eq!(rects.cog.width(), TITLEBAR_BUTTON_WIDTH, "{width} pt");
+            assert_eq!(rects.cog.width(), TITLEBAR_BUTTON_SIZE, "{width} pt");
             assert_eq!(
                 rects.controls.width(),
-                3.0 * TITLEBAR_BUTTON_WIDTH,
+                titlebar_cells_width(3),
                 "{width} pt"
             );
-            assert_eq!(rects.controls.right(), bar(width).right(), "{width} pt");
+            // The run ends clear of the window's corner rather than on it: the
+            // close button's fill is a rounded square now, and flush it would
+            // reach the corner the compositor cut.
+            assert_eq!(
+                rects.controls.right(),
+                bar(width).right() - TITLEBAR_EDGE_MARGIN,
+                "{width} pt"
+            );
         }
     }
 
@@ -6623,14 +6746,105 @@ mod tests {
         assert!(MailAction::Delete.tooltip().contains("server"));
     }
 
+    /// Every button in the title bar is the same cell: a
+    /// `TITLEBAR_BUTTON_SIZE` square, centred in the bar's height and
+    /// `TITLEBAR_BUTTON_GAP` from the next one, whose hover fill is a small
+    /// rounded square. This walks the whole bar — the left group, the run of
+    /// mail actions, the cog and the window controls — and puts the pointer on
+    /// each cell in turn, which is also what says every one of them is a real
+    /// hit target rather than a glyph painted on the chrome.
+    ///
+    /// The two runs are measured with `titlebar_cells_width`, which is what the
+    /// fit plans with and the bar draws with; the left group's cells are found
+    /// from the layout its row makes (the edge margin, the brand icon, then a
+    /// cell every pitch).
+    #[test]
+    fn every_button_in_the_title_bar_is_the_same_cell() {
+        let ctx = egui::Context::default();
+        crate::fonts::install(&ctx, None, None);
+        let mut app = app_with_messages(&ctx, 4);
+        // The run is enabled by the mail the reading pane shows.
+        app.selected_message = Some("0".to_string());
+
+        // One frame first: the run starts where the search box ended, and the
+        // box's rect is only known once the bar has drawn it.
+        frame_shapes_at(&ctx, &mut app, 1400.0);
+        let search = ctx
+            .read_response(egui::Id::new("titlebar-search"))
+            .expect("the bar drew no search box")
+            .rect;
+        let bar = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1400.0, TITLEBAR_HEIGHT));
+        let rects = titlebar_rects(bar, 3);
+        let pitch = TITLEBAR_BUTTON_SIZE + TITLEBAR_BUTTON_GAP;
+        let middle = TITLEBAR_HEIGHT / 2.0;
+
+        // The left group: the brand icon, then the nav toggle, compose and —
+        // Debug mode's alone — sync, a cell every pitch after it.
+        let first_left = TITLEBAR_EDGE_MARGIN + BRAND_ICON_SIZE + TITLEBAR_BUTTON_GAP;
+        let left_cells = if app.working_mode == WorkingMode::Debug {
+            3
+        } else {
+            2
+        };
+        let mut cells: Vec<egui::Pos2> = (0..left_cells)
+            .map(|index| {
+                egui::pos2(
+                    first_left + index as f32 * pitch + TITLEBAR_BUTTON_SIZE / 2.0,
+                    middle,
+                )
+            })
+            .collect();
+
+        // The mail actions: the run starts where the search box ended, the
+        // fit's clear chrome further right.
+        let actions = titlebar_cells_width(MailAction::ALL.len());
+        let fit = titlebar_fit(rects.cog.min.x - search.left(), actions);
+        assert!(fit.actions, "the bar gave the actions up at 1400 pt");
+        let left = search.right() + fit.padding;
+        for index in 0..MailAction::ALL.len() {
+            cells.push(egui::pos2(
+                left + index as f32 * pitch + TITLEBAR_BUTTON_SIZE / 2.0,
+                middle,
+            ));
+        }
+
+        // The right end: the cog, then the three window controls, which end
+        // `TITLEBAR_EDGE_MARGIN` short of the window's own edge.
+        cells.push(rects.cog.center());
+        for index in 0..3 {
+            cells.push(egui::pos2(
+                rects.controls.right() - TITLEBAR_BUTTON_SIZE / 2.0 - index as f32 * pitch,
+                middle,
+            ));
+        }
+
+        for center in cells {
+            let filled = fill_under_the_pointer(&ctx, &mut app, 1400.0, center)
+                .unwrap_or_else(|| panic!("nothing filled under {center:?}"));
+            assert_eq!(filled.rect.center(), center);
+            assert_eq!(
+                filled.corner_radius,
+                egui::CornerRadius::same(TITLEBAR_BUTTON_CORNER_RADIUS),
+                "{center:?}: the hover fill is not the rounded cell"
+            );
+        }
+
+        // The run of actions is the width the fit planned: it ends before the
+        // bar's right end begins.
+        assert!(
+            left + actions <= rects.cog.min.x,
+            "the run draws {} pt into the bar's right end",
+            left + actions - rects.cog.min.x
+        );
+    }
+
     /// What the bar gives up when it runs out of room, in the order it gives it
     /// up — plus the rule that makes the whole thing safe: the fit never plans
     /// a middle group wider than the room it was given. (The other half of that
     /// rule is the clip every group is drawn through, `clip_to`.)
     #[test]
     fn the_title_bar_gives_its_room_up_in_one_order() {
-        let actions = MailAction::ALL.len() as f32 * TITLEBAR_BUTTON_WIDTH
-            + (MailAction::ALL.len() - 1) as f32 * 8.0;
+        let actions = titlebar_cells_width(MailAction::ALL.len());
         let widest = TITLEBAR_SEARCH_WIDTH;
         let narrowest = TITLEBAR_SEARCH_FLOOR;
 
@@ -6646,7 +6860,7 @@ mod tests {
         );
 
         // Narrower: the gap closes before anything is lost, and both the box
-        // and the six cells are whole when the two are at their closest.
+        // and the seven cells are whole when the two are at their closest.
         let tight = widest + MAIL_ACTION_MIN_PADDING + actions;
         assert_eq!(
             titlebar_fit(tight, actions),
@@ -6731,7 +6945,7 @@ mod tests {
     /// group rect itself, so the test can tell the bar's right end from a
     /// widget that has wandered into it — which is exactly what used to
     /// happen, when the bar was one run of widgets that drew past the end of
-    /// the window and the six mail cells landed on minimize / maximize / close.
+    /// the window and the mail cells landed on minimize / maximize / close.
     #[test]
     fn nothing_in_the_title_bar_is_drawn_into_the_window_controls() {
         let ctx = egui::Context::default();
@@ -6742,9 +6956,13 @@ mod tests {
             let bar =
                 egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(width, TITLEBAR_HEIGHT));
             let rects = titlebar_rects(bar, 3);
-            // The bar's own right end: the cog and the window controls. Shapes
-            // drawn through its clip are the only ones allowed there.
-            let right_end = rects.cog.union(rects.controls);
+            // The bar's own right end: the cog and the window controls, from
+            // the cog's left edge to the window's corner. That is the rect the
+            // right group draws through — its cells are `TITLEBAR_BUTTON_SIZE`
+            // squares inside it — so a shape clipped to it is the group's own,
+            // and anything else that reaches into it is what this catches.
+            let right_end =
+                egui::Rect::from_min_max(egui::pos2(rects.cog.left(), bar.top()), bar.max);
             for clipped in frame_shapes_at(&ctx, &mut app, width) {
                 // What the frame actually shows of the shape: the bar clips
                 // its groups, and egui clips the window.
@@ -6790,8 +7008,7 @@ mod tests {
         let ctx = egui::Context::default();
         crate::fonts::install(&ctx, None, None);
         let mut app = app_with_messages(&ctx, 4);
-        let actions = MailAction::ALL.len() as f32 * TITLEBAR_BUTTON_WIDTH
-            + (MailAction::ALL.len() - 1) as f32 * 8.0;
+        let actions = titlebar_cells_width(MailAction::ALL.len());
 
         // A window with room for the whole middle group: the box is at the
         // width the fit gives a bar that has nothing to give up.
