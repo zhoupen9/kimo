@@ -639,6 +639,28 @@ Event (mpsc) ──► drain_events() at frame start ──► merge into Accoun
   from `MailMessage.attachments`, a search hit from the count the query
   returned — so a hit no longer spells the paperclip out in its third line: the
   glyph is the one way the list says it.
+  **A row offers its own delete button under the pointer**: a `ROW_ACTION_SIZE`
+  (24 pt) cell at the right end of its first line, where the timestamp sits —
+  the timestamp, and a conversation's count before it, gives way to a muted
+  trash glyph (`paint_delete_icon` at `ROW_ACTION_GLYPH`), which takes the
+  scheme's `danger_hover` fill with the `on_danger` glyph once the pointer is on
+  the button itself — the treatment the title bar's close button gets, for the
+  same reason: the button is the confirmation, and what it does cannot be
+  undone. What is *laid out* on that line does not change with the hover — the
+  sender is elided against the timestamp's slot either way — so nothing on the
+  row moves under the pointer; only what is painted does. The button is a
+  target on every row, drawn or not, like the box: a target that only appears
+  once the pointer is already on it is one a click can miss. **What it takes is
+  the mail the row speaks for** — a mail row's own mail, a conversation's
+  *newest* one, which is the mail the row opens in the pane and the one the
+  title bar's Delete would
+  take — and not the whole thread: that is the row's box (all of it at once) or
+  the pane's mail through the title bar (one at a time). A conversation's hover
+  text says the newest mail outright; the title bar's own wording is used for a
+  mail. A search hit's button is keyed by the hit, so it deletes where the hit
+  lives and never opens the folder instead. It is offered in **both modes** — a
+  row is a row — so select mode's box checks and its button still takes that one
+  mail, without leaving the mode or touching the selection.
 - The message list is a list of **conversations** by default: `crate::threads::group`
   turns a folder's mail into threads — a reply joins its parent through
   `References` read from the end (the last id this folder holds is the parent),
@@ -1314,7 +1336,7 @@ Do not "fix" these casually — they are known:
   just as final. There is no Delete-key shortcut and no shift-click range: a
   selection is made one checkbox at a time, or every mail of the list at once
   (see the select-mode bullet under Conventions) — and that click is just as
-  final.
+  final, as is a row's own hover button (see the message-row bullet).
 - A written mail goes out over SMTP and no further: no attachments (there is
   nothing to pick a file with — a native dialog is a dependency, and a portal on
   Wayland), no HTML body (the card is a text box, so the mail is `text/plain;

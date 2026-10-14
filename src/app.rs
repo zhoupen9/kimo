@@ -241,6 +241,19 @@ impl MailAction {
     }
 }
 
+/// What a row's own delete button says: the mail the row speaks for, and — for
+/// a conversation — that it is only that one, since a conversation's row shows
+/// its newest mail and the button takes the same mail the row opens in the
+/// pane. The wording is the title bar's Delete, which takes the same mail.
+fn row_delete_tooltip(place: RowPlace<'_>) -> &'static str {
+    match place {
+        RowPlace::Thread { .. } => {
+            "Delete — removes the newest mail of this conversation from the server too"
+        }
+        RowPlace::Plain | RowPlace::InThread => MailAction::Delete.tooltip(),
+    }
+}
+
 /// What the Delete cell says in select mode, where what it would delete is a
 /// selection rather than the one mail the reading pane shows. The count is the
 /// one thing the seven glyphs cannot say.
@@ -667,6 +680,21 @@ impl MailKey {
             folder: folder.to_string(),
             uid: uid.to_string(),
         }
+    }
+}
+
+/// The mail a row's own delete button is about: the mail the row speaks for. A
+/// conversation's row shows its newest mail — the one the reading pane opens
+/// from it — and that is the one its button takes; the mails the conversation
+/// holds are the list's to delete one by one, or the selection's to take whole.
+fn row_delete_target<'a>(
+    row: ListRow,
+    rows: &ListRows,
+    messages: &'a [MailMessage],
+) -> Option<&'a MailMessage> {
+    match row {
+        ListRow::Thread { thread } => messages.get(rows.threads[thread].newest),
+        ListRow::Message { index, .. } => messages.get(index),
     }
 }
 
@@ -1877,14 +1905,27 @@ impl KimoApp {
         ) else {
             return;
         };
+        self.delete_mail(&account_id, &folder, &uid);
+    }
+
+    /// Delete one mail, by way of a worker thread: the mail the title bar's
+    /// Delete has for the reading pane, and the mail a row's own delete button
+    /// is about. The server is told first and the mail's database row goes only
+    /// once it has agreed (`Job::DeleteMessage`), so mail that is still on the
+    /// server is never dropped here; the row leaves the list when the deletion
+    /// comes back (`Event::MessageDeleted`).
+    ///
+    /// Nothing asks first: the button is the confirmation, and a deletion that
+    /// cannot be undone is what the tooltip says it is.
+    fn delete_mail(&mut self, account_id: &str, folder: &str, uid: &str) {
         let Some(account) = self.accounts.iter().find(|a| a.id == account_id).cloned() else {
             return;
         };
         sync::spawn(
             Job::DeleteMessage {
                 account,
-                folder,
-                uids: vec![uid],
+                folder: folder.to_string(),
+                uids: vec![uid.to_string()],
             },
             self.ctx.clone(),
             self.tx.clone(),
@@ -3016,7 +3057,9 @@ impl KimoApp {
                 MailAction::Label => paint_label_icon(painter, response.rect, color),
                 MailAction::Flag => paint_flag_icon(painter, response.rect, color),
                 MailAction::Export => paint_export_icon(painter, response.rect, color),
-                MailAction::Delete => paint_delete_icon(painter, response.rect, color),
+                MailAction::Delete => {
+                    paint_delete_icon(painter, response.rect, color, MAIL_ACTION_GLYPH)
+                }
             }
             let response = response.on_hover_text(if enabled {
                 if self.select_mode && action == MailAction::Delete {
@@ -3737,6 +3780,9 @@ impl KimoApp {
         // A box was clicked: the mail it stands for — one mail, or every mail of
         // a conversation — is checked once the borrow of the state is over.
         let mut checked: Option<Vec<MailKey>> = None;
+        // A row's own delete button was clicked: the mail the row speaks for
+        // goes once the borrow of the state is over.
+        let mut deleted: Option<MailKey> = None;
         // A click on a row in select mode is the way out of it, and nothing
         // else: it does not open the mail under the pointer.
         let mut leave_select = false;
@@ -3753,7 +3799,7 @@ impl KimoApp {
             ..LIST_PADDING
         };
         let rows_top = LIST_PADDING.top as f32 + if select_all { SELECT_ALL_HEIGHT } else { 0.0 };
-        let select_all_id = checkbox_id("select-all", account, folder, "");
+        let select_all_id = row_widget_id("select-all", account, folder, "");
         let list = egui::ScrollArea::vertical()
             .auto_shrink([false, false])
             .show_viewport(ui, |ui, viewport| {
@@ -3783,14 +3829,21 @@ impl KimoApp {
                                             open,
                                             first,
                                         );
-                                        // The box checks every mail the
-                                        // conversation holds, the chevron
-                                        // opens and closes them in the
-                                        // list, and the row opens the
-                                        // conversation in the pane — or, in
-                                        // select mode, leaves it. A click on
-                                        // one is not a click on another.
-                                        if drawn.checkbox.clicked() {
+                                        // The row's own delete button takes the
+                                        // mail the row speaks for, the box
+                                        // checks every mail the conversation
+                                        // holds, the chevron opens and closes
+                                        // them in the list, and the row opens
+                                        // the conversation in the pane — or, in
+                                        // select mode, leaves it. A click on one
+                                        // is not a click on another.
+                                        if drawn.delete.clicked() {
+                                            deleted =
+                                                row_delete_target(rows.rows[index], rows, messages)
+                                                    .map(|msg| {
+                                                        MailKey::new(account, folder, &msg.uid)
+                                                    });
+                                        } else if drawn.checkbox.clicked() {
                                             checked = Some(
                                                 conversation
                                                     .messages
@@ -3826,7 +3879,13 @@ impl KimoApp {
                                         };
                                         let drawn =
                                             self.message_row(ui, &messages[index], first, place);
-                                        if drawn.checkbox.clicked() {
+                                        if drawn.delete.clicked() {
+                                            deleted = Some(MailKey::new(
+                                                account,
+                                                folder,
+                                                &messages[index].uid,
+                                            ));
+                                        } else if drawn.checkbox.clicked() {
                                             checked = Some(vec![MailKey::new(
                                                 account,
                                                 folder,
@@ -3882,12 +3941,16 @@ impl KimoApp {
             self.open_rev += 1;
             self.ctx.request_repaint();
         }
-        // A checked row, the select-all row, and the way out of select mode.
-        // Like the chevron, what the click made is what the next frame draws,
-        // so the frame is asked for here rather than waited for.
+        // A checked row, a row's own delete, the select-all row, and the way
+        // out of select mode. Like the chevron, what the click made is what the
+        // next frame draws, so the frame is asked for here rather than waited
+        // for; the deleted row leaves when the worker says the server agreed.
         if let Some(keys) = checked {
             self.toggle_check(keys);
             self.ctx.request_repaint();
+        }
+        if let Some(key) = deleted {
+            self.delete_mail(&key.account, &key.folder, &key.uid);
         }
         if let Some(keys) = select_all_clicked {
             self.toggle_all(keys);
@@ -4278,6 +4341,8 @@ impl KimoApp {
         // built from the hit and not from the column.
         let mut clicked: Option<SearchHit> = None;
         let mut checked: Option<Vec<MailKey>> = None;
+        // A hit's own delete button was clicked: the hit goes.
+        let mut deleted: Option<MailKey> = None;
         let mut leave_select = false;
         // The select-all row was clicked: every hit is checked — or the
         // selection is cleared — once the borrow of the hits is over.
@@ -4290,7 +4355,7 @@ impl KimoApp {
             ..LIST_PADDING
         };
         let rows_top = LIST_PADDING.top as f32 + if select_all { SELECT_ALL_HEIGHT } else { 0.0 };
-        let select_all_id = checkbox_id("select-all", "search", "", "");
+        let select_all_id = row_widget_id("select-all", "search", "", "");
         let hits = &self.search_hits;
         let list = egui::ScrollArea::vertical()
             .auto_shrink([false, false])
@@ -4307,7 +4372,10 @@ impl KimoApp {
                             for index in rows {
                                 let hit = &hits[index];
                                 let drawn = self.search_row(ui, hit, index == 0);
-                                if drawn.checkbox.clicked() {
+                                if drawn.delete.clicked() {
+                                    deleted =
+                                        Some(MailKey::new(&hit.account_id, &hit.folder, &hit.uid));
+                                } else if drawn.checkbox.clicked() {
                                     checked = Some(vec![MailKey::new(
                                         &hit.account_id,
                                         &hit.folder,
@@ -4344,6 +4412,9 @@ impl KimoApp {
         if let Some(keys) = checked {
             self.toggle_check(keys);
             self.ctx.request_repaint();
+        }
+        if let Some(key) = deleted {
+            self.delete_mail(&key.account, &key.folder, &key.uid);
         }
         if let Some(keys) = select_all_clicked {
             self.toggle_all(keys);
@@ -4489,7 +4560,8 @@ impl KimoApp {
             has_attachments: !msg.attachments.is_empty(),
             place,
             checkbox,
-            checkbox_id: checkbox_id("mail-checkbox", account, folder, &msg.uid),
+            checkbox_id: row_widget_id("mail-checkbox", account, folder, &msg.uid),
+            delete_id: row_widget_id("mail-delete", account, folder, &msg.uid),
         };
         self.message_card(ui, &card, first)
     }
@@ -4547,7 +4619,8 @@ impl KimoApp {
             // The thread's own key, not its mails': the conversation's row and
             // the oldest mail under it can be the same uid, and two widgets may
             // not share one id.
-            checkbox_id: checkbox_id("thread-checkbox", account, folder, &thread.key),
+            checkbox_id: row_widget_id("thread-checkbox", account, folder, &thread.key),
+            delete_id: row_widget_id("thread-delete", account, folder, &thread.key),
         };
         self.message_card(ui, &card, first)
     }
@@ -4583,7 +4656,8 @@ impl KimoApp {
             checkbox,
             // A hit names the folder it lives in, which is what keeps two
             // accounts' uids apart on one screen.
-            checkbox_id: checkbox_id("mail-checkbox", &hit.account_id, &hit.folder, &hit.uid),
+            checkbox_id: row_widget_id("mail-checkbox", &hit.account_id, &hit.folder, &hit.uid),
+            delete_id: row_widget_id("mail-delete", &hit.account_id, &hit.folder, &hit.uid),
         };
         self.message_card(ui, &card, first)
     }
@@ -4621,9 +4695,25 @@ impl KimoApp {
             card.checkbox_id,
             egui::Sense::click(),
         );
-        // The pointer on the box is the pointer on the row: the box is a
-        // control inside the row, not a hole in it.
-        let hovered = resp.hovered() || checkbox.hovered();
+        // Where the row's text runs, and the cell its own delete button takes
+        // when the pointer is on the row: the timestamp's slot at the right end
+        // of the first line, which gives way to it.
+        let text_left = avatar_center.x + diameter / 2.0 + 10.0;
+        let text_right = rect.right() - 10.0;
+        let delete_rect = egui::Rect::from_center_size(
+            egui::pos2(
+                text_right - ROW_ACTION_SIZE / 2.0,
+                rect.top() + ROW_SENDER_Y,
+            ),
+            egui::Vec2::splat(ROW_ACTION_SIZE),
+        );
+        // A target on every row, like the box: egui hit-tests a pass against the
+        // widget rects of the previous one, so a target that only appears once
+        // the pointer is already on it is a target a click can miss.
+        let delete = ui.interact(delete_rect, card.delete_id, egui::Sense::click());
+        // The pointer on one of the row's controls is the pointer on the row:
+        // they are controls inside the row, not holes in it.
+        let hovered = resp.hovered() || checkbox.hovered() || delete.hovered();
 
         // Both highlights are the mail's whole row: a square block that fills
         // the column edge to edge, hairlines included, rather than a rounded
@@ -4761,8 +4851,6 @@ impl KimoApp {
             }
         }
 
-        let text_left = avatar_center.x + diameter / 2.0 + 10.0;
-        let text_right = rect.right() - 10.0;
         // Sender and subject always take the body color — read mail is not
         // muted — and unread mail is set heavier instead, so the two states
         // stay apart without dimming half the list. Only the preview below is
@@ -4771,6 +4859,10 @@ impl KimoApp {
 
         // First row: timestamp right-aligned, sender truncated before it — and,
         // for a conversation, the count of what it holds in front of the date.
+        // Under the pointer the row's own delete button takes that end of the
+        // line: what is *laid out* here does not change with the hover — the
+        // sender is elided against the timestamp's place either way — only what
+        // is painted does, so nothing on the row moves under the pointer.
         let mut line_right = text_right;
         if let RowPlace::Thread { count, .. } = card.place {
             let small = egui::TextStyle::Small.resolve(ui.style());
@@ -4778,11 +4870,13 @@ impl KimoApp {
                 .ctx()
                 .fonts_mut(|f| f.layout_no_wrap(count.to_string(), small, scheme.text_weak));
             line_right -= badge.size().x;
-            painter.galley(
-                egui::pos2(line_right, rect.top() + ROW_SENDER_Y - badge.size().y * 0.5),
-                badge,
-                scheme.text_weak,
-            );
+            if !hovered {
+                painter.galley(
+                    egui::pos2(line_right, rect.top() + ROW_SENDER_Y - badge.size().y * 0.5),
+                    badge,
+                    scheme.text_weak,
+                );
+            }
             line_right -= 8.0;
         }
         let date_galley = ui.ctx().fonts_mut(|f| {
@@ -4796,7 +4890,9 @@ impl KimoApp {
             line_right - date_galley.size().x,
             rect.top() + ROW_SENDER_Y - date_galley.size().y * 0.5,
         );
-        painter.galley(date_pos, date_galley, scheme.text_weak);
+        if !hovered {
+            painter.galley(date_pos, date_galley, scheme.text_weak);
+        }
         let sender_max_width = (date_pos.x - text_left - 12.0).max(40.0);
         let sender = truncate_galley(
             ui.ctx(),
@@ -4869,10 +4965,28 @@ impl KimoApp {
             scheme.text_weak,
         );
 
+        // The row's own delete button, in the slot the timestamp gave up: a
+        // muted glyph while the pointer is anywhere on the row, and the
+        // scheme's danger fill under the glyph once the pointer is on the
+        // button itself — the treatment the title bar's close button gets, and
+        // for the same reason: the button is the confirmation, and what it does
+        // cannot be undone.
+        if hovered {
+            if delete.hovered() {
+                painter.rect_filled(delete_rect, ROW_ACTION_CORNER_RADIUS, scheme.danger_hover);
+                ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                paint_delete_icon(painter, delete_rect, scheme.on_danger, ROW_ACTION_GLYPH);
+            } else {
+                paint_delete_icon(painter, delete_rect, scheme.text_weak, ROW_ACTION_GLYPH);
+            }
+        }
+
+        let delete = delete.on_hover_text(row_delete_tooltip(card.place));
         RowResponse {
             row: resp,
             chevron,
             checkbox,
+            delete,
         }
     }
 
@@ -6720,6 +6834,9 @@ struct CardText<'a> {
     /// The widget id the box's click target is registered under: one per row,
     /// stable between frames the way the chevron's key is.
     checkbox_id: egui::Id,
+    /// The widget id of the row's own delete button — the one it offers under
+    /// the pointer — one per row like the box's.
+    delete_id: egui::Id,
 }
 
 /// What a row's checkbox says about the mail the row stands for.
@@ -6792,6 +6909,9 @@ struct RowResponse {
     /// The box, on every row: it is a target whether or not it is drawn — see
     /// `message_card`.
     checkbox: egui::Response,
+    /// The row's own delete button: a target on every row like the box, drawn
+    /// when the pointer is on the row (see `message_card`).
+    delete: egui::Response,
 }
 
 const MESSAGE_ROW_HEIGHT: f32 = 68.0;
@@ -6810,6 +6930,13 @@ const AVATAR_DIAMETER: f32 = 32.0;
 const CHECKBOX_SIZE: f32 = 18.0;
 const CHECKBOX_PADDING: f32 = 5.0;
 const CHECKBOX_CORNER_RADIUS: u8 = 4;
+/// The delete button a mail row offers under the pointer: the cell at the right
+/// end of its first line — where the timestamp sits, which gives way to it —
+/// and the glyph drawn in it. Smaller than the title bar's cells: a row's
+/// control is a note on the mail, not chrome.
+const ROW_ACTION_SIZE: f32 = 24.0;
+const ROW_ACTION_GLYPH: f32 = 15.0;
+const ROW_ACTION_CORNER_RADIUS: u8 = 4;
 /// The width of the check drawn on a checked box, and of the dash a partly
 /// checked conversation gets.
 const CHECKBOX_STROKE: f32 = 2.0;
@@ -7553,11 +7680,13 @@ fn glyph_point(center: egui::Pos2, x: f32, y: f32) -> egui::Pos2 {
     outline_point(center, x, y, MAIL_ACTION_GLYPH)
 }
 
-/// The widget id of a row's checkbox: one per row, stable between frames the
-/// way the chevron's key is. `tag` keeps a conversation's box apart from the
-/// box of the mail it holds — the two can be the same mail — and the account and
-/// folder keep a search's hits apart, since two accounts can hold one uid.
-fn checkbox_id(tag: &'static str, account: &str, folder: &str, key: &str) -> egui::Id {
+/// The widget id of one of a row's controls — its checkbox, or the delete button
+/// it offers under the pointer — or of the list's select-all row: one per row,
+/// stable between frames the way the chevron's key is. `tag` keeps a
+/// conversation's controls apart from the ones of the mail it holds — the two can
+/// be the same mail — and the account and folder keep a search's hits apart,
+/// since two accounts can hold one uid.
+fn row_widget_id(tag: &'static str, account: &str, folder: &str, key: &str) -> egui::Id {
     egui::Id::new((tag, account, folder, key))
 }
 
@@ -7844,9 +7973,11 @@ fn paint_export_icon(p: &egui::Painter, rect: egui::Rect, color: egui::Color32) 
 
 /// Delete: the trash can — lid, handle above it, and the open-topped body. The
 /// two lines the outline draws inside the body are left out: at this size they
-/// close up into a smudge and the can reads better empty.
-fn paint_delete_icon(p: &egui::Painter, rect: egui::Rect, color: egui::Color32) {
-    let g = |x: f32, y: f32| glyph_point(rect.center(), x, y);
+/// close up into a smudge and the can reads better empty. `size` is the glyph's
+/// own size: the title bar's cells draw it at `MAIL_ACTION_GLYPH`, a mail row's
+/// smaller button at `ROW_ACTION_GLYPH`.
+fn paint_delete_icon(p: &egui::Painter, rect: egui::Rect, color: egui::Color32, size: f32) {
+    let g = |x: f32, y: f32| outline_point(rect.center(), x, y, size);
     let stroke = egui::Stroke::new(1.5_f32, color);
     p.add(egui::Shape::line(vec![g(3.0, 6.0), g(21.0, 6.0)], stroke));
     p.add(egui::Shape::line(
@@ -10038,6 +10169,21 @@ mod tests {
         )
     }
 
+    /// Where a row's own delete button sits: the cell at the right end of the
+    /// row's first line, in the timestamp's slot. Select mode's select-all row
+    /// pushes every mail row one band lower.
+    fn row_delete_center(app: &KimoApp, row: usize) -> egui::Pos2 {
+        let select_all = if app.select_mode {
+            SELECT_ALL_HEIGHT
+        } else {
+            0.0
+        };
+        egui::pos2(
+            app.list_column.right() - LIST_MARGIN as f32 - 10.0 - ROW_ACTION_SIZE / 2.0,
+            TITLEBAR_HEIGHT + select_all + MESSAGE_ROW_HEIGHT * row as f32 + ROW_SENDER_Y,
+        )
+    }
+
     /// Where the select-all row's own checkbox sits: the plain-row slot in the
     /// band above the first row.
     fn select_all_center(app: &KimoApp) -> egui::Pos2 {
@@ -11097,6 +11243,217 @@ mod tests {
             60,
             "the band checks the folder, not the rows a viewport shows"
         );
+    }
+
+    /// A row offers its own delete button under the pointer: the timestamp gives
+    /// way to a muted trash glyph, and the glyph takes the scheme's danger fill
+    /// once the pointer is on the button itself. Nothing about the row's layout
+    /// moves — the sender is elided against the timestamp's slot either way.
+    #[test]
+    fn the_pointer_puts_a_delete_button_on_the_row_it_is_on() {
+        let ctx = egui::Context::default();
+        crate::fonts::install(&ctx, None, None);
+        let mut app = app_with_messages(&ctx, 3);
+        let date = {
+            let msg = &app.folder_messages_of("acct", "INBOX").expect("mail")[1];
+            date_label(msg.timestamp, &msg.date)
+        };
+        let danger = theme::of(&ctx).danger_hover;
+
+        // The pointer away: every row's timestamp stands — the fixture's mails
+        // share one, so the count is what says one of them went — and no button
+        // is drawn.
+        let texts = frame_texts(&ctx, &mut app);
+        assert_eq!(
+            texts.iter().filter(|text| *text == &date).count(),
+            3,
+            "the timestamps stand while the pointer is away: {texts:?}"
+        );
+        let shapes = frame_shapes_at(&ctx, &mut app, 1400.0);
+        assert!(
+            fills_in_color(&shapes, danger).is_empty(),
+            "nothing is filled at rest"
+        );
+
+        // The pointer on the row, away from the button: the timestamp gives way
+        // and the glyph is drawn in its slot.
+        let row = checkbox_center(&app, 1, false);
+        let over_row = egui::pos2(320.0, row.y);
+        frame_shapes_with(
+            &ctx,
+            &mut app,
+            1400.0,
+            vec![egui::Event::PointerMoved(over_row)],
+        );
+        let shapes = frame_shapes_at(&ctx, &mut app, 1400.0);
+        let texts = frame_texts(&ctx, &mut app);
+        assert_eq!(
+            texts.iter().filter(|text| *text == &date).count(),
+            2,
+            "the hovered row's timestamp gave way to the button: {texts:?}"
+        );
+        let cell = egui::Rect::from_center_size(
+            row_delete_center(&app, 1),
+            egui::Vec2::splat(ROW_ACTION_SIZE),
+        );
+        assert_eq!(
+            strokes_in(&shapes, cell).len(),
+            3,
+            "the trash can is three strokes on its slot"
+        );
+        assert!(
+            fills_in_color(&shapes, danger).is_empty(),
+            "and it is not filled until the pointer is on the button"
+        );
+
+        // The pointer on the button itself: the danger fill under the glyph.
+        let at = row_delete_center(&app, 1);
+        frame_shapes_with(&ctx, &mut app, 1400.0, vec![egui::Event::PointerMoved(at)]);
+        let shapes = frame_shapes_at(&ctx, &mut app, 1400.0);
+        assert!(
+            fills_in_color(&shapes, danger)
+                .iter()
+                .any(|rect| rect.center() == at),
+            "the button takes the danger fill under the pointer"
+        );
+    }
+
+    /// The button is a target of its own: a click on it is not a click on the
+    /// row, so the mail it deletes is not the mail the reading pane opens.
+    #[test]
+    fn the_row_delete_button_is_not_a_click_on_the_mail() {
+        let ctx = egui::Context::default();
+        crate::fonts::install(&ctx, None, None);
+        let mut app = app_with_messages(&ctx, 3);
+        let _ = frame_shapes_at(&ctx, &mut app, 1400.0);
+
+        let at = row_delete_center(&app, 1);
+        click_at(&ctx, &mut app, at);
+        assert_eq!(
+            app.selected_message, None,
+            "the click deleted rather than opened the mail"
+        );
+    }
+
+    /// In select mode the row's own button is not the selection's: it takes the
+    /// one mail the row speaks for and leaves the mode and the checks alone.
+    #[test]
+    fn the_row_delete_button_leaves_select_mode_alone() {
+        let ctx = egui::Context::default();
+        crate::fonts::install(&ctx, None, None);
+        let mut app = app_with_messages(&ctx, 3);
+        app.select_mode = true;
+        app.selected_mails
+            .insert(MailKey::new("acct", "INBOX", "0"));
+        let _ = frame_shapes_at(&ctx, &mut app, 1400.0);
+
+        let at = row_delete_center(&app, 2);
+        click_at(&ctx, &mut app, at);
+        assert!(app.select_mode, "the row's button is not the way out");
+        assert_eq!(
+            app.selected_mails.len(),
+            1,
+            "the checks are the box's business"
+        );
+        assert!(
+            app.selected_mails
+                .contains(&MailKey::new("acct", "INBOX", "0")),
+            "and the checked mail is still checked"
+        );
+        assert_eq!(app.selected_message, None, "and no mail was opened");
+    }
+
+    /// A conversation's row speaks for its newest mail — the one the reading pane
+    /// opens from it — and that is the mail its own button takes, not the whole
+    /// thread: the thread's mails are the box's (all at once) or the title bar's
+    /// (one at a time) to delete.
+    #[test]
+    fn a_conversations_delete_button_takes_the_mail_its_row_speaks_for() {
+        let ctx = egui::Context::default();
+        crate::fonts::install(&ctx, None, None);
+        let mut app = app_with_one_conversation(&ctx);
+        let _ = frame_shapes_at(&ctx, &mut app, 1400.0);
+
+        let rows = app.list_rows.as_ref().expect("the list derived its rows");
+        let messages = app.folder_messages_of("acct", "INBOX").expect("mail");
+        let conversation = rows.rows[0];
+        assert!(
+            matches!(conversation, ListRow::Thread { .. }),
+            "the fixture's row is a conversation: {:?}",
+            conversation
+        );
+        assert_eq!(
+            row_delete_target(conversation, rows, messages).map(|msg| msg.uid.as_str()),
+            Some("3"),
+            "the newest mail of the thread, not the whole of it"
+        );
+
+        // A plain mail row takes the mail it is.
+        let plain = ListRow::Message {
+            index: 1,
+            in_thread: false,
+        };
+        assert_eq!(
+            row_delete_target(plain, rows, messages).map(|msg| msg.uid.as_str()),
+            Some(messages[1].uid.as_str())
+        );
+    }
+
+    /// What the button says it takes: the same wording as the title bar's Delete
+    /// for a mail, and the newest mail named outright for a conversation, since
+    /// one click there takes one mail of it.
+    #[test]
+    fn the_row_delete_button_says_what_it_takes() {
+        assert_eq!(
+            row_delete_tooltip(RowPlace::Plain),
+            MailAction::Delete.tooltip()
+        );
+        assert_eq!(
+            row_delete_tooltip(RowPlace::InThread),
+            MailAction::Delete.tooltip()
+        );
+        let thread = row_delete_tooltip(RowPlace::Thread {
+            open: false,
+            count: 3,
+            key: "1",
+        });
+        assert!(
+            thread.contains("newest mail"),
+            "a conversation's button says which mail it takes: {thread}"
+        );
+    }
+
+    /// A hit's own delete button is keyed by the hit and not by the row: the
+    /// click is not the row's, so the window does not switch to the folder the
+    /// hit lives in.
+    #[test]
+    fn a_search_hits_delete_button_is_not_its_row() {
+        let ctx = egui::Context::default();
+        crate::fonts::install(&ctx, None, None);
+        let mut app = app_with_messages(&ctx, 1);
+        app.search.text = "report".to_string();
+        app.search_hits = vec![SearchHit {
+            account_id: "acct".to_string(),
+            folder: "Archive".to_string(),
+            uid: "7".to_string(),
+            subject: "Subject 7".to_string(),
+            from: "Ada <ada@example.com>".to_string(),
+            date: "2026-01-01".to_string(),
+            timestamp: Some(1_700_000_000),
+            seen: false,
+            attachments: 0,
+            snippet: "a line with report in it".to_string(),
+        }];
+        let _ = frame_shapes_at(&ctx, &mut app, 1400.0);
+
+        let at = row_delete_center(&app, 0);
+        click_at(&ctx, &mut app, at);
+        assert_eq!(
+            app.selected_folder.as_deref(),
+            Some("INBOX"),
+            "the click deleted rather than opened the hit"
+        );
+        assert_eq!(app.selected_message, None);
     }
 
     /// The floating `Load older mail` button: drawn only while the folder's
