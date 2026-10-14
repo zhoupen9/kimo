@@ -3,9 +3,9 @@
 //! only in worker threads.
 //!
 //! Layout: custom title bar on top (nav toggle, sync in Debug mode, search,
-//! then the mail actions — reply, reply all, forward, label, flag, delete — as
-//! one flat group a fixed gap to its right, then the preferences cog and the
-//! window controls), then three columns — collapsible
+//! then the mail actions — reply, reply all, forward, label, flag, export,
+//! delete — as one flat group a fixed gap to its right, then the preferences
+//! cog and the window controls), then three columns — collapsible
 //! navigation (every account as a collapsible section of its folders), message
 //! list, reading pane.
 //!
@@ -182,7 +182,8 @@ enum PrefsTab {
 }
 
 /// One of the mail actions in the title bar. All of them act on the mail open
-/// in the reading pane; Delete is the one that does something so far.
+/// in the reading pane; Export and Delete are the ones that do something so
+/// far.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum MailAction {
     Reply,
@@ -190,17 +191,20 @@ enum MailAction {
     Forward,
     Label,
     Flag,
+    Export,
     Delete,
 }
 
 impl MailAction {
-    /// The buttons, in the order the bar draws them.
-    const ALL: [MailAction; 6] = [
+    /// The buttons, in the order the bar draws them: writing a mail out comes
+    /// before throwing one away.
+    const ALL: [MailAction; 7] = [
         MailAction::Reply,
         MailAction::ReplyAll,
         MailAction::Forward,
         MailAction::Label,
         MailAction::Flag,
+        MailAction::Export,
         MailAction::Delete,
     ];
 
@@ -213,15 +217,20 @@ impl MailAction {
             MailAction::Forward => "Forward",
             MailAction::Label => "Label",
             MailAction::Flag => "Flag",
+            MailAction::Export => "Export",
             MailAction::Delete => "Delete",
         }
     }
 
-    /// The hover text while there is mail to act on. Delete says what it
-    /// does: it is the one action here that cannot be undone, because it
-    /// expunges the mail on the server as well.
+    /// The hover text while there is mail to act on. The two actions that do
+    /// something say what it is: Export where the file goes, and Delete that
+    /// it cannot be undone, because it expunges the mail on the server as
+    /// well.
     fn tooltip(self) -> &'static str {
         match self {
+            MailAction::Export => {
+                "Export — saves the original mail as a .eml file in your Downloads directory"
+            }
             MailAction::Delete => "Delete — removes this mail from the server too",
             other => other.label(),
         }
@@ -341,6 +350,11 @@ pub struct KimoApp {
     /// Why the mail database is not being written to disk, when that is the
     /// case; drawn as a one-line banner above the message list.
     storage_warning: Option<String>,
+    /// What the last export wrote, and when it said so: one line above the
+    /// message list for `EXPORT_NOTICE_TIME`. A file that lands in a directory
+    /// the user was not watching is a file they cannot find, and the numbered
+    /// name it ended up under is the worker's to know — hence the event.
+    export_notice: Option<(String, Instant)>,
     /// Remote images for HTML mail, keyed by URL; fetched on worker threads
     /// and cached in memory as egui textures (disk cache in storage).
     images: HashMap<String, ImageStatus>,
@@ -901,6 +915,7 @@ impl KimoApp {
             theme: Theme::parse(&settings.theme),
             system_dark: system_prefers_dark(),
             storage_warning: crate::db::warning(),
+            export_notice: None,
             images: HashMap::new(),
             stylesheets: HashMap::new(),
             inline_textures: HashMap::new(),
@@ -1077,6 +1092,13 @@ impl KimoApp {
                     self.spawn_search();
                 }
             }
+            Event::MessageExported { path } => {
+                // The file is on disk. Where it went is the one thing the app
+                // has to say — and the one thing it could not have known when
+                // the export was asked for, since a name that was taken is
+                // numbered.
+                self.export_notice = Some((format!("Saved to {}", path.display()), Instant::now()));
+            }
             Event::ImageLoaded {
                 url,
                 width,
@@ -1243,6 +1265,46 @@ impl KimoApp {
             self.tx.clone(),
         );
         self.forget_blitz_pages(account_id);
+    }
+
+    /// Export the mail the reading pane shows: a worker fetches its original
+    /// source from the server and writes it into the downloads directory as a
+    /// `.eml` (`Job::ExportMessage`, `storage::downloads_dir`). The file is
+    /// the message whole — every header, every body part, every attachment —
+    /// which is why the server is asked rather than the database read: what
+    /// Kimo keeps is the parsed mail, and the attachments by name only.
+    ///
+    /// The round trip is the catch: mail the server no longer has cannot be
+    /// exported at all, and that comes back on the account (`Event::SyncFailed`,
+    /// prefixed "export:") like any other job's failure. What went right is
+    /// reported as one timed line above the message list
+    /// (`Event::MessageExported`).
+    fn export_selected_message(&mut self) {
+        // The reading pane's own lookup, like Delete's: a uid the pane no
+        // longer shows is no mail to export, and the mail's subject is what
+        // names the file.
+        let Some(msg) = self.selected_message_view() else {
+            return;
+        };
+        let (Some(account_id), Some(folder)) =
+            (self.selected_account.clone(), self.selected_folder.clone())
+        else {
+            return;
+        };
+        let Some(account) = self.accounts.iter().find(|a| a.id == account_id).cloned() else {
+            return;
+        };
+        sync::spawn(
+            Job::ExportMessage {
+                account,
+                folder,
+                uid: msg.uid,
+                dir: storage::downloads_dir(),
+                subject: msg.subject,
+            },
+            self.ctx.clone(),
+            self.tx.clone(),
+        );
     }
 
     /// Delete the mail the reading pane shows, by way of a worker thread: the
@@ -2253,19 +2315,22 @@ impl KimoApp {
     }
 
     /// The mail actions the title bar carries — reply, reply all, forward,
-    /// label, flag, delete — in one run to the right of the search box. They
-    /// act on the mail open in the reading pane, so that is what enables them
-    /// (`has_selected_message`): with no mail there the six glyphs are dimmed,
-    /// the buttons stop sensing clicks and nothing fills under the pointer.
+    /// label, flag, export, delete — in one run to the right of the search box.
+    /// They act on the mail open in the reading pane, so that is what enables
+    /// them (`has_selected_message`): with no mail there the seven glyphs are
+    /// dimmed, the buttons stop sensing clicks and nothing fills under the
+    /// pointer.
     ///
     /// Every cell is flat, like the rest of the bar's buttons — empty at rest
-    /// and filled under the pointer — which is also what keeps the six of them
-    /// reading as one group rather than as six framed widgets.
+    /// and filled under the pointer — which is also what keeps the seven of
+    /// them reading as one group rather than as seven framed widgets.
     ///
-    /// Delete is wired: it hands the mail to `delete_selected_message`, which
-    /// has a worker take it off the server before it leaves the database. The
-    /// other five are still drawn only — a click on one runs nothing, so they
-    /// stay UI until the actions they name exist.
+    /// Export and Delete are wired: Export hands the mail to
+    /// `export_selected_message`, which has a worker write the server's own
+    /// copy of it out as a `.eml`, and Delete hands it to
+    /// `delete_selected_message`, which takes it off the server before it
+    /// leaves the database. The other four are still drawn only — a click on
+    /// one runs nothing, so they stay UI until the actions they name exist.
     fn titlebar_mail_actions(
         &mut self,
         row: &mut egui::Ui,
@@ -2287,6 +2352,7 @@ impl KimoApp {
                 MailAction::Forward => paint_forward_icon(painter, response.rect, color),
                 MailAction::Label => paint_label_icon(painter, response.rect, color),
                 MailAction::Flag => paint_flag_icon(painter, response.rect, color),
+                MailAction::Export => paint_export_icon(painter, response.rect, color),
                 MailAction::Delete => paint_delete_icon(painter, response.rect, color),
             }
             let response = response.on_hover_text(if enabled {
@@ -2296,6 +2362,7 @@ impl KimoApp {
             });
             if enabled && response.clicked() {
                 match action {
+                    MailAction::Export => self.export_selected_message(),
                     MailAction::Delete => self.delete_selected_message(),
                     MailAction::Reply
                     | MailAction::ReplyAll
@@ -2455,28 +2522,36 @@ impl KimoApp {
             .vline(column.left() + 0.5, column.y_range(), stroke);
         ui.painter()
             .vline(column.right() - 0.5, column.y_range(), stroke);
-        // The database could not be opened: the session works, nothing is
-        // saved, and this is the only place that says so.
+        // Two things can stand where the first row would: the database could
+        // not be opened (the session works, nothing is saved, and this is the
+        // one place that says so), and an export that has just finished (its
+        // file went somewhere the user was not watching). The second follows
+        // the first rather than clearing the bar's own height again.
+        let mut banner_top = TITLEBAR_HEIGHT_I8 + LIST_MARGIN;
         if let Some(warning) = &self.storage_warning {
-            // Padded like the rows are, since the column's frame no longer does
-            // it for anything.
-            egui::Frame::new()
-                .inner_margin(egui::Margin {
-                    left: LIST_MARGIN,
-                    right: LIST_MARGIN,
-                    // Below the bar like the rows are, since this stands where
-                    // the first of them would.
-                    top: TITLEBAR_HEIGHT_I8 + LIST_MARGIN,
-                    bottom: 0,
-                })
-                .show(ui, |ui| {
-                    ui.label(
-                        egui::RichText::new(format!("Mail is not being saved: {warning}"))
-                            .small()
-                            .color(theme::of(ui.ctx()).danger),
-                    );
-                    ui.separator();
-                });
+            list_banner(
+                ui,
+                banner_top,
+                &format!("Mail is not being saved: {warning}"),
+                Some(theme::of(ui.ctx()).danger),
+            );
+            banner_top = LIST_MARGIN;
+        }
+        // The notice is timed: it answers a click and has said what it has to
+        // say once it has been read. The repaint request is what takes it away
+        // when nothing else is drawing a frame.
+        if self
+            .export_notice
+            .as_ref()
+            .is_some_and(|(_, at)| at.elapsed() >= EXPORT_NOTICE_TIME)
+        {
+            self.export_notice = None;
+        } else if let Some((_, at)) = &self.export_notice {
+            ui.ctx()
+                .request_repaint_after(EXPORT_NOTICE_TIME - at.elapsed());
+        }
+        if let Some((notice, _)) = &self.export_notice {
+            list_banner(ui, banner_top, notice, None);
         }
         if self.accounts.is_empty() || self.selected_account.is_none() {
             // Nothing to scroll, so the bar is docked: whatever the last list
@@ -4041,6 +4116,32 @@ fn swatch(ui: &mut egui::Ui, color: egui::Color32) {
     );
 }
 
+/// One line standing above the message list's first row, where the rows are
+/// padded for the title bar. `top` is that padding, which the second banner in
+/// the column drops so the two stack; `color` is left to the label when a
+/// banner is not a warning.
+fn list_banner(ui: &mut egui::Ui, top: i8, text: &str, color: Option<egui::Color32>) {
+    // Padded like the rows are, since the column's frame no longer does it for
+    // anything.
+    egui::Frame::new()
+        .inner_margin(egui::Margin {
+            left: LIST_MARGIN,
+            right: LIST_MARGIN,
+            // Below the bar like the rows are, since this stands where the
+            // first of them would.
+            top,
+            bottom: 0,
+        })
+        .show(ui, |ui| {
+            let text = egui::RichText::new(text).small();
+            ui.label(match color {
+                Some(color) => text.color(color),
+                None => text,
+            });
+            ui.separator();
+        });
+}
+
 impl KimoApp {
     /// One frame. The integration (`crate::gpu`) hands over the root `Ui` egui
     /// 0.36 draws the whole app into; the context is cloned out of it because
@@ -4237,6 +4338,11 @@ const MAIL_ACTION_MIN_PADDING: f32 = 16.0;
 /// How large the mail actions' glyphs are drawn. Their outlines are designed in
 /// a 24×24 box, which `glyph_point` scales to this.
 const MAIL_ACTION_GLYPH: f32 = 18.0;
+
+/// How long the line an export leaves above the message list stays there: long
+/// enough to read a path and go looking for the file, short enough not to
+/// become furniture. The file does not go anywhere when the line does.
+const EXPORT_NOTICE_TIME: Duration = Duration::from_secs(8);
 
 /// Padding on the sides of the message list's rows: the hairlines `mail_list`
 /// draws down the column's sides sit just outside it.
@@ -5197,9 +5303,9 @@ fn paint_cog_icon(p: &egui::Painter, rect: egui::Rect, color: egui::Color32) {
 }
 
 // The title bar's mail-action glyphs — reply, reply all, forward, label, flag,
-// delete — painted as vector shapes from their own 24×24 outlines (the box the
-// icon set the folder icons come from is drawn in), so they render identically
-// regardless of which fonts are installed.
+// export, delete — painted as vector shapes from their own 24×24 outlines (the
+// box the icon set the folder icons come from is drawn in), so they render
+// identically regardless of which fonts are installed.
 
 /// Map a point of one of those 24×24 outlines onto a title-bar cell, centred
 /// on `center` and drawn at `MAIL_ACTION_GLYPH`.
@@ -5334,6 +5440,24 @@ fn paint_flag_icon(p: &egui::Painter, rect: egui::Rect, color: egui::Color32) {
             g(19.0, 14.0),
             g(5.0, 14.0),
         ],
+        stroke,
+    ));
+}
+
+/// Export: an arrow coming down into an open tray, the file leaving the app.
+/// It is the one glyph of the set that points into something rather than along
+/// the mail (reply, forward) or at the mail (label, flag, delete), which is
+/// what keeps it from reading as part of the trash can next to it.
+fn paint_export_icon(p: &egui::Painter, rect: egui::Rect, color: egui::Color32) {
+    let g = |x: f32, y: f32| glyph_point(rect.center(), x, y);
+    let stroke = egui::Stroke::new(1.5_f32, color);
+    p.add(egui::Shape::line(
+        vec![g(4.0, 14.0), g(4.0, 21.0), g(20.0, 21.0), g(20.0, 14.0)],
+        stroke,
+    ));
+    p.add(egui::Shape::line(vec![g(12.0, 3.0), g(12.0, 15.0)], stroke));
+    p.add(egui::Shape::line(
+        vec![g(7.0, 10.0), g(12.0, 15.0), g(17.0, 10.0)],
         stroke,
     ));
 }
@@ -6164,6 +6288,41 @@ mod tests {
         output.textures_delta.clear();
     }
 
+    /// An export answers with the path the worker wrote, and the app says so:
+    /// one line above the message list. It is the only place the name the file
+    /// ended up under is known — a name that was taken is numbered — and the
+    /// line is timed, since the file itself does not go anywhere when it goes.
+    #[test]
+    fn a_finished_export_says_where_the_file_went() {
+        let ctx = egui::Context::default();
+        crate::fonts::install(&ctx, None, None);
+        let mut app = app_with_messages(&ctx, 1);
+        app.apply_event(Event::MessageExported {
+            path: std::path::PathBuf::from("/home/ada/Downloads/Invoice 42.eml"),
+        });
+
+        let texts = frame_texts(&ctx, &mut app);
+        assert!(
+            texts
+                .iter()
+                .any(|text| text == "Saved to /home/ada/Downloads/Invoice 42.eml"),
+            "{texts:?}"
+        );
+
+        // Past its time the line is gone, and the app has stopped asking to be
+        // repainted for it.
+        let stale = Instant::now()
+            .checked_sub(EXPORT_NOTICE_TIME + Duration::from_millis(1))
+            .expect("the machine has been up longer than the notice lasts");
+        app.export_notice = app.export_notice.take().map(|(text, _)| (text, stale));
+        let texts = frame_texts(&ctx, &mut app);
+        assert!(app.export_notice.is_none(), "the notice outlived its time");
+        assert!(
+            !texts.iter().any(|text| text.starts_with("Saved to")),
+            "{texts:?}"
+        );
+    }
+
     /// Clicking a row opens that mail: the list draws itself from the account
     /// state and only remembers what was clicked, so this is the test that the
     /// click still lands on the mail under the pointer (`folder_messages`).
@@ -6435,6 +6594,33 @@ mod tests {
             );
             assert_eq!(rects.controls.right(), bar(width).right(), "{width} pt");
         }
+    }
+
+    /// The mail actions are one group and their order is the bar's: Export
+    /// stands immediately before Delete — the mail is written out before it is
+    /// thrown away — and every action says what it is, the two wired ones
+    /// saying what they do.
+    #[test]
+    fn export_stands_immediately_before_delete() {
+        assert_eq!(
+            MailAction::ALL,
+            [
+                MailAction::Reply,
+                MailAction::ReplyAll,
+                MailAction::Forward,
+                MailAction::Label,
+                MailAction::Flag,
+                MailAction::Export,
+                MailAction::Delete,
+            ]
+        );
+        for action in MailAction::ALL {
+            assert!(!action.label().is_empty());
+            assert!(!action.tooltip().is_empty());
+        }
+        // One says where the file goes, the other that it cannot be undone.
+        assert!(MailAction::Export.tooltip().contains(".eml"));
+        assert!(MailAction::Delete.tooltip().contains("server"));
     }
 
     /// What the bar gives up when it runs out of room, in the order it gives it

@@ -67,6 +67,15 @@ pub fn mail_db_path() -> PathBuf {
     data_dir().join("mail.db")
 }
 
+/// Where an exported mail is written: `$HOME/Downloads`, the directory a
+/// desktop keeps downloads in (made on the first export if it is not there
+/// yet). There is no file dialog — a native one is a dependency, and on
+/// Wayland a portal to talk to — so an export has one destination, and the app
+/// says the path it wrote to, which is what lets the file be found.
+pub fn downloads_dir() -> PathBuf {
+    home().join("Downloads")
+}
+
 /// The message cache directory of the pre-database layout:
 /// `<account-id>.json` files, imported once by `crate::db` and then deleted.
 /// The remote-resource cache lives in a subdirectory of it.

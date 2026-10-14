@@ -560,8 +560,9 @@ Event (mpsc) ──► drain_events() at frame start ──► merge into Accoun
   Release syncs on its own), the search box (a field with the magnifier inside
   it, one widget,
   whose click opens the search popup), the group of mail actions
-  (`titlebar_mail_actions`: reply, reply all, forward, label, flag, delete, one
-  drawing function per glyph, each from a 24×24 outline through `glyph_point`
+  (`titlebar_mail_actions`: reply, reply all, forward, label, flag, export,
+  delete, one drawing function per glyph, each from a 24×24 outline through
+  `glyph_point`
   and placed `MAIL_ACTION_PADDING` to the right of the search box), the
   preferences cog, drag area,
   double-click maximize, and the
@@ -590,13 +591,13 @@ Event (mpsc) ──► drain_events() at frame start ──► merge into Accoun
   `titlebar_flat_button`, the same window-control-wide, bar-tall cell the nav
   toggle and the cog use, empty at rest and filled under the pointer. They are
   deliberately not a framed group: the bar stays chrome plus flat icons, and
-  the run of six is held together by the gap that sets it apart from the search
-  box rather than by a pill. The six enable and disable together, on
+  the run of seven is held together by the gap that sets it apart from the
+  search box rather than by a pill. The seven enable and disable together, on
   `has_selected_message` — the reading pane's own lookup, so a uid the pane no
   longer shows counts as no mail: a disabled cell drops its glyph to
-  `weak_text_color`, stops sensing clicks and never fills. Delete is wired —
-  it is the one action whose job exists so far — and the other five still run
-  nothing, so a click on one of them is not even read.
+  `weak_text_color`, stops sensing clicks and never fills. Export and Delete
+  are wired — they are the actions whose jobs exist so far — and the other four
+  still run nothing, so a click on one of them is not even read.
   The bar is `TITLEBAR_HEIGHT` (40 pt) tall and the search box fills all but
   16 pt of that (`TITLEBAR_SEARCH_HEIGHT`), with a rounder corner than the
   stock widget radius (`SEARCH_BOX_CORNER_RADIUS`); its frame is stock
@@ -614,7 +615,7 @@ Event (mpsc) ──► drain_events() at frame start ──► merge into Accoun
   now).
   The bar is laid out as *groups*, not as one run of widgets, because what a
   narrow window used to eat was the window controls: the row simply drew past
-  the end of the bar, and the search box and the six mail cells landed on
+  the end of the bar, and the search box and the mail cells landed on
   minimize / maximize / close. `titlebar_rects` carves the bar into the room for
   its own content (`content`: everything left of the cog) and the fixed right end
   — the cog, then the three window controls, placed from the window's own edge,
@@ -633,7 +634,7 @@ Event (mpsc) ──► drain_events() at frame start ──► merge into Accoun
   `the_title_bar_gives_its_room_up_in_one_order`): the clear chrome in front of
   the mail actions closes from `MAIL_ACTION_PADDING` down to
   `MAIL_ACTION_MIN_PADDING` first, then the actions leave — as the one group
-  they are, because half a run of six reads as a mistake rather than as a
+  they are, because half a run of seven reads as a mistake rather than as a
   smaller bar — and only then does the search box narrow, down to
   `TITLEBAR_SEARCH_FLOOR` and no further, with the box itself the last thing to
   go. The window's own buttons are what the bar keeps to the end, and every width
@@ -709,6 +710,31 @@ Event (mpsc) ──► drain_events() at frame start ──► merge into Accoun
   for the project owner, not a fix to slip in. The folder's sync mark is
   deliberately not moved back: the mail is gone from the server too, and a mark
   that walked back to it would only make the next sync fetch it again.
+- Exporting a mail (the title bar's Export → `KimoApp::export_selected_message`
+  → `Job::ExportMessage`) is the one thing in the app that writes a mail out of
+  it. A worker fetches the message's original RFC 5322 source from the server —
+  IMAP `UID FETCH <uid> (UID FLAGS BODY.PEEK[])` through
+  `ImapClient::uid_body` (PEEK on purpose: fetching a mail to export it must not
+  mark it read), POP3 `UIDL` + `RETR` through `Pop3Client::retr_by_uidl` — and
+  writes it byte for byte to `$HOME/Downloads/<subject>.eml`
+  (`storage::downloads_dir`, made on the first export). There is no file dialog:
+  one destination, and the app says the path it wrote.
+  **The original is the point.** What is stored here is the parsed mail, with the
+  attachments by name only, so a `.eml` rebuilt from the database would not be
+  the message the sender wrote, while this one is the message whole, attachments
+  and all. The price is that mail the server no longer has cannot be exported at
+  all, and says so rather than writing something close (`Event::SyncFailed`,
+  prefixed "export:" — the local copy is not a substitute for the original).
+  The file is named after the subject, with what a file name cannot carry
+  replaced and the whole capped at `EXPORT_STEM_BYTES` (`export_stem`; `slug`
+  would ASCII-fy every non-Latin subject away), numbered `<stem>-2.eml` and on
+  when a name is taken, and *created* (`create_new`) rather than merely asked
+  about, so two exports of the same mail cannot overwrite each other. The job
+  brackets its round trip with `SyncStarted`/`SyncDone` like a delete, and
+  answers `Event::MessageExported { path }` — with the path, because a name that
+  was taken is numbered and only the worker knows what it got. The app shows it
+  as one line above the message list for `EXPORT_NOTICE_TIME` (`list_banner`,
+  the place the storage warning stands).
 - The compose window (`compose_window`, opened by the title bar's pencil) is an
   `egui::Modal`, like the search popup and Preferences: a card `COMPOSE_WIDTH`
   wide in the foreground layer, whose backdrop dims the columns and the bar and
@@ -898,7 +924,8 @@ Event (mpsc) ──► drain_events() at frame start ──► merge into Accoun
 
 Do not "fix" these casually — they are known:
 
-- Attachments are listed by name but cannot be saved or opened yet.
+- Attachments are listed by name but cannot be saved or opened on their own
+  yet; Export writes the whole mail out as one `.eml`, attachments included.
 - TLS finite-field DH covers the 2048-bit groups listed in
   `src/protocol/ffdhe.rs` and nothing else. A server whose DHE group is
   another size, or yet another custom prime, still fails the handshake with
@@ -907,11 +934,12 @@ Do not "fix" these casually — they are known:
   title bar's Delete expunges the mail on the server without asking first, and
   it acts on the one mail the reading pane shows — no multi-select, no
   Delete-key shortcut.
-- Nothing a mail is written into can leave the machine: the compose window's
+- Nothing a mail is *written into* can leave the machine: the compose window's
   draft cannot be sent (no SMTP), saved, or reopened once its window is
   closed, and the title bar's reply / reply all / forward / label / flag
-  buttons are drawn but not wired to anything yet (delete is wired; see the
-  deletion bullet above).
+  buttons are drawn but not wired to anything yet (export and delete are wired;
+  see those bullets above). Export is the other direction — the received mail
+  leaving as a file — and it does not touch the draft.
 - Credentials in plain text in `mail.db` (mode 0600, see above); no
   OAuth2/XOAUTH2. The database is not encrypted, and the app never renames or
   deletes it on its own: a corrupt file is the user's to move aside.

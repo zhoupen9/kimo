@@ -187,6 +187,21 @@ impl ImapClient {
             .map(|_| ())
     }
 
+    /// The whole raw source of one message, if the mailbox selected now still
+    /// has it: one `UID FETCH <uid> (UID FLAGS BODY.PEEK[])`, the command a sync
+    /// sends for a range. Both details matter. `BODY.PEEK[]` rather than
+    /// `BODY[]`, because fetching a mail to export it must not mark it read;
+    /// the UID rather than a sequence number, because a sequence number names
+    /// whatever stands in that position now. `None` is a UID the server does
+    /// not answer for — mail this mailbox no longer has.
+    pub fn uid_body(&mut self, uid: u32) -> MailResult<Option<Vec<u8>>> {
+        Ok(self
+            .fetch_bodies(&uid.to_string(), true)?
+            .into_iter()
+            .find(|fetched| fetched.uid == uid)
+            .map(|fetched| fetched.raw))
+    }
+
     /// Delete one message from `folder`, if the server still has it.
     ///
     /// The mailbox is checked against LIST first: one the server no longer
@@ -772,5 +787,36 @@ mod tests {
         // what makes a flags-only answer harmless.
         assert!(client.fetch_bodies("1:50", false).unwrap().is_empty());
         assert_eq!(server.join().unwrap().len(), 2);
+    }
+
+    /// One body is fetched by UID for an export, and with PEEK: the UID names
+    /// the mail that was asked for rather than whatever stands in that
+    /// position, the PEEK keeps it unread, and a UID the mailbox no longer has
+    /// is `None` — the server answers it with no FETCH line at all — rather
+    /// than a failed fetch.
+    #[test]
+    fn one_body_is_fetched_by_uid_with_a_peek() {
+        let body = "Subject: hi\r\n\r\nbody\r\n";
+        let response = format!(
+            "* 3 FETCH (UID 45 BODY[] {{{}}}\r\n{body})\r\n{{tag}} OK FETCH completed\r\n",
+            body.len()
+        );
+        let (account, server) = one_shot_server(vec![
+            (
+                "SELECT \"INBOX\"",
+                "* 3 EXISTS\r\n{tag} OK [READ-WRITE] SELECT completed\r\n".to_string(),
+            ),
+            ("UID FETCH 45 (UID FLAGS BODY.PEEK[])", response),
+            (
+                "UID FETCH 46 (UID FLAGS BODY.PEEK[])",
+                "{tag} OK FETCH completed\r\n".to_string(),
+            ),
+        ]);
+        let mut client = ImapClient::connect(&account).unwrap();
+        client.select("INBOX").unwrap();
+
+        assert_eq!(client.uid_body(45).unwrap().unwrap(), body.as_bytes());
+        assert_eq!(client.uid_body(46).unwrap(), None);
+        assert_eq!(server.join().unwrap().len(), 3);
     }
 }

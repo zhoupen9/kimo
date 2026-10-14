@@ -90,15 +90,33 @@ impl Pop3Client {
     /// connection that drops in between leaves the mail alone, which is the
     /// safe direction.
     pub fn delete_by_uidl(&mut self, uid: &str) -> MailResult<()> {
-        let number = self
-            .uidl()?
-            .into_iter()
-            .find(|(_, id)| id == uid)
-            .map(|(number, _)| number);
-        match number {
+        match self.number_of_uidl(uid)? {
             Some(number) => self.dele(number),
             None => Ok(()),
         }
+    }
+
+    /// The full raw bytes of the message with this UIDL, if the drop still has
+    /// it (RETR). `None` is a UIDL the drop no longer answers for: the message
+    /// is gone from the server, which the caller has to be able to tell apart
+    /// from a connection that failed — one is "there is nothing to fetch", the
+    /// other is "try again".
+    pub fn retr_by_uidl(&mut self, uid: &str) -> MailResult<Option<Vec<u8>>> {
+        match self.number_of_uidl(uid)? {
+            Some(number) => self.retr(number).map(Some),
+            None => Ok(None),
+        }
+    }
+
+    /// The message number a UIDL names, from a fresh UIDL listing: POP3's only
+    /// way from the identity Kimo stores with a message to the number RETR and
+    /// DELE are addressed by. `None` is a message the drop no longer has.
+    fn number_of_uidl(&mut self, uid: &str) -> MailResult<Option<usize>> {
+        Ok(self
+            .uidl()?
+            .into_iter()
+            .find(|(_, id)| id == uid)
+            .map(|(number, _)| number))
     }
 
     /// Mark one message deleted (`DELE`).
@@ -214,6 +232,51 @@ mod tests {
         client.login("me", "secret").unwrap();
 
         client.delete_by_uidl("bbb").unwrap();
+        client.quit();
+        assert_eq!(server.join().unwrap().len(), 4);
+    }
+
+    /// Fetching is addressed the same way deleting is: the UIDL names the
+    /// message number, and RETR asks for exactly that one. The session ends
+    /// with QUIT like any other — no DELE went out, so nothing is deleted.
+    #[test]
+    fn fetching_a_message_sends_retr_for_the_number_its_uidl_names() {
+        let (account, server) = one_shot_server(vec![
+            ("USER me", "+OK\r\n"),
+            ("PASS secret", "+OK\r\n"),
+            ("UIDL", "+OK\r\n1 aaa\r\n2 bbb\r\n.\r\n"),
+            (
+                "RETR 2",
+                "+OK 26 octets\r\nSubject: hi\r\n\r\nbody\r\n.\r\n",
+            ),
+            ("QUIT", "+OK bye\r\n"),
+        ]);
+        let mut client = Pop3Client::connect(&account).unwrap();
+        client.login("me", "secret").unwrap();
+
+        let raw = client.retr_by_uidl("bbb").unwrap().unwrap();
+        client.quit();
+        // The bytes are the message as it left the server: the terminating
+        // dot and the dot-stuffing POP3 adds are the transport's, not the
+        // mail's.
+        assert_eq!(raw, b"Subject: hi\r\n\r\nbody\r\n");
+        assert_eq!(server.join().unwrap().len(), 5);
+    }
+
+    /// The message is not in the drop any more: nothing is fetched for it, and
+    /// the caller is told so rather than handed another message's bytes.
+    #[test]
+    fn a_uidl_the_drop_no_longer_has_fetches_nothing() {
+        let (account, server) = one_shot_server(vec![
+            ("USER me", "+OK\r\n"),
+            ("PASS secret", "+OK\r\n"),
+            ("UIDL", "+OK\r\n1 aaa\r\n.\r\n"),
+            ("QUIT", "+OK bye\r\n"),
+        ]);
+        let mut client = Pop3Client::connect(&account).unwrap();
+        client.login("me", "secret").unwrap();
+
+        assert!(client.retr_by_uidl("bbb").unwrap().is_none());
         client.quit();
         assert_eq!(server.join().unwrap().len(), 4);
     }

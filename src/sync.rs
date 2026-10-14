@@ -5,7 +5,9 @@
 //! Besides mail sync, jobs also fetch remote HTML-mail resources (images,
 //! stylesheets) over HTTPS.
 
-use std::io::Read;
+use std::fs;
+use std::io::{Read, Write};
+use std::path::{Path, PathBuf};
 use std::sync::mpsc::Sender;
 use std::time::Duration;
 
@@ -113,6 +115,22 @@ pub enum Job {
         folder: String,
         uid: String,
     },
+    /// Fetch one message's original RFC 5322 source and write it into `dir` as
+    /// `<subject>.eml` — the title bar's Export. The server's copy is the
+    /// message whole (every header, every body part, every attachment), which
+    /// is why this is a round trip rather than a rebuild from the database:
+    /// what is stored here is the parsed mail, with the attachments by name
+    /// only.
+    ExportMessage {
+        account: Account,
+        folder: String,
+        uid: String,
+        /// The directory the file goes in (`storage::downloads_dir`).
+        dir: PathBuf,
+        /// What the file is named after: the subject, which the worker turns
+        /// into a file name (`export_stem`).
+        subject: String,
+    },
     /// Remove an account: its row, its folders and, through the cascades, every
     /// message cached for it.
     DeleteAccount { account_id: String },
@@ -175,6 +193,12 @@ pub enum Event {
         account_id: String,
         folder: String,
         uid: String,
+    },
+    /// One message was written out as a `.eml`, at this path. The path is the
+    /// one thing about an export the UI cannot know by itself: the name it
+    /// asked for may already have been taken, and the file is then numbered.
+    MessageExported {
+        path: PathBuf,
     },
     ImageLoaded {
         url: String,
@@ -346,6 +370,40 @@ pub fn spawn(job: Job, ctx: egui::Context, tx: Sender<Event>) {
             }
             ctx.request_repaint();
         }
+        Job::ExportMessage {
+            account,
+            folder,
+            uid,
+            dir,
+            subject,
+        } => {
+            // A round trip like a delete's, and bracketed the same way: the
+            // account's spinner is what says a mail is being fetched while the
+            // server is asked.
+            let account_id = account.id.clone();
+            let _ = tx.send(Event::SyncStarted {
+                account_id: account_id.clone(),
+            });
+            match export_message(&account, &folder, &uid, &dir, &subject) {
+                Ok(path) => {
+                    // The file is on disk before the app is told where: the
+                    // event is what the notice above the message list is drawn
+                    // from.
+                    let _ = tx.send(Event::MessageExported { path });
+                    let _ = tx.send(Event::SyncDone { account_id });
+                }
+                // Nothing was written — a write that failed halfway took its
+                // partial file with it — so the account carries the reason,
+                // like it does for every other job that failed.
+                Err(error) => {
+                    let _ = tx.send(Event::SyncFailed {
+                        account_id,
+                        error: format!("export: {error}"),
+                    });
+                }
+            }
+            ctx.request_repaint();
+        }
         account_job => {
             let account_id = match &account_job {
                 Job::Sync { account, .. } | Job::SyncFolder { account, .. } => account.id.clone(),
@@ -356,6 +414,7 @@ pub fn spawn(job: Job, ctx: egui::Context, tx: Sender<Event>) {
                 | Job::Search { .. }
                 | Job::MarkSeen { .. }
                 | Job::DeleteMessage { .. }
+                | Job::ExportMessage { .. }
                 | Job::LoadOlder { .. }
                 | Job::DeleteAccount { .. } => unreachable!(),
             };
@@ -390,6 +449,7 @@ pub fn spawn(job: Job, ctx: egui::Context, tx: Sender<Event>) {
                 | Job::Search { .. }
                 | Job::MarkSeen { .. }
                 | Job::DeleteMessage { .. }
+                | Job::ExportMessage { .. }
                 | Job::LoadOlder { .. }
                 | Job::DeleteAccount { .. } => unreachable!(),
             };
@@ -768,6 +828,136 @@ fn pop3_delete(account: &Account, uid: &str) -> MailResult<()> {
     result
 }
 
+/// Export one message: its original source, as the server has it, written into
+/// `dir` as `<subject>.eml`. The fetch is the whole job — what Kimo stores is
+/// the parsed mail, with the attachments by name only, so an `.eml` rebuilt
+/// from the database would not be the message the sender wrote. The other side
+/// of that: mail the server no longer has cannot be exported at all, and says
+/// so rather than writing something close.
+fn export_message(
+    account: &Account,
+    folder: &str,
+    uid: &str,
+    dir: &Path,
+    subject: &str,
+) -> MailResult<PathBuf> {
+    let raw = match account.protocol {
+        Protocol::Imap => imap_body(account, folder, uid)?,
+        Protocol::Pop3 => pop3_body(account, uid)?,
+    };
+    write_export(dir, &export_stem(subject), &raw)
+}
+
+fn imap_body(account: &Account, folder: &str, uid: &str) -> MailResult<Vec<u8>> {
+    let number = uid
+        .parse::<u32>()
+        .map_err(|_| MailError::Protocol(format!("not an IMAP UID: {uid}")))?;
+    with_imap(account, |client| {
+        client.login(&account.username, &account.password)?;
+        client.select(folder)?;
+        client.uid_body(number)?.ok_or_else(mail_is_gone)
+    })
+}
+
+/// POP3 has no folders, so the UIDL is the whole address of the message. The
+/// `QUIT` at the end is what *would* commit a deletion, and none was sent: the
+/// session ends without touching the drop.
+fn pop3_body(account: &Account, uid: &str) -> MailResult<Vec<u8>> {
+    let mut client = Pop3Client::connect(account)?;
+    let result = (|| -> MailResult<Vec<u8>> {
+        client.login(&account.username, &account.password)?;
+        client.retr_by_uidl(uid)?.ok_or_else(mail_is_gone)
+    })();
+    client.quit();
+    result
+}
+
+/// The server does not answer for this message any more. There is no original
+/// left to export, and the local copy is not a substitute for one.
+fn mail_is_gone() -> MailError {
+    MailError::Protocol("the server no longer has this mail".to_string())
+}
+
+/// How many bytes of a subject a file name keeps. A file name is 255 bytes on
+/// the filesystems Kimo writes to, and the `.eml` suffix and a `-12` counter
+/// have to fit in that with it.
+const EXPORT_STEM_BYTES: usize = 100;
+
+/// How many names one export tries before giving up: `<stem>.eml`, then
+/// `<stem>-2.eml` and on. Nobody has a thousand mails with one subject, and the
+/// search has to end somewhere.
+const EXPORT_NAME_TRIES: u32 = 1000;
+
+/// A subject as a file name: what a file name cannot carry — the two path
+/// separators, the characters Windows forbids, control characters — becomes a
+/// space, runs of them collapse into one, and the ends lose their dots and
+/// spaces. `slug` is the wrong tool here: it lowercases and ASCII-fies, which
+/// would throw away every non-Latin subject ("发票号码 12345" is a file the user
+/// recognises; "account" is not). A subject with no usable character left still
+/// needs a name, and the numbering tells one such mail from the next.
+fn export_stem(subject: &str) -> String {
+    let mut stem = String::new();
+    for c in subject.chars() {
+        let c = if c.is_control()
+            || matches!(c, '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|')
+        {
+            ' '
+        } else {
+            c
+        };
+        if c == ' ' && (stem.is_empty() || stem.ends_with(' ')) {
+            continue;
+        }
+        if stem.len() + c.len_utf8() > EXPORT_STEM_BYTES {
+            break;
+        }
+        stem.push(c);
+    }
+    let stem = stem.trim_matches(|c: char| c == '.' || c.is_whitespace());
+    if stem.is_empty() {
+        "mail".to_string()
+    } else {
+        stem.to_string()
+    }
+}
+
+/// Write `raw` into `dir` as `<stem>.eml`, numbered if that name is taken, and
+/// answer with the path it went to. The file is *created* rather than merely
+/// asked about, so two exports of the same mail cannot land on one name: the
+/// loser of that race moves to the next number instead of overwriting the
+/// winner. A write that fails halfway takes its partial file with it — a
+/// half-written file with a `.eml` suffix looks like a mail and is not one.
+fn write_export(dir: &Path, stem: &str, raw: &[u8]) -> MailResult<PathBuf> {
+    fs::create_dir_all(dir)?;
+    for n in 1..=EXPORT_NAME_TRIES {
+        let name = if n == 1 {
+            format!("{stem}.eml")
+        } else {
+            format!("{stem}-{n}.eml")
+        };
+        let path = dir.join(name);
+        let mut file = match fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+        {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error.into()),
+        };
+        if let Err(error) = file.write_all(raw) {
+            drop(file);
+            let _ = fs::remove_file(&path);
+            return Err(error.into());
+        }
+        return Ok(path);
+    }
+    Err(MailError::Storage(format!(
+        "no free file name for {stem}.eml in {}",
+        dir.display()
+    )))
+}
+
 fn load_older_pop3(account: &Account, tx: &Sender<Event>) -> MailResult<()> {
     let mut client = Pop3Client::connect(account)?;
     let result = (|| -> MailResult<()> {
@@ -993,5 +1183,56 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(resume_uid(&nonsense, Some(7)), None, "UID 0 is no UID");
+    }
+
+    /// An exported file is named after the subject, which keeps its own
+    /// characters — non-Latin ones included — and loses only what a file name
+    /// cannot carry.
+    #[test]
+    fn an_export_is_named_after_the_subject() {
+        assert_eq!(export_stem("Invoice 42"), "Invoice 42");
+        assert_eq!(export_stem("发票号码 12345"), "发票号码 12345");
+        // Path separators and the characters Windows forbids, each becoming
+        // one space rather than a gap per character.
+        assert_eq!(
+            export_stem("Re: a/b\\c:d*e?f\"g<h>i|j"),
+            "Re a b c d e f g h i j"
+        );
+        // A newline would end up in a terminal or a shell's output.
+        assert_eq!(export_stem("a\nb\tc"), "a b c");
+        // Nothing usable left: the file still needs a name.
+        assert_eq!(export_stem(""), "mail");
+        assert_eq!(export_stem("   "), "mail");
+        assert_eq!(export_stem(".. .."), "mail");
+        // Hidden files and trailing dots are a file name's own conventions.
+        assert_eq!(export_stem("..hidden.."), "hidden");
+        assert_eq!(export_stem("v1.2 release."), "v1.2 release");
+        // The suffix and a counter have to fit in a 255-byte file name. The
+        // cap is on bytes and a character is never cut in half, so the name
+        // ends just below it rather than exactly on it ("日" is three bytes).
+        let long = export_stem(&"日".repeat(200));
+        assert!(long.len() <= EXPORT_STEM_BYTES, "{} bytes", long.len());
+        assert!(long.len() > EXPORT_STEM_BYTES - 4, "{} bytes", long.len());
+        assert!(long.chars().all(|c| c == '日'));
+    }
+
+    /// The bytes go to disk as they came off the server, and a name that is
+    /// taken is numbered rather than overwritten: exporting the same mail twice
+    /// is two files, not one that replaced the other.
+    #[test]
+    fn writing_an_export_numbers_a_name_that_is_taken() {
+        let dir = std::env::temp_dir().join(format!("kimo-export-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+
+        let first = write_export(&dir, "Invoice 42", b"one").unwrap();
+        let second = write_export(&dir, "Invoice 42", b"two").unwrap();
+        assert_eq!(first, dir.join("Invoice 42.eml"));
+        assert_eq!(second, dir.join("Invoice 42-2.eml"));
+        assert_eq!(fs::read(&first).unwrap(), b"one");
+        assert_eq!(fs::read(&second).unwrap(), b"two");
+        // The directory is made rather than refused when it is not there yet.
+        assert!(dir.is_dir());
+
+        fs::remove_dir_all(&dir).unwrap();
     }
 }
