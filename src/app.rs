@@ -4174,18 +4174,24 @@ impl KimoApp {
         RowResponse { row: resp, chevron }
     }
 
-    /// Right column: the selected message on the card the reading pane floats
-    /// on — the lighter content surface, inset in the chrome by
-    /// CONTENT_GUTTER, whose left side is also the splitter. With nothing
-    /// selected there is no card at all: the pane is bare chrome and the
-    /// placeholder sits directly on it.
+    /// Right column: the selected mail on the card the reading pane floats on —
+    /// the lighter content surface, inset in the chrome by CONTENT_GUTTER,
+    /// whose left side is also the splitter. With nothing selected there is no
+    /// card at all: the pane is bare chrome and the placeholder sits directly on
+    /// it.
     ///
-    /// The card is the pane's scroll container: the headers, the rule and the
-    /// body are one column inside the card's own scroll area, so the scroll bar
-    /// runs down the card's edge rather than down the body's. The card reaches
-    /// the window's top edge — the floating title bar lies over it — and its
-    /// top padding is the bar's height (see `mail_card`), so the mail scrolls
-    /// under the glass exactly like the message list's rows do.
+    /// A conversation draws one such card per mail (`mail_card`), the cards
+    /// stacked with chrome showing between them, rather than one card holding a
+    /// card per mail: the pane's own surface, once per mail, so a thread reads
+    /// as the mails it is made of and each of them sits on the pane the way a
+    /// mail of its own does.
+    ///
+    /// The cards share the pane's scroll container: the headers, the rule and
+    /// the body of a mail are one column on its card, so the scroll bar runs
+    /// down the pane's edge rather than down a card's. The cards reach the
+    /// window's top edge — the floating title bar lies over them — and the first
+    /// one's top padding is the bar's height (see `mail_card`), so a mail
+    /// scrolls under the glass exactly like the message list's rows do.
     fn mail_content(&mut self, ui: &mut egui::Ui) {
         let scheme = theme::of(ui.ctx());
         // The chrome is painted here rather than by the panel's frame: a frame
@@ -4234,13 +4240,12 @@ impl KimoApp {
             self.scrolled_message = Some(message_key);
         }
 
-        // The card hugs the mail instead of always filling the pane, so its
-        // height is only known once the mail has been laid out: the painter
-        // reserves the shape here and it is filled in below. Painting the card
-        // rather than framing the content is also what keeps the scroll bar *on*
-        // the card: a frame would be inset by the bar's own strip, leaving the
-        // bar over the chrome beside it.
-        let where_to_put_card = ui.painter().add(egui::Shape::Noop);
+        // The cards are laid out with the mails and filled in below, once the
+        // mails have been laid out: a card hugs its mail, so its height is only
+        // known then. The pane draws them itself rather than framing each mail,
+        // because a card is the pane's own surface: as wide as the pane, so a
+        // mail wider than the pane — most HTML mail — scrolls sideways over its
+        // card instead of dragging the card off the pane's edge with it.
         let card_left = panel.left() + CONTENT_GUTTER;
         let card_right = panel.right() - CONTENT_GUTTER;
         let card_top = panel.top() + CONTENT_GUTTER;
@@ -4249,113 +4254,107 @@ impl KimoApp {
             egui::pos2(card_left, card_top),
             egui::pos2(card_right, card_bottom),
         );
-        let used = ui
-            .scope_builder(egui::UiBuilder::new().max_rect(inner), |ui| {
-                // Both directions on purpose. With horizontal scrolling off,
-                // a mail whose layout cannot be narrower than the pane — a
-                // fixed-width table, which is most HTML mail — made this
-                // scroll area wider than the pane, and through it the panel's
-                // *content* rect. egui persists that rect as the panel's width
-                // for the next frame, so the splitter sprang back to the
-                // mail's width on release: the pane could never be dragged
-                // narrower than the mail inside it. Scrolling the overflow
-                // sideways keeps the pane's width the user's, and the
-                // horizontal bar only appears when the mail really is wider.
-                let mut scroll = egui::ScrollArea::both()
-                    // Full width, but only as tall as the mail: the card around
-                    // a short message hugs it instead of running to the pane's
-                    // floor, while a long one takes the pane and scrolls.
-                    .auto_shrink([false, true])
-                    // Switching renderers swaps the whole card; a scroll offset
-                    // from the other renderer would land in empty space.
-                    .id_salt(("mail-card", self.html_renderer.as_str()));
-                if new_message {
-                    // A newly opened mail starts at its top *left*: the
-                    // horizontal offset outlives the message otherwise.
-                    scroll = scroll
-                        .vertical_scroll_offset(0.0)
-                        .horizontal_scroll_offset(0.0);
-                }
-                let output = scroll.show(ui, |ui| {
-                    if let [msg] = conversation.messages.as_slice() {
-                        // A mail of its own: the pane's card is its card.
-                        self.mail_card(ui, msg);
-                        return;
+        // One entry per mail: the card's reserved shape, and the rect the mail
+        // came to rest in, which is what the card is drawn around below.
+        let mut cards = Vec::new();
+        ui.scope_builder(egui::UiBuilder::new().max_rect(inner), |ui| {
+            // Both directions on purpose. With horizontal scrolling off,
+            // a mail whose layout cannot be narrower than the pane — a
+            // fixed-width table, which is most HTML mail — made this
+            // scroll area wider than the pane, and through it the panel's
+            // *content* rect. egui persists that rect as the panel's width
+            // for the next frame, so the splitter sprang back to the
+            // mail's width on release: the pane could never be dragged
+            // narrower than the mail inside it. Scrolling the overflow
+            // sideways keeps the pane's width the user's, and the
+            // horizontal bar only appears when the mail really is wider.
+            let mut scroll = egui::ScrollArea::both()
+                // Full width, but only as tall as the mail: the card around
+                // a short message hugs it instead of running to the pane's
+                // floor, while a long one takes the pane and scrolls.
+                .auto_shrink([false, true])
+                // Switching renderers swaps the whole card; a scroll offset
+                // from the other renderer would land in empty space.
+                .id_salt(("mail-card", self.html_renderer.as_str()));
+            if new_message {
+                // A newly opened mail starts at its top *left*: the
+                // horizontal offset outlives the message otherwise.
+                scroll = scroll
+                    .vertical_scroll_offset(0.0)
+                    .horizontal_scroll_offset(0.0);
+            }
+            let output = scroll.show(ui, |ui| {
+                // One card per mail, oldest first — a mail of its own is
+                // the same card, drawn once.
+                for (index, mail) in conversation.messages.iter().enumerate() {
+                    if index > 0 {
+                        // `add_space` leaves egui's own item spacing on top of
+                        // what it is asked for, and the room between two cards
+                        // is chrome: ask for the gap minus that spacing, so the
+                        // chrome between them is the gap itself.
+                        ui.add_space(
+                            (CONVERSATION_CARD_GAP - ui.spacing().item_spacing.y).max(0.0),
+                        );
                     }
-                    // A conversation: one card per mail, oldest first, inside
-                    // the pane's own card — the padding the single mail's card
-                    // keeps (the title bar's height at the top, so the first
-                    // card can scroll under the glass) is kept once, around all
-                    // of them.
-                    egui::Frame::new()
-                        .inner_margin(egui::Margin {
-                            left: CONTENT_PADDING_I8,
-                            right: CONTENT_PADDING_I8,
-                            top: TITLEBAR_HEIGHT_I8 + CONTENT_PADDING_I8,
-                            bottom: CONTENT_PADDING_I8,
-                        })
-                        .show(ui, |ui| {
-                            ui.set_min_width(ui.available_width());
-                            for (index, mail) in conversation.messages.iter().enumerate() {
-                                if index > 0 {
-                                    ui.add_space(CONVERSATION_CARD_GAP);
-                                }
-                                self.conversation_card(ui, mail);
-                            }
-                        });
-                });
-                // Scrolled away from the top, the bar floats over this card.
-                self.mail_scroll = output.state.offset.y;
-            })
-            .response
-            .rect;
-        let card = egui::Rect::from_min_max(
-            egui::pos2(card_left, card_top),
-            egui::pos2(card_right, used.bottom().min(card_bottom)),
-        );
-        ui.painter().set(
-            where_to_put_card,
-            egui::Shape::rect_filled(card, CONTENT_CARD_CORNER_RADIUS, scheme.content),
-        );
+                    cards.push(self.mail_card(ui, mail, index == 0));
+                }
+            });
+            // Scrolled away from the top, the bar floats over the cards.
+            self.mail_scroll = output.state.offset.y;
+        });
+        // The fills, in behind the mails: a card spans the pane and stays on it
+        // while the mail scrolls, and it is clipped to the pane, so a card
+        // scrolled up under the title bar is cut at the pane's top edge rather
+        // than painted over the chrome's gutter.
+        let painter = ui.painter().with_clip_rect(inner);
+        for (where_to_put, laid_out) in cards {
+            painter.set(
+                where_to_put,
+                egui::Shape::rect_filled(
+                    egui::Rect::from_x_y_ranges(card_left..=card_right, laid_out.y_range()),
+                    CONTENT_CARD_CORNER_RADIUS,
+                    scheme.content,
+                ),
+            );
+        }
     }
 
-    /// The mail on its card: the headers, the rule under them and the body in
-    /// one padded column, which the card's scroll area scrolls as a whole.
+    /// One mail on the pane: the sheet it draws (`mail_sheet`), padded away
+    /// from the card's edges — the card itself is the pane's, reserved as a
+    /// shape here for it to fill in below, because the mail's height is only
+    /// known once it has been laid out.
     ///
     /// The padding is inside the scroll area, so the scroll bar sits on the
-    /// card's edge and not on the text. Its top is the title bar's height on
-    /// top of the card's own: the bar floats over the card, and that is what
-    /// keeps the subject below it at rest — scrolling takes the padding away
-    /// with the headers, which is what lets them pass under the glass.
-    fn mail_card(&mut self, ui: &mut egui::Ui, msg: &MailMessage) {
-        egui::Frame::new()
+    /// card's edge and not on the text. `first` is the mail at the top of what
+    /// the pane shows, whose top padding is the title bar's height on top of the
+    /// card's own: the bar floats over the card, and that is what keeps the
+    /// subject below it at rest — scrolling takes the padding away with the
+    /// headers, which is what lets them pass under the glass. The mails under it
+    /// keep the card's own padding alone, and the room between two cards is the
+    /// pane's (`CONVERSATION_CARD_GAP`).
+    fn mail_card(
+        &mut self,
+        ui: &mut egui::Ui,
+        msg: &MailMessage,
+        first: bool,
+    ) -> (egui::layers::ShapeIdx, egui::Rect) {
+        let where_to_put = ui.painter().add(egui::Shape::Noop);
+        let laid_out = egui::Frame::new()
             .inner_margin(egui::Margin {
                 left: CONTENT_PADDING_I8,
                 right: CONTENT_PADDING_I8,
-                top: TITLEBAR_HEIGHT_I8 + CONTENT_PADDING_I8,
+                top: CONTENT_PADDING_I8 + if first { TITLEBAR_HEIGHT_I8 } else { 0 },
                 bottom: CONTENT_PADDING_I8,
             })
-            .show(ui, |ui| self.mail_sheet(ui, msg));
-    }
-
-    /// One mail of a conversation: the sheet a mail on its own fills, drawn as a
-    /// card of its own — the scheme's faint fill, a hairline, its own padding —
-    /// inside the pane's card, so a thread reads as the mails it is made of
-    /// rather than as one long document with three sets of headers in it.
-    fn conversation_card(&mut self, ui: &mut egui::Ui, msg: &MailMessage) {
-        let scheme = theme::of(ui.ctx());
-        egui::Frame::new()
-            .fill(scheme.card)
-            .stroke(egui::Stroke::new(1.0_f32, scheme.border))
-            .corner_radius(CONVERSATION_CARD_CORNER_RADIUS)
-            .inner_margin(egui::Margin::same(CONVERSATION_CARD_PADDING_I8))
-            .show(ui, |ui| self.mail_sheet(ui, msg));
+            .show(ui, |ui| self.mail_sheet(ui, msg))
+            .response
+            .rect;
+        (where_to_put, laid_out)
     }
 
     /// What one mail says and nothing around it: the headers, the rule under
-    /// them, the body and the cards of what it came with. The pane pads the card
-    /// around a mail on its own (`mail_card`) and each card of a conversation
-    /// pads itself (`conversation_card`), which is why the padding is not here.
+    /// them, the body and the cards of what it came with. The pane pads every
+    /// card (`mail_card`), which is why the padding is not here.
     fn mail_sheet(&mut self, ui: &mut egui::Ui, msg: &MailMessage) {
         ui.set_min_width(ui.available_width());
         // The mail's own column: the headers draw across it and so do the
@@ -5378,13 +5377,10 @@ const CONTENT_PADDING: egui::Vec2 =
     egui::vec2(CONTENT_PADDING_I8 as f32, CONTENT_PADDING_I8 as f32);
 /// Corner radius of the reading pane's card.
 const CONTENT_CARD_CORNER_RADIUS: u8 = 8;
-/// A conversation's cards in the reading pane: the room between two of them,
-/// the padding each keeps around its own mail, and the corner radius they are
-/// drawn with — the same faint fill and hairline the attachment cards use, one
-/// step in from the pane's own card.
+/// The room between two cards of a conversation in the reading pane, which is
+/// the chrome showing between them: a conversation is one card per mail
+/// (`mail_card`), each of them the card a mail on its own gets.
 const CONVERSATION_CARD_GAP: f32 = 12.0;
-const CONVERSATION_CARD_PADDING_I8: i8 = 10;
-const CONVERSATION_CARD_CORNER_RADIUS: u8 = 6;
 /// The attachment cards under a mail's body: one card per file, as tall as a
 /// line of the list, with the gap between two of them and the room the section
 /// keeps between itself and the body above it. The card's own paddings are the
@@ -8222,6 +8218,75 @@ mod tests {
         );
     }
 
+    /// A conversation is one card per mail on the pane, the same card a mail on
+    /// its own gets: the pane's own surface, as wide as the pane, with the
+    /// chrome showing between two of them. Nothing is nested — no card drawn
+    /// around the conversation with a card per mail inside it.
+    #[test]
+    fn a_conversation_draws_one_card_per_mail_on_the_pane() {
+        let ctx = egui::Context::default();
+        crate::fonts::install(&ctx, None, None);
+        let mut app = app_with_one_conversation(&ctx);
+        app.selected_message = Some("3".to_string());
+        // A frame to settle the columns: the list's own edge is what tells the
+        // pane's cards apart from the surface the list is drawn on.
+        let _ = frame_shapes_at(&ctx, &mut app, 1400.0);
+        let content = theme::of(&ctx).content;
+        let cards_of = |app: &mut KimoApp| {
+            let pane_left = app.list_column.right();
+            let mut cards: Vec<egui::Rect> =
+                fills_in_color(&frame_shapes_at(&ctx, app, 1400.0), content)
+                    .into_iter()
+                    .filter(|rect| rect.center().x > pane_left)
+                    .collect();
+            cards.sort_by(|a, b| a.top().total_cmp(&b.top()));
+            cards
+        };
+
+        let cards = cards_of(&mut app);
+        assert_eq!(cards.len(), 2, "one card per mail: {cards:?}");
+        let (first, second) = (cards[0], cards[1]);
+        let pane_left = app.list_column.right();
+        for card in &cards {
+            assert!(
+                card.left() <= pane_left + CONTENT_GUTTER + 0.5
+                    && card.right() >= 1400.0 - CONTENT_GUTTER - 0.5,
+                "a card spans the pane, gutter to gutter: {card:?}"
+            );
+        }
+        assert!(
+            (first.top() - CONTENT_GUTTER).abs() < 0.5,
+            "the pane's cards start at the pane's top, not under the bar's height: {first:?}"
+        );
+        let gap = second.top() - first.bottom();
+        assert!(
+            (gap - CONVERSATION_CARD_GAP).abs() < 0.5,
+            "the chrome between two cards is {gap} pt tall"
+        );
+        assert!(
+            !(first.contains_rect(second) || second.contains_rect(first)),
+            "the cards are stacked, not one inside another: {cards:?}"
+        );
+        // The old shape: a card around all of them, and a card per mail inside
+        // it — the faint fill and hairline an inset card is drawn with. The
+        // pane has neither now; the list's own faint fills are its business.
+        let inset = fills_in_color(
+            &frame_shapes_at(&ctx, &mut app, 1400.0),
+            theme::of(&ctx).card,
+        );
+        assert!(
+            inset.iter().all(|rect| rect.center().x < pane_left),
+            "no inset card left in the pane: {inset:?}"
+        );
+
+        // And the card a mail on its own gets, with threading off, is the same
+        // card: same edges, same width.
+        app.threaded = false;
+        let alone = cards_of(&mut app);
+        assert_eq!(alone.len(), 1, "a mail of its own is one card: {alone:?}");
+        assert_eq!(alone[0], first, "a conversation's card is the pane's card");
+    }
+
     /// The chevron is what opens and closes a conversation's mails in the list,
     /// and it does nothing else: no mail is opened by it, and the pane is left
     /// where it was.
@@ -8625,6 +8690,33 @@ mod tests {
             && centre.y > TITLEBAR_HEIGHT
         {
             out.push(bounds);
+        }
+    }
+
+    /// Every rectangle one frame filled in a given color, however deeply egui
+    /// nested it, for the tests that count surfaces rather than click them. A
+    /// bar or a panel draws its fill the same way, so what the caller asks for
+    /// is told apart by where it is, not by its color alone.
+    fn fills_in_color(
+        shapes: &[egui::epaint::ClippedShape],
+        fill: egui::Color32,
+    ) -> Vec<egui::Rect> {
+        let mut out = Vec::new();
+        for clipped in shapes {
+            collect_fills_in_color(&clipped.shape, fill, &mut out);
+        }
+        out
+    }
+
+    fn collect_fills_in_color(shape: &egui::Shape, fill: egui::Color32, out: &mut Vec<egui::Rect>) {
+        match shape {
+            egui::Shape::Rect(rect) if rect.fill == fill => out.push(rect.rect),
+            egui::Shape::Vec(shapes) => {
+                for shape in shapes {
+                    collect_fills_in_color(shape, fill, out);
+                }
+            }
+            _ => {}
         }
     }
 

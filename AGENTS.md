@@ -501,17 +501,25 @@ Event (mpsc) ──► drain_events() at frame start ──► merge into Accoun
   bullet below): the navigation is inset by the bar's height and never goes
   under it, while the two content columns keep clear of the bar with padding
   *inside* their scroll areas, which scrolls away with what they hold — the
-  list's rows, and the reading pane's entire card, its headers included, which
+  list's rows, and the reading pane's cards, their headers included, which
   is why mail passes under the glass there too. The list column is
   framed by a hairline down each side (`mail_list`, drawn at the column's own
   rect), and the reading pane is a card of `content`
   (`CONTENT_CARD_CORNER_RADIUS`) inset by `CONTENT_GUTTER` into the chrome,
   whose left side doubles as the splitter; with nothing selected there is no
-  card at all. The card is the pane's own scroll container — headers, rule,
-  body and the attachment cards at the foot scroll together, and the scroll bar
-  runs down the card's edge rather than down the body's — and it still hugs a
-  short mail: it is exactly as tall as the mail until the mail outgrows the
-  pane. It scrolls *both* ways, which is
+  card at all. **A conversation is that card once per mail** — not a card
+  holding a card per mail — stacked oldest first with `CONVERSATION_CARD_GAP`
+  of chrome showing between two of them, so every mail of a thread sits on the
+  pane the way a mail on its own does. Each card is drawn by the pane and not
+  by a frame around its mail: `mail_card` reserves the shape and the pane
+  fills it in from the pane's own left edge to its right one, because a card is
+  the pane's surface — a mail wider than the pane scrolls sideways over its
+  card instead of dragging the card off the pane with it. The cards are the
+  pane's scroll container — headers, rule,
+  body and the attachment cards at the foot of each mail scroll together, and
+  the scroll bar runs down the pane's edge rather than down a card's — and a
+  card still hugs its mail: it is exactly as tall as the mail until the mail
+  outgrows the pane. The scroll area scrolls *both* ways, which is
   what keeps the splitter honest: with horizontal scrolling off, a mail whose
   layout cannot be narrower than the pane (a fixed-width table — most HTML
   mail) widened this scroll area, and through it the panel's *content* rect,
@@ -545,13 +553,13 @@ Event (mpsc) ──► drain_events() at frame start ──► merge into Accoun
   each scroll area
   (`Frame::inner_margin(LIST_PADDING)` around the rows — sides, bottom, and
   the bar's height at the top, which is what the rows scroll under — and
-  `mail_card` for the mail, whose top margin is the bar's height on top of the
-  card's own), not on the panel's frame, which is what lets the scroll bars
-  reach the column's edge and the card's edge instead of stopping on the
-  padding. egui's
-  panel separators are off in both schemes (they would double those hairlines
-  and the card's gutter) and the two boundary pixels are repainted with the
-  chrome after the panels, so hovering a splitter draws no line at all.
+  `mail_card` for each mail: the card's own padding all round, and the bar's
+  height on top of it for the first card of what the pane shows — and only for
+  that one), not on the panel's frame, which is what lets the scroll bars reach
+  the column's edge and the pane's edge instead of stopping on the padding.
+  egui's panel separators are off in both schemes (they would double those
+  hairlines and the card's gutter) and the two boundary pixels are repainted
+  with the chrome after the panels, so hovering a splitter draws no line at all.
 - Search lives in the title bar and in the popup it opens, never in the
   column. The title-bar box shows the query with the magnifier drawn inside its
   left edge, and the whole box is one click target: a click anywhere in it —
@@ -627,14 +635,18 @@ Event (mpsc) ──► drain_events() at frame start ──► merge into Accoun
   **The row and the chevron do different things.** The *chevron* opens and closes
   the thread's mails under it in the list — and does nothing else, so the list's
   shape only ever changes when the user asks for it. The *row* opens the
-  conversation in the reading pane: every mail it holds, oldest first, as a card
-  of its own (`conversation_card`, one step in from the pane's card), so a
-  thread reads as the mails it is made of rather than as one long document with
-  three sets of headers in it. That is `KimoApp::open_conversation`, which takes
-  the thread the selection is in from the list's own model; with nothing
-  threading, or a model that does not cover the folder, it is the mail alone and
-  the pane draws a single card as before. The pane's scroll offset is keyed by
-  the *conversation* (`Conversation::key`), so opening another mail of the thread
+  conversation in the reading pane: every mail it holds, oldest first, each on
+  the pane's own card (`mail_card`) — the cards stacked with
+  `CONVERSATION_CARD_GAP` of chrome between them and nothing drawn around
+  them — so a thread reads as the mails it is made of rather than as one long
+  document with three sets of headers in it. A mail on its own is that same
+  card, once: same edges, same width, which is what the pane's card test pins
+  (`a_conversation_draws_one_card_per_mail_on_the_pane`). That is
+  `KimoApp::open_conversation`, which takes the thread the selection is in
+  from the list's own model; with nothing threading, or a model that does not
+  cover the folder, the pane shows the mail alone. The pane's scroll offset is
+  keyed by the *conversation* (`Conversation::key`), so opening another mail of
+  the thread
   already on screen does not jump back to its top.
   The chevron is a click target of its own (`ui.interact` over the row's, with
   `RowResponse` reporting the two), it is a line drawing rather than the filled
@@ -901,7 +913,7 @@ Event (mpsc) ──► drain_events() at frame start ──► merge into Accoun
   out across, taken from the pane *before* the body is drawn — a body wider than
   the column (a fixed-width HTML table) widens the ui as it lays itself out, and
   the cards belong to the mail, not to what the mail overflowed by. They are the
-  last thing on the reading pane's card whichever renderer drew the body,
+  last thing on the mail's card whichever renderer drew the body,
   because `mail_card` draws them after `mail_body` rather than inside it: a
   Blitz body is a raster a worker made, and the cards are not part of it.
   **The whole card is a link, and the name is drawn as one**: the scheme's link
