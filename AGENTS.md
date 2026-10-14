@@ -378,7 +378,9 @@ Event (mpsc) ──► drain_events() at frame start ──► merge into Accoun
   subprocesses or D-Bus), `html_renderer` (`egui`/`blitz`, absent means
   `egui`), `working_mode` (`debug`/`release`, absent means the build — see the
   syncing bullet above), `threaded` (whether the message list groups mail into
-  conversations; absent means the app's own default, which is on), and the font
+  conversations; absent means the app's own default, which is on), `auto_sync`
+  and `auto_sync_minutes` (the automatic sync's switch and its interval, both
+  absent by default — see the automatic-sync bullet below), and the font
   families picked in Preferences →
   Appearance (`ui_font`, `mono_font`; absent means egui's built-in font plus
   the CJK fallback). Family *names* are stored, not paths, so the file survives font
@@ -996,9 +998,28 @@ Event (mpsc) ──► drain_events() at frame start ──► merge into Accoun
   refusal keeps the card (and the draft) with the server's words in it, ready
   to be sent again. Adding a way to keep a draft, attach a file or queue a send
   is a decision for the project owner, not an oversight to fix in passing.
+- **The automatic sync is a preference, and the working mode is its outer
+  switch**: `auto_sync` (off unless asked for) sweeps *every* account every
+  `auto_sync_minutes` (15 by default, clamped to 1–1440) — `KimoApp::sync_all`,
+  the same sweep the title-bar Sync runs, so an account that is not configured
+  is not asked and a failed one reports itself like any other sync. It runs
+  only while `WorkingMode::syncs_automatically()` holds: a Debug session never
+  syncs on a clock, and the preferences page disables the two controls and says
+  so rather than leaving a switch that does nothing. `pump_auto_sync` is the
+  clock, called once a frame: `auto_sync_wait` is the whole decision (nothing
+  while off, otherwise the interval left since the last sweep, never negative),
+  and the wait it returns is what the app asks egui to repaint after — no other
+  timer runs, and a frame with nothing to draw would otherwise never come. A
+  sweep already in flight is left to finish and the clock is set anyway, so a
+  busy account is asked again a full interval later instead of every frame; the
+  clock is reset by `sync_all` itself, so pressing Sync is not a reason to be
+  swept a moment later. Changing the preference restarts the clock, and the
+  preference is what `settings.json` keeps — the timer is not persisted and
+  starts fresh with the process.
 - `preferences_modal()` is the one place to configure Kimo: an
   `egui::Modal` (backdrop click or Escape closes it) with a sidebar of
-  pages — **General** (the working mode), **Accounts** (account list with
+  pages — **General** (the working mode and the automatic sync), **Accounts**
+  (account list with
   use/edit/remove, and the add/edit account form in place of the list: it is
   pre-filled from the account it was opened on, and `Save & sync` updates that
   account and syncs it) and **Appearance** (theme, Simple/Blitz HTML

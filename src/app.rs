@@ -454,6 +454,13 @@ pub struct KimoApp {
     html_renderer: HtmlRenderer,
     /// Whether Kimo may sync without being asked (Preferences → General).
     working_mode: WorkingMode,
+    /// Whether the automatic sync is switched on, how long between its sweeps,
+    /// and when the last one ran — or when the app started, so the first is a
+    /// full interval away. The preference is in minutes; the clock wants a
+    /// `Duration` (see `pump_auto_sync`).
+    auto_sync: bool,
+    auto_sync_every: Duration,
+    auto_synced_at: Instant,
     /// Installed font families for the Appearance pickers; `None` while the
     /// worker scan (`Job::ScanFonts`) is still running.
     font_families: Option<Vec<FontFamily>>,
@@ -1219,6 +1226,12 @@ impl KimoApp {
             inline_textures: HashMap::new(),
             html_renderer: HtmlRenderer::parse(settings.html_renderer.as_deref().unwrap_or("")),
             working_mode: WorkingMode::from_settings(settings.working_mode.as_deref()),
+            // Absent in settings.json means the app's own defaults: nothing
+            // syncs on a timer until it is asked to, and `AUTO_SYNC_MINUTES`
+            // apart when it is.
+            auto_sync: settings.auto_sync.unwrap_or(false),
+            auto_sync_every: auto_sync_interval(settings.auto_sync_minutes),
+            auto_synced_at: Instant::now(),
             font_families: None,
             ui_font: settings.ui_font.clone(),
             mono_font: settings.mono_font.clone(),
@@ -1482,6 +1495,10 @@ impl KimoApp {
     /// case, so the button has to honour it: the sweep only revisits folders
     /// that already carry a mark.
     fn sync_all(&mut self) {
+        // The automatic sync's clock is measured from the last sweep, whoever
+        // asked for it: pressing Sync is not a reason to be swept again a moment
+        // later.
+        self.auto_synced_at = Instant::now();
         for account in self.accounts.clone() {
             let open = match (&self.selected_account, &self.selected_folder) {
                 (Some(selected), Some(folder))
@@ -1501,6 +1518,40 @@ impl KimoApp {
                 self.tx.clone(),
             );
         }
+    }
+
+    /// The automatic sync: every `auto_sync_every`, and only while the
+    /// preference is on and the working mode allows a sync nobody asked for.
+    /// Nothing else asks for a frame minutes from now, so the wait is what keeps
+    /// the clock ticking — a frame with nothing to draw is not a frame the app
+    /// would otherwise be given.
+    ///
+    /// A sweep that is already in flight is left to finish (a second one would
+    /// fetch the same mail twice); the clock is set either way, so a busy
+    /// account is asked again a full interval later rather than every frame.
+    fn pump_auto_sync(&mut self, ctx: &egui::Context) {
+        let now = Instant::now();
+        let Some(wait) = auto_sync_wait(
+            self.auto_sync && self.working_mode.syncs_automatically(),
+            self.auto_synced_at,
+            self.auto_sync_every,
+            now,
+        ) else {
+            return;
+        };
+        if wait.is_zero() {
+            self.auto_synced_at = now;
+            if !self.sync_in_flight() {
+                self.sync_all();
+            }
+        }
+        ctx.request_repaint_after(wait);
+    }
+
+    /// Whether any account is syncing right now, which is what the automatic
+    /// sync waits for.
+    fn sync_in_flight(&self) -> bool {
+        self.states.values().any(|state| state.syncing)
     }
 
     fn select_folder(&mut self, account_id: String, folder: String, protocol: Protocol) {
@@ -2057,6 +2108,8 @@ impl KimoApp {
             ui_font: self.ui_font.clone(),
             mono_font: self.mono_font.clone(),
             threaded: Some(self.threaded),
+            auto_sync: Some(self.auto_sync),
+            auto_sync_minutes: Some((self.auto_sync_every.as_secs() / SECS_PER_MINUTE) as u32),
         });
     }
 
@@ -4967,6 +5020,60 @@ impl KimoApp {
             .small()
             .weak(),
         );
+
+        ui.add_space(12.0);
+        ui.separator();
+        ui.add_space(8.0);
+
+        ui.label(egui::RichText::new("Automatic sync").strong());
+        // The working mode is the outer switch: a Debug session never syncs on
+        // its own, so the controls are disabled and the line under them says
+        // what they are waiting for rather than doing nothing quietly.
+        let allowed = self.working_mode.syncs_automatically();
+        if ui
+            .add_enabled(
+                allowed,
+                egui::Checkbox::new(&mut self.auto_sync, "Sync mail automatically"),
+            )
+            .changed()
+        {
+            // The clock starts now: switching it on does not mean syncing this
+            // instant, and switching it off and on again is not a retry.
+            self.auto_synced_at = Instant::now();
+            self.persist_settings();
+        }
+        let mut minutes = (self.auto_sync_every.as_secs() / SECS_PER_MINUTE) as u32;
+        ui.horizontal(|ui| {
+            ui.add_enabled_ui(allowed && self.auto_sync, |ui| {
+                ui.label("Every");
+                if ui
+                    .add(
+                        egui::DragValue::new(&mut minutes)
+                            .range(AUTO_SYNC_MIN_MINUTES..=AUTO_SYNC_MAX_MINUTES)
+                            .suffix(" min"),
+                    )
+                    .changed()
+                {
+                    self.auto_sync_every = auto_sync_interval(Some(minutes));
+                    self.auto_synced_at = Instant::now();
+                    self.persist_settings();
+                }
+                ui.label("apart, while Kimo is running");
+            });
+        });
+        ui.label(
+            egui::RichText::new(if allowed {
+                "Every account is asked for its mail on that clock, and only when \
+                 no sync is already running. Pressing Sync still fetches at once, \
+                 and a folder opened for the first time is still fetched when it is \
+                 opened."
+            } else {
+                "The Debug working mode keeps Kimo off the network, so nothing is \
+                 synced on a clock until the mode is Release."
+            })
+            .small()
+            .weak(),
+        );
     }
 
     /// Preferences → Appearance: theme and HTML renderer, both persisted to
@@ -5150,6 +5257,9 @@ impl KimoApp {
         let ctx = &ctx;
         self.drain_events();
         self.apply_theme(ctx);
+        // The automatic sync is a frame's business too: it is what asks for the
+        // frame its clock needs, and what starts the sweep when it is up.
+        self.pump_auto_sync(ctx);
 
         // Collapse the nav bar automatically when the window becomes narrow;
         // re-expanding is a manual choice and stays until the next crossing.
@@ -5358,6 +5468,15 @@ const MAIL_ACTION_GLYPH: f32 = 18.0;
 /// path — or that a mail went out — and act on it, short enough not to become
 /// furniture. Whatever it says does not change when the line goes.
 const NOTICE_TIME: Duration = Duration::from_secs(8);
+
+/// The automatic sync (Preferences → General): how many minutes apart its sweeps
+/// are unless the preference says otherwise, and the range the preference
+/// offers. A minute is the shortest that is not a busy loop, and a day the
+/// longest that still reads as "automatically" rather than as a schedule.
+const AUTO_SYNC_MINUTES: u32 = 15;
+const AUTO_SYNC_MIN_MINUTES: u32 = 1;
+const AUTO_SYNC_MAX_MINUTES: u32 = 1440;
+const SECS_PER_MINUTE: u64 = 60;
 
 /// Padding on the sides of the message list's rows: the hairlines `mail_list`
 /// draws down the column's sides sit just outside it.
@@ -5719,6 +5838,24 @@ fn virtual_rows<R>(
         add_contents(rows_ui, first..last)
     })
     .inner
+}
+
+/// How long between automatic syncs, from the preference's minutes: the app's
+/// own default when settings.json names none, and clamped to the range the
+/// preferences page offers however the file was edited.
+fn auto_sync_interval(minutes: Option<u32>) -> Duration {
+    let minutes = minutes
+        .unwrap_or(AUTO_SYNC_MINUTES)
+        .clamp(AUTO_SYNC_MIN_MINUTES, AUTO_SYNC_MAX_MINUTES);
+    Duration::from_secs(minutes as u64 * SECS_PER_MINUTE)
+}
+
+/// How long until the automatic sync is next due: `None` when it is not running
+/// at all — switched off in Preferences, or a working mode that keeps Kimo off
+/// the network — and zero from the moment the interval since the last sweep has
+/// passed, however long ago that was.
+fn auto_sync_wait(enabled: bool, last: Instant, every: Duration, now: Instant) -> Option<Duration> {
+    enabled.then(|| every.saturating_sub(now.saturating_duration_since(last)))
 }
 
 /// True when a popup field was left by pressing Enter — the search popup takes
@@ -7272,6 +7409,42 @@ mod tests {
         assert_eq!(WorkingMode::from_build(), expected);
     }
 
+    /// The interval the preference asks for, and the clamp it is read through:
+    /// nothing in settings.json — a hand-edited file included — gets a sweep
+    /// every frame, or one a week.
+    #[test]
+    fn the_auto_sync_interval_is_the_preference_clamped() {
+        let minutes = |n: u64| Duration::from_secs(n * SECS_PER_MINUTE);
+        assert_eq!(auto_sync_interval(None), minutes(AUTO_SYNC_MINUTES as u64));
+        assert_eq!(auto_sync_interval(Some(0)), minutes(1));
+        assert_eq!(auto_sync_interval(Some(30)), minutes(30));
+        assert_eq!(auto_sync_interval(Some(100_000)), minutes(1440));
+    }
+
+    /// The automatic sync's clock: nothing at all while it is switched off, the
+    /// whole interval right after a sweep, and due — never negative — once that
+    /// interval has passed.
+    #[test]
+    fn the_auto_sync_waits_out_its_interval() {
+        let start = Instant::now();
+        let every = Duration::from_secs(600);
+        assert_eq!(auto_sync_wait(false, start, every, start), None);
+        assert_eq!(auto_sync_wait(true, start, every, start), Some(every));
+        assert_eq!(
+            auto_sync_wait(true, start, every, start + Duration::from_secs(599)),
+            Some(Duration::from_secs(1))
+        );
+        assert_eq!(
+            auto_sync_wait(true, start, every, start + every),
+            Some(Duration::ZERO)
+        );
+        assert_eq!(
+            auto_sync_wait(true, start, every, start + Duration::from_secs(90_000)),
+            Some(Duration::ZERO),
+            "a clock that is long overdue is due now, not in the past"
+        );
+    }
+
     #[test]
     fn a_new_draft_is_written_from_the_open_account_or_the_first() {
         let mut personal = test_account("imap.example.com");
@@ -7921,6 +8094,84 @@ mod tests {
         }
     }
 
+    /// Whether a sync starts within `window`: the worker sends `SyncStarted`
+    /// before it touches the network, so a sweep the app asked for shows up on
+    /// the channel at once. Whatever is already on the channel is dropped first,
+    /// so a sweep of an earlier frame cannot answer for this one — the caller
+    /// drains before the frame it is asking about, never after.
+    fn sync_starts_within(app: &mut KimoApp, window: Duration) -> bool {
+        let deadline = Instant::now() + window;
+        while Instant::now() < deadline {
+            match app.rx.try_recv() {
+                Ok(Event::SyncStarted { .. }) => return true,
+                Ok(_) => {}
+                Err(std::sync::mpsc::TryRecvError::Empty) => {
+                    std::thread::sleep(Duration::from_millis(2));
+                }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => return false,
+            }
+        }
+        false
+    }
+
+    /// The automatic sync is what its preference says: a sweep of every account
+    /// once the interval since the last one is up, nothing before that, and
+    /// nothing at all while the working mode keeps Kimo off the network.
+    #[test]
+    fn the_automatic_sync_sweeps_when_its_interval_is_up() {
+        let ctx = egui::Context::default();
+        crate::fonts::install(&ctx, None, None);
+        let mut app = app_with_messages(&ctx, 1);
+        // A port with nothing behind it: the sweep reaches the job, which fails
+        // to connect and says so on the account. What the clock does is the
+        // question here, not what the server answers.
+        app.accounts[0].host = "127.0.0.1".to_string();
+        app.accounts[0].port = 1;
+        app.working_mode = WorkingMode::Release;
+        app.auto_sync_every = Duration::from_secs(10 * SECS_PER_MINUTE);
+
+        // One frame with the clock where the case wants it: what is on the
+        // channel beforehand is dropped, and what arrives after is the answer.
+        let frame = |app: &mut KimoApp| {
+            while app.rx.try_recv().is_ok() {}
+            let _ = frame_texts(&ctx, app);
+        };
+
+        // Switched off: an overdue clock sweeps nothing.
+        app.auto_synced_at = Instant::now() - Duration::from_secs(3600);
+        frame(&mut app);
+        assert!(
+            !sync_starts_within(&mut app, Duration::from_millis(300)),
+            "the preference is off"
+        );
+
+        // Switched on, and not yet due: nothing either.
+        app.auto_sync = true;
+        app.auto_synced_at = Instant::now();
+        frame(&mut app);
+        assert!(
+            !sync_starts_within(&mut app, Duration::from_millis(300)),
+            "the interval has not passed"
+        );
+
+        // Due: every account is asked.
+        app.auto_synced_at = Instant::now() - Duration::from_secs(601);
+        frame(&mut app);
+        assert!(
+            sync_starts_within(&mut app, Duration::from_secs(5)),
+            "the sweep starts once its interval is up"
+        );
+
+        // And the Debug working mode has the last word, however the preference
+        // is set and however overdue the clock is.
+        app.working_mode = WorkingMode::Debug;
+        app.auto_synced_at = Instant::now() - Duration::from_secs(3600);
+        frame(&mut app);
+        assert!(
+            !sync_starts_within(&mut app, Duration::from_millis(300)),
+            "the working mode keeps Kimo off the network"
+        );
+    }
     /// Clicking an attachment card starts a download: the app finds the account
     /// and the mail the pane is showing, and hands the worker the part's place
     /// and the file's name. What the worker does with them is `sync`'s own

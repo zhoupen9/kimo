@@ -18,6 +18,8 @@ rustls with the `ring` crypto provider and Mozilla's root certificates.
 - Multiple accounts, IMAP and POP3
 - Implicit TLS, STARTTLS and plain connections, for reading and for sending
 - Folder listing (IMAP), folder selection and per-folder caches
+- Optional automatic sync: every account on a clock you set in Preferences →
+  General (off by default, 1–1440 minutes)
 - Message list with unread markers and text preview, grouped into
   conversations: one row per thread — its newest mail, how many it holds and a
   paperclip — with the chevron at its left opening the thread's mails in the

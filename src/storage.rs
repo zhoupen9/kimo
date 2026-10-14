@@ -111,6 +111,13 @@ pub struct Settings {
     /// threading is what the list does unless it is told otherwise.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub threaded: Option<bool>,
+    /// Whether Kimo syncs every account on a timer, and how many minutes apart
+    /// its sweeps are (`KimoApp::pump_auto_sync`). Both absent mean the app's
+    /// own defaults: off, and `AUTO_SYNC_MINUTES` between sweeps.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auto_sync: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auto_sync_minutes: Option<u32>,
 }
 
 pub fn load_settings() -> Settings {
@@ -194,6 +201,8 @@ mod tests {
             ui_font: Some("DejaVu Sans".into()),
             threaded: Some(false),
             mono_font: Some("DejaVu Sans Mono".into()),
+            auto_sync: Some(true),
+            auto_sync_minutes: Some(30),
         };
         let json = serde_json::to_string(&s).unwrap();
         let back: Settings = serde_json::from_str(&json).unwrap();
@@ -203,6 +212,8 @@ mod tests {
         assert_eq!(back.ui_font.as_deref(), Some("DejaVu Sans"));
         assert_eq!(back.threaded, Some(false));
         assert_eq!(back.mono_font.as_deref(), Some("DejaVu Sans Mono"));
+        assert_eq!(back.auto_sync, Some(true));
+        assert_eq!(back.auto_sync_minutes, Some(30));
         // settings.json with missing keys must still load.
         let missing: Settings = serde_json::from_str("{}").unwrap();
         assert_eq!(missing.theme, "");
@@ -211,6 +222,8 @@ mod tests {
         assert_eq!(missing.ui_font, None);
         assert_eq!(missing.mono_font, None);
         assert_eq!(missing.threaded, None, "absent means the app's default");
+        assert_eq!(missing.auto_sync, None, "absent means the app's default");
+        assert_eq!(missing.auto_sync_minutes, None);
         // An absent mode is not written back as one: the file stays a file
         // that says nothing, and the build decides what that means.
         let unset = Settings::default();
