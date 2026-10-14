@@ -112,6 +112,26 @@ impl Gpu {
         let mut config = surface
             .get_default_config(&adapter, size.width.max(1), size.height.max(1))
             .expect("kimo: the surface does not support this GPU");
+        let capabilities = surface.get_capabilities(&adapter);
+        // A gamma-space target rather than the sRGB one the default config
+        // picks. egui blends premultiplied colors, and egui-wgpu's
+        // linear-framebuffer shader runs them through the sRGB curve *while they
+        // are still premultiplied* — on an sRGB surface that makes every
+        // antialiased edge a shade darker than the shape it belongs to, which on
+        // a rounded hover fill is a dark rim around the corners. Its own docs
+        // ask for `Rgba8Unorm`/`Bgra8Unorm` for exactly this reason. The scene
+        // texture, the composite and the blur all take their format from this
+        // one, so nothing below has to convert anything either way.
+        if let Some(gamma) = capabilities
+            .formats
+            .iter()
+            .copied()
+            .find(|format| !format.is_srgb())
+        {
+            config.format = gamma;
+        } else {
+            eprintln!("kimo: this surface offers only sRGB formats; antialiased edges will be a shade dark");
+        }
         // Vsynced, and never multisampled: egui does its own antialiasing, and
         // the glass reads the frame back as a texture, which a multisampled
         // attachment would not allow.
@@ -122,8 +142,7 @@ impl Gpu {
         // which would leave the cut corners black. Premultiplied is also the
         // space egui-wgpu's own blending is in. A surface with no alpha mode at
         // all keeps its square corners instead of growing black ones.
-        let alpha = surface
-            .get_capabilities(&adapter)
+        let alpha = capabilities
             .alpha_modes
             .contains(&wgpu::CompositeAlphaMode::PreMultiplied);
         if alpha {

@@ -18,7 +18,7 @@
 //! Appearance page the theme (which resolves to a `theme::ColorScheme`), the
 //! HTML renderer and the fonts. That renderer draws the mail either as egui
 //! widgets (`crate::html`) or rasterized by Blitz (`crate::blitz_render`) on a
-//! worker thread. The pencil is the compose card, which holds a draft and
+//! worker thread. The pen is the compose card, which holds a draft and
 //! nothing else — Kimo has no SMTP, so there is nowhere for it to go.
 
 use std::collections::{HashMap, HashSet};
@@ -5382,29 +5382,30 @@ fn glyph_tail(
     ));
 }
 
-/// Compose: the pencil the mail actions' outline set carries, drawn like the
-/// rest of them — one closed outline for the body with the nib at the lower
-/// left, and the line across the top that separates the eraser. It is the one
-/// glyph of that set that sits outside the actions group, beside the nav
-/// toggle, because it is the one that needs no mail open.
+/// Compose: a page with a pen writing on it — the page an outline of rounded
+/// corners whose top-right one is left *open*, and the pen the straight stroke
+/// that crosses exactly there. The two are one drawing: the pen passes through
+/// the gap, so no stroke of the page ever touches it, which is what says the
+/// pen is writing on the page rather than lying on top of it. Like the rest of
+/// the bar's glyphs it comes from a 24×24 outline, so it needs no asset.
 fn paint_compose_icon(p: &egui::Painter, rect: egui::Rect, color: egui::Color32) {
     let g = |x: f32, y: f32| glyph_point(rect.center(), x, y);
     let stroke = egui::Stroke::new(1.5_f32, color);
-    // The outline is the asset's, but its shaft is widened: at the size the
-    // bar draws its glyphs the 24×24 original is two edges a pixel apart, which
-    // reads as a sliver. The nib, the eraser edge and the ferrule keep their
-    // proportions to the shaft.
-    p.add(egui::Shape::closed_line(
-        vec![
-            g(21.0, 8.5),
-            g(15.5, 3.0),
-            g(3.5, 15.0),
-            g(3.25, 20.75),
-            g(9.0, 20.5),
-        ],
-        stroke,
-    ));
-    p.add(egui::Shape::line(vec![g(13.5, 5.0), g(19.0, 10.5)], stroke));
+
+    // The page, cut open where the pen crosses its top-right corner: the top
+    // side, then the rest of the way round from where the right side starts
+    // again. A corner is a quarter turn drawn the way the icon set draws them
+    // — a quadratic whose control is the corner itself (`glyph_tail`).
+    p.add(egui::Shape::line(vec![g(7.6, 5.0), g(16.0, 5.0)], stroke));
+    p.add(egui::Shape::line(vec![g(20.0, 8.8), g(20.0, 17.4)], stroke));
+    glyph_tail(p, g(20.0, 17.4), g(20.0, 21.0), g(16.4, 21.0), stroke);
+    p.add(egui::Shape::line(vec![g(16.4, 21.0), g(7.6, 21.0)], stroke));
+    glyph_tail(p, g(7.6, 21.0), g(4.0, 21.0), g(4.0, 17.4), stroke);
+    p.add(egui::Shape::line(vec![g(4.0, 17.4), g(4.0, 8.6)], stroke));
+    glyph_tail(p, g(4.0, 8.6), g(4.0, 5.0), g(7.6, 5.0), stroke);
+
+    // The pen: its nib inside the page, its tip out past the corner.
+    p.add(egui::Shape::line(vec![g(9.2, 17.2), g(21.6, 4.8)], stroke));
 }
 
 /// Reply: an arrow curving back to the left, its shaft turning down at the

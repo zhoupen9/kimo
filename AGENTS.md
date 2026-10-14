@@ -556,7 +556,13 @@ Event (mpsc) ──► drain_events() at frame start ──► merge into Accoun
   no mipmaps to filter a 256 px source down to 18 pt), the nav collapse
   toggle, the compose button (the one mail action that needs no mail open, so
   it sits beside the toggle rather than in the group on the right, which acts
-  on the mail in the reading pane), the icon-only sync button (Debug mode only:
+  on the mail in the reading pane; its glyph is a page with a pen writing on it
+  — `paint_compose_icon`, one of the bar's own 24×24 outlines like the mail
+  actions' below — where the icon set's pencil used to be. The page is a
+  rounded-rectangle outline whose top-right corner is left *open*, and the pen
+  is the straight stroke that crosses exactly there: no stroke of the page ever
+  touches it, which is what says the pen is writing on the page rather than
+  lying on top of it), the icon-only sync button (Debug mode only:
   Release syncs on its own), the search box (a field with the magnifier inside
   it, one widget,
   whose click opens the search popup), the group of mail actions
@@ -588,6 +594,17 @@ Event (mpsc) ──► drain_events() at frame start ──► merge into Accoun
   `CompositeAlphaMode::PreMultiplied` — `Auto` resolves to `Opaque`, which
   would cut black corners instead — and why a surface with no alpha mode at all
   keeps its square corners rather than gaining black ones.
+  The surface's *color* format is a gamma-space one (`Bgra8Unorm` / `Rgba8Unorm`,
+  the first the surface offers), not the sRGB format `get_default_config` picks,
+  and that is what makes egui's antialiasing come out right: egui blends
+  premultiplied colors, and egui-wgpu's linear-framebuffer shader runs them
+  through the sRGB curve *while they are still premultiplied*, so on an sRGB
+  target every feathered edge — a rounded hover fill's corners most visibly —
+  lands a shade darker than the shape it belongs to. egui-wgpu's own docs ask
+  for a gamma-space target for this reason, and the scene texture, the composite
+  and the blur all take their format from `config.format`, so nothing below
+  converts anything either way. A surface that offers only sRGB formats says so
+  once on stderr and keeps the dark edges.
   `WINDOW_CORNER_RADIUS` (8 pt) is also the radius a compositor-side window
   rule has to agree with (niri's `geometry-corner-radius`): without it the
   compositor still assumes a square window and its shadow shows through the
@@ -750,7 +767,7 @@ Event (mpsc) ──► drain_events() at frame start ──► merge into Accoun
   was taken is numbered and only the worker knows what it got. The app shows it
   as one line above the message list for `EXPORT_NOTICE_TIME` (`list_banner`,
   the place the storage warning stands).
-- The compose window (`compose_window`, opened by the title bar's pencil) is an
+- The compose window (`compose_window`, opened by the title bar's pen) is an
   `egui::Modal`, like the search popup and Preferences: a card `COMPOSE_WIDTH`
   wide in the foreground layer, whose backdrop dims the columns and the bar and
   takes their clicks, so a mail is written with the rest of the app out of the
