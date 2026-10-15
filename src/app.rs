@@ -4672,7 +4672,7 @@ impl KimoApp {
             ui.set_width(COMPOSE_WIDTH);
             ui.heading(heading);
             ui.separator();
-            outcome = self.compose_card(ui, COMPOSE_WIDTH);
+            outcome = self.compose_card(ui, COMPOSE_WIDTH, ComposeSpot::Popup);
         });
         self.settle_compose_outcome(outcome);
     }
@@ -4696,10 +4696,14 @@ impl KimoApp {
     /// reading the account list — and put back unless the card was
     /// discarded. Send is returned for the caller to act on: the draft is
     /// back in place by then, which is what `send_draft` reads.
-    fn compose_card(&mut self, ui: &mut egui::Ui, width: f32) -> ComposeOutcome {
+    fn compose_card(&mut self, ui: &mut egui::Ui, width: f32, spot: ComposeSpot) -> ComposeOutcome {
         let Some(mut draft) = self.compose.take() else {
             return ComposeOutcome::Shown;
         };
+        // The card under the mail it answers, rather than the popup over
+        // everything: the two differ in what they show, and the container is
+        // what says which one this is (`ComposeSpot`).
+        let inline = spot == ComposeSpot::Pane;
         let accounts: Vec<(String, String, String)> = self
             .accounts
             .iter()
@@ -4749,17 +4753,22 @@ impl KimoApp {
                 .inner
             };
 
-            let from_label = draft
-                .from
-                .as_ref()
-                .and_then(|id| accounts.iter().find(|(account_id, ..)| account_id == id))
-                .map(|(_, name, address)| format!("{name} <{address}>"));
-            ui.horizontal(|ui| {
-                ui.add_sized(
-                    [COMPOSE_LABEL_WIDTH, COMPOSE_FIELD_HEIGHT],
-                    egui::Label::new("From").halign(egui::Align::RIGHT),
-                );
-                match (accounts.is_empty(), from_label) {
+            // The From line, drawn wherever the card wants it: one row of the
+            // popup's form, labelled, and — on the spot — the card's own head
+            // bar, with the avatar of the account the answer goes from in the
+            // place the label takes.
+            //
+            // `flat` takes the combo's box off for that head: an outline and a
+            // fill belong to a form of boxes, and this one is the reply's own
+            // from — a list that opens, not a field to fill in. Only its hover
+            // keeps a fill, which is what still says it can be opened.
+            let fallback_from = compose_from(&self.accounts, self.selected_account.as_deref());
+            let from_list = |ui: &mut egui::Ui, from: &mut Option<String>, flat: bool| {
+                let label = from
+                    .as_ref()
+                    .and_then(|id| accounts.iter().find(|(account_id, ..)| account_id == id))
+                    .map(|(_, name, address)| format!("{name} <{address}>"));
+                match (accounts.is_empty(), label) {
                     (true, _) => {
                         ui.label(
                             egui::RichText::new(
@@ -4770,13 +4779,16 @@ impl KimoApp {
                     }
                     (false, Some(label)) => {
                         ui.add_enabled_ui(!sending, |ui| {
+                            if flat {
+                                flatten_widgets(ui, theme::of(ui.ctx()).hover);
+                            }
                             egui::ComboBox::from_id_salt("compose-from")
                                 .selected_text(label)
                                 .width(field_width)
                                 .show_ui(ui, |ui| {
                                     for (id, name, address) in &accounts {
                                         ui.selectable_value(
-                                            &mut draft.from,
+                                            from,
                                             Some(id.clone()),
                                             format!("{name} <{address}>"),
                                         );
@@ -4788,18 +4800,64 @@ impl KimoApp {
                     // two frames; pick the fallback rather than showing a
                     // list with nothing selected.
                     (false, None) => {
-                        draft.from = compose_from(&self.accounts, self.selected_account.as_deref());
+                        *from = fallback_from.clone();
                     }
                 }
-            });
+            };
+            if inline {
+                // The head bar: the face of the account this answer goes from
+                // where a field's label would be, and the list beside it. The
+                // separator under it is the popup's own head treatment — its
+                // heading has one — and it is what makes the row a bar rather
+                // than the first field of the form.
+                let scheme = theme::of(ui.ctx());
+                ui.horizontal(|ui| {
+                    let (slot, _) = ui.allocate_exact_size(
+                        egui::vec2(COMPOSE_LABEL_WIDTH, AVATAR_DIAMETER),
+                        egui::Sense::hover(),
+                    );
+                    if let Some(account) = sender.as_ref() {
+                        let centre = slot.center();
+                        let painter = ui.painter();
+                        painter.circle_filled(
+                            centre,
+                            AVATAR_DIAMETER / 2.0,
+                            sender_color(scheme, &account.username),
+                        );
+                        painter.text(
+                            centre,
+                            egui::Align2::CENTER_CENTER,
+                            sender_initial(&account.name),
+                            egui::FontId::proportional(AVATAR_FONT_SIZE),
+                            scheme.avatar_text,
+                        );
+                    }
+                    from_list(ui, &mut draft.from, true);
+                });
+                ui.separator();
+            } else {
+                ui.horizontal(|ui| {
+                    ui.add_sized(
+                        [COMPOSE_LABEL_WIDTH, COMPOSE_FIELD_HEIGHT],
+                        egui::Label::new("From").halign(egui::Align::RIGHT),
+                    );
+                    from_list(ui, &mut draft.from, false);
+                });
+            }
 
             let to = field(ui, "To", &mut draft.to, "name@example.com");
             if std::mem::take(&mut draft.focus) {
                 to.request_focus();
             }
-            field(ui, "Cc", &mut draft.cc, "name@example.com");
-            field(ui, "Bcc", &mut draft.bcc, "name@example.com");
-            field(ui, "Subject", &mut draft.subject, "Subject");
+            // Cc, Bcc and Subject are the popup's: an answer written on the spot
+            // under its mail is the reply itself — who it is from, who it goes
+            // to, what it says — and the three that are not drawn are still in
+            // the draft, so a Reply all goes on copying whom it was copying.
+            if !inline {
+                field(ui, "Cc", &mut draft.cc, "name@example.com");
+                field(ui, "Bcc", &mut draft.bcc, "name@example.com");
+                field(ui, "Subject", &mut draft.subject, "Subject");
+            }
 
             // The files that would go out with the mail, as the reading pane
             // draws them, and the two ways to add one: the desktop's own dialog,
@@ -4923,21 +4981,55 @@ impl KimoApp {
                     ui.label(egui::RichText::new(reason.as_str()).small().weak());
                 }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    let response = ui.add_enabled(
-                        !sending && blocker.is_none(),
-                        egui::Button::new(if sending { "Sending…" } else { "Send" }),
-                    );
-                    if response.clicked() {
-                        send = true;
-                    }
-                    if let Some(reason) = &blocker {
-                        response.on_disabled_hover_text(reason.as_str());
-                    }
-                    if ui
-                        .add_enabled(!sending, egui::Button::new("Discard"))
-                        .clicked()
-                    {
-                        discard = true;
+                    if inline {
+                        // The card's own two: an icon each and room around them,
+                        // Send in the accent because sending is what the card is
+                        // for, and Discard an outline beside it that turns the
+                        // scheme's danger on hover — the mail it throws away is
+                        // the only copy there is, and nothing is saved.
+                        let go = compose_button(
+                            ui,
+                            if sending { "Sending…" } else { "Send" },
+                            paint_send_icon,
+                            true,
+                            !sending && blocker.is_none(),
+                        );
+                        if go.clicked() {
+                            send = true;
+                        }
+                        if let Some(reason) = &blocker {
+                            go.on_disabled_hover_text(reason.as_str());
+                        }
+                        let drop = compose_button(
+                            ui,
+                            "Discard",
+                            |p, rect, color| paint_delete_icon(p, rect, color, COMPOSE_BUTTON_ICON),
+                            false,
+                            !sending,
+                        );
+                        if drop.clicked() {
+                            discard = true;
+                        }
+                        if sending {
+                            drop.on_disabled_hover_text("The mail is already on its way");
+                        }
+                    } else {
+                        let response = ui.add_enabled(
+                            !sending && blocker.is_none(),
+                            egui::Button::new(if sending { "Sending…" } else { "Send" }),
+                        );
+                        if response.clicked() {
+                            send = true;
+                        }
+                        if let Some(reason) = &blocker {
+                            response.on_disabled_hover_text(reason.as_str());
+                        }
+                        if ui
+                            .add_enabled(!sending, egui::Button::new("Discard"))
+                            .clicked()
+                        {
+                            discard = true;
+                        }
                     }
                 });
             });
@@ -7243,14 +7335,11 @@ impl KimoApp {
             .show(ui, |ui| {
                 let width = ui.available_width();
                 ui.set_min_width(width);
-                let heading = self
-                    .compose
-                    .as_ref()
-                    .map(|draft| draft.kind.label())
-                    .unwrap_or("New mail");
-                ui.heading(heading);
-                ui.separator();
-                outcome = self.compose_card(ui, width);
+                // No heading and no separator: the card's own first line is the
+                // From list, which is what the answer is *from* — and the mail
+                // it answers is right above it, which is what the heading used
+                // to say (`compose_card`, `inline`).
+                outcome = self.compose_card(ui, width, ComposeSpot::Pane);
             })
             .response
             .rect;
@@ -8894,6 +8983,16 @@ const TITLEBAR_EDGE_MARGIN: f32 = 10.0;
 /// the card.
 const COMPOSE_WIDTH: f32 = 560.0;
 const COMPOSE_LABEL_WIDTH: f32 = 56.0;
+/// The footer buttons the on-the-spot card draws: an icon and a word in one
+/// target, taller than a stock button and wider than its label needs. The
+/// popup keeps egui's own two — its form is wide and its footer is a line of it,
+/// while this card is a card and its two buttons are what it is for.
+const COMPOSE_BUTTON_HEIGHT: f32 = 34.0;
+const COMPOSE_BUTTON_PADDING: f32 = 12.0;
+const COMPOSE_BUTTON_ICON: f32 = 16.0;
+const COMPOSE_BUTTON_ICON_GAP: f32 = 8.0;
+const COMPOSE_BUTTON_FONT_SIZE: f32 = 13.0;
+const COMPOSE_BUTTON_CORNER_RADIUS: u8 = 6;
 const COMPOSE_FIELD_HEIGHT: f32 = 22.0;
 const COMPOSE_BODY_HEIGHT: f32 = 320.0;
 /// The area the compose card's attach target takes: one line of text, the width
@@ -9824,6 +9923,143 @@ fn attach_card(
     } else {
         response
     }
+}
+
+/// The send glyph: a paper plane — a dart pointing right, its two wings meeting
+/// at the fold. Two convex fills rather than one path, because that is what the
+/// tessellator wants and a notch is not convex.
+fn paint_send_icon(p: &egui::Painter, rect: egui::Rect, color: egui::Color32) {
+    let c = rect.center();
+    let r = rect.width().min(rect.height()) / 2.0;
+    let at = |x: f32, y: f32| egui::pos2(c.x + r * x, c.y + r * y);
+    // A dart pointing right: the tip, the two back corners, and the fold
+    // between them — indented to the *right* of the back edge, which is what
+    // leaves two wings of equal area. (A fold left of that line flattens the
+    // lower wing into a sliver, and the whole glyph then reads as a slash.)
+    let tip = at(0.95, 0.0);
+    let back_top = at(-0.75, -0.85);
+    let notch = at(-0.3, 0.0);
+    let back_bottom = at(-0.75, 0.85);
+    p.add(egui::Shape::convex_polygon(
+        vec![tip, back_top, notch],
+        color,
+        egui::Stroke::NONE,
+    ));
+    p.add(egui::Shape::convex_polygon(
+        vec![tip, notch, back_bottom],
+        color,
+        egui::Stroke::NONE,
+    ));
+}
+
+/// One of the compose footer's own buttons, where the card has the room for
+/// them: an icon, a word, and tall enough to be the thing the form points at.
+/// `primary` is the accent-filled one — Send, because it is what the card is
+/// for; the other is a quiet outline that turns the scheme's danger on hover,
+/// the treatment a delete button gets everywhere else in the app. A disabled
+/// button is the card's fill and a muted word: what it would do is in its
+/// tooltip (`on_disabled_hover_text`, the caller's).
+fn compose_button(
+    ui: &mut egui::Ui,
+    label: &str,
+    icon: impl Fn(&egui::Painter, egui::Rect, egui::Color32),
+    primary: bool,
+    enabled: bool,
+) -> egui::Response {
+    let scheme = theme::of(ui.ctx());
+    let font = egui::FontId::proportional(COMPOSE_BUTTON_FONT_SIZE);
+    let galley = ui
+        .ctx()
+        .fonts_mut(|fonts| fonts.layout_no_wrap(label.to_string(), font, scheme.text));
+    let width = COMPOSE_BUTTON_PADDING * 2.0
+        + COMPOSE_BUTTON_ICON
+        + COMPOSE_BUTTON_ICON_GAP
+        + galley.size().x;
+    let (rect, response) = ui.allocate_exact_size(
+        egui::vec2(width, COMPOSE_BUTTON_HEIGHT),
+        egui::Sense::click(),
+    );
+    if !ui.is_rect_visible(rect) {
+        return response;
+    }
+    let hovered = response.hovered() && enabled;
+    let (fill, stroke, ink) = match (enabled, primary) {
+        (false, _) => (
+            scheme.card,
+            egui::Stroke::new(1.0_f32, scheme.border),
+            scheme.text_weak,
+        ),
+        (true, true) => (
+            if hovered {
+                scheme.accent.lerp_to_gamma(egui::Color32::WHITE, 0.12)
+            } else {
+                scheme.accent
+            },
+            egui::Stroke::NONE,
+            scheme.on_accent,
+        ),
+        (true, false) => (
+            if hovered {
+                scheme.danger_hover
+            } else {
+                scheme.card
+            },
+            egui::Stroke::new(1.0_f32, scheme.border),
+            if hovered {
+                scheme.on_danger
+            } else {
+                scheme.text
+            },
+        ),
+    };
+    ui.painter()
+        .rect_filled(rect, COMPOSE_BUTTON_CORNER_RADIUS, fill);
+    ui.painter().rect_stroke(
+        rect,
+        COMPOSE_BUTTON_CORNER_RADIUS,
+        stroke,
+        egui::StrokeKind::Inside,
+    );
+    let glyph = egui::Rect::from_center_size(
+        egui::pos2(
+            rect.left() + COMPOSE_BUTTON_PADDING + COMPOSE_BUTTON_ICON / 2.0,
+            rect.center().y,
+        ),
+        egui::Vec2::splat(COMPOSE_BUTTON_ICON),
+    );
+    icon(ui.painter(), glyph, ink);
+    ui.painter().galley(
+        egui::pos2(
+            glyph.right() + COMPOSE_BUTTON_ICON_GAP,
+            rect.center().y - galley.size().y / 2.0,
+        ),
+        galley,
+        ink,
+    );
+    if enabled {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
+    response
+}
+
+/// Take the box off the widgets of this `Ui`: no outline, no fill — only the
+/// hover keeps `hover`, which is the one thing that still says a flat control
+/// can be used. It is scoped to the `Ui` it is called on, so the rest of the
+/// form keeps its boxes.
+fn flatten_widgets(ui: &mut egui::Ui, hover: egui::Color32) {
+    let widgets = &mut ui.visuals_mut().widgets;
+    for state in [
+        &mut widgets.inactive,
+        &mut widgets.hovered,
+        &mut widgets.active,
+        &mut widgets.open,
+    ] {
+        state.bg_stroke = egui::Stroke::NONE;
+        state.weak_bg_fill = egui::Color32::TRANSPARENT;
+    }
+    widgets.hovered.weak_bg_fill = hover;
+    widgets.active.weak_bg_fill = hover;
+    widgets.open.weak_bg_fill = hover;
 }
 
 /// What an attachment card's click targets came to: the card itself, and — where
@@ -15237,6 +15473,31 @@ mod tests {
         out
     }
 
+    /// The centres of every filled circle a frame drew in this colour: what an
+    /// avatar is, and the one shape on a card nothing else draws.
+    fn circles_in_color(
+        shapes: &[egui::epaint::ClippedShape],
+        fill: egui::Color32,
+    ) -> Vec<egui::Pos2> {
+        let mut out = Vec::new();
+        for clipped in shapes {
+            collect_circles(&clipped.shape, fill, &mut out);
+        }
+        out
+    }
+
+    fn collect_circles(shape: &egui::Shape, fill: egui::Color32, out: &mut Vec<egui::Pos2>) {
+        match shape {
+            egui::Shape::Circle(circle) if circle.fill == fill => out.push(circle.center),
+            egui::Shape::Vec(shapes) => {
+                for shape in shapes {
+                    collect_circles(shape, fill, out);
+                }
+            }
+            _ => {}
+        }
+    }
+
     fn collect_fills_in_color(shape: &egui::Shape, fill: egui::Color32, out: &mut Vec<egui::Rect>) {
         match shape {
             egui::Shape::Rect(rect) if rect.fill == fill => out.push(rect.rect),
@@ -16988,11 +17249,69 @@ mod tests {
             "On 2026-01-01, Ada <ada@example.com> wrote:\n> body\n"
         );
 
-        // The pane says both things at once: the mail above, the card's
-        // heading under it.
+        // The pane says both things at once: the mail above, and the card under
+        // it — which, being under its own mail, does not say what it is: its
+        // first line is who the answer is from, in the place the heading took,
+        // and Cc, Bcc and Subject are not among the fields it shows.
         let texts = frame_texts(&ctx, &mut app);
         assert!(texts.iter().any(|text| text == "Subject 0"));
-        assert!(texts.iter().any(|text| text == "Reply"));
+        assert!(
+            texts.iter().any(|text| text == "Test <ada>"),
+            "the account the answer goes from is on its head bar: {texts:?}"
+        );
+        assert!(
+            !texts.iter().any(|text| text == "Reply") && !texts.iter().any(|text| text == "From"),
+            "the place says what this card is, and the head bar's label is a face: {texts:?}"
+        );
+        for absent in ["Cc", "Bcc", "Subject"] {
+            assert!(
+                !texts.iter().any(|text| text == absent),
+                "an answer written under its mail shows the head bar, To, the files, \
+                 the body and the two buttons: {absent} is not one of them, {texts:?}"
+            );
+        }
+
+        // The head bar's label is the account's own face: a filled circle in the
+        // colour its address hashes to, in the label column's place on the card
+        // that answers the mail.
+        let colour = sender_color(theme::of(&ctx), "ada");
+        let shapes = frame_shapes_at(&ctx, &mut app, 1400.0);
+        let answer = *pane_cards(&ctx, &mut app)
+            .last()
+            .expect("the answer is a card of the pane");
+        let avatars: Vec<egui::Pos2> = circles_in_color(&shapes, colour)
+            .into_iter()
+            .filter(|centre| answer.contains(*centre))
+            .collect();
+        assert_eq!(
+            avatars.len(),
+            1,
+            "one face on the answer's head bar: {avatars:?} of {answer:?}"
+        );
+
+        // And the footer's two are the card's own: they stand a whole button
+        // tall — the stock ones are a line of a form — and one of them, Send,
+        // has the plane drawn inside it. (Send is the *disabled* one here: the
+        // fixture account has no outgoing server, and a disabled button is the
+        // card's own fill rather than the accent.)
+        let scheme = theme::of(&ctx);
+        let buttons: Vec<egui::Rect> = fills_in_color(&shapes, scheme.card)
+            .into_iter()
+            .filter(|rect| {
+                (rect.height() - COMPOSE_BUTTON_HEIGHT).abs() < 0.5
+                    && answer.contains(rect.center())
+            })
+            .collect();
+        assert_eq!(buttons.len(), 2, "Send and Discard: {buttons:?}");
+        assert!(
+            buttons.iter().all(|rect| rect.width() > 60.0),
+            "an icon and a word fit in each: {buttons:?}"
+        );
+        let planes: Vec<&egui::Rect> = buttons
+            .iter()
+            .filter(|rect| !glyph_colors_in(&shapes, **rect).is_empty())
+            .collect();
+        assert_eq!(planes.len(), 1, "the plane is on Send alone: {buttons:?}");
 
         // The title bar's cell opens the same three as popups — the same
         // draft, another container.
@@ -17002,6 +17321,26 @@ mod tests {
         assert_eq!(
             app.compose.as_ref().expect("draft").kind,
             ComposeKind::ReplyAll
+        );
+        // And the popup is the whole form: the same draft in the other container
+        // has its heading back, and the three fields the on-the-spot card leaves
+        // out — which is where a Reply all's own Cc is read.
+        for _ in 0..3 {
+            run_app_frame(&ctx, &mut app, Vec::new());
+        }
+        let texts = frame_texts(&ctx, &mut app);
+        for present in ["Reply all", "Cc", "Bcc", "Subject"] {
+            assert!(
+                texts.iter().any(|text| text == present),
+                "{present} is on the popup's form: {texts:?}"
+            );
+        }
+        let shapes = frame_shapes_at(&ctx, &mut app, 1400.0);
+        assert!(
+            !fills_in_color(&shapes, theme::of(&ctx).card)
+                .iter()
+                .any(|rect| (rect.height() - COMPOSE_BUTTON_HEIGHT).abs() < 0.5),
+            "the popup keeps egui's own two buttons"
         );
     }
 
@@ -17202,9 +17541,10 @@ mod tests {
             "the thread goes on under the answer: {cards:?}"
         );
 
-        // And everything the pane held is still on it.
+        // And everything the pane held is still on it — the two mails, and the
+        // answer's own card, whose first line is who it is from.
         let texts = frame_texts(&ctx, &mut app);
-        for expected in ["body of 1", "body of 3", "Reply"] {
+        for expected in ["body of 1", "body of 3", "Files"] {
             assert!(
                 texts.iter().any(|text| text == expected),
                 "{expected} is on the pane: {texts:?}"
@@ -17727,6 +18067,41 @@ mod tests {
         }
         shot(&mut app, "ui-filter-flagged.png", &mut textures);
         app.set_list_filters(ListFilters::default());
+
+        // And an answer written on the spot: the card under its own mail, whose
+        // head bar is the account's avatar and the From list — no heading, and no
+        // Cc, Bcc or Subject. The account is given an outgoing server and an
+        // address to send as first, so the shot shows the footer a working
+        // account has: the accent-filled Send with the plane in its own ink,
+        // rather than the muted pair a blocked draft draws.
+        {
+            if let Some(account) = app.accounts.first_mut() {
+                account.username = "ada@example.com".to_string();
+                account.smtp = Some(SmtpSettings {
+                    host: "smtp.example.com".to_string(),
+                    port: 587,
+                    tls: TlsMode::StartTls,
+                    login: None,
+                });
+            }
+            let mail = app.selected_mail().cloned().or_else(|| {
+                app.states.get("acct").and_then(|state| {
+                    state
+                        .mailbox
+                        .folders
+                        .first()
+                        .and_then(|folder| folder.messages.first().cloned())
+                })
+            });
+            if let Some(mail) = mail {
+                app.compose_about(MailAction::Reply, ComposeSpot::Pane, &mail);
+                for _ in 0..4 {
+                    collect_frame(&ctx, &mut app, &mut textures, Vec::new());
+                }
+                shot(&mut app, "ui-reply-on-the-spot.png", &mut textures);
+                app.compose = None;
+            }
+        }
 
         // And the compose card with a file on it: the row the attachment takes,
         // its size, the Remove, and the box that is the other way in.

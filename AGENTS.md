@@ -1297,10 +1297,32 @@ Event (mpsc) ──► drain_events() at frame start ──► merge into Accoun
   falling back to the first (`compose_from`); To, Cc, Bcc, Subject and the body
   are plain strings in `ComposeDraft`, deliberately not widget state: what a
   card opens with is the draft's own — nothing, for a new mail; the mail it
-  answers, for the three. The boxes are a fixed label column plus what
-  `COMPOSE_WIDTH` leaves, the body is `COMPOSE_BODY_HEIGHT` tall and scrolls
-  inside that rather than growing the card, and the first frame puts the
-  keyboard in To.
+  answers, for the three. **The on-the-spot card is the shorter form**
+  (`compose_card`’s `inline`, which is what `ComposeSpot::Pane` means): an
+  answer written under its own mail shows From, To, the files, the body and the
+  two buttons, and nothing else. It has no heading — the mail above it says
+  what it answers — but it has a **head bar**: the avatar of the account the
+  answer goes from, drawn in the label column’s own slot, and the From list
+  beside it, with the separator under the row that the popup’s heading has
+  above its form. The list is *flat* there: `flatten_widgets` takes the combo’s
+  outline and fill off in that Ui and leaves the hover, because an outline
+  belongs to a form of boxes and this line is the reply’s own from. The face is
+  the one a mail’s card wears (`sender_color` and `sender_initial` of the
+  account’s address and name, at `AVATAR_DIAMETER`), so the card says who it is
+  from the way every other card in the app says who it is from. Cc, Bcc and
+  Subject are the popup’s rows and are not drawn here — but they are still *in
+  the draft*, so a Reply all goes on copying whom it was copying even though
+  the card does not show it. The popup keeps its heading and all five rows, and
+  one draft moves between the two containers with only the container changing.
+  The footer is the one other thing the two do not share: the on-the-spot card
+  draws `compose_button`’s pair — an icon and a word in one tall target, Send
+  in the accent because sending is what the card is for (`paint_send_icon`, the
+  plane) and Discard an outline beside it that turns the scheme’s danger on
+  hover (`paint_delete_icon`, the trash, the treatment every delete in the app
+  gets) — while the popup keeps egui’s own two, a line of its form. The boxes
+  are a fixed label column plus what `COMPOSE_WIDTH` leaves, the body is
+  `COMPOSE_BODY_HEIGHT` tall and scrolls inside that rather than growing the
+  card, and the first frame puts the keyboard in To.
   **The backdrop does not close it.** `ModalResponse::should_close` — a click
   beside the card, or Escape — is deliberately ignored: the draft is the only
   copy of the mail, and neither should be what throws it away. Discard is the
