@@ -370,8 +370,10 @@ Event (mpsc) ──► drain_events() at frame start ──► merge into Accoun
   `refs` — the last one is not `references`: that is a SQL keyword),
   `attachments` (the name, the MIME type and the decoded size — never the
   bytes; see the attachment-card convention) and `inline_images` (raw bytes,
-  not base64) as children of a message, and the external-content FTS5 table
-  `messages_fts`, which only the
+  not base64) as children of a message, `labels` (a name, unique
+  case-insensitively — a label is nothing else) and `message_labels` (which
+  labels a message carries, cascading with it), and the external-content FTS5
+  table `messages_fts`, which only the
   three triggers in `db::SCHEMA_SQL` ever write. `PRAGMA foreign_keys = ON`
   per connection and `ON DELETE CASCADE` all the way down, so
   `Job::DeleteAccount` is one `DELETE FROM accounts`. `PRAGMA user_version`
@@ -393,7 +395,10 @@ Event (mpsc) ──► drain_events() at frame start ──► merge into Accoun
   stored — the rows it holds keep an empty type and a zero size, and only mail
   fetched after the step carries them. The version-7 step is the third of that
   kind: it adds the threading headers, which were never stored either, and a
-  mail from before it threads by subject instead (`crate::threads`).
+  mail from before it threads by subject instead (`crate::threads`). The
+  version-8 step is the fourth: it adds the two label tables and derives
+  nothing, because a database from before it has no labels and no way to have
+  meant one — every mail in it starts unlabelled.
 - The account list is **in the database, passwords in plain text**. That is a
   documented, accepted limitation; do not add a secrets daemon (rule 1). An
   account's `id` is minted once (the slug of its name, numbered if taken) and
@@ -607,9 +612,12 @@ Event (mpsc) ──► drain_events() at frame start ──► merge into Accoun
   pane the way a mail on its own does. **A mail's head is its sender**: the
   list's own avatar in front of the name (`AVATAR_DIAMETER`, with the sender's
   `sender_color` and `sender_initial` — the same circle the rows draw), the
-  mail's four actions at that row's right end (`mail_sheet`, the bar's cells in
+  mail's five actions at that row's right end (`mail_sheet`, the bar's cells in
   a smaller square, `CARD_ACTION_SIZE`, drawn `text_weak` until the pointer
-  brings one to the text color), and the
+  brings one to the text color — delete, label, forward, reply all, reply: the
+  bar's run with flag and export left out, and the label one opens the label
+  popup on *this* mail rather than running an action), the chips of the labels
+  it carries while it has any (`label_chips`), and the
   subject, the addresses and the date under it. Each card is drawn by the pane and not
   by a frame around its mail: `mail_card` reserves the shape and the pane
   fills it in from the pane's own left edge to its right one, because a card is
@@ -972,9 +980,12 @@ Event (mpsc) ──► drain_events() at frame start ──► merge into Accoun
   longer shows counts as no mail — while select mode leaves Delete alone live
   (see the select-mode bullet below), the one of the seven that has something to
   do with more than one mail. A disabled cell drops its glyph to
-  `weak_text_color`, stops sensing clicks and never fills. Export and Delete
-  are wired — they are the actions whose jobs exist so far — and the other four
-  still run nothing, so a click on one of them is not even read.
+  `weak_text_color`, stops sensing clicks and never fills. Six of the seven
+  are wired: reply, reply all and forward open the compose
+  (`compose_about`, as the popup the pen opens), label opens the label popup
+  (`label_popup`, anchored to the cell), and export and delete hand the mail
+  to a worker. Flag is the one still drawn only — a click on it is not even
+  read.
   The bar is `TITLEBAR_HEIGHT` (40 pt) tall, its buttons
   `TITLEBAR_BUTTON_SIZE` (32 pt) squares centred in that, and the search box
   fills all but 16 pt of it (`TITLEBAR_SEARCH_HEIGHT`), with a rounder corner
@@ -1344,6 +1355,62 @@ Event (mpsc) ──► drain_events() at frame start ──► merge into Accoun
   under them, drawn weak whatever their unread count with a tooltip saying why,
   and still clickable. A folder of that second kind is only dropped from the
   column when it holds no mail at all; its row in the database stays.
+  **The labels are the column's last group, under every account**, which is
+  where a thing that belongs to no account can be: `label_group_header` is
+  the word alone — no disclosure triangle, because there is no section to
+  collapse, and no count, because the labels are not one list — at the left
+  edge the accounts' names start from, and the rows are indented under it the
+  way folders are. A row (`label_row`) is a folder row's shape with the
+  bar's tag glyph where the icon goes, the name, and the amount of mail carrying
+  it right-aligned; the whole row is the click target, and one whose label is in
+  the filter takes the selection fill. A label no mail carries any more is drawn
+  weak and stays in the column: it is the user's own word rather than a count of
+  the mail under it.
+- **A label is the user's own mark on a mail, and a filter of its own.** The
+  two are one feature: what makes a label first-class is that the column can
+  look at the mail that carries it, and what makes the column able to is that
+  the mark belongs to the mail. A mail lives in exactly one folder — where the
+  server put it — and carries any number of labels; the name is the whole of
+  one, unique case-insensitively, so `Work` and `work` are the same label
+  rather than two rows (the popup keeps the spelling it was made with).
+  `MailMessage::labels` is the app's copy of them, filled by
+  `db::load_mailboxes` from the join table and **never by a fetch**: nothing
+  about a label is asked of or told to a server, which is why a re-synced mail
+  keeps the marks it had here (the merge in `Event::Messages` takes the
+  fetched mail's fields and the held labels).
+  **A label is made by being used.** There is no "new label" form: the popup's
+  box names one, and `db::set_labels` creates whatever row it needs as it puts
+  it on the mail — one transaction, and the message's own rows replaced, so what
+  a mail carries afterwards is the set that was asked for rather than something
+  merged with what was there. The popup (`KimoApp::label_popup`) is the label
+  cell's menu — `egui::Popup::menu` with `CloseOnClickOutside`, so ticking
+  several labels is one visit — anchored to the cell that opened it, opened from
+  the title bar's cell for the mail the reading pane shows and from the cell on
+  a mail's own head for that mail (`mail_sheet`; the head's five cells are the
+  bar's run with flag and export left out). Its checklist is every label, ticked
+  for the ones the mail carries, and a tick or an untick writes the whole set
+  through `Job::SetLabels` — the app's copy first, so the next frame draws it,
+  and a worker to make it durable. Its box is emptied each time a popup opens:
+  what was typed for one mail is not a draft for the next.
+  **The mail says what it is labelled with**: a card draws its own labels as one
+  run of chips under the head (`label_chips`), one per label and only while it
+  has any, so an unlabelled mail's head is still the first thing on it.
+- **The label filter is an AND, and it is the mailbox's rather than a
+  folder's.** A click on a label row adds it to `KimoApp::label_filter`
+  (`toggle_label`), a click on a selected one takes it out, and the message
+  list becomes every mail that carries *all* of them — across folders and
+  accounts, which is what "first-class filter" means here and why those rows are
+  drawn like search hits (`labelled_row`: the third line is where the mail
+  lives) and are flat rather than threaded. The list is derived rather than
+  scanned per frame (`LabelView`, `refresh_label_view`, keyed by
+  `labels_rev`, the accounts' `folders_rev` and the filter), the way the
+  list's conversations are. Nothing about the filter is persisted: which labels
+  you are looking at is a per-session thing, like select mode and the open
+  conversations. A query and a label filter are two answers to what the middle
+  column shows, so a label click ends an active search (`end_search`) — while
+  a folder click, and opening a mail from the filtered list, deliberately leave
+  the filter alone: the pane's folder is where the mail it shows is filed, not
+  what the list is showing.
 - Folders are custom rows — kind icon, name (elided with an ellipsis), unread
   count right-aligned — because the whole row should be the click target and
   carry the selection highlight, which `selectable_label` cannot do once an
@@ -1380,7 +1447,17 @@ Event (mpsc) ──► drain_events() at frame start ──► merge into Accoun
   layout has no golden tests. `blitz_render` has a developer tool for
   eyeballing fidelity without the GUI:
   `KIMO_RENDER_HTML=mail.html cargo test -- --ignored dump_render` writes
-  `mail.png` next to the input. For cost rather than fidelity, use
+  `mail.png` next to the input. `dump_label_ui` is the same idea for the app's
+  own frames and needs no compositor at all:
+  `cargo test -- --ignored --nocapture dump_label_ui` drives the clicks
+  itself and rasterizes the frames — the columns, the card, the label popup —
+  straight from egui's own triangles into `target/ui-labels-*.png`
+  (`KIMO_UI_DUMP` picks another directory), which is how a layout is looked at
+  on a machine whose display is somebody else's. Its frames have to go through
+  `collect_frame` or a glyph the frame was the first to draw comes out blank:
+  egui sends the font atlas whole once and patches after that. Looking at a
+  picture is not running the app — click through the real one before calling a
+  change done. For cost rather than fidelity, use
   `render_bench` (test-only, asserts nothing):
   `cargo test --release -- --ignored --nocapture bench_render` times both
   renderers on a short mail, a newsletter-shaped fixture and — with
@@ -1447,6 +1524,14 @@ Do not "fix" these casually — they are known:
   selection is made one checkbox at a time, or every mail of the list at once
   (see the select-mode bullet under Conventions) — and that click is just as
   final, as is a row's own hover button (see the message-row bullet).
+- Labels are **local to this machine**: nothing about them is asked of or told
+  to a server, so another client's labels are invisible here and Kimo's are in
+  `mail.db` alone — a label names a message row, so mail that comes back under
+  a new UIDVALIDITY generation comes back unlabelled. A label cannot be renamed
+  or deleted (the popup only puts one on a mail or takes it off, and a name no
+  mail carries any more stays in the column), nothing is labelled in bulk
+  (select mode leaves Delete as its one live action, and the label cell on a
+  mail's head is about that mail), and the filter is in memory only.
 - A written mail goes out over SMTP and no further: no attachments (there is
   nothing to pick a file with — a native dialog is a dependency, and a portal on
   Wayland), no HTML body (the card is a text box, so the mail is `text/plain;
@@ -1454,10 +1539,11 @@ Do not "fix" these casually — they are known:
   the mail, and a failed send keeps the draft in the card but nowhere else — no
   outbox, queue or retry, no DKIM, and no OAuth2: submission authenticates with
   `AUTH PLAIN`/`AUTH LOGIN` over TLS, or not at all when the server asks for no
-  login. The title bar's label and flag buttons are still drawn but not wired
-  to anything (reply, reply all and forward open the compose popup, and the
-  mail's own header answers on the spot; export, delete and the compose pen
-  are wired; see those bullets above).
+  login. The title bar's flag button is still drawn but wired to nothing (the
+  other six are: reply, reply all and forward open the compose, label opens
+  the label popup, export and delete hand the mail to a worker, and the compose
+  pen is wired; the mail's own header carries the same cells and answers on the
+  spot — see those bullets above).
 - Credentials in plain text in `mail.db` (mode 0600, see above); no
   OAuth2/XOAUTH2. The database is not encrypted, and the app never renames or
   deletes it on its own: a corrupt file is the user's to move aside.

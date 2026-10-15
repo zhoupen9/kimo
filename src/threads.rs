@@ -288,6 +288,7 @@ mod tests {
             preview: "body".to_string(),
             attachments: Vec::new(),
             inline_images: Vec::new(),
+            labels: Default::default(),
         }
     }
 

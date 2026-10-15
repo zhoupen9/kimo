@@ -1,6 +1,8 @@
 //! Raw RFC 5322 bytes → `MailMessage` via `mail-parser`. HTML bodies are
 //! kept as-is (`body_html`) and rendered by `crate::html` in the UI.
 
+use std::collections::BTreeSet;
+
 use mail_parser::{MessageParser, MimeHeaders};
 
 use crate::models::MailMessage;
@@ -102,6 +104,9 @@ pub fn parse(raw: &[u8], uid: &str, seen: bool) -> MailMessage {
         preview,
         attachments,
         inline_images,
+        // A mail just parsed off the wire carries no labels: they are the
+        // user's own marks, and they live in the database.
+        labels: BTreeSet::new(),
     }
 }
 

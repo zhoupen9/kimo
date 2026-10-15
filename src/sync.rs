@@ -110,6 +110,21 @@ pub enum Job {
         folder: String,
         uid: String,
     },
+    /// Put exactly these labels on one message, creating any that is new
+    /// (`db::set_labels`). The popup's "create a label for this mail" is this
+    /// job and nothing else, and a label removed from the mail is a call with
+    /// the set it was removed from.
+    ///
+    /// Not a sync and not a round trip: labels are the user's own marks and
+    /// never the server's, so nothing is asked of anybody but the database —
+    /// and the app has already made the change in memory, which is why nothing
+    /// comes back on success.
+    SetLabels {
+        account_id: String,
+        folder: String,
+        uid: String,
+        labels: Vec<String>,
+    },
     /// Delete messages of one folder — the title bar's Delete, which takes the
     /// mail the reading pane shows or, in select mode, every mail the list has
     /// checked. The server is told first and each database row goes only once
@@ -389,6 +404,24 @@ pub fn spawn(job: Job, ctx: egui::Context, tx: Sender<Event>) {
             }
             ctx.request_repaint();
         }
+        Job::SetLabels {
+            account_id,
+            folder,
+            uid,
+            labels,
+        } => {
+            // Not a sync: no spinner for a write of the user's own marks. The
+            // failure is reported on the account's row the way a flag write's
+            // is, and the app's copy of the labels stands: what did not reach
+            // the disk is still what the user asked for.
+            if let Err(error) = db::set_labels(&account_id, &folder, &uid, &labels) {
+                let _ = tx.send(Event::SyncFailed {
+                    account_id,
+                    error: error.to_string(),
+                });
+            }
+            ctx.request_repaint();
+        }
         Job::DeleteAccount { account_id } => {
             if let Err(error) = db::delete_account(&account_id) {
                 let _ = tx.send(Event::SyncFailed {
@@ -551,6 +584,7 @@ pub fn spawn(job: Job, ctx: egui::Context, tx: Sender<Event>) {
                 | Job::DownloadAttachment { .. }
                 | Job::SendMessage { .. }
                 | Job::LoadOlder { .. }
+                | Job::SetLabels { .. }
                 | Job::DeleteAccount { .. } => unreachable!(),
             };
             let _ = tx.send(Event::SyncStarted {
@@ -588,6 +622,7 @@ pub fn spawn(job: Job, ctx: egui::Context, tx: Sender<Event>) {
                 | Job::DownloadAttachment { .. }
                 | Job::SendMessage { .. }
                 | Job::LoadOlder { .. }
+                | Job::SetLabels { .. }
                 | Job::DeleteAccount { .. } => unreachable!(),
             };
             let _ = match result {

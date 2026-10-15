@@ -23,7 +23,7 @@
 //! a mail on the wire, and the one that says what the server said when it did
 //! not.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
@@ -839,6 +839,27 @@ pub struct KimoApp {
     /// its own would not do. Dropped whenever the column moves to another list
     /// (`cancel_select`).
     selected_mails: HashSet<MailKey>,
+    /// Every label the user has made (`crate::db::load_labels` at startup, and
+    /// one more for each name the popup creates), in the order the navigation
+    /// column's label group draws them. A label is a first-class filter beside
+    /// the folders: the column's last group, and the list the middle column
+    /// shows while one of them is picked.
+    labels: Vec<String>,
+    /// The labels the message list is filtered by, in name order, and empty
+    /// when no filter is on. A click on a label adds it; a click on one that is
+    /// already here takes it out. **The filter is an AND**: the list shows the
+    /// mail that carries every one of them, so a second label narrows it.
+    label_filter: Vec<String>,
+    /// The label group's rows and the mail the filter selects, derived from the
+    /// mail's own labels rather than built every frame — see [`LabelView`].
+    label_view: Option<LabelView>,
+    /// What the label popup's new-label box holds. In memory only, and emptied
+    /// each time the popup is opened: what was typed for one mail is not a
+    /// draft for the next.
+    label_draft: String,
+    /// Bumped whenever a label is made or put on a mail, so the derived view
+    /// knows it is stale without comparing the whole label set of every mail.
+    labels_rev: u64,
     /// The same for the reading pane's card, which scrolls the whole mail:
     /// either column scrolled is content under the floating bar. Zero while
     /// no mail is open.
@@ -982,6 +1003,48 @@ struct ListRows {
     threaded: bool,
     threads: Vec<Thread>,
     rows: Vec<ListRow>,
+}
+
+/// One label as the navigation column draws it: the user's own name for it, how
+/// much mail carries it, and whether it is one of the labels the list is
+/// filtered by.
+struct LabelCount {
+    name: String,
+    count: usize,
+    selected: bool,
+}
+
+/// One mail a label filter selects, as a row needs it: where the mail lives and
+/// the fields a card draws. Copied rather than borrowed — the view outlives the
+/// state it was read from — the way a search hit is.
+#[derive(Clone)]
+struct LabelledMail {
+    account_id: String,
+    folder: String,
+    uid: String,
+    from: String,
+    subject: String,
+    date: String,
+    timestamp: Option<i64>,
+    seen: bool,
+    attachments: usize,
+}
+
+/// What the mail's labels say, derived once per change rather than once per
+/// frame (`KimoApp::refresh_label_view`): every label with the amount of mail
+/// under it, and the mail the selected labels all agree on.
+///
+/// The counts are a walk over every mail of every account, which is not a
+/// frame's work — keeping the answer is the whole point. `key` is what it was
+/// derived from, so a frame that moved nothing derives nothing.
+#[derive(Default)]
+struct LabelView {
+    /// The labels revision, the accounts' own mail revision and the filter;
+    /// `None` until the first derivation, which no key equals.
+    key: Option<(u64, u64, Vec<String>)>,
+    rows: Vec<LabelCount>,
+    /// The mail the filter selects, newest first. Empty while no filter is on.
+    matches: Vec<LabelledMail>,
 }
 
 /// A Blitz page: rendering, rendered, or failed.
@@ -1654,6 +1717,13 @@ impl KimoApp {
             list_rows: None,
             select_mode: false,
             selected_mails: HashSet::new(),
+            // The labels are the database's; the filter and the popup's box are
+            // this session's, and start empty.
+            labels: crate::db::load_labels().unwrap_or_default(),
+            label_filter: Vec::new(),
+            label_view: None,
+            label_draft: String::new(),
+            labels_rev: 0,
         };
 
         app.selected_account = app.accounts.first().map(|a| a.id.clone());
@@ -1770,6 +1840,11 @@ impl KimoApp {
                                 let keep_seen = fc.messages[i].seen || m.seen;
                                 let mut merged = m;
                                 merged.seen = keep_seen;
+                                // Labels are the user's own marks and were
+                                // never in the fetched mail, so the copy the
+                                // app holds is the one that stays — a POP3
+                                // re-sync re-downloads every message it has.
+                                merged.labels = std::mem::take(&mut fc.messages[i].labels);
                                 fc.messages[i] = merged;
                             }
                             None => {
@@ -3391,7 +3466,9 @@ impl KimoApp {
                 MailAction::Forward => {
                     paint_forward_icon(painter, response.rect, color, MAIL_ACTION_GLYPH)
                 }
-                MailAction::Label => paint_label_icon(painter, response.rect, color),
+                MailAction::Label => {
+                    paint_label_icon(painter, response.rect, color, MAIL_ACTION_GLYPH)
+                }
                 MailAction::Flag => paint_flag_icon(painter, response.rect, color),
                 MailAction::Export => paint_export_icon(painter, response.rect, color),
                 MailAction::Delete => {
@@ -3413,7 +3490,19 @@ impl KimoApp {
             } else {
                 format!("{} — no mail selected", action.label())
             });
-            if enabled && response.clicked() {
+            // The label cell carries the popup rather than running one action
+            // (`label_popup`): picking several labels is what it is for, so the
+            // menu stays open across the clicks in it, and it is drawn on every
+            // frame the cell is. The box starts empty for each mail it is opened
+            // on: what was typed for the last one is not a draft for this.
+            if enabled && action == MailAction::Label {
+                if let Some(key) = self.selected_mail_key() {
+                    if response.clicked() {
+                        self.label_draft.clear();
+                    }
+                    self.label_popup(&response, &key);
+                }
+            } else if enabled && response.clicked() {
                 match action {
                     MailAction::Export => self.export_selected_message(),
                     MailAction::Delete => self.delete_selected_message(),
@@ -3471,7 +3560,40 @@ impl KimoApp {
                 for (id, name, protocol) in &accounts {
                     self.account_section(ui, scheme, id, name, *protocol);
                 }
+                // Always the column's last group: the labels belong to no
+                // account, so they cannot be filed under one.
+                self.label_group(ui, scheme);
             });
+    }
+
+    /// The navigation column's last group: the user's labels, under every
+    /// account and its folders, drawn like folders because a label is a
+    /// first-class filter beside them. A selected one carries the selection
+    /// fill, and the message list shows the mail that carries **all** of the
+    /// selected ones (`KimoApp::toggle_label`).
+    fn label_group(&mut self, ui: &mut egui::Ui, scheme: ColorScheme) {
+        // Derived here for the same reason the accounts' rows are: the frame
+        // draws, and only a change derives.
+        self.refresh_label_view();
+        let Some(view) = &self.label_view else {
+            return;
+        };
+        if view.rows.is_empty() {
+            return;
+        }
+        let mut clicked: Option<String> = None;
+        ui.add_space(LABEL_GROUP_GAP);
+        label_group_header(ui, scheme);
+        ui.indent("label-rows", |ui| {
+            for row in &view.rows {
+                if label_row(ui, scheme, &row.name, row.count, row.selected).clicked() {
+                    clicked = Some(row.name.clone());
+                }
+            }
+        });
+        if let Some(name) = clicked {
+            self.toggle_label(&name);
+        }
     }
 
     /// One account in the navigation column: a header that collapses it, then
@@ -3626,8 +3748,14 @@ impl KimoApp {
         // emptied box ends the search). Running the search — and the settle
         // clock — is the frame's business, since the popup can be open over
         // any of this.
+        // Three lists can stand in the column, and in this order: a query's
+        // hits, a label filter's mail, or the folder's own. A query and a label
+        // filter are two answers to what the column shows, and
+        // `KimoApp::toggle_label` is where one gives way to the other.
         let listed = if self.search.is_active() {
             self.search_results(ui)
+        } else if !self.label_filter.is_empty() {
+            self.label_results(ui)
         } else {
             self.folder_messages(ui)
         };
@@ -4476,6 +4604,286 @@ impl KimoApp {
         });
     }
 
+    /// The label group's rows and the mail the filter selects, derived when
+    /// anything they depend on has moved: a label made or put on a mail
+    /// (`labels_rev`), the accounts' mail (`folders_rev` — mail arriving, or a
+    /// labelled mail being deleted) and the filter itself. A frame that changed
+    /// nothing re-derives nothing.
+    fn refresh_label_view(&mut self) {
+        let mail_rev = self
+            .states
+            .values()
+            .fold(0_u64, |sum, state| sum.wrapping_add(state.folders_rev));
+        let key = (self.labels_rev, mail_rev, self.label_filter.clone());
+        if self
+            .label_view
+            .as_ref()
+            .is_some_and(|view| view.key.as_ref() == Some(&key))
+        {
+            return;
+        }
+        // The counts are about every label; the matches are only asked for while
+        // a filter is on. An empty filter matches everything, which is exactly
+        // what must not be collected.
+        let filtered = !self.label_filter.is_empty();
+        let mut counts = vec![0_usize; self.labels.len()];
+        let mut matches = Vec::new();
+        for (account_id, state) in &self.states {
+            for folder in &state.mailbox.folders {
+                for message in &folder.messages {
+                    if message.labels.is_empty() {
+                        continue;
+                    }
+                    for (index, name) in self.labels.iter().enumerate() {
+                        if message.labels.contains(name) {
+                            counts[index] += 1;
+                        }
+                    }
+                    if !filtered
+                        || !self
+                            .label_filter
+                            .iter()
+                            .all(|name| message.labels.contains(name))
+                    {
+                        continue;
+                    }
+                    matches.push(LabelledMail {
+                        account_id: account_id.clone(),
+                        folder: folder.name.clone(),
+                        uid: message.uid.clone(),
+                        from: message.from.clone(),
+                        subject: message.subject.clone(),
+                        date: message.date.clone(),
+                        timestamp: message.timestamp,
+                        seen: message.seen,
+                        attachments: message.attachments.len(),
+                    });
+                }
+            }
+        }
+        // Newest first, and a total order besides: the filter spans every folder
+        // and account, so two mails of one timestamp would otherwise come out in
+        // whatever order the accounts were walked in.
+        matches.sort_by(|a, b| {
+            b.timestamp
+                .unwrap_or(0)
+                .cmp(&a.timestamp.unwrap_or(0))
+                .then_with(|| a.account_id.cmp(&b.account_id))
+                .then_with(|| a.folder.cmp(&b.folder))
+                .then_with(|| a.uid.cmp(&b.uid))
+        });
+        let rows = self
+            .labels
+            .iter()
+            .zip(&counts)
+            .map(|(name, &count)| LabelCount {
+                name: name.clone(),
+                count,
+                selected: self.label_filter.iter().any(|label| label == name),
+            })
+            .collect();
+        self.label_view = Some(LabelView {
+            key: Some(key),
+            rows,
+            matches,
+        });
+    }
+
+    /// Look at the mail one label holds, or stop looking at it: what a click on a
+    /// label in the navigation column does. One label narrows the list to the
+    /// mail that carries it, a second narrows it further — the filter is an AND,
+    /// so the list holds the mail that carries both — and a click on a selected
+    /// label takes it back out. The last one out leaves the folders' own list.
+    ///
+    /// The reading pane is deliberately left alone: the mail it shows is still
+    /// the mail it showed, and the filled folder row still says where that mail
+    /// is filed.
+    fn toggle_label(&mut self, name: &str) {
+        match self.label_filter.iter().position(|label| label == name) {
+            Some(index) => {
+                self.label_filter.remove(index);
+            }
+            None => {
+                self.label_filter.push(name.to_string());
+                self.label_filter.sort();
+            }
+        }
+        // Another list than the one the checks were made on.
+        self.cancel_select();
+        // A query and a label filter are two answers to what the middle column
+        // shows, and the label is the one that was just asked for.
+        self.end_search();
+        self.ctx.request_repaint();
+    }
+
+    /// End an active search, leaving the column to the folders — or to a label
+    /// filter that is about to take it. The popup's own Clear is the same thing
+    /// with its boxes in front of the user; this is what a label click does to a
+    /// query it replaces.
+    fn end_search(&mut self) {
+        if !self.search.is_active() {
+            return;
+        }
+        self.search = SearchQuery::default();
+        self.search_pending = None;
+        self.spawn_search();
+    }
+
+    /// The key of a mail the reading pane is showing: the account and folder the
+    /// pane reads from and the mail's own uid, which is what the label tables
+    /// name a message by.
+    fn pane_mail_key(&self, uid: &str) -> Option<MailKey> {
+        let account = self.selected_account.as_deref()?;
+        let folder = self.selected_folder.as_deref()?;
+        Some(MailKey::new(account, folder, uid))
+    }
+
+    /// The key of the mail the title bar's mail actions are about, if the pane
+    /// shows one — the pane's own lookup, so a uid it no longer shows is no
+    /// mail.
+    fn selected_mail_key(&self) -> Option<MailKey> {
+        if !self.has_selected_message() {
+            return None;
+        }
+        self.pane_mail_key(self.selected_message.as_deref()?)
+    }
+
+    /// The labels one mail carries, by name, read from the app's copy of the
+    /// mail — which is what the popup's checklist is drawn from and what the
+    /// card's chips say.
+    fn mail_labels(&self, key: &MailKey) -> Vec<String> {
+        self.states
+            .get(&key.account)
+            .and_then(|state| {
+                state
+                    .mailbox
+                    .folders
+                    .iter()
+                    .find(|folder| folder.name == key.folder)
+            })
+            .and_then(|folder| folder.messages.iter().find(|mail| mail.uid == key.uid))
+            .map(|mail| mail.labels.iter().cloned().collect())
+            .unwrap_or_default()
+    }
+
+    /// Put one label on a mail or take it off: what every click in the label
+    /// popup does.
+    ///
+    /// The app's own copy moves first, so the frame that follows draws it, and a
+    /// worker makes it durable (`Job::SetLabels`) — with the whole set, because
+    /// that is what the label tables hold. A name that is not a label yet is made
+    /// one by this click and by nothing else, and a name that differs only in
+    /// case from one that exists is that label: the spelling the user made first
+    /// is the one kept.
+    fn set_label_on_mail(&mut self, key: &MailKey, name: &str, on: bool) {
+        let name = name.trim();
+        if name.is_empty() {
+            return;
+        }
+        let label = self
+            .labels
+            .iter()
+            .find(|existing| existing.eq_ignore_ascii_case(name))
+            .cloned()
+            .unwrap_or_else(|| name.to_string());
+        let updated: Option<Vec<String>> = self
+            .states
+            .get_mut(&key.account)
+            .and_then(|state| {
+                state
+                    .mailbox
+                    .folders
+                    .iter_mut()
+                    .find(|folder| folder.name == key.folder)
+            })
+            .and_then(|folder| folder.messages.iter_mut().find(|mail| mail.uid == key.uid))
+            .map(|mail| {
+                if on {
+                    mail.labels.insert(label.clone());
+                } else {
+                    mail.labels.remove(&label);
+                }
+                mail.labels.iter().cloned().collect()
+            });
+        // The mail has left the state (deleted, or a folder opened in its
+        // place): there is nothing to label.
+        let Some(labels) = updated else {
+            return;
+        };
+        if on && !self.labels.contains(&label) {
+            self.labels.push(label);
+            // The order the column draws them in, which is the database's own
+            // (`db::load_labels`).
+            self.labels.sort_by_key(|name| name.to_lowercase());
+        }
+        self.labels_rev = self.labels_rev.wrapping_add(1);
+        sync::spawn(
+            Job::SetLabels {
+                account_id: key.account.clone(),
+                folder: key.folder.clone(),
+                uid: key.uid.clone(),
+                labels,
+            },
+            self.ctx.clone(),
+            self.tx.clone(),
+        );
+        self.ctx.request_repaint();
+    }
+
+    /// The label popup: the mail's labels as a checklist, and a box that makes a
+    /// new one by putting it on the mail — which is the only way a label comes
+    /// into being. Anchored to the cell that opened it (`Popup::menu`), and
+    /// closed by a click outside it rather than by a click on a label: picking
+    /// several is what the popup is for.
+    fn label_popup(&mut self, response: &egui::Response, key: &MailKey) {
+        let attached = self.mail_labels(key);
+        let mut toggled: Option<(String, bool)> = None;
+        let mut created = false;
+        egui::Popup::menu(response)
+            .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
+            .width(LABEL_POPUP_WIDTH)
+            .show(|ui| {
+                ui.set_min_width(LABEL_POPUP_WIDTH);
+                if self.labels.is_empty() {
+                    ui.label(
+                        egui::RichText::new("No labels yet — name one below.")
+                            .small()
+                            .weak(),
+                    );
+                }
+                egui::ScrollArea::vertical()
+                    .max_height(LABEL_POPUP_MAX_HEIGHT)
+                    .show(ui, |ui| {
+                        for name in &self.labels {
+                            let mut checked = attached.contains(name);
+                            if ui.checkbox(&mut checked, name).changed() {
+                                toggled = Some((name.clone(), checked));
+                            }
+                        }
+                    });
+                ui.separator();
+                ui.horizontal(|ui| {
+                    let field = ui.add(
+                        egui::TextEdit::singleline(&mut self.label_draft)
+                            .hint_text("New label…")
+                            .desired_width(LABEL_POPUP_FIELD_WIDTH),
+                    );
+                    let enter = entered(&field, ui);
+                    if (ui.button("Create").clicked() || enter)
+                        && !self.label_draft.trim().is_empty()
+                    {
+                        created = true;
+                    }
+                });
+            });
+        if let Some((name, on)) = toggled {
+            self.set_label_on_mail(key, &name, on);
+        } else if created {
+            let name = std::mem::take(&mut self.label_draft);
+            self.set_label_on_mail(key, name.trim(), true);
+        }
+    }
+
     /// The folder the list is showing, as `(account, folder)`: what a folder
     /// row's selection key and its checkbox id are built from. The rows are only
     /// drawn while a folder is open — the search results have a row of their
@@ -4511,6 +4919,21 @@ impl KimoApp {
             return None;
         }
         let key = MailKey::new(&hit.account_id, &hit.folder, &hit.uid);
+        Some(if self.selected_mails.contains(&key) {
+            CheckState::On
+        } else {
+            CheckState::Off
+        })
+    }
+
+    /// The same for one row of a label filter, whose mail is not necessarily
+    /// the open folder's: one mail is one row, so its box has no state between
+    /// off and on.
+    fn labelled_checkbox(&self, mail: &LabelledMail) -> Option<CheckState> {
+        if !self.select_mode {
+            return None;
+        }
+        let key = MailKey::new(&mail.account_id, &mail.folder, &mail.uid);
         Some(if self.selected_mails.contains(&key) {
             CheckState::On
         } else {
@@ -4882,6 +5305,168 @@ impl KimoApp {
         Some(list.content_size.y)
     }
 
+    /// The middle column while a label filter is on: one card per mail that
+    /// carries every selected label, newest first.
+    ///
+    /// A label filter is a lens over the whole mailbox — the mail of every
+    /// folder and account at once — so a row says where its mail lives the way a
+    /// search hit's does, and the list is flat rather than threaded, for the
+    /// same reason the hits are: where a mail sits among its own folder's
+    /// conversations is not what was asked for.
+    ///
+    /// Returns the height of the rows it drew, which is the height of the
+    /// column's card, or `None` when there is nothing on it (see `mail_list`).
+    fn label_results(&mut self, ui: &mut egui::Ui) -> Option<f32> {
+        self.refresh_label_view();
+        // A row was clicked: the mail it stands for is opened once the rows have
+        // stopped borrowing the view they came from — the same shape the folder
+        // list and the hits use. A box checks the row's mail instead (and a
+        // click on the row itself leaves select mode), and the row's own delete
+        // button takes it.
+        let mut clicked: Option<LabelledMail> = None;
+        let mut checked: Option<Vec<MailKey>> = None;
+        let mut deleted: Option<MailKey> = None;
+        let mut leave_select = false;
+        let mut select_all_clicked: Option<Vec<MailKey>> = None;
+        // The same pinned band the folder's list draws, about this list: one
+        // mail is one row here, and every row names the folder it lives in.
+        let select_all = self.select_mode;
+        let margin = egui::Margin {
+            top: LIST_PADDING.top + if select_all { SELECT_ALL_HEIGHT_I8 } else { 0 },
+            ..LIST_PADDING
+        };
+        let rows_top = LIST_PADDING.top as f32 + if select_all { SELECT_ALL_HEIGHT } else { 0.0 };
+        let select_all_id = row_widget_id("select-all", "labels", "", "");
+        let Some(view) = &self.label_view else {
+            return None;
+        };
+        if view.matches.is_empty() {
+            ui.centered_and_justified(|ui| {
+                ui.label(
+                    egui::RichText::new("No mail carries all of these labels.")
+                        .weak()
+                        .heading(),
+                );
+            });
+            // Nothing to scroll: whatever the labels hold, this *is* the bottom
+            // of the list, and the bar is docked over it.
+            self.list_scroll = 0.0;
+            return None;
+        }
+        let matches = &view.matches;
+        let list = egui::ScrollArea::vertical()
+            .auto_shrink([false, false])
+            .show_viewport(ui, |ui, viewport| {
+                egui::Frame::new().inner_margin(margin).show(ui, |ui| {
+                    ui.spacing_mut().item_spacing.y = 0.0;
+                    virtual_rows(
+                        ui,
+                        viewport,
+                        rows_top,
+                        MESSAGE_ROW_HEIGHT,
+                        matches.len(),
+                        |ui, rows| {
+                            for index in rows {
+                                let mail = &matches[index];
+                                let drawn = self.labelled_row(ui, mail, index == 0);
+                                if drawn.delete.clicked() {
+                                    deleted = Some(MailKey::new(
+                                        &mail.account_id,
+                                        &mail.folder,
+                                        &mail.uid,
+                                    ));
+                                } else if drawn.checkbox.clicked() {
+                                    checked = Some(vec![MailKey::new(
+                                        &mail.account_id,
+                                        &mail.folder,
+                                        &mail.uid,
+                                    )]);
+                                } else if drawn.row.clicked() {
+                                    if self.select_mode {
+                                        leave_select = true;
+                                    } else {
+                                        clicked = Some(mail.clone());
+                                    }
+                                }
+                            }
+                        },
+                    );
+                });
+            });
+        if select_all {
+            let band = select_all_band(list.inner_rect);
+            let state = select_all_state(self.selected_mails.len(), matches.len());
+            if self.select_all_row(ui, band, state, matches.len(), select_all_id) {
+                select_all_clicked = Some(
+                    matches
+                        .iter()
+                        .map(|mail| MailKey::new(&mail.account_id, &mail.folder, &mail.uid))
+                        .collect(),
+                );
+            }
+        }
+        // A scrolled filter floats the bar exactly like the folder's list does.
+        self.list_scroll = list.state.offset.y;
+        if let Some(keys) = checked {
+            self.toggle_check(keys);
+            self.ctx.request_repaint();
+        }
+        if let Some(key) = deleted {
+            self.delete_mail(&key.account, &key.folder, &key.uid);
+        }
+        if let Some(keys) = select_all_clicked {
+            self.toggle_all(keys);
+            self.ctx.request_repaint();
+        }
+        if leave_select {
+            self.cancel_select();
+            self.ctx.request_repaint();
+        }
+        // Opening a mail of the filter does not end the filter: the list is the
+        // lens the user is reading the mailbox through, and the pane is what
+        // they are reading — the same division a search's hits have.
+        if let Some(mail) = clicked {
+            self.open_mail_at(&mail.account_id, &mail.folder, &mail.uid);
+        }
+        Some(list.content_size.y)
+    }
+
+    /// One row of a label filter: the card a message row is, with where the mail
+    /// lives as its third line. The filter spans folders and accounts, so where
+    /// a mail is filed is the one thing about it the row has to add — the rest
+    /// is the mail's own.
+    fn labelled_row(&self, ui: &mut egui::Ui, mail: &LabelledMail, first: bool) -> RowResponse {
+        let checkbox = self.labelled_checkbox(mail);
+        let selected = (self.selected_account.as_deref() == Some(mail.account_id.as_str())
+            && self.selected_folder.as_deref() == Some(mail.folder.as_str())
+            && self.selected_message.as_deref() == Some(mail.uid.as_str()))
+            || checkbox == Some(CheckState::On);
+        let account = self
+            .accounts
+            .iter()
+            .find(|account| account.id == mail.account_id)
+            .map(|account| account.name.as_str())
+            .unwrap_or(mail.account_id.as_str());
+        let folder = crate::protocol::imap::decode_mailbox_name(&mail.folder);
+        let third = format!("{account} · {folder}");
+        let card = CardText {
+            from: &mail.from,
+            title: &mail.subject,
+            date: &date_label(mail.timestamp, &mail.date),
+            third: &third,
+            unread: !mail.seen,
+            selected,
+            has_attachments: mail.attachments > 0,
+            place: RowPlace::Plain,
+            checkbox,
+            // Named by where the mail lives, like a hit's: two accounts' uids
+            // can be the same string.
+            checkbox_id: row_widget_id("mail-checkbox", &mail.account_id, &mail.folder, &mail.uid),
+            delete_id: row_widget_id("mail-delete", &mail.account_id, &mail.folder, &mail.uid),
+        };
+        self.message_card(ui, &card, first)
+    }
+
     /// Ask for what the search popup is showing, once the query has held still;
     /// `force` is Enter (or Search/Clear), which skips the wait.
     fn pump_search(&mut self, force: bool) {
@@ -4952,26 +5537,34 @@ impl KimoApp {
         );
     }
 
-    /// Open a search result: switch to the account and folder it lives in, then
-    /// open the message the way a click in the list would.
+    /// Open a search result: where the hit lives is all the row knows, and that
+    /// is all this needs.
     fn open_hit(&mut self, hit: &SearchHit) {
+        self.open_mail_at(&hit.account_id, &hit.folder, &hit.uid);
+    }
+
+    /// Open one mail by where it lives: switch to the account and folder it is
+    /// filed in, then open it the way a click in the list would. What a search
+    /// hit's row and a label filter's row both do — neither list is a folder's,
+    /// so neither row can be opened by the column's own selection.
+    fn open_mail_at(&mut self, account_id: &str, folder: &str, uid: &str) {
         let Some(protocol) = self
             .accounts
             .iter()
-            .find(|account| account.id == hit.account_id)
+            .find(|account| account.id == account_id)
             .map(|account| account.protocol)
         else {
             return;
         };
-        self.select_folder(hit.account_id.clone(), hit.folder.clone(), protocol);
-        // The whole mailbox is in memory, so the hit is normally right there.
+        self.select_folder(account_id.to_string(), folder.to_string(), protocol);
+        // The whole mailbox is in memory, so the mail is normally right there.
         // If it is not (the account was edited under us), the pane stays empty
         // instead of opening somebody else's mail.
         let message = self
             .states
-            .get(&hit.account_id)
-            .and_then(|state| state.mailbox.folders.iter().find(|f| f.name == hit.folder))
-            .and_then(|folder| folder.messages.iter().find(|m| m.uid == hit.uid))
+            .get(account_id)
+            .and_then(|state| state.mailbox.folders.iter().find(|f| f.name == folder))
+            .and_then(|folder| folder.messages.iter().find(|m| m.uid == uid))
             .cloned();
         if let Some(message) = message {
             self.open_message(&message);
@@ -5774,12 +6367,14 @@ impl KimoApp {
         // all and forward open their compose right here (the card comes up
         // under this mail, `ComposeSpot::Pane`), and delete takes this one
         // mail, the same `Job::DeleteMessage` the row's own button sends. The
-        // cells are the bar's own (`card_action_button` — the bar's button in a
-        // smaller square — and the bar's glyphs), so the two runs read as one
-        // family, delete outermost as it is in the bar. The cells are not the
-        // bar's size: on a card they share their row with the sender, and a
-        // 32 pt square would make the row read as a piece of the bar rather
-        // than of the mail.
+        // label cell opens the label popup on this mail, so a mail is labelled
+        // where it is read. The cells are the bar's own
+        // (`card_action_button` — the bar's button in a smaller square — and
+        // the bar's glyphs), so the two runs read as one family, delete
+        // outermost as it is in the bar, and the five are the bar's run with
+        // flag and export left out. The cells are not the bar's size: on a card
+        // they share their row with the sender, and a 32 pt square would make
+        // the row read as a piece of the bar rather than of the mail.
         //
         // The row is laid out from its right end, so the actions take the room
         // they need and the name is elided against what is left: laid out from
@@ -5800,6 +6395,7 @@ impl KimoApp {
                 ui.spacing_mut().item_spacing.x = TITLEBAR_BUTTON_GAP;
                 for action in [
                     MailAction::Delete,
+                    MailAction::Label,
                     MailAction::Forward,
                     MailAction::ReplyAll,
                     MailAction::Reply,
@@ -5817,12 +6413,26 @@ impl KimoApp {
                         MailAction::Forward => {
                             paint_forward_icon(painter, response.rect, color, CARD_ACTION_GLYPH)
                         }
+                        MailAction::Label => {
+                            paint_label_icon(painter, response.rect, color, CARD_ACTION_GLYPH)
+                        }
                         MailAction::Delete => {
                             paint_delete_icon(painter, response.rect, color, CARD_ACTION_GLYPH)
                         }
-                        _ => unreachable!("the four the head draws"),
+                        _ => unreachable!("the five the head draws"),
                     }
-                    if response.on_hover_text(action.tooltip()).clicked() {
+                    let hovered = response.on_hover_text(action.tooltip());
+                    if action == MailAction::Label {
+                        // The card is the mail's own head, so labelling happens
+                        // here the way answering does: the popup about this
+                        // mail, opened from the cell on it.
+                        if let Some(key) = self.pane_mail_key(&msg.uid) {
+                            if hovered.clicked() {
+                                self.label_draft.clear();
+                            }
+                            self.label_popup(&hovered, &key);
+                        }
+                    } else if hovered.clicked() {
                         if action == MailAction::Delete {
                             delete = true;
                         } else {
@@ -5867,6 +6477,13 @@ impl KimoApp {
                 return;
             };
             self.delete_mail(&account_id, &folder, &msg.uid);
+        }
+        // What the user has marked the mail with, on the mail itself: the label
+        // popup's checkmarks say it while it is open, and these say it after it
+        // has closed. A mail nobody labelled carries no row at all.
+        if !msg.labels.is_empty() {
+            ui.add_space(LABEL_CHIPS_TOP_GAP);
+            label_chips(ui, scheme, &msg.labels);
         }
         ui.heading(msg.subject.as_str());
         if !msg.to.is_empty() {
@@ -7044,6 +7661,31 @@ const MAIL_ACTION_GLYPH: f32 = 18.0;
 /// bar they share theirs with the window's own controls.
 const CARD_ACTION_SIZE: f32 = 26.0;
 const CARD_ACTION_GLYPH: f32 = 15.0;
+
+/// What the navigation column's label group keeps clear of the account above
+/// it: the folders of an account end with a gap of their own, and this is what
+/// makes the group read as its own thing under all of them.
+const LABEL_GROUP_GAP: f32 = 10.0;
+
+/// The label popup (the label cell's menu): as wide as its checklist and its
+/// new-label box want, and no taller than this before the labels scroll — a
+/// user with fifty labels should not get a menu taller than the window.
+const LABEL_POPUP_WIDTH: f32 = 220.0;
+const LABEL_POPUP_MAX_HEIGHT: f32 = 240.0;
+const LABEL_POPUP_FIELD_WIDTH: f32 = 120.0;
+
+/// The labels a mail carries, drawn on its own card under the head: one chip per
+/// label, as wide as the name wants, wrapping when the run does not fit the
+/// card. The fill is the scheme's hover — the palette's faintest surface that is
+/// not the card itself — and the text weak, because the labels are a note about
+/// the mail rather than part of it. The corner is half the height, so a chip
+/// reads as a pill rather than as a small button.
+const LABEL_CHIP_HEIGHT: f32 = 18.0;
+const LABEL_CHIP_PADDING: f32 = 6.0;
+const LABEL_CHIP_GAP: f32 = 4.0;
+const LABEL_CHIP_CORNER_RADIUS: u8 = 9;
+/// What the chip run keeps clear of the head row above it.
+const LABEL_CHIPS_TOP_GAP: f32 = 6.0;
 
 /// How long the line above the message list stays there: long enough to read a
 /// path — or that a mail went out — and act on it, short enough not to become
@@ -8246,6 +8888,43 @@ fn paint_row_text(
 /// Account header in the navigation column: a disclosure triangle, the
 /// account name and its unread total. Clicking the row collapses or expands
 /// the account's folders.
+/// The labels a mail carries, drawn as one run of chips on the mail's own card:
+/// what the user marked it with, said on the mail rather than only in the popup
+/// that put it there. Each chip is as wide as its name wants, and the run wraps
+/// where the next one does not fit — the way the attachment cards under the body
+/// do — so a mail with a handful of labels says so without widening the card.
+fn label_chips(ui: &mut egui::Ui, scheme: ColorScheme, labels: &BTreeSet<String>) {
+    ui.horizontal_wrapped(|ui| {
+        ui.spacing_mut().item_spacing = egui::vec2(LABEL_CHIP_GAP, LABEL_CHIP_GAP);
+        for name in labels {
+            let small = egui::TextStyle::Small.resolve(ui.style());
+            let galley = ui
+                .ctx()
+                .fonts_mut(|fonts| fonts.layout_no_wrap(name.clone(), small, scheme.text_weak));
+            let (rect, _) = ui.allocate_exact_size(
+                egui::vec2(
+                    galley.size().x + LABEL_CHIP_PADDING * 2.0,
+                    LABEL_CHIP_HEIGHT,
+                ),
+                egui::Sense::hover(),
+            );
+            ui.painter().rect_filled(
+                rect,
+                egui::CornerRadius::same(LABEL_CHIP_CORNER_RADIUS),
+                scheme.hover,
+            );
+            ui.painter().galley(
+                egui::pos2(
+                    rect.center().x - galley.size().x / 2.0,
+                    rect.center().y - galley.size().y / 2.0,
+                ),
+                galley,
+                scheme.text_weak,
+            );
+        }
+    });
+}
+
 fn account_row(
     ui: &mut egui::Ui,
     scheme: ColorScheme,
@@ -8403,6 +9082,109 @@ fn folder_row(
         response
     } else {
         response.on_hover_text("No longer on the server — the mail cached for it is still here")
+    }
+}
+
+/// The heading of the navigation column's label group. A label is not an
+/// account: there is nothing to collapse and nothing to count under it as a
+/// whole, so the heading is the word alone — at the column's left edge, where
+/// the accounts' own names are, with the label rows indented under it the way
+/// folders are.
+fn label_group_header(ui: &mut egui::Ui, scheme: ColorScheme) {
+    const ROW_HEIGHT: f32 = 20.0;
+    /// Where the accounts' names start, so the two headings line up.
+    const TEXT_LEFT: f32 = 20.0;
+
+    let (rect, _) = ui.allocate_exact_size(
+        egui::vec2(ui.available_width(), ROW_HEIGHT),
+        egui::Sense::hover(),
+    );
+    if !ui.is_rect_visible(rect) {
+        return;
+    }
+    let small = egui::TextStyle::Small.resolve(ui.style());
+    let name = ui
+        .ctx()
+        .fonts_mut(|fonts| fonts.layout_no_wrap("Labels".to_string(), small, scheme.text_weak));
+    ui.painter().galley(
+        egui::pos2(
+            rect.left() + TEXT_LEFT,
+            rect.center().y - name.size().y / 2.0,
+        ),
+        name,
+        scheme.text_weak,
+    );
+}
+
+/// One label in the navigation column: the bar's own tag glyph where a folder
+/// row has its icon, the name, and how much mail carries it. A selected one
+/// takes the selection fill, and a click anywhere on the row is what toggles
+/// that — the whole row is the target, for the same reason a folder's is. A
+/// label with mail under it reads brighter than one whose mail has all let it
+/// go, which is the one thing the count is there to say.
+fn label_row(
+    ui: &mut egui::Ui,
+    scheme: ColorScheme,
+    name: &str,
+    count: usize,
+    selected: bool,
+) -> egui::Response {
+    const ROW_HEIGHT: f32 = 22.0;
+    const GLYPH_BOX: f32 = 16.0;
+    const GLYPH: f32 = 14.0;
+
+    let (rect, response) = ui.allocate_exact_size(
+        egui::vec2(ui.available_width(), ROW_HEIGHT),
+        egui::Sense::click(),
+    );
+    if !ui.is_rect_visible(rect) {
+        return response;
+    }
+    if selected {
+        ui.painter().rect_filled(rect, 3.0_f32, scheme.selection);
+    } else if response.hovered() {
+        ui.painter().rect_filled(rect, 3.0_f32, scheme.hover);
+    }
+    let color = if selected || count > 0 {
+        scheme.text
+    } else {
+        scheme.text_weak
+    };
+
+    let glyph_center = egui::pos2(rect.left() + 4.0 + GLYPH_BOX / 2.0, rect.center().y);
+    paint_label_icon(
+        ui.painter(),
+        egui::Rect::from_center_size(glyph_center, egui::Vec2::splat(GLYPH_BOX)),
+        color,
+        GLYPH,
+    );
+
+    let left = rect.left() + 4.0 + GLYPH_BOX + 6.0;
+    let mut right = rect.right() - 6.0;
+    if count > 0 {
+        let small = egui::TextStyle::Small.resolve(ui.style());
+        let text = ui
+            .ctx()
+            .fonts_mut(|fonts| fonts.layout_no_wrap(count.to_string(), small, color));
+        right -= text.size().x;
+        ui.painter().galley(
+            egui::pos2(right, rect.center().y - text.size().y / 2.0),
+            text,
+            color,
+        );
+        right -= 6.0;
+    }
+    let body = egui::TextStyle::Body.resolve(ui.style());
+    let label = truncate_galley(ui.ctx(), name, body.size, color, (right - left).max(1.0));
+    ui.painter().galley(
+        egui::pos2(left, rect.center().y - label.size().y / 2.0),
+        label,
+        color,
+    );
+    if selected {
+        response.on_hover_text(format!("Stop filtering by {name}"))
+    } else {
+        response.on_hover_text(format!("Show the mail labelled {name}"))
     }
 }
 
@@ -8891,8 +9673,8 @@ fn paint_forward_icon(p: &egui::Painter, rect: egui::Rect, color: egui::Color32,
 
 /// Label: a tag — a square turned so that it points right, with the hole near
 /// its flat end.
-fn paint_label_icon(p: &egui::Painter, rect: egui::Rect, color: egui::Color32) {
-    let g = |x: f32, y: f32| glyph_point(rect.center(), x, y);
+fn paint_label_icon(p: &egui::Painter, rect: egui::Rect, color: egui::Color32, size: f32) {
+    let g = |x: f32, y: f32| outline_point(rect.center(), x, y, size);
     let stroke = egui::Stroke::new(1.5_f32, color);
     p.add(egui::Shape::line(
         vec![
@@ -8906,7 +9688,7 @@ fn paint_label_icon(p: &egui::Painter, rect: egui::Rect, color: egui::Color32) {
         stroke,
     ));
     // The hole is a dot rather than a ring: at this size a ring closes up.
-    p.circle_filled(g(7.5, 7.5), MAIL_ACTION_GLYPH * 0.055, color);
+    p.circle_filled(g(7.5, 7.5), size * 0.055, color);
 }
 
 /// Flag: a pole with a swallow-tailed pennant on it.
@@ -9455,6 +10237,7 @@ mod tests {
             preview: "preview".to_string(),
             attachments: Vec::new(),
             inline_images: Vec::new(),
+            labels: BTreeSet::new(),
         }
     }
 
@@ -9495,8 +10278,11 @@ mod tests {
         // The fixtures below measure geometry, and the warning the app carries
         // when *this machine's* database cannot be written stands at the top of
         // the middle column, over the first row. It is a fact about the machine,
-        // not about the layout the test is pinning.
+        // not about the layout the test is pinning — and so are the labels the
+        // machine's database holds, which the app loads at startup.
         app.storage_warning = None;
+        app.labels.clear();
+        app.label_view = None;
         app
     }
 
@@ -13810,6 +14596,7 @@ mod tests {
                 preview: String::new(),
                 attachments: vec![],
                 inline_images: vec![],
+                labels: BTreeSet::new(),
             },
             MailMessage {
                 uid: "2".into(),
@@ -13827,6 +14614,7 @@ mod tests {
                 preview: String::new(),
                 attachments: vec![],
                 inline_images: vec![],
+                labels: BTreeSet::new(),
             },
         ];
         sort_messages(&mut msgs);
@@ -14146,14 +14934,16 @@ mod tests {
             preview: "Here it is.".to_string(),
             attachments: Vec::new(),
             inline_images: Vec::new(),
+            labels: BTreeSet::new(),
         }
     }
 
     /// Where a mail's action cells sit, on the pane's first card: the right
     /// end of its head row — the sender's own row, above the subject —
     /// against the card's own padding, delete outermost as the title bar has
-    /// it. `from_right` counts cells from the right: 0 delete, 1 forward,
-    /// 2 reply all, 3 reply.
+    /// it. `from_right` counts cells from the right: 0 delete, 1 label,
+    /// 2 forward, 3 reply all, 4 reply — the bar's own run with flag and
+    /// export left out.
     fn header_action_center(from_right: usize) -> egui::Pos2 {
         let stride = CARD_ACTION_SIZE + TITLEBAR_BUTTON_GAP;
         let row_height = AVATAR_DIAMETER.max(CARD_ACTION_SIZE);
@@ -14223,7 +15013,7 @@ mod tests {
 
         // The reply cell, on the mail's header: the card comes up under the
         // mail.
-        click_at(&ctx, &mut app, header_action_center(3));
+        click_at(&ctx, &mut app, header_action_center(4));
         let draft = app.compose.as_ref().expect("the reply opened a draft");
         assert_eq!(app.compose_spot, ComposeSpot::Pane);
         assert_eq!(draft.kind, ComposeKind::Reply);
@@ -14319,7 +15109,7 @@ mod tests {
         // what the pointer fills under one is `CARD_ACTION_SIZE` square,
         // where a title-bar cell fills the whole `TITLEBAR_BUTTON_SIZE`.
         let scheme = theme::of(&ctx);
-        let cell = header_action_center(3);
+        let cell = header_action_center(4);
         let filled = fill_under_the_pointer(&ctx, &mut app, 1400.0, cell, CARD_ACTION_SIZE)
             .unwrap_or_else(|| panic!("nothing filled under the reply cell at {cell:?}"));
         assert_eq!(filled.rect.center(), cell);
@@ -14416,7 +15206,7 @@ mod tests {
 
         // The oldest mail's reply cell — the conversation was opened on the
         // newest, and the answer is the oldest's own.
-        click_at(&ctx, &mut app, header_action_center(3));
+        click_at(&ctx, &mut app, header_action_center(4));
         let draft = app.compose.as_ref().expect("the reply opened a draft");
         assert_eq!(app.compose_spot, ComposeSpot::Pane);
         assert_eq!(
@@ -14469,12 +15259,769 @@ mod tests {
         let mut app = app_with_messages(&ctx, 3);
         app.selected_message = Some("0".to_string());
         run_app_frame(&ctx, &mut app, Vec::new());
-        click_at(&ctx, &mut app, header_action_center(3));
+        click_at(&ctx, &mut app, header_action_center(4));
         assert_eq!(app.compose_spot, ComposeSpot::Pane);
 
         app.selected_message = None;
         run_app_frame(&ctx, &mut app, Vec::new());
         assert_eq!(app.compose_spot, ComposeSpot::Popup);
         assert!(app.compose.is_some(), "the move kept the draft");
+    }
+
+    // ----- labels ------------------------------------------------------------
+
+    /// The boxes of every run of text a frame drew as exactly `text`, inside
+    /// `rect`, in the order they were painted. The same name can be drawn
+    /// twice — the navigation column's label group, and a popup over it — and
+    /// the one painted last is the one on top.
+    fn text_boxes_of(
+        shapes: &[egui::epaint::ClippedShape],
+        rect: egui::Rect,
+        text: &str,
+    ) -> Vec<egui::Rect> {
+        let mut out = Vec::new();
+        for clipped in shapes {
+            collect_text_boxes_of(&clipped.shape, rect, text, &mut out);
+        }
+        out
+    }
+
+    fn collect_text_boxes_of(
+        shape: &egui::Shape,
+        rect: egui::Rect,
+        text: &str,
+        out: &mut Vec<egui::Rect>,
+    ) {
+        match shape {
+            egui::Shape::Text(run) => {
+                let drawn = egui::Rect::from_min_size(run.pos, run.galley.size());
+                if run.galley.text() == text && rect.contains_rect(drawn) {
+                    out.push(drawn);
+                }
+            }
+            egui::Shape::Vec(shapes) => {
+                for shape in shapes {
+                    collect_text_boxes_of(shape, rect, text, out);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// The navigation column's own rect this frame: everything left of the
+    /// message list.
+    fn nav_column(app: &KimoApp) -> egui::Rect {
+        egui::Rect::from_min_max(egui::Pos2::ZERO, egui::pos2(app.list_column.left(), 900.0))
+    }
+
+    /// The part of the window a label popup opens over: right of the navigation
+    /// column and below the title bar, which is where both cells that open one
+    /// sit — and what keeps the column's own label row out of a search for a
+    /// name the popup draws too.
+    fn popup_area() -> egui::Rect {
+        egui::Rect::from_min_max(
+            egui::pos2(400.0, TITLEBAR_HEIGHT),
+            egui::pos2(1400.0, 900.0),
+        )
+    }
+
+    /// An app with two accounts, each holding one INBOX of `mails` mails named
+    /// `<account>-<n>`, one second apart. What the label tests need: a label
+    /// spans the whole mailbox — every account and folder at once — and the
+    /// navigation column's label group stands under all of them.
+    fn app_with_two_accounts(ctx: &egui::Context, mails: usize) -> KimoApp {
+        let mut app = app_with_messages(ctx, 0);
+        app.accounts = ["acct", "other"]
+            .iter()
+            .map(|id| Account {
+                id: id.to_string(),
+                name: id.to_string(),
+                protocol: Protocol::Imap,
+                host: "imap.example.com".to_string(),
+                port: 993,
+                username: "ada".to_string(),
+                password: "secret".to_string(),
+                tls: TlsMode::Implicit,
+                smtp: None,
+            })
+            .collect();
+        let mut states = HashMap::new();
+        for account in &app.accounts {
+            let messages: Vec<MailMessage> = (0..mails)
+                .map(|index| {
+                    let mut mail = test_message(&format!("{}-{index}", account.id), false);
+                    mail.timestamp = Some(1_700_000_000 + index as i64);
+                    mail
+                })
+                .collect();
+            states.insert(
+                account.id.clone(),
+                AccountUiState {
+                    folders: vec!["INBOX".to_string()],
+                    mailbox: storage::Mailbox {
+                        folders: vec![storage::Folder {
+                            name: "INBOX".to_string(),
+                            uidvalidity: Some(1),
+                            synced: true,
+                            listed: true,
+                            can_load_older: false,
+                            messages,
+                        }],
+                    },
+                    ..Default::default()
+                },
+            );
+        }
+        app.states = states;
+        app.selected_account = Some("acct".to_string());
+        app.selected_folder = Some("INBOX".to_string());
+        app
+    }
+
+    /// Put one label on a mail of the fixture, the way the app's own copy of the
+    /// mail's labels has to be for anything to be derived from it: the marks are
+    /// the message's own (`MailMessage::labels`), and what the view reads.
+    fn label_mail(app: &mut KimoApp, account: &str, folder: &str, uid: &str, name: &str) {
+        {
+            let mail = app
+                .states
+                .get_mut(account)
+                .and_then(|state| {
+                    state
+                        .mailbox
+                        .folders
+                        .iter_mut()
+                        .find(|candidate| candidate.name == folder)
+                })
+                .and_then(|folder| folder.messages.iter_mut().find(|mail| mail.uid == uid))
+                .unwrap_or_else(|| panic!("no mail {uid} in {account}/{folder}"));
+            mail.labels.insert(name.to_string());
+        }
+        if !app.labels.iter().any(|label| label == name) {
+            app.labels.push(name.to_string());
+            app.labels.sort_by_key(|name| name.to_lowercase());
+        }
+        app.labels_rev = app.labels_rev.wrapping_add(1);
+    }
+
+    /// Click one label's row in the navigation column: the whole row is the
+    /// target, and its name is what it draws.
+    fn click_label(ctx: &egui::Context, app: &mut KimoApp, name: &str) {
+        let shapes = frame_shapes_at(ctx, app, 1400.0);
+        let row = text_boxes_of(&shapes, nav_column(app), name)
+            .into_iter()
+            .next()
+            .unwrap_or_else(|| panic!("the column draws no row for {name}"));
+        click_at(ctx, app, row.center());
+    }
+
+    /// Where one of the title bar's mail action cells sits: the bar's own
+    /// arithmetic, from the search box the run is laid out after onwards
+    /// (`titlebar_rects`, `titlebar_fit`).
+    fn titlebar_action_center(
+        ctx: &egui::Context,
+        app: &mut KimoApp,
+        action: MailAction,
+        width: f32,
+    ) -> egui::Pos2 {
+        frame_shapes_at(ctx, app, width);
+        let search = ctx
+            .read_response(egui::Id::new("titlebar-search"))
+            .expect("the bar drew no search box")
+            .rect;
+        let bar = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(width, TITLEBAR_HEIGHT));
+        let rects = titlebar_rects(bar, 3);
+        let cells = titlebar_cells_width(MailAction::ALL.len());
+        let fit = titlebar_fit(rects.cog.min.x - search.left(), cells);
+        assert!(fit.actions, "the bar gave the actions up at {width} pt");
+        let index = MailAction::ALL
+            .iter()
+            .position(|candidate| *candidate == action)
+            .expect("one of the seven");
+        egui::pos2(
+            search.right()
+                + fit.padding
+                + index as f32 * (TITLEBAR_BUTTON_SIZE + TITLEBAR_BUTTON_GAP)
+                + TITLEBAR_BUTTON_SIZE / 2.0,
+            TITLEBAR_HEIGHT / 2.0,
+        )
+    }
+
+    /// The labels are a group of their own, and the navigation column's last
+    /// one: under every account and its folders, headed by the word alone — a
+    /// label is not an account, so there is nothing to collapse — with the mail
+    /// each holds counted beside it.
+    #[test]
+    fn the_labels_are_the_navigation_columns_last_group() {
+        let ctx = egui::Context::default();
+        crate::fonts::install(&ctx, None, None);
+        let mut app = app_with_two_accounts(&ctx, 2);
+        label_mail(&mut app, "acct", "INBOX", "acct-0", "Work");
+        label_mail(&mut app, "acct", "INBOX", "acct-1", "Work");
+        label_mail(&mut app, "other", "INBOX", "other-0", "Travel");
+
+        // What the group says, before the frame draws it: both labels, in name
+        // order, each with the amount of mail under it.
+        app.refresh_label_view();
+        let rows = &app.label_view.as_ref().expect("derived just above").rows;
+        assert_eq!(
+            rows.iter()
+                .map(|row| (row.name.as_str(), row.count, row.selected))
+                .collect::<Vec<_>>(),
+            [("Travel", 1, false), ("Work", 2, false)]
+        );
+
+        let shapes = frame_shapes_at(&ctx, &mut app, 1400.0);
+        let nav = nav_column(&app);
+        let heading = text_boxes_of(&shapes, nav, "Labels")
+            .into_iter()
+            .next()
+            .expect("the group is headed");
+        let work = text_boxes_of(&shapes, nav, "Work")
+            .into_iter()
+            .next()
+            .expect("the row is drawn");
+        let travel = text_boxes_of(&shapes, nav, "Travel")
+            .into_iter()
+            .next()
+            .expect("the second row too");
+        // The heading, then the rows in name order: Travel before Work.
+        assert!(
+            heading.top() < travel.top() && travel.bottom() <= work.top(),
+            "the group draws its heading and then its rows: {heading:?} {travel:?} {work:?}"
+        );
+        // Under every account: the folders of both are above the heading, and
+        // an account's name with them.
+        for folder in ["INBOX", "acct", "other"] {
+            for row in text_boxes_of(&shapes, nav, folder) {
+                assert!(
+                    row.bottom() <= heading.top(),
+                    "{folder} is drawn under the label group: {row:?} against {heading:?}"
+                );
+            }
+        }
+    }
+
+    /// A click on a label is a filter over the whole mailbox: the list becomes
+    /// the mail carrying it — the mail of every folder and account at once, each
+    /// row saying where it lives — and a click on the same label takes the
+    /// filter back out.
+    #[test]
+    fn clicking_a_label_narrows_the_list_to_its_mail() {
+        let ctx = egui::Context::default();
+        crate::fonts::install(&ctx, None, None);
+        let mut app = app_with_two_accounts(&ctx, 2);
+        // The two accounts' mail, one labelled each: the folder's own list is
+        // never what the filter shows.
+        label_mail(&mut app, "acct", "INBOX", "acct-0", "Work");
+        label_mail(&mut app, "other", "INBOX", "other-1", "Work");
+
+        click_label(&ctx, &mut app, "Work");
+        assert_eq!(app.label_filter, ["Work".to_string()]);
+
+        let texts = frame_texts(&ctx, &mut app);
+        let drawn = |text: &str| texts.iter().any(|run| run == text);
+        assert!(drawn("Subject acct-0") && drawn("Subject other-1"));
+        assert!(
+            !drawn("Subject acct-1") && !drawn("Subject other-0"),
+            "the list is the label's mail, not the folder's: {texts:?}"
+        );
+        // The rows are the search rows' shape: where a mail lives, because the
+        // filter spans the accounts.
+        assert!(drawn("acct · INBOX") && drawn("other · INBOX"), "{texts:?}");
+
+        // The same click again: the filter is off, and the column is the
+        // folder's list.
+        click_label(&ctx, &mut app, "Work");
+        assert!(app.label_filter.is_empty());
+        let texts = frame_texts(&ctx, &mut app);
+        assert!(texts.iter().any(|run| run == "Subject acct-1"));
+        assert!(!texts.iter().any(|run| run == "Subject other-1"));
+    }
+
+    /// Two labels narrow the list rather than widening it: the filter is an AND,
+    /// so the list is the mail that carries both — and taking one back out
+    /// leaves the other's mail.
+    #[test]
+    fn two_labels_filter_with_an_and_and_a_click_takes_one_back() {
+        let ctx = egui::Context::default();
+        crate::fonts::install(&ctx, None, None);
+        let mut app = app_with_two_accounts(&ctx, 2);
+        label_mail(&mut app, "acct", "INBOX", "acct-0", "Work");
+        label_mail(&mut app, "acct", "INBOX", "acct-1", "Work");
+        label_mail(&mut app, "acct", "INBOX", "acct-1", "Travel");
+        label_mail(&mut app, "other", "INBOX", "other-0", "Travel");
+
+        click_label(&ctx, &mut app, "Work");
+        let texts = frame_texts(&ctx, &mut app);
+        let drawn = |text: &str| texts.iter().any(|run| run == text);
+        assert!(drawn("Subject acct-0") && drawn("Subject acct-1"));
+        assert!(!drawn("Subject other-0"));
+
+        click_label(&ctx, &mut app, "Travel");
+        assert_eq!(app.label_filter, ["Travel".to_string(), "Work".to_string()]);
+        let texts = frame_texts(&ctx, &mut app);
+        let drawn = |text: &str| texts.iter().any(|run| run == text);
+        assert!(
+            drawn("Subject acct-1"),
+            "the one mail carrying both: {texts:?}"
+        );
+        assert!(
+            !drawn("Subject acct-0") && !drawn("Subject other-0"),
+            "an AND narrows: {texts:?}"
+        );
+
+        // One out again: the other's mail comes back.
+        click_label(&ctx, &mut app, "Work");
+        assert_eq!(app.label_filter, ["Travel".to_string()]);
+        let texts = frame_texts(&ctx, &mut app);
+        let drawn = |text: &str| texts.iter().any(|run| run == text);
+        assert!(drawn("Subject acct-1") && drawn("Subject other-0"));
+        assert!(!drawn("Subject acct-0"));
+    }
+
+    /// Developer tool (there is no compositor at hand in a test): draw a few
+    /// frames of the label UI and write them out as PNGs, so the layout can be
+    /// looked at. `KIMO_UI_DUMP` picks the directory (default `target`).
+    ///
+    ///     cargo test -- --ignored --nocapture dump_label_ui
+    #[test]
+    #[ignore = "developer tool: writes PNGs of the label UI and asserts nothing"]
+    fn dump_label_ui() {
+        let ctx = egui::Context::default();
+        crate::fonts::install(&ctx, None, None);
+        let mut app = app_with_two_accounts(&ctx, 3);
+        label_mail(&mut app, "acct", "INBOX", "acct-0", "Work");
+        label_mail(&mut app, "acct", "INBOX", "acct-1", "Work");
+        label_mail(&mut app, "acct", "INBOX", "acct-1", "Travel");
+        label_mail(&mut app, "other", "INBOX", "other-0", "Travel");
+        app.selected_message = Some("acct-1".to_string());
+        // The first frame the app draws text on is the one that uploads the
+        // font atlas, and every frame after it only patches what is there: the
+        // rasterizer has to be in on that frame, so the textures outlive it.
+        let mut textures = HashMap::new();
+        collect_frame(&ctx, &mut app, &mut textures, Vec::new());
+        let dir = std::path::PathBuf::from(
+            std::env::var("KIMO_UI_DUMP").unwrap_or_else(|_| "target".to_string()),
+        );
+        let shot = |app: &mut KimoApp, name: &str, textures: &mut HashMap<_, _>| {
+            let path = dir.join(name);
+            render_frame_png(&ctx, app, &path, textures);
+            println!("wrote {}", path.display());
+        };
+        shot(&mut app, "ui-labels-card.png", &mut textures);
+        // The label row in the column, found where the frame drew it.
+        let shapes = collect_frame(&ctx, &mut app, &mut textures, Vec::new());
+        let row = text_boxes_of(&shapes, nav_column(&app), "Work")
+            .into_iter()
+            .next()
+            .expect("the column draws the label");
+        dump_click(&ctx, &mut app, &mut textures, row.center());
+        shot(&mut app, "ui-labels-filter.png", &mut textures);
+        dump_click(&ctx, &mut app, &mut textures, header_action_center(1));
+        shot(&mut app, "ui-labels-popup.png", &mut textures);
+    }
+
+    /// One headless frame of the app, rasterized straight from egui's own
+    /// triangles: a frame is a mesh per texture with premultiplied vertex
+    /// colors, so what a real backend would draw is a barycentric fill each.
+    /// The font atlas (and any other texture the frame uploaded) is sampled for
+    /// it; there is no anti-aliasing to do — egui has already feathered every
+    /// edge into the vertices.
+    fn render_frame_png(
+        ctx: &egui::Context,
+        app: &mut KimoApp,
+        path: &std::path::Path,
+        textures: &mut HashMap<egui::TextureId, (usize, usize, Vec<egui::Color32>)>,
+    ) {
+        const WIDTH: usize = 1400;
+        const HEIGHT: usize = 900;
+
+        let shapes = collect_frame(ctx, app, textures, Vec::new());
+        let ppp = ctx.pixels_per_point();
+        let primitives = ctx.tessellate(shapes, ppp);
+        let mut canvas = vec![egui::Color32::TRANSPARENT; WIDTH * HEIGHT];
+        for primitive in &primitives {
+            let egui::epaint::Primitive::Mesh(mesh) = &primitive.primitive else {
+                continue;
+            };
+            let Some((tw, th, texels)) = textures.get(&mesh.texture_id) else {
+                continue;
+            };
+            for triangle in mesh.indices.as_chunks::<3>().0 {
+                let v = [
+                    mesh.vertices[triangle[0] as usize],
+                    mesh.vertices[triangle[1] as usize],
+                    mesh.vertices[triangle[2] as usize],
+                ];
+                let xs = v.map(|vertex| vertex.pos.x * ppp);
+                let ys = v.map(|vertex| vertex.pos.y * ppp);
+                let (x0, x1) = (
+                    xs.iter()
+                        .cloned()
+                        .fold(f32::INFINITY, f32::min)
+                        .floor()
+                        .max(0.0) as usize,
+                    xs.iter()
+                        .cloned()
+                        .fold(f32::NEG_INFINITY, f32::max)
+                        .ceil()
+                        .min(WIDTH as f32) as usize,
+                );
+                let (y0, y1) = (
+                    ys.iter()
+                        .cloned()
+                        .fold(f32::INFINITY, f32::min)
+                        .floor()
+                        .max(0.0) as usize,
+                    ys.iter()
+                        .cloned()
+                        .fold(f32::NEG_INFINITY, f32::max)
+                        .ceil()
+                        .min(HEIGHT as f32) as usize,
+                );
+                for y in y0..y1 {
+                    for x in x0..x1 {
+                        let point = egui::pos2((x as f32 + 0.5) / ppp, (y as f32 + 0.5) / ppp);
+                        if !primitive.clip_rect.contains(point) {
+                            continue;
+                        }
+                        let Some(weights) = barycentric(v.map(|vertex| vertex.pos), point) else {
+                            continue;
+                        };
+                        if weights.iter().any(|weight| *weight < 0.0) {
+                            continue;
+                        }
+                        let uv = egui::pos2(
+                            v[0].uv.x * weights[0]
+                                + v[1].uv.x * weights[1]
+                                + v[2].uv.x * weights[2],
+                            v[0].uv.y * weights[0]
+                                + v[1].uv.y * weights[1]
+                                + v[2].uv.y * weights[2],
+                        );
+                        let tx = ((uv.x * *tw as f32) as usize).min(tw.saturating_sub(1));
+                        let ty = ((uv.y * *th as f32) as usize).min(th.saturating_sub(1));
+                        let texel = texels[ty * *tw + tx];
+                        let source = v[0].color;
+                        let color = egui::Color32::from_rgba_premultiplied(
+                            (source.r() as u32 * texel.r() as u32 / 255) as u8,
+                            (source.g() as u32 * texel.g() as u32 / 255) as u8,
+                            (source.b() as u32 * texel.b() as u32 / 255) as u8,
+                            (source.a() as u32 * texel.a() as u32 / 255) as u8,
+                        );
+                        let dst = canvas[y * WIDTH + x];
+                        let alpha = color.a() as u32;
+                        canvas[y * WIDTH + x] = egui::Color32::from_rgba_premultiplied(
+                            (color.r() as u32 + dst.r() as u32 * (255 - alpha) / 255) as u8,
+                            (color.g() as u32 + dst.g() as u32 * (255 - alpha) / 255) as u8,
+                            (color.b() as u32 + dst.b() as u32 * (255 - alpha) / 255) as u8,
+                            (alpha + dst.a() as u32 * (255 - alpha) / 255) as u8,
+                        );
+                    }
+                }
+            }
+        }
+        let bytes: Vec<u8> = canvas.iter().flat_map(|pixel| pixel.to_array()).collect();
+        let image = image::RgbaImage::from_raw(WIDTH as u32, HEIGHT as u32, bytes)
+            .expect("the canvas is the size it was allocated");
+        image.save(path).expect("the dump directory is writable");
+    }
+
+    /// Run one frame of the app and keep the textures it brought: the font
+    /// atlas arrives on the frame that first draws a glyph and every frame after
+    /// it patches what is there, so a rasterizer that misses one frame draws
+    /// that frame's glyphs as nothing. Every frame a dump drives — the clicks
+    /// included — has to come through here.
+    fn collect_frame(
+        ctx: &egui::Context,
+        app: &mut KimoApp,
+        textures: &mut HashMap<egui::TextureId, (usize, usize, Vec<egui::Color32>)>,
+        events: Vec<egui::Event>,
+    ) -> Vec<egui::epaint::ClippedShape> {
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1400.0, 900.0),
+            )),
+            events,
+            ..Default::default()
+        };
+        let mut output = ctx.run_ui(input, |ui| app.ui(ui));
+        apply_textures(&output.textures_delta, textures);
+        output.textures_delta.clear();
+        output.shapes
+    }
+
+    /// A click, frame by frame, through `collect_frame` — the pointer moved onto
+    /// the target and then the button down and up.
+    fn dump_click(
+        ctx: &egui::Context,
+        app: &mut KimoApp,
+        textures: &mut HashMap<egui::TextureId, (usize, usize, Vec<egui::Color32>)>,
+        pos: egui::Pos2,
+    ) {
+        collect_frame(ctx, app, textures, vec![egui::Event::PointerMoved(pos)]);
+        for pressed in [true, false] {
+            collect_frame(
+                ctx,
+                app,
+                textures,
+                vec![egui::Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Primary,
+                    pressed,
+                    modifiers: egui::Modifiers::default(),
+                }],
+            );
+        }
+    }
+
+    /// Keep the textures a frame uploaded or patched: the font atlas whole the
+    /// first time, in patches as it grows, and any picture the mail brought.
+    fn apply_textures(
+        delta: &egui::TexturesDelta,
+        textures: &mut HashMap<egui::TextureId, (usize, usize, Vec<egui::Color32>)>,
+    ) {
+        for (id, deltas) in &delta.set {
+            for delta in deltas {
+                let egui::ImageData::Color(image) = &delta.image;
+                let (width, height) = (image.size[0], image.size[1]);
+                let Some([x0, y0]) = delta.pos else {
+                    // A whole texture, and the font atlas is sent whole again
+                    // whenever it grows: it replaces what was there, or the
+                    // glyphs past the old edge would be missing.
+                    textures.insert(*id, (width, height, image.pixels.clone()));
+                    continue;
+                };
+                let Some(target) = textures.get_mut(id) else {
+                    continue;
+                };
+                for y in 0..height {
+                    for x in 0..width {
+                        let (tx, ty) = (x0 + x, y0 + y);
+                        if tx < target.0 && ty < target.1 {
+                            target.2[ty * target.0 + tx] = image.pixels[y * width + x];
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// The three barycentric weights of a point in a triangle, or `None` when
+    /// the triangle has no area.
+    fn barycentric(triangle: [egui::Pos2; 3], point: egui::Pos2) -> Option<[f32; 3]> {
+        let [a, b, c] = triangle;
+        let area = (b.x - a.x) * (c.y - a.y) - (c.x - a.x) * (b.y - a.y);
+        if area.abs() < f32::EPSILON {
+            return None;
+        }
+        let first = ((b.x - point.x) * (c.y - point.y) - (c.x - point.x) * (b.y - point.y)) / area;
+        let second = ((c.x - point.x) * (a.y - point.y) - (a.x - point.x) * (c.y - point.y)) / area;
+        Some([first, second, 1.0 - first - second])
+    }
+
+    /// A query and a label filter are two answers to what the middle column
+    /// shows, and the label is the one that was just asked for: looking at a
+    /// label gives an active search up rather than stacking the two into a list
+    /// that is neither.
+    #[test]
+    fn a_label_filter_gives_up_an_active_search() {
+        let ctx = egui::Context::default();
+        crate::fonts::install(&ctx, None, None);
+        let mut app = app_with_two_accounts(&ctx, 2);
+        label_mail(&mut app, "acct", "INBOX", "acct-0", "Work");
+        app.search.text = "acct".to_string();
+        assert!(app.search.is_active());
+
+        click_label(&ctx, &mut app, "Work");
+        assert_eq!(app.label_filter, ["Work".to_string()]);
+        assert!(!app.search.is_active() && app.search.text.is_empty());
+        assert!(
+            app.search_applied
+                .as_ref()
+                .is_some_and(|query| !query.is_active()),
+            "the applied query is the emptied one, so nothing is searched for it"
+        );
+    }
+
+    /// The label cell on a mail's own head opens the popup about that mail, the
+    /// way its reply cell opens the compose: the labels it carries are ticked,
+    /// a click in the list puts one on it or takes it off, and the card says so
+    /// afterwards.
+    #[test]
+    fn the_label_cell_labels_the_mail_it_is_on() {
+        let ctx = egui::Context::default();
+        crate::fonts::install(&ctx, None, None);
+        let mut app = app_with_messages(&ctx, 2);
+        app.labels = vec!["Travel".to_string(), "Work".to_string()];
+        app.selected_message = Some("0".to_string());
+        run_app_frame(&ctx, &mut app, Vec::new());
+
+        click_at(&ctx, &mut app, header_action_center(1));
+        let shapes = frame_shapes_at(&ctx, &mut app, 1400.0);
+        let texts = frame_texts(&ctx, &mut app);
+        assert!(
+            texts.iter().any(|run| run == "New label…"),
+            "the popup is the label list and a box: {texts:?}"
+        );
+        // The checklist is the app's own labels, over the columns rather than in
+        // them.
+        let boxes = |text: &str| text_boxes_of(&shapes, popup_area(), text);
+        assert_eq!(boxes("Work").len(), 1, "the popup lists the label once");
+        assert_eq!(boxes("Travel").len(), 1);
+
+        // A click on a label in the popup puts it on this mail.
+        let work = boxes("Work")[0].center();
+        click_at(&ctx, &mut app, work);
+        let key = MailKey::new("acct", "INBOX", "0");
+        assert_eq!(app.mail_labels(&key), ["Work".to_string()]);
+        // The card says it: the mail carries a chip of its own now.
+        let texts = frame_texts(&ctx, &mut app);
+        assert!(
+            texts.iter().any(|run| run == "Work"),
+            "the card shows the label: {texts:?}"
+        );
+
+        // And a click on it again takes it off — the popup stayed open, and the
+        // mail's chip is a different thing at another place: the popup is what
+        // is drawn over the columns.
+        let shapes = frame_shapes_at(&ctx, &mut app, 1400.0);
+        let work = text_boxes_of(&shapes, popup_area(), "Work")
+            .pop()
+            .expect("the popup is still open");
+        click_at(&ctx, &mut app, work.center());
+        assert!(app.mail_labels(&key).is_empty());
+    }
+
+    /// A name the app does not have is made a label by being put on a mail: the
+    /// popup's box is the only place one comes into being, and the navigation
+    /// column's group has it from that moment on.
+    #[test]
+    fn a_new_label_is_made_for_the_mail_in_the_popup() {
+        let ctx = egui::Context::default();
+        crate::fonts::install(&ctx, None, None);
+        let mut app = app_with_messages(&ctx, 2);
+        app.selected_message = Some("0".to_string());
+        run_app_frame(&ctx, &mut app, Vec::new());
+        assert!(app.labels.is_empty());
+
+        // The label cell on the mail's head, and the popup it opens: with no
+        // labels at all it says so, and offers the box.
+        click_at(&ctx, &mut app, header_action_center(1));
+        let texts = frame_texts(&ctx, &mut app);
+        assert!(
+            texts
+                .iter()
+                .any(|run| run == "No labels yet — name one below."),
+            "{texts:?}"
+        );
+
+        // Type a name in the box and press the button.
+        let shapes = frame_shapes_at(&ctx, &mut app, 1400.0);
+        let field = text_boxes_of(&shapes, popup_area(), "New label…")
+            .pop()
+            .expect("the box is in the popup");
+        click_at(&ctx, &mut app, field.center());
+        run_app_frame(
+            &ctx,
+            &mut app,
+            vec![egui::Event::Text("Receipts".to_string())],
+        );
+        assert_eq!(app.label_draft, "Receipts", "the box holds what was typed");
+
+        let shapes = frame_shapes_at(&ctx, &mut app, 1400.0);
+        let create = text_boxes_of(&shapes, popup_area(), "Create")
+            .pop()
+            .expect("the button is in the popup");
+        click_at(&ctx, &mut app, create.center());
+
+        assert_eq!(app.labels, ["Receipts".to_string()], "the label was made");
+        let key = MailKey::new("acct", "INBOX", "0");
+        assert_eq!(app.mail_labels(&key), ["Receipts".to_string()]);
+        assert!(
+            app.label_draft.is_empty(),
+            "the box is emptied by the click"
+        );
+        // And the column draws it from here on.
+        let shapes = frame_shapes_at(&ctx, &mut app, 1400.0);
+        assert!(
+            !text_boxes_of(&shapes, nav_column(&app), "Receipts").is_empty(),
+            "the group has the new label"
+        );
+    }
+
+    /// The title bar's own label cell opens the same popup, about the mail the
+    /// reading pane shows: the bar answers the pane's mail, the card head the
+    /// mail it sits on.
+    #[test]
+    fn the_title_bars_label_cell_opens_the_popup_too() {
+        let ctx = egui::Context::default();
+        crate::fonts::install(&ctx, None, None);
+        let mut app = app_with_messages(&ctx, 3);
+        app.selected_message = Some("0".to_string());
+        run_app_frame(&ctx, &mut app, Vec::new());
+
+        let centre = titlebar_action_center(&ctx, &mut app, MailAction::Label, 1400.0);
+        // The bar drew the cell where the arithmetic says (the fill under the
+        // pointer is the cell's own), and the click opens the popup.
+        assert!(
+            fill_under_the_pointer(&ctx, &mut app, 1400.0, centre, TITLEBAR_BUTTON_SIZE).is_some(),
+            "no label cell at {centre:?}"
+        );
+        click_at(&ctx, &mut app, centre);
+        let texts = frame_texts(&ctx, &mut app);
+        assert!(
+            texts
+                .iter()
+                .any(|run| run == "No labels yet — name one below."),
+            "the bar's label cell opened the popup: {texts:?}"
+        );
+    }
+
+    /// A mail's card says what it is labelled with, under its head: one chip per
+    /// label, as wide as the name wants. A mail nobody labelled carries no row at
+    /// all, so the head is still the first thing on it.
+    #[test]
+    fn a_mails_card_says_what_it_is_labelled_with() {
+        let ctx = egui::Context::default();
+        crate::fonts::install(&ctx, None, None);
+        let mut app = app_with_messages(&ctx, 2);
+        app.selected_message = Some("0".to_string());
+        let pane = |app: &KimoApp| {
+            egui::Rect::from_min_max(
+                egui::pos2(app.list_column.right(), 0.0),
+                egui::pos2(1400.0, 900.0),
+            )
+        };
+
+        // Nothing labelled: no chips, and the subject follows the head row.
+        let shapes = frame_shapes_at(&ctx, &mut app, 1400.0);
+        assert!(text_boxes_of(&shapes, pane(&app), "Work").is_empty());
+
+        label_mail(&mut app, "acct", "INBOX", "0", "Work");
+        let shapes = frame_shapes_at(&ctx, &mut app, 1400.0);
+        let name = text_boxes_of(&shapes, pane(&app), "Work")
+            .pop()
+            .expect("the chip's name is on the card");
+        let head_bottom = TITLEBAR_HEIGHT
+            + CONTENT_GUTTER
+            + CONTENT_PADDING.y
+            + AVATAR_DIAMETER.max(CARD_ACTION_SIZE);
+        assert!(
+            name.top() >= head_bottom,
+            "the chips go under the head row: {name:?} against {head_bottom}"
+        );
+        let scheme = theme::of(&ctx);
+        let chip = fills_in_color(&shapes, scheme.hover)
+            .into_iter()
+            .find(|rect| rect.contains_rect(name))
+            .unwrap_or_else(|| panic!("nothing filled under {name:?}"));
+        assert!((chip.height() - LABEL_CHIP_HEIGHT).abs() < 0.5, "{chip:?}");
+        assert!(
+            (chip.width() - (name.width() + LABEL_CHIP_PADDING * 2.0)).abs() < 0.5,
+            "the chip is the name and its padding: {chip:?}"
+        );
     }
 }

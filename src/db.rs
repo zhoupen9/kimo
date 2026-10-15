@@ -35,7 +35,7 @@
 //! Keep the mirror structs at the bottom of this file until no installation can
 //! still predate the database, like `storage::migrate_legacy_dir`.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::path::Path;
 use std::sync::{Mutex, MutexGuard, OnceLock};
@@ -52,7 +52,7 @@ use crate::models::{
 use crate::storage::{self, Folder, Mailbox};
 
 /// The schema version this build writes and understands.
-pub const SCHEMA_VERSION: i64 = 7;
+pub const SCHEMA_VERSION: i64 = 8;
 
 /// How long a statement waits for another writer before giving up. Jobs hold
 /// the connection only around their SQL, so this is a backstop, not a plan.
@@ -167,6 +167,22 @@ CREATE TABLE IF NOT EXISTS inline_images (
     PRIMARY KEY (message_id, cid)
 );
 
+-- A label on a mail (schema v8): the user's own mark, and a first-class filter
+-- beside the folders. A mail lives in exactly one folder — where the server put
+-- it — and carries any number of labels; nothing about a label is the server's,
+-- so the whole of one is its name. Names are unique case-insensitively, so
+-- "Work" and "work" are the same label rather than two rows.
+CREATE TABLE IF NOT EXISTS labels (
+    id   INTEGER PRIMARY KEY,
+    name TEXT NOT NULL COLLATE NOCASE UNIQUE
+);
+
+CREATE TABLE IF NOT EXISTS message_labels (
+    message_id INTEGER NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
+    label_id   INTEGER NOT NULL REFERENCES labels(id) ON DELETE CASCADE,
+    PRIMARY KEY (message_id, label_id)
+);
+
 CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(
     subject, from_addr, to_addr, body_text, cjk,
     content = 'messages',
@@ -270,6 +286,24 @@ ALTER TABLE messages ADD COLUMN refs        TEXT NOT NULL DEFAULT '';
 const MIGRATE_V6_SQL: &str = r#"
 ALTER TABLE attachments ADD COLUMN content_type TEXT NOT NULL DEFAULT '';
 ALTER TABLE attachments ADD COLUMN size INTEGER NOT NULL DEFAULT 0;
+"#;
+
+/// The step from `user_version` 7 to 8: the two label tables. There is nothing
+/// to derive — a database from before this step has no labels and no way to
+/// have meant one — so every mail it holds starts unlabelled and the tables are
+/// born empty. `IF NOT EXISTS`, like the schema itself, so a database that
+/// already has them is simply finished.
+const MIGRATE_V8_SQL: &str = r#"
+CREATE TABLE IF NOT EXISTS labels (
+    id   INTEGER PRIMARY KEY,
+    name TEXT NOT NULL COLLATE NOCASE UNIQUE
+);
+
+CREATE TABLE IF NOT EXISTS message_labels (
+    message_id INTEGER NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
+    label_id   INTEGER NOT NULL REFERENCES labels(id) ON DELETE CASCADE,
+    PRIMARY KEY (message_id, label_id)
+);
 "#;
 
 /// IMAP's floor as the mail a database from before version 4 already implies:
@@ -565,6 +599,12 @@ fn migrate(conn: &mut Connection, legacy: Option<(&Path, &Path)>) -> MailResult<
         let tx = conn.transaction()?;
         tx.execute_batch(MIGRATE_V7_SQL)?;
         tx.pragma_update(None, "user_version", 7)?;
+        tx.commit()?;
+    }
+    if start < 8 {
+        let tx = conn.transaction()?;
+        tx.execute_batch(MIGRATE_V8_SQL)?;
+        tx.pragma_update(None, "user_version", 8)?;
         tx.commit()?;
     }
     Ok(())
@@ -1055,6 +1095,8 @@ fn load_mailboxes_on(
                     body_text: row.get(10)?,
                     body_html: row.get(11)?,
                     preview: row.get(12)?,
+                    // Filled in below, from the label tables.
+                    labels: BTreeSet::new(),
                     attachments: Vec::new(),
                     inline_images: Vec::new(),
                 },
@@ -1110,6 +1152,24 @@ fn load_mailboxes_on(
             let (message_id, image) = row?;
             if let Some(&index) = positions.get(&message_id) {
                 loaded[index].3.inline_images.push(image);
+            }
+        }
+    }
+    // The labels, fourth: a mail comes back with the marks the user put on it,
+    // and one nobody labelled with none. The set is what the message carries,
+    // so the order the rows arrive in does not matter.
+    {
+        let mut stmt = conn.prepare(
+            "SELECT ml.message_id, l.name FROM message_labels ml
+               JOIN labels l ON l.id = ml.label_id",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+        })?;
+        for row in rows {
+            let (message_id, name) = row?;
+            if let Some(&index) = positions.get(&message_id) {
+                loaded[index].3.labels.insert(name);
             }
         }
     }
@@ -1370,6 +1430,87 @@ fn delete_message_on(
     Ok(())
 }
 
+// ----- labels ----------------------------------------------------------------
+
+/// Every label the user has made, in the order the navigation column draws
+/// them: by name, case-insensitively. A label no mail carries any more is still
+/// here — it is the user's own word rather than a fact about the mail, and the
+/// popup offers it again the next time that mail is labelled.
+pub fn load_labels() -> MailResult<Vec<String>> {
+    let db = db()?;
+    load_labels_on(db.conn())
+}
+
+fn load_labels_on(conn: &Connection) -> MailResult<Vec<String>> {
+    let mut stmt = conn.prepare("SELECT name FROM labels ORDER BY name COLLATE NOCASE")?;
+    let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+    let mut names = Vec::new();
+    for row in rows {
+        names.push(row?);
+    }
+    Ok(names)
+}
+
+/// Put exactly `labels` on one message. Creating a label is this and nothing
+/// else: a name the table does not have yet is added as the mail is labelled
+/// with it, which is what "create a label for this mail" means. The message's
+/// own rows are replaced rather than merged, so what the mail carries after
+/// this is the set that was asked for.
+///
+/// One transaction, so a mail is never half labelled. A message the database
+/// does not have is left alone and creates no label either, and an empty name
+/// is skipped — a row for the empty string would be a label nobody could say.
+pub fn set_labels(account_id: &str, folder: &str, uid: &str, labels: &[String]) -> MailResult<()> {
+    let mut db = db()?;
+    set_labels_on(db.conn_mut(), account_id, folder, uid, labels)
+}
+
+fn set_labels_on(
+    conn: &mut Connection,
+    account_id: &str,
+    folder: &str,
+    uid: &str,
+    labels: &[String],
+) -> MailResult<()> {
+    let tx = conn.transaction()?;
+    let message_id: Option<i64> = tx
+        .query_row(
+            "SELECT id FROM messages WHERE account_id = ?1 AND folder = ?2 AND uid = ?3",
+            params![account_id, folder, uid],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let Some(message_id) = message_id else {
+        // Nothing to label, and nothing to create for it: the transaction is
+        // dropped with no statement run in it.
+        return Ok(());
+    };
+    tx.execute(
+        "DELETE FROM message_labels WHERE message_id = ?1",
+        [message_id],
+    )?;
+    {
+        // The name is the label: an unknown one is created by being asked for,
+        // and a name that differs only in case is the label already there.
+        let mut create =
+            tx.prepare("INSERT INTO labels (name) VALUES (?1) ON CONFLICT(name) DO NOTHING")?;
+        let mut find = tx.prepare("SELECT id FROM labels WHERE name = ?1")?;
+        let mut link = tx.prepare(
+            "INSERT OR IGNORE INTO message_labels (message_id, label_id) VALUES (?1, ?2)",
+        )?;
+        for name in labels {
+            if name.is_empty() {
+                continue;
+            }
+            create.execute([name])?;
+            let label_id: i64 = find.query_row([name], |row| row.get(0))?;
+            link.execute(params![message_id, label_id])?;
+        }
+    }
+    tx.commit()?;
+    Ok(())
+}
+
 /// Check the database file and the FTS index. Every mutation test ends with
 /// this, so a trigger that stopped firing or a missed `cascade` cannot go
 /// unnoticed.
@@ -1585,6 +1726,8 @@ impl LegacyMessage {
             message_id: String::new(),
             in_reply_to: Vec::new(),
             references: Vec::new(),
+            // And it kept no labels: a mail imported from it starts unlabelled.
+            labels: BTreeSet::new(),
             body_text: self.body_text,
             body_html: self.body_html,
             preview: self.preview,
@@ -1668,6 +1811,11 @@ pub(crate) mod test_support {
             for column in ["message_id", "in_reply_to", "refs"] {
                 sql.push_str(&format!("ALTER TABLE messages DROP COLUMN {column};\n"));
             }
+        }
+        if version < 8 {
+            // The join table first: it is the one that names the other two.
+            sql.push_str("DROP TABLE message_labels;\n");
+            sql.push_str("DROP TABLE labels;\n");
         }
         conn.execute_batch(&sql).unwrap();
         conn.pragma_update(None, "user_version", version).unwrap();
@@ -1755,6 +1903,7 @@ mod tests {
             message_id: String::new(),
             in_reply_to: Vec::new(),
             references: Vec::new(),
+            labels: BTreeSet::new(),
             body_text: body.to_string(),
             body_html: None,
             preview: body.chars().take(20).collect(),
@@ -2632,6 +2781,194 @@ mod tests {
         let none = loaded.iter().find(|m| m.uid == "3").unwrap();
         assert_eq!(none.message_id, "");
         assert!(none.in_reply_to.is_empty() && none.references.is_empty());
+        integrity_check_on(&conn).unwrap();
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A label is a mark of the user's own on a mail, and both halves of that
+    /// survive the round trip: the mail comes back carrying what was put on it,
+    /// and the label list holds the name. The set is a set — the order the rows
+    /// arrive in is not a fact about the mail.
+    #[test]
+    fn labels_round_trip_through_a_message() {
+        let (mut conn, dir) = test_db("labels-round-trip");
+        save_account_on(&conn, &account("work")).unwrap();
+        save_messages_on(
+            &mut conn,
+            "work",
+            "INBOX",
+            Some(1),
+            &[message("1", "Hello", "body")],
+        )
+        .unwrap();
+
+        set_labels_on(
+            &mut conn,
+            "work",
+            "INBOX",
+            "1",
+            &["Travel".to_string(), "Work".to_string()],
+        )
+        .unwrap();
+
+        let mailboxes = load_mailboxes_on(&conn, &["work".to_string()]).unwrap();
+        let mail = &mailboxes["work"].folders[0].messages[0];
+        assert_eq!(
+            mail.labels.iter().map(String::as_str).collect::<Vec<_>>(),
+            ["Travel", "Work"]
+        );
+        assert_eq!(load_labels_on(&conn).unwrap(), ["Travel", "Work"]);
+        integrity_check_on(&conn).unwrap();
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Labelling replaces what a mail carried rather than adding to it, a name
+    /// nobody has used before becomes a label as it is asked for, and two
+    /// spellings of one name are one label. A label is the user's own word
+    /// besides: taking it off the last mail it was on leaves it in the list.
+    #[test]
+    fn a_label_is_made_by_being_used_and_one_name_is_one_label() {
+        let (mut conn, dir) = test_db("labels-set");
+        save_account_on(&conn, &account("work")).unwrap();
+        save_messages_on(
+            &mut conn,
+            "work",
+            "INBOX",
+            Some(1),
+            &[message("1", "Hello", "body")],
+        )
+        .unwrap();
+
+        set_labels_on(
+            &mut conn,
+            "work",
+            "INBOX",
+            "1",
+            &["Work".to_string(), "work".to_string()],
+        )
+        .unwrap();
+        assert_eq!(
+            count(&conn, "SELECT COUNT(*) FROM labels"),
+            1,
+            "a name is unique case-insensitively"
+        );
+        let labels_of = |conn: &Connection| -> Vec<String> {
+            load_mailboxes_on(conn, &["work".to_string()]).unwrap()["work"].folders[0].messages[0]
+                .labels
+                .iter()
+                .cloned()
+                .collect()
+        };
+        assert_eq!(labels_of(&conn), ["Work".to_string()]);
+
+        set_labels_on(
+            &mut conn,
+            "work",
+            "INBOX",
+            "1",
+            &["WORK".to_string(), "Travel".to_string()],
+        )
+        .unwrap();
+        assert_eq!(
+            labels_of(&conn),
+            ["Travel".to_string(), "Work".to_string()],
+            "the second name adds to the first, and keeps the spelling it was made with"
+        );
+
+        set_labels_on(&mut conn, "work", "INBOX", "1", &["Travel".to_string()]).unwrap();
+        assert_eq!(labels_of(&conn), ["Travel".to_string()]);
+        assert_eq!(
+            load_labels_on(&conn).unwrap(),
+            ["Travel", "Work"],
+            "the label stays after its last mail lets it go"
+        );
+
+        // A mail the database does not have creates nothing: there is nothing
+        // for the name to be a mark on.
+        set_labels_on(&mut conn, "work", "INBOX", "404", &["Ghost".to_string()]).unwrap();
+        assert!(!load_labels_on(&conn)
+            .unwrap()
+            .contains(&"Ghost".to_string()));
+        integrity_check_on(&conn).unwrap();
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A label is not the mail's content: a re-fetch — which a POP3 sync does to
+    /// every message it holds, bodies and all — leaves the marks where they
+    /// were, and deleting the mail takes them with it, through the cascade,
+    /// while the label itself stays.
+    #[test]
+    fn labels_outlive_a_re_fetch_and_go_with_the_mail() {
+        let (mut conn, dir) = test_db("labels-life");
+        save_account_on(&conn, &account("work")).unwrap();
+        let mail = message("1", "Hello", "body");
+        save_messages_on(
+            &mut conn,
+            "work",
+            "INBOX",
+            Some(1),
+            std::slice::from_ref(&mail),
+        )
+        .unwrap();
+        set_labels_on(&mut conn, "work", "INBOX", "1", &["Work".to_string()]).unwrap();
+
+        let mut refetched = message("1", "Hello again", "a longer body");
+        refetched.seen = true;
+        save_messages_on(&mut conn, "work", "INBOX", Some(1), &[refetched]).unwrap();
+        let mailboxes = load_mailboxes_on(&conn, &["work".to_string()]).unwrap();
+        let kept = &mailboxes["work"].folders[0].messages[0];
+        assert_eq!(kept.subject, "Hello again", "the fetch updated the row");
+        assert_eq!(
+            kept.labels.iter().map(String::as_str).collect::<Vec<_>>(),
+            ["Work"],
+            "and the labels name a row the upsert kept"
+        );
+
+        delete_message_on(&conn, "work", "INBOX", "1").unwrap();
+        assert_eq!(
+            count(&conn, "SELECT COUNT(*) FROM message_labels"),
+            0,
+            "the marks go with the mail"
+        );
+        assert_eq!(load_labels_on(&conn).unwrap(), ["Work"]);
+        integrity_check_on(&conn).unwrap();
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A database from version 7 gains the two label tables empty: there were no
+    /// labels before this step, so nothing is moved over and every mail it holds
+    /// starts unlabelled — and the tables the step makes are the ones labelling
+    /// writes to.
+    #[test]
+    fn a_version_7_database_gains_empty_label_tables() {
+        let (mut conn, dir) = test_db("migrate-v8");
+        save_account_on(&conn, &account("work")).unwrap();
+        save_messages_on(
+            &mut conn,
+            "work",
+            "INBOX",
+            Some(1),
+            &[message("1", "Hello", "body")],
+        )
+        .unwrap();
+        rewind_to(&conn, 7);
+        assert!(
+            conn.prepare("SELECT * FROM labels").is_err(),
+            "the tables are what the step is for"
+        );
+
+        migrate(&mut conn, None).unwrap();
+        assert_eq!(
+            count(&conn, "SELECT * FROM pragma_user_version"),
+            SCHEMA_VERSION
+        );
+        assert_eq!(load_labels_on(&conn).unwrap().len(), 0);
+        let mailboxes = load_mailboxes_on(&conn, &["work".to_string()]).unwrap();
+        assert!(mailboxes["work"].folders[0].messages[0].labels.is_empty());
+
+        set_labels_on(&mut conn, "work", "INBOX", "1", &["Work".to_string()]).unwrap();
+        let mailboxes = load_mailboxes_on(&conn, &["work".to_string()]).unwrap();
+        assert_eq!(mailboxes["work"].folders[0].messages[0].labels.len(), 1);
         integrity_check_on(&conn).unwrap();
         let _ = fs::remove_dir_all(&dir);
     }

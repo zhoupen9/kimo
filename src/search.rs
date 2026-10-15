@@ -604,6 +604,7 @@ mod tests {
             preview: body.chars().take(20).collect(),
             attachments: Vec::new(),
             inline_images: Vec::new(),
+            labels: Default::default(),
         }
     }
 
@@ -981,6 +982,7 @@ mod tests {
             preview: String::new(),
             attachments: Vec::new(),
             inline_images: Vec::new(),
+            labels: Default::default(),
         };
         let column = cjk_column(&message);
         for bigram in ["发票", "票号", "号码", "确认", "请确"] {

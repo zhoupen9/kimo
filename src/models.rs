@@ -5,6 +5,8 @@
 //! `settings.json` (`crate::storage::Settings`) and the one-shot legacy
 //! import in `db.rs`.
 
+use std::collections::BTreeSet;
+
 /// The two (and only two) mail retrieval protocols Kimo speaks.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Protocol {
@@ -209,6 +211,13 @@ pub struct MailMessage {
     pub body_html: Option<String>,
     /// One-line plain-text snippet for the message list.
     pub preview: String,
+    /// The labels the user has put on this mail (schema v8), by name. A mail
+    /// lives in exactly one folder — where the server put it — and a label is a
+    /// mark of the user's own on top of that, of which a mail carries any
+    /// number. Filled from the database when the mail is loaded, and never by a
+    /// fetch: labels were never the server's, so re-fetching a mail keeps the
+    /// ones it had here (`crate::sync`'s merge).
+    pub labels: BTreeSet<String>,
     /// The mail's attachments, in the order the parts appear in it. Draws
     /// one card each at the end of the body.
     pub attachments: Vec<Attachment>,
