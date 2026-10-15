@@ -747,6 +747,11 @@ pub struct KimoApp {
     /// Bumped whenever `open_threads` changes, so the derived rows know they
     /// are stale without comparing the whole set.
     open_rev: u64,
+    /// The order the message list is drawn in (the title bar's sort cell): which
+    /// way round it runs, and by which of the three keys. Beside the filter,
+    /// which is the other thing about the column that is the window's rather
+    /// than the mail's.
+    list_sort: ListSort,
     /// The views the message list is narrowed to (the title bar's filter cell):
     /// optional, and an AND — see `ListFilters`. A view of the column rather than
     /// part of a query, so it applies to a folder's mail, a label's matches and
@@ -800,16 +805,14 @@ pub struct KimoApp {
 /// is the shape the list had before conversations.
 fn list_rows_of(
     threads: &[Thread],
-    shown: &[bool],
+    flat: &[usize],
     open: &HashSet<String>,
     threaded: bool,
 ) -> Vec<ListRow> {
     if !threaded {
-        return shown
+        return flat
             .iter()
-            .enumerate()
-            .filter(|(_, shown)| **shown)
-            .map(|(index, _)| ListRow::Message {
+            .map(|&index| ListRow::Message {
                 index,
                 in_thread: false,
             })
@@ -836,6 +839,62 @@ fn list_rows_of(
         }
     }
     rows
+}
+
+/// The key a conversation's row is sorted by: what the row shows — the newest
+/// mail's date and sender, the conversation's own subject — and where that mail
+/// sits in the folder, which is what keeps two equal rows in the folder's order.
+fn thread_sort_key<'a>(thread: &'a Thread, messages: &'a [MailMessage]) -> SortKey<'a> {
+    let newest = &messages[thread.newest];
+    SortKey {
+        timestamp: newest.timestamp,
+        from: &newest.from,
+        subject: &thread.subject,
+        position: thread.newest,
+    }
+}
+
+/// The same key for one of the label view's copies of a mail: the fields its
+/// row draws. Its position is zero — the label list's own total order is what
+/// keeps two equal rows still, because the mail it holds comes from every folder
+/// and account at once.
+fn labelled_sort_key(mail: &LabelledMail) -> SortKey<'_> {
+    SortKey {
+        timestamp: mail.timestamp,
+        from: &mail.from,
+        subject: &mail.subject,
+        position: 0,
+    }
+}
+
+/// The same key for a mail on its own: the fields its own row draws.
+fn mail_sort_key<'a>(mail: &'a MailMessage, position: usize) -> SortKey<'a> {
+    SortKey {
+        timestamp: mail.timestamp,
+        from: &mail.from,
+        subject: &mail.subject,
+        position,
+    }
+}
+
+/// The order the flat list draws in: the mail the filter lets through, sorted by
+/// the column's own sort. What comes back are indices into the folder's mail —
+/// the order, rather than the mail itself, because the folder's slice is what
+/// the rows are drawn from and it is not this function's to reorder.
+fn flat_order(shown: &[bool], messages: &[MailMessage], sort: ListSort) -> Vec<usize> {
+    let mut order: Vec<usize> = shown
+        .iter()
+        .enumerate()
+        .filter(|(_, shown)| **shown)
+        .map(|(index, _)| index)
+        .collect();
+    order.sort_by(|&one, &two| {
+        sort.compare(
+            mail_sort_key(&messages[one], one),
+            mail_sort_key(&messages[two], two),
+        )
+    });
+    order
 }
 
 /// The facts a filter asks a row about (`FilterFacts`), read off each of the
@@ -998,8 +1057,119 @@ struct ListRows {
     /// of views is a different list, and one that would show mail the rows do
     /// not.
     filters: ListFilters,
+    /// The order the column was sorted in when these were derived.
+    sort: ListSort,
     threads: Vec<Thread>,
     rows: Vec<ListRow>,
+}
+
+/// Which way the message list runs: the newest mail at the top, or the oldest.
+/// What the sort cell's own menu calls the *order* group.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum SortOrder {
+    #[default]
+    Newest,
+    Oldest,
+}
+
+impl SortOrder {
+    const ALL: [SortOrder; 2] = [SortOrder::Newest, SortOrder::Oldest];
+
+    fn label(self) -> &'static str {
+        match self {
+            SortOrder::Newest => "Newest on top",
+            SortOrder::Oldest => "Oldest on top",
+        }
+    }
+
+    /// Whether the comparison runs the other way round: `Newest` is what the
+    /// message list has always done — the folder's own order, newest first.
+    fn ascending(self) -> bool {
+        matches!(self, SortOrder::Oldest)
+    }
+}
+
+/// What the message list is sorted *by*: the mail's date, its sender, or its
+/// subject — what the row itself shows, so sorting a threaded list by "from"
+/// sorts by the sender each conversation's row is drawn with.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum SortBy {
+    #[default]
+    Date,
+    From,
+    Subject,
+}
+
+impl SortBy {
+    const ALL: [SortBy; 3] = [SortBy::Date, SortBy::From, SortBy::Subject];
+
+    fn label(self) -> &'static str {
+        match self {
+            SortBy::Date => "Date",
+            SortBy::From => "From",
+            SortBy::Subject => "Subject",
+        }
+    }
+}
+
+/// How the message list is ordered, from the title bar's sort cell: which way
+/// round, and by what — the menu's two groups and nothing else. The default is
+/// the order the folder arrives in (newest first, by date).
+///
+/// Like the filter it is a view of the column rather than part of a query, so a
+/// change re-derives the list rather than asking the database again.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct ListSort {
+    order: SortOrder,
+    by: SortBy,
+}
+
+impl ListSort {
+    /// What the cell's tooltip says: the two choices by name.
+    fn summary(self) -> String {
+        format!(
+            "{}, by {}",
+            self.order.label().to_lowercase(),
+            self.by.label().to_lowercase()
+        )
+    }
+
+    /// Where one row goes, as the comparison the list is sorted with: the key
+    /// the menu named — the mail's date, its sender as the row draws it, its
+    /// subject as the row draws it — and the order the other group chose, with
+    /// where the mail sits as the tie-break, so two mails that compare equal
+    /// keep the order the folder is in rather than swapping about.
+    fn compare(self, one: SortKey<'_>, two: SortKey<'_>) -> std::cmp::Ordering {
+        let by = match self.by {
+            SortBy::Date => one.timestamp.cmp(&two.timestamp),
+            SortBy::From => compare_names(one.from, two.from),
+            SortBy::Subject => compare_names(one.subject, two.subject),
+        };
+        let by = if self.order.ascending() {
+            by
+        } else {
+            by.reverse()
+        };
+        by.then(one.position.cmp(&two.position))
+    }
+}
+
+/// The three things a row can be sorted by, as the row draws them: a mail's own,
+/// or — for a conversation — the ones its row speaks for (its newest mail's date
+/// and sender, its own subject).
+struct SortKey<'a> {
+    timestamp: Option<i64>,
+    from: &'a str,
+    subject: &'a str,
+    /// Where the mail sits in the folder, which is what keeps the sort stable.
+    position: usize,
+}
+
+/// Compare two display names the way a reader would: case-insensitively, so
+/// "ada" and "Ada" sort together rather than one running before the other on a
+/// byte value.
+fn compare_names(one: &str, two: &str) -> std::cmp::Ordering {
+    one.to_lowercase().cmp(&two.to_lowercase())
 }
 
 /// One view of the message list, offered as a checkbox in the title bar's
@@ -1207,9 +1377,9 @@ struct LabelledMail {
 /// derived from, so a frame that moved nothing derives nothing.
 #[derive(Default)]
 struct LabelView {
-    /// The labels revision, the accounts' own mail revision and the filter;
-    /// `None` until the first derivation, which no key equals.
-    key: Option<(u64, u64, Vec<String>)>,
+    /// The labels revision, the accounts' own mail revision, the filter and the
+    /// sort; `None` until the first derivation, which no key equals.
+    key: Option<(u64, u64, Vec<String>, ListSort)>,
     rows: Vec<LabelCount>,
     /// The mail the filter selects, newest first. Empty while no filter is on.
     matches: Vec<LabelledMail>,
@@ -1882,6 +2052,7 @@ impl KimoApp {
             open_threads: HashSet::new(),
             open_rev: 0,
             list_filters: ListFilters::default(),
+            list_sort: ListSort::default(),
             list_rows: None,
             select_mode: false,
             selected_mails: HashSet::new(),
@@ -3444,11 +3615,13 @@ impl KimoApp {
             box_end = Some(box_rect.right());
         }
 
-        // --- the filter cell: the search box's own companion ---
-        // The list's view control, in the box's group rather than with the pane's
-        // actions: it is about what the column *shows*, which is what the box is
-        // about too. It says its state the way the magnifier does — the accent
-        // while any view is ticked — and its menu is the views as checkboxes.
+        // --- the filter and sort cells: the search box's own companions ---
+        // The column's two view controls, in the box's group rather than with the
+        // pane's actions: they are about what the list *is* — which of its mail
+        // is shown, and in what order — which is what the box is about too. Each
+        // says its state the way the magnifier does, taking the accent while it
+        // is doing something other than its default, and each opens its own menu
+        // of two or three groups of choices.
         if let Some(filter) = anchors.filter {
             ui.scope_builder(
                 egui::UiBuilder::new()
@@ -3468,6 +3641,29 @@ impl KimoApp {
                     let response = response
                         .on_hover_text(format!("Filter — showing {}", self.list_filters.summary()));
                     self.filter_popup(&response);
+                },
+            );
+        }
+        if let Some(sort) = anchors.sort {
+            ui.scope_builder(
+                egui::UiBuilder::new()
+                    .max_rect(sort)
+                    .layout(egui::Layout::left_to_right(egui::Align::Center)),
+                |row| {
+                    clip_to(row, sort);
+                    let response = titlebar_button(row, true);
+                    // The accent while the list is ordered by anything but the
+                    // default: the sort is always doing something, so what the
+                    // colour says is that the user asked for it.
+                    let color = if self.list_sort == ListSort::default() {
+                        visuals.text_color()
+                    } else {
+                        scheme.accent
+                    };
+                    paint_sort_icon(row.painter(), response.rect, color, MAIL_ACTION_GLYPH);
+                    let response =
+                        response.on_hover_text(format!("Sort — {}", self.list_sort.summary()));
+                    self.sort_popup(&response);
                 },
             );
         }
@@ -3515,9 +3711,13 @@ impl KimoApp {
             // The box is drawn: two stretches, one on each side of it.
             Some(end) => {
                 free.push((left_end, anchors.search));
-                // The box and the filter cell are one group, so what is left of
-                // the bar starts after whichever of them ends last.
-                free.push((anchors.filter.map_or(end, |filter| filter.right()), next));
+                // The box and the cells beside it are one group, so what is left
+                // of the bar starts after whichever of them ends last.
+                let group_end = anchors
+                    .sort
+                    .or(anchors.filter)
+                    .map_or(end, |cell| cell.right());
+                free.push((group_end, next));
             }
             // No box — not even a narrow one: one stretch from the first group
             // to whatever comes next.
@@ -4877,7 +5077,8 @@ impl KimoApp {
                 && rows.rev == rev
                 && rows.open_rev == self.open_rev
                 && rows.threaded == self.threaded
-                && rows.filters == self.list_filters;
+                && rows.filters == self.list_filters
+                && rows.sort == self.list_sort;
             if fresh {
                 return;
             }
@@ -4893,6 +5094,7 @@ impl KimoApp {
         // what is derived is built from its own borrow and handed over once it
         // is owned.
         let filters = self.list_filters.clone();
+        let sort = self.list_sort;
         let me = self.my_addresses();
         let derived = self.folder_messages_of(&account, &folder).map(|messages| {
             // What the column's filter lets through, in the folder's own order:
@@ -4903,7 +5105,7 @@ impl KimoApp {
                 .map(|mail| filters.matches(mail_facts(mail), &me))
                 .collect();
             let threads = threads::group(messages);
-            let threads = if filters.is_all() {
+            let mut threads = if filters.is_all() {
                 threads
             } else {
                 threads
@@ -4911,7 +5113,18 @@ impl KimoApp {
                     .filter_map(|thread| thread_of_shown(thread, messages, &shown))
                     .collect()
             };
-            let rows = list_rows_of(&threads, &shown, &open, self.threaded);
+            // The column's own order, over the conversations' rows and over the
+            // flat list both: what a row is sorted by is what the row shows, and
+            // the order the default asks for is the folder's own, so nothing
+            // moves until the menu is used.
+            threads.sort_by(|one, two| {
+                sort.compare(
+                    thread_sort_key(one, messages),
+                    thread_sort_key(two, messages),
+                )
+            });
+            let flat = flat_order(&shown, messages, sort);
+            let rows = list_rows_of(&threads, &flat, &open, self.threaded);
             (threads, rows)
         });
         self.list_rows = derived.map(|(threads, rows)| ListRows {
@@ -4921,6 +5134,7 @@ impl KimoApp {
             open_rev: self.open_rev,
             threaded: self.threaded,
             filters,
+            sort,
             threads,
             rows,
         });
@@ -4951,7 +5165,12 @@ impl KimoApp {
             .states
             .values()
             .fold(0_u64, |sum, state| sum.wrapping_add(state.folders_rev));
-        let key = (self.labels_rev, mail_rev, self.label_filter.clone());
+        let key = (
+            self.labels_rev,
+            mail_rev,
+            self.label_filter.clone(),
+            self.list_sort,
+        );
         if self
             .label_view
             .as_ref()
@@ -5000,13 +5219,13 @@ impl KimoApp {
                 }
             }
         }
-        // Newest first, and a total order besides: the filter spans every folder
-        // and account, so two mails of one timestamp would otherwise come out in
-        // whatever order the accounts were walked in.
+        // The column's own order — the sort cell's, which is newest first by
+        // date until the menu is used — and a total order besides: the filter
+        // spans every folder and account, so two mails that compare equal would
+        // otherwise come out in whatever order the accounts were walked in.
+        let sort = self.list_sort;
         matches.sort_by(|a, b| {
-            b.timestamp
-                .unwrap_or(0)
-                .cmp(&a.timestamp.unwrap_or(0))
+            sort.compare(labelled_sort_key(a), labelled_sort_key(b))
                 .then_with(|| a.account_id.cmp(&b.account_id))
                 .then_with(|| a.folder.cmp(&b.folder))
                 .then_with(|| a.uid.cmp(&b.uid))
@@ -5279,13 +5498,13 @@ impl KimoApp {
         let mut changed = false;
         egui::Popup::menu(response)
             .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
-            .width(FILTER_POPUP_WIDTH)
+            .width(LIST_MENU_WIDTH)
             .show(|ui| {
-                ui.set_min_width(FILTER_POPUP_WIDTH);
+                ui.set_min_width(LIST_MENU_WIDTH);
                 ui.spacing_mut().item_spacing.y = FILTER_ROW_GAP;
                 // "All" is not one of the views: it is the absence of them, drawn
                 // ticked exactly while none is, and ticking it clears the rest.
-                if filter_menu_row(ui, FilterIcon::All, "All", filters.is_all(), true)
+                if menu_row(ui, MenuIcon::All, "All", filters.is_all(), true)
                     .on_hover_text("Every mail in the list")
                     .clicked()
                 {
@@ -5297,7 +5516,7 @@ impl KimoApp {
                     // a session whose accounts are all bare logins has nothing to
                     // ask, and the row says so rather than filtering to nothing.
                     let asked = filter != ListFilter::ToMe || !me.is_empty();
-                    let row = filter_menu_row(
+                    let row = menu_row(
                         ui,
                         filter.icon(),
                         filter.label(),
@@ -5338,7 +5557,60 @@ impl KimoApp {
         self.ctx.request_repaint();
     }
 
-    /// The folder the list is showing, as `(account, folder)`: what a folder
+    /// The sort menu: the *order* group — newest on top, or oldest — and the
+    /// *by* group — date, sender, subject — each an independent choice of one,
+    /// drawn as a row per choice with the one in force ticked at its end.
+    ///
+    /// Anchored to the cell that opened it (`Popup::menu`) and left open across
+    /// picks, like the filter's menu and for the same reason: changing one's
+    /// mind about the order and about the key is two clicks, not two visits.
+    fn sort_popup(&mut self, response: &egui::Response) {
+        let mut sort = self.list_sort;
+        let mut changed = false;
+        egui::Popup::menu(response)
+            .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
+            .width(LIST_MENU_WIDTH)
+            .show(|ui| {
+                ui.set_min_width(LIST_MENU_WIDTH);
+                ui.spacing_mut().item_spacing.y = FILTER_ROW_GAP;
+                menu_heading(ui, "Sort order");
+                for order in SortOrder::ALL {
+                    let row = menu_row(ui, order.icon(), order.label(), sort.order == order, true);
+                    if row.clicked() {
+                        sort.order = order;
+                        changed = true;
+                    }
+                }
+                ui.separator();
+                menu_heading(ui, "Sort by");
+                for by in SortBy::ALL {
+                    let row = menu_row(ui, by.icon(), by.label(), sort.by == by, true);
+                    if row.clicked() {
+                        sort.by = by;
+                        changed = true;
+                    }
+                }
+            });
+        if changed && sort != self.list_sort {
+            self.set_list_sort(sort);
+        }
+    }
+
+    /// Order the message list the way the sort menu asked: the other half of what
+    /// the column's view is, beside the filter.
+    ///
+    /// The derived rows carry the sort they were built with (`ListRows::sort`), so
+    /// the next frame derives them again; the frame is asked for here because a
+    /// click on a menu row is the last thing that happens in this one.
+    fn set_list_sort(&mut self, sort: ListSort) {
+        if self.list_sort == sort {
+            return;
+        }
+        self.list_sort = sort;
+        self.ctx.request_repaint();
+    }
+
+    /// The folder the list is showing, as `(account, folder)`: what a folder    /// The folder the list is showing, as `(account, folder)`: what a folder
     /// row's selection key and its checkbox id are built from. The rows are only
     /// drawn while a folder is open — the search results have a row of their
     /// own, `search_row`, which names the folder each hit lives in — so the two
@@ -8196,9 +8468,11 @@ const LABEL_GROUP_GAP: f32 = 10.0;
 /// new-label box want, and no taller than this before the labels scroll — a
 /// user with fifty labels should not get a menu taller than the window.
 const LABEL_POPUP_WIDTH: f32 = 220.0;
-/// The filter menu: a row per view, each the view's own mark, its name, and the
-/// tick at the end that says whether it is one of the views in force.
-const FILTER_POPUP_WIDTH: f32 = 240.0;
+/// The bar's two menus — the filter's and the sort's: a row per choice, each the
+/// choice's own mark, its name, and the tick at the end that says whether it is
+/// the one in force. One width for both, because they hang from adjacent cells
+/// and are read as one control.
+const LIST_MENU_WIDTH: f32 = 240.0;
 /// The room a menu row takes, the gap between two of them, and how far the row's
 /// content stays clear of its own ends — the mark's inset and the tick's, which
 /// are one number so the two line up down the menu.
@@ -8514,9 +8788,12 @@ struct TitlebarAnchors {
     /// How wide the plan makes the box (`titlebar_search_width`), or `None` when
     /// the bar has no room for it at all.
     search_width: Option<f32>,
-    /// The filter cell beside the box — the two are one group, a bar's own cell
+    /// The filter cell beside the box — they are one group, a bar's own cell
     /// apart — or `None` when the room the box leaves is too little for it.
     filter: Option<egui::Rect>,
+    /// The sort cell after the filter, or `None` when the room ran out before
+    /// it: the two are given up in the order they are drawn in.
+    sort: Option<egui::Rect>,
     /// The mail actions' rect — the reading pane's own row, as wide as the run —
     /// or `None` when the pane has no room for it beside the window controls.
     actions: Option<egui::Rect>,
@@ -8561,27 +8838,38 @@ fn titlebar_anchors(
             egui::vec2(width, TITLEBAR_BUTTON_SIZE),
         )
     });
-    // The box's own width is planned first, exactly as it was before there was a
-    // filter to sit beside it: the box is the list's, and a bar that cannot hold
-    // both holds the box. What the box leaves is the filter cell's room — the
-    // two are one group, a cell's gap apart — and a bar with too little of it
-    // for the cell does not draw one.
+    // The box's own width is planned first, exactly as it was before there were
+    // cells to sit beside it: the box is the list's, and a bar that cannot hold
+    // everything holds the box. What the box leaves is the cells' room — they are
+    // one group with it, a cell's gap apart — and each cell is drawn while the
+    // room reaches its own end: the filter first, then the sort, so a bar that
+    // can hold one of the two holds the filter. The box's width never depends on
+    // them, which is what keeps a window being resized from flickering.
     let search = list_left.max(first_end + TITLEBAR_GROUP_GAP);
     let next = actions.map_or(cluster_left, |actions| actions.left());
     let search_width = titlebar_search_width(next - search - TITLEBAR_GROUP_GAP);
-    let filter = search_width.and_then(|width| {
-        let left = search + width + TITLEBAR_BUTTON_GAP;
-        (left + TITLEBAR_BUTTON_SIZE + TITLEBAR_GROUP_GAP <= next + 0.5).then(|| {
-            egui::Rect::from_min_size(
-                egui::pos2(left, bar.center().y - TITLEBAR_BUTTON_SIZE / 2.0),
-                egui::vec2(TITLEBAR_BUTTON_SIZE, TITLEBAR_BUTTON_SIZE),
-            )
-        })
-    });
+    let mut cell_left = search + search_width.unwrap_or_default() + TITLEBAR_BUTTON_GAP;
+    let room_for_cell = |left: f32| left + TITLEBAR_BUTTON_SIZE + TITLEBAR_GROUP_GAP <= next + 0.5;
+    let cell = |left: f32| {
+        egui::Rect::from_min_size(
+            egui::pos2(left, bar.center().y - TITLEBAR_BUTTON_SIZE / 2.0),
+            egui::vec2(TITLEBAR_BUTTON_SIZE, TITLEBAR_BUTTON_SIZE),
+        )
+    };
+    let mut next_cell = || {
+        let rect = room_for_cell(cell_left).then(|| cell(cell_left));
+        if rect.is_some() {
+            cell_left += TITLEBAR_BUTTON_SIZE + TITLEBAR_BUTTON_GAP;
+        }
+        rect
+    };
+    let filter = search_width.and_then(|_| next_cell());
+    let sort = filter.and_then(|_| next_cell());
     TitlebarAnchors {
         search,
         search_width,
         filter,
+        sort,
         actions,
     }
 }
@@ -10312,6 +10600,27 @@ fn paint_flag_icon(p: &egui::Painter, rect: egui::Rect, color: egui::Color32, si
     ));
 }
 
+/// Sort: two arrows side by side, one up and one down — the mark every list
+/// with an order draws on its sort control. The bar's own, like the funnel: a
+/// menu row that names a direction uses one arrow of the pair
+/// (`MenuIcon::Newest`), so the cell and the rows are drawn from one idea.
+fn paint_sort_icon(p: &egui::Painter, rect: egui::Rect, color: egui::Color32, size: f32) {
+    let g = |x: f32, y: f32| outline_point(rect.center(), x, y, size);
+    let stroke = egui::Stroke::new(1.5_f32, color);
+    // Up: the shaft, then the head above it.
+    p.add(egui::Shape::line(vec![g(9.0, 20.0), g(9.0, 6.0)], stroke));
+    p.add(egui::Shape::line(
+        vec![g(4.5, 10.5), g(9.0, 6.0), g(13.5, 10.5)],
+        stroke,
+    ));
+    // Down: the same, the other way round.
+    p.add(egui::Shape::line(vec![g(15.0, 4.0), g(15.0, 18.0)], stroke));
+    p.add(egui::Shape::line(
+        vec![g(10.5, 13.5), g(15.0, 18.0), g(19.5, 13.5)],
+        stroke,
+    ));
+}
+
 /// Filter: a funnel, the one glyph of the bar's set that is not about a mail —
 /// it says which mail the *list* is showing. Drawn like the rest: one stroked
 /// path inside the 24×24 outline the set shares.
@@ -10332,45 +10641,69 @@ fn paint_filter_icon(p: &egui::Painter, rect: egui::Rect, color: egui::Color32, 
     ));
 }
 
-/// What one of the filter menu's rows draws at its left: a mark per view, and
-/// the "All" row's own. The two that the list already draws somewhere are the
-/// same functions — the flag and the paperclip — so the menu and the list say
-/// the same thing with the same shape.
+/// What one row of the bar's two menus draws at its left. The filter's marks say
+/// what a view is about, the sort's say which way the list runs and by what —
+/// and where the list already draws the same thing somewhere (the flag, the
+/// paperclip), it is the same function, so the menu and the list say it with one
+/// shape.
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum FilterIcon {
+enum MenuIcon {
     All,
     Unread,
     Flagged,
     ToMe,
     HasFiles,
+    /// An arrow down: the list runs from the newest mail at the top to the
+    /// oldest at the foot, which is the sort direction the whole world draws
+    /// this way round.
+    Newest,
+    /// And up, for the other way.
+    Oldest,
+    ByDate,
+    ByFrom,
+    BySubject,
 }
 
 impl ListFilter {
-    fn icon(self) -> FilterIcon {
+    fn icon(self) -> MenuIcon {
         match self {
-            ListFilter::Unread => FilterIcon::Unread,
-            ListFilter::Flagged => FilterIcon::Flagged,
-            ListFilter::ToMe => FilterIcon::ToMe,
-            ListFilter::HasFiles => FilterIcon::HasFiles,
+            ListFilter::Unread => MenuIcon::Unread,
+            ListFilter::Flagged => MenuIcon::Flagged,
+            ListFilter::ToMe => MenuIcon::ToMe,
+            ListFilter::HasFiles => MenuIcon::HasFiles,
         }
     }
 }
 
-/// One filter menu row's glyph, in the 24×24 outline style the whole icon set is
-/// drawn in, at `FILTER_ICON_SIZE`.
-fn paint_filter_menu_icon(
-    p: &egui::Painter,
-    icon: FilterIcon,
-    rect: egui::Rect,
-    color: egui::Color32,
-) {
+impl SortOrder {
+    fn icon(self) -> MenuIcon {
+        match self {
+            SortOrder::Newest => MenuIcon::Newest,
+            SortOrder::Oldest => MenuIcon::Oldest,
+        }
+    }
+}
+
+impl SortBy {
+    fn icon(self) -> MenuIcon {
+        match self {
+            SortBy::Date => MenuIcon::ByDate,
+            SortBy::From => MenuIcon::ByFrom,
+            SortBy::Subject => MenuIcon::BySubject,
+        }
+    }
+}
+
+/// One menu row's glyph, in the 24×24 outline style the whole icon set is drawn
+/// in, at `FILTER_ICON_SIZE`.
+fn paint_menu_icon(p: &egui::Painter, icon: MenuIcon, rect: egui::Rect, color: egui::Color32) {
     let size = FILTER_ICON_SIZE;
     let g = |x: f32, y: f32| outline_point(rect.center(), x, y, size);
     let stroke = egui::Stroke::new(1.5_f32 * size / MAIL_ACTION_GLYPH, color);
     match icon {
         // The whole mailbox: an envelope, the one mark that means *mail* rather
         // than something about it.
-        FilterIcon::All | FilterIcon::Unread => {
+        MenuIcon::All | MenuIcon::Unread => {
             p.add(egui::Shape::line(
                 vec![
                     g(3.0, 5.0),
@@ -10386,7 +10719,7 @@ fn paint_filter_menu_icon(
                 vec![g(3.0, 6.5), g(12.0, 12.0), g(21.0, 6.5)],
                 stroke,
             ));
-            if icon == FilterIcon::Unread {
+            if icon == MenuIcon::Unread {
                 // A mail that has not been read: the envelope with the new-mail
                 // pip at its lower corner, the one part of this set that is
                 // filled.
@@ -10394,9 +10727,9 @@ fn paint_filter_menu_icon(
             }
         }
         // The list's own mark for a flagged mail, at the menu's size.
-        FilterIcon::Flagged => paint_flag_icon(p, rect, color, size),
+        MenuIcon::Flagged => paint_flag_icon(p, rect, color, size),
         // Addressed to me: a person — a head and the shoulders under it.
-        FilterIcon::ToMe => {
+        MenuIcon::ToMe | MenuIcon::ByFrom => {
             p.circle_stroke(g(12.0, 8.0), 3.6 * size / 24.0, stroke);
             p.add(egui::Shape::line(
                 vec![
@@ -10411,22 +10744,63 @@ fn paint_filter_menu_icon(
             ));
         }
         // What the mail carries, in the list's own paperclip.
-        FilterIcon::HasFiles => paint_clip_icon(p, rect, color),
+        MenuIcon::HasFiles => paint_clip_icon(p, rect, color),
+        // The sort's two directions: one arrow each, the same shaft and head
+        // turned round.
+        MenuIcon::Newest | MenuIcon::Oldest => {
+            let down = icon == MenuIcon::Newest;
+            let (tail, head_y) = if down { (5.0, 17.0) } else { (19.0, 7.0) };
+            p.add(egui::Shape::line(
+                vec![g(12.0, tail), g(12.0, head_y)],
+                stroke,
+            ));
+            let (wing, tip) = if down {
+                (head_y - 4.5, head_y)
+            } else {
+                (head_y + 4.5, head_y)
+            };
+            p.add(egui::Shape::line(
+                vec![g(7.5, wing), g(12.0, tip), g(16.5, wing)],
+                stroke,
+            ));
+        }
+        // Sorted by date: a calendar — a box with its binding along the top and
+        // the two days' ticks under it.
+        MenuIcon::ByDate => {
+            p.add(egui::Shape::line(
+                vec![
+                    g(4.0, 6.5),
+                    g(20.0, 6.5),
+                    g(20.0, 19.5),
+                    g(4.0, 19.5),
+                    g(4.0, 6.5),
+                ],
+                stroke,
+            ));
+            p.add(egui::Shape::line(vec![g(4.0, 10.5), g(20.0, 10.5)], stroke));
+            p.add(egui::Shape::line(vec![g(8.5, 4.5), g(8.5, 8.0)], stroke));
+            p.add(egui::Shape::line(vec![g(15.5, 4.5), g(15.5, 8.0)], stroke));
+        }
+        // Sorted by subject: the title's own two lines, the second shorter.
+        MenuIcon::BySubject => {
+            p.add(egui::Shape::line(vec![g(4.0, 9.0), g(20.0, 9.0)], stroke));
+            p.add(egui::Shape::line(vec![g(4.0, 15.0), g(14.0, 15.0)], stroke));
+        }
     }
 }
 
-/// One row of the filter menu: the view's mark at its left, the name, and — at
-/// the row's *end*, where a menu's tick belongs — the check when the view is one
-/// of those in force. The whole row is the target, not only the words, and the
-/// row is the app's own drawing rather than a stock widget: a checkbox puts its
-/// box in front of the name, which is where the mark goes.
+/// One row of either of the bar's menus: the choice's own mark at its left, the
+/// name, and — at the row's *end*, where a menu's tick belongs — the check when
+/// the choice is the one in force. The whole row is the target, not only the
+/// words, and the row is the app's own drawing rather than a stock widget: a
+/// checkbox puts its box in front of the name, which is where the mark goes.
 ///
 /// `enabled` is false for a view the session cannot answer — "To me" without an
 /// address to match — and such a row neither fills under the pointer nor
 /// responds to it.
-fn filter_menu_row(
+fn menu_row(
     ui: &mut egui::Ui,
-    icon: FilterIcon,
+    icon: MenuIcon,
     label: &str,
     ticked: bool,
     enabled: bool,
@@ -10458,7 +10832,7 @@ fn filter_menu_row(
         ),
         egui::Vec2::splat(FILTER_ICON_SIZE),
     );
-    paint_filter_menu_icon(ui.painter(), icon, icon_rect, color);
+    paint_menu_icon(ui.painter(), icon, icon_rect, color);
     // The name, in the interface font the rest of the menu's text is drawn in.
     let font = ui
         .style()
@@ -10486,6 +10860,15 @@ fn filter_menu_row(
         paint_check_icon(ui.painter(), tick, scheme.accent);
     }
     response.on_hover_cursor(egui::CursorIcon::PointingHand)
+}
+
+/// A menu's group heading: the word alone, small and weak — the sort menu's two
+/// groups are what it is for, and the filter menu's "All" row is a choice rather
+/// than a heading, so it is drawn as one.
+fn menu_heading(ui: &mut egui::Ui, text: &str) {
+    ui.add_space(FILTER_ROW_GAP * 2.0);
+    ui.label(egui::RichText::new(text).small().weak());
+    ui.add_space(FILTER_ROW_GAP);
 }
 
 /// The tick a menu row carries at its end when its view is on: one stroke, the
@@ -12471,7 +12854,7 @@ mod tests {
 
         let closed: std::collections::HashSet<String> = std::collections::HashSet::new();
         assert_eq!(
-            list_rows_of(&threads, &all_shown(&mails), &closed, true),
+            list_rows_of(&threads, &all_in_order(&mails), &closed, true),
             vec![
                 ListRow::Thread { thread: 0 },
                 // A conversation of one is a mail, and is drawn like one: no
@@ -12487,7 +12870,7 @@ mod tests {
         let open: std::collections::HashSet<String> =
             [threads[0].key.clone()].into_iter().collect();
         assert_eq!(
-            list_rows_of(&threads, &all_shown(&mails), &open, true),
+            list_rows_of(&threads, &all_in_order(&mails), &open, true),
             vec![
                 ListRow::Thread { thread: 0 },
                 ListRow::Message {
@@ -12511,7 +12894,7 @@ mod tests {
 
         // Not threading: every mail is a row of its own.
         assert_eq!(
-            list_rows_of(&threads, &all_shown(&mails), &open, false),
+            list_rows_of(&threads, &all_in_order(&mails), &open, false),
             (0..mails.len())
                 .map(|index| ListRow::Message {
                     index,
@@ -14390,11 +14773,13 @@ mod tests {
         }
     }
 
-    /// Every mail shown: what the list is derived from with no filter on, for
-    /// the tests that drive `list_rows_of` themselves — the filter's own tests go
-    /// through the app, which builds this mask from `ListFilter::matches`.
-    fn all_shown(mails: &[MailMessage]) -> Vec<bool> {
-        vec![true; mails.len()]
+    /// Every mail shown, in the folder's own order: what the list is derived from
+    /// with no filter and no sort of its own, for the tests that drive
+    /// `list_rows_of` themselves — the filter's and the sort's own tests go
+    /// through the app, which builds the mask and the order from
+    /// `ListFilter::matches` and `ListSort::compare`.
+    fn all_in_order(mails: &[MailMessage]) -> Vec<usize> {
+        (0..mails.len()).collect()
     }
 
     /// Every rectangle one frame filled in a given color, however deeply egui
@@ -14729,11 +15114,33 @@ mod tests {
             filter.right() + TITLEBAR_GROUP_GAP <= cluster_left(1400.0) + 0.5,
             "the filter stays clear of the bar's right end: {filter:?}"
         );
+        // And the sort cell follows it, one cell's gap further on: the two are
+        // the box's group, in the order they are given up in.
+        let sort = anchors
+            .sort
+            .expect("the bar has room for the sort at 1400 pt");
+        assert_eq!(sort.left(), filter.right() + TITLEBAR_BUTTON_GAP);
+        assert_eq!(sort.width(), TITLEBAR_BUTTON_SIZE);
+        assert!(
+            sort.right() + TITLEBAR_GROUP_GAP <= cluster_left(1400.0) + 0.5,
+            "the sort stays clear of the bar's right end: {sort:?}"
+        );
+
+        // A bar with room for the filter but not for the sort after it: the
+        // filter is the one that stays, and the sort is not drawn at all.
+        let anchors = titlebar_anchors(bar(560.0), first_end, 0.0, 0.0, 360.0);
+        assert_eq!(anchors.search_width, Some(TITLEBAR_SEARCH_WIDTH));
+        assert!(anchors.filter.is_some(), "the filter still fits");
+        assert!(
+            anchors.sort.is_none(),
+            "and the sort does not: {:?}",
+            anchors.sort
+        );
 
         // A bar with room for the box but none for a cell beside it: the box is
         // what is kept — it is the list's own, and its width is planned first —
-        // and the filter is not drawn at all rather than squeezed or drawn over
-        // its neighbours.
+        // and neither cell is drawn rather than squeezed or drawn over its
+        // neighbours.
         let anchors = titlebar_anchors(bar(506.0), first_end, 0.0, 0.0, 312.0);
         assert_eq!(anchors.search_width, Some(TITLEBAR_SEARCH_WIDTH));
         assert!(
@@ -14741,6 +15148,7 @@ mod tests {
             "no room for a cell beside the box: {:?}",
             anchors.filter
         );
+        assert!(anchors.sort.is_none(), "nor for the one after it");
 
         // A collapsed navigation column puts the list at the window's edge: the
         // box follows it and stops clear of the first group instead of landing
@@ -14809,6 +15217,9 @@ mod tests {
                     filter.left() >= first_end + TITLEBAR_GROUP_GAP,
                     "{filter:?}"
                 );
+            }
+            if let Some(sort) = anchors.sort {
+                assert!(sort.left() >= first_end + TITLEBAR_GROUP_GAP, "{sort:?}");
             }
             if let Some(actions) = anchors.actions {
                 assert!(
@@ -16551,7 +16962,30 @@ mod tests {
         .expect("the bar draws a filter cell here")
     }
 
-    /// Where one of the title bar's mail action cells sits: the bar's own    /// Where one of the title bar's mail action cells sits: the bar's own
+    /// Where the bar's sort cell sits: the filter's other half, a cell's gap to
+    /// its right in the same group (`titlebar_anchors`). Runs a frame, like
+    /// `titlebar_filter_rect`.
+    fn titlebar_sort_rect(ctx: &egui::Context, app: &mut KimoApp, width: f32) -> egui::Rect {
+        frame_shapes_at(ctx, app, width);
+        let bar = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(width, TITLEBAR_HEIGHT));
+        let rects = titlebar_rects(bar, 3);
+        let pane_left = if app.pane_popup {
+            0.0
+        } else {
+            app.list_column.right()
+        };
+        titlebar_anchors(
+            bar,
+            first_group_end(),
+            app.list_column.left(),
+            pane_left,
+            rects.sync.left(),
+        )
+        .sort
+        .expect("the bar draws a sort cell here")
+    }
+
+    /// Where one of the title bar's mail action cells sits: the bar's own
     /// arithmetic, from the search box the run is laid out after onwards
     /// (`titlebar_rects`, `titlebar_anchors`).
     fn titlebar_action_center(
@@ -16741,9 +17175,9 @@ mod tests {
 
     /// Developer tool (there is no compositor at hand in a test): draw a few
     /// frames — the labelled list and card, the label filter and popup, the
-    /// flagged list, the list filter's menu and the list it leaves, the bar with
-    /// and without a mail open in the pane, and Preferences → General — and
-    /// write them out as PNGs, so the layout can be
+    /// flagged list, the list filter's menu and the list it leaves, the sort
+    /// menu, the bar with and without a mail open in the pane, and
+    /// Preferences → General — and write them out as PNGs, so the layout can be
     /// looked at. `KIMO_UI_DUMP` picks the directory (default `target`) and
     /// `KIMO_UI_WIDTH` the window's width (default 1400).
     ///
@@ -16853,6 +17287,16 @@ mod tests {
         }
         shot(&mut app, "ui-filter-flagged.png", &mut textures);
         app.set_list_filters(ListFilters::default());
+
+        // And the sort cell's menu: the order group above the by group, each a
+        // choice of one and ticked at the end of the row in force.
+        let sort_cell = titlebar_sort_rect(&ctx, &mut app, 1400.0).center();
+        dump_click(&ctx, &mut app, &mut textures, sort_cell);
+        for _ in 0..2 {
+            collect_frame(&ctx, &mut app, &mut textures, Vec::new());
+        }
+        shot(&mut app, "ui-sort-menu.png", &mut textures);
+        egui::Popup::close_all(&ctx);
 
         // The bar with nothing open in the pane first: the pane's run is not
         // there at all rather than there and dimmed, and the chrome it would
@@ -17299,7 +17743,7 @@ mod tests {
             );
             let tail = egui::Rect::from_min_max(
                 egui::pos2(text.right() + 2.0, text.top() - 4.0),
-                egui::pos2(row_left + FILTER_POPUP_WIDTH, text.bottom() + 4.0),
+                egui::pos2(row_left + LIST_MENU_WIDTH, text.bottom() + 4.0),
             );
             (icon, tail)
         };
@@ -17371,6 +17815,249 @@ mod tests {
             drawn(&texts, "0") && drawn(&texts, "1") && drawn(&texts, "2"),
             "every mail is back: {texts:?}"
         );
+    }
+
+    /// The sort cell sits after the filter and opens the menu's two groups: the
+    /// order — newest on top, or oldest — and the key — date, sender, subject.
+    /// Each is a choice of one, ticked at the end of the row in force, and the
+    /// list is drawn in the order the two add up to.
+    #[test]
+    fn the_sort_cell_orders_the_list() {
+        let ctx = egui::Context::default();
+        crate::fonts::install(&ctx, None, None);
+        let mut app = app_with_messages(&ctx, 3);
+        app.selected_message = None;
+        // Three mails whose three keys all disagree, so that which one the list
+        // was sorted by is what the rows say. By date: Zebra (300), Apple (200),
+        // Mango (100); by sender: Cleo, Bob, Ada; by subject: Apple, Mango,
+        // Zebra.
+        {
+            let state = app.states.get_mut("acct").expect("the fixture account");
+            let mails = &mut state.mailbox.folders[0].messages;
+            for (index, (ts, from, subject)) in [
+                (100, "Cleo <cleo@example.com>", "Mango"),
+                (200, "Ada <ada@example.com>", "Apple"),
+                (300, "Bob <bob@example.com>", "Zebra"),
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                mails[index].timestamp = Some(ts);
+                mails[index].from = from.to_string();
+                mails[index].subject = subject.to_string();
+            }
+            state.folders_changed();
+        }
+        // What the list drew, in the order it drew it. Each subject is one run
+        // per row — an unread row's text is struck twice, half a point apart, so
+        // the frame draws it twice — and the pane has no mail of its own on it to
+        // draw a third.
+        let drawn = |texts: &[String]| -> Vec<String> {
+            let mut order: Vec<String> = Vec::new();
+            for run in texts {
+                if matches!(run.as_str(), "Mango" | "Apple" | "Zebra") && !order.contains(run) {
+                    order.push(run.clone());
+                }
+            }
+            order
+        };
+
+        let texts = frame_texts(&ctx, &mut app);
+        assert_eq!(
+            drawn(&texts),
+            ["Zebra", "Apple", "Mango"],
+            "the default: newest first, by date"
+        );
+
+        // The menu, in the two groups the cell promises.
+        let menu_area = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1400.0, 900.0));
+        let open_sort = |ctx: &egui::Context, app: &mut KimoApp| {
+            let cell = titlebar_sort_rect(ctx, app, 1400.0);
+            click_at(ctx, app, cell.center());
+            let _ = frame_shapes_at(ctx, app, 1400.0);
+            frame_shapes_at(ctx, app, 1400.0)
+        };
+        let click_row = |ctx: &egui::Context, app: &mut KimoApp, label: &str| {
+            let shapes = frame_shapes_at(ctx, app, 1400.0);
+            let row = text_boxes_of(&shapes, menu_area, label);
+            assert_eq!(row.len(), 1, "the menu draws one {label} row");
+            click_at(ctx, app, row[0].center());
+        };
+        let shapes = open_sort(&ctx, &mut app);
+        for text in [
+            "Sort order",
+            "Sort by",
+            "Newest on top",
+            "Oldest on top",
+            "Date",
+            "From",
+            "Subject",
+        ] {
+            assert_eq!(
+                text_boxes_of(&shapes, menu_area, text).len(),
+                1,
+                "the menu draws {text}"
+            );
+        }
+        for row in ["Newest on top", "Oldest on top", "Date", "From", "Subject"] {
+            let text = text_boxes_of(&shapes, menu_area, row)[0];
+            let icon = egui::Rect::from_min_max(
+                egui::pos2(text.left() - 40.0, text.top() - 4.0),
+                egui::pos2(text.left() - 2.0, text.bottom() + 4.0),
+            );
+            assert!(
+                !glyph_colors_in(&shapes, icon).is_empty(),
+                "the {row} row carries a mark of its own"
+            );
+        }
+
+        // Oldest on top: the same three mails, the other way round.
+        click_row(&ctx, &mut app, "Oldest on top");
+        assert_eq!(app.list_sort.order, SortOrder::Oldest);
+        let texts = frame_texts(&ctx, &mut app);
+        assert_eq!(drawn(&texts), ["Mango", "Apple", "Zebra"], "oldest first");
+
+        // By sender, with "newest on top" back on: the order group is what turns
+        // the key round, so the names run Z to A.
+        click_row(&ctx, &mut app, "Newest on top");
+        click_row(&ctx, &mut app, "From");
+        assert_eq!(app.list_sort.by, SortBy::From);
+        let texts = frame_texts(&ctx, &mut app);
+        assert_eq!(
+            drawn(&texts),
+            ["Mango", "Zebra", "Apple"],
+            "Cleo, Bob, Ada: the reverse of the names"
+        );
+
+        // And oldest first: the names themselves.
+        click_row(&ctx, &mut app, "Oldest on top");
+        let texts = frame_texts(&ctx, &mut app);
+        assert_eq!(drawn(&texts), ["Apple", "Zebra", "Mango"], "Ada, Bob, Cleo");
+
+        // By subject, the last of the three keys.
+        click_row(&ctx, &mut app, "Subject");
+        assert_eq!(app.list_sort.by, SortBy::Subject);
+        let texts = frame_texts(&ctx, &mut app);
+        assert_eq!(drawn(&texts), ["Apple", "Mango", "Zebra"], "A to Z");
+
+        // The row in force in each group carries the tick at its end, and the
+        // others do not: the menu says what the list is doing.
+        let scheme = theme::of(&ctx);
+        for _ in 0..16 {
+            run_app_frame(&ctx, &mut app, Vec::new());
+        }
+        let shapes = frame_shapes_at(&ctx, &mut app, 1400.0);
+        let tail = |label: &str| {
+            let text = text_boxes_of(&shapes, menu_area, label)[0];
+            let row_left = text.left() - (FILTER_ROW_INSET + FILTER_ICON_SIZE + FILTER_ICON_GAP);
+            egui::Rect::from_min_max(
+                egui::pos2(text.right() + 2.0, text.top() - 4.0),
+                egui::pos2(row_left + LIST_MENU_WIDTH, text.bottom() + 4.0),
+            )
+        };
+        for (row, ticked) in [
+            ("Oldest on top", true),
+            ("Subject", true),
+            ("Newest on top", false),
+            ("Date", false),
+            ("From", false),
+        ] {
+            let colors = glyph_colors_in(&shapes, tail(row));
+            assert_eq!(
+                colors.contains(&scheme.accent),
+                ticked,
+                "the {row} row's tick: {colors:?}"
+            );
+        }
+    }
+
+    /// The sort the menu asks for is one comparison: the three keys, either way
+    /// round, and where the mail sits as the tie-break — so two mails equal by
+    /// the key keep the folder's order rather than swapping about.
+    #[test]
+    fn the_list_sort_compares_by_its_key_and_stays_stable() {
+        let key = |timestamp, from: &'static str, subject: &'static str, position| SortKey {
+            timestamp,
+            from,
+            subject,
+            position,
+        };
+        let newest_date = ListSort::default();
+        assert_eq!(newest_date.order, SortOrder::Newest);
+        assert_eq!(newest_date.by, SortBy::Date);
+        // Newest first: the later date runs before the earlier one, and a mail
+        // whose date would not parse is the oldest there is.
+        assert_eq!(
+            newest_date.compare(key(Some(200), "a", "a", 0), key(Some(100), "a", "a", 1)),
+            std::cmp::Ordering::Less
+        );
+        assert_eq!(
+            newest_date.compare(key(None, "a", "a", 0), key(Some(1), "a", "a", 1)),
+            std::cmp::Ordering::Greater
+        );
+        // The order group turns whatever key round.
+        let oldest = ListSort {
+            order: SortOrder::Oldest,
+            ..ListSort::default()
+        };
+        assert_eq!(
+            oldest.compare(key(Some(200), "a", "a", 0), key(Some(100), "a", "a", 1)),
+            std::cmp::Ordering::Greater
+        );
+        // By sender and by subject: display names, compared as a reader would —
+        // case-insensitively.
+        let by_from = ListSort {
+            by: SortBy::From,
+            ..ListSort::default()
+        };
+        assert_eq!(
+            by_from.compare(
+                key(Some(1), "Ada <a@x>", "z", 0),
+                key(Some(2), "bob <b@x>", "a", 1)
+            ),
+            std::cmp::Ordering::Greater,
+            "newest first reverses the names too: Ada runs after bob"
+        );
+        let by_from_ascending = ListSort {
+            order: SortOrder::Oldest,
+            ..by_from
+        };
+        assert_eq!(
+            by_from_ascending.compare(
+                key(Some(1), "Ada <a@x>", "z", 0),
+                key(Some(2), "bob <b@x>", "a", 1)
+            ),
+            std::cmp::Ordering::Less,
+            "and oldest first is the names themselves, case-insensitively"
+        );
+        let by_subject = ListSort {
+            by: SortBy::Subject,
+            ..ListSort::default()
+        };
+        assert_eq!(
+            by_subject.compare(key(Some(2), "a", "Apple", 0), key(Some(1), "b", "Mango", 1)),
+            std::cmp::Ordering::Greater,
+            "the same reversal, by subject"
+        );
+        let by_subject_ascending = ListSort {
+            order: SortOrder::Oldest,
+            ..by_subject
+        };
+        assert_eq!(
+            by_subject_ascending
+                .compare(key(Some(2), "a", "Apple", 0), key(Some(1), "b", "Mango", 1)),
+            std::cmp::Ordering::Less,
+            "Apple before Mango, oldest first"
+        );
+        // Equal by the key: where the mail sits decides, whichever way the sort
+        // runs — which is what keeps the list still between two frames.
+        for sort in [newest_date, oldest, by_from, by_subject] {
+            assert_eq!(
+                sort.compare(key(Some(5), "a", "a", 3), key(Some(5), "a", "a", 7)),
+                std::cmp::Ordering::Less,
+                "{sort:?}"
+            );
+        }
     }
 
     /// The four views ask a row the four things a list can answer, and "to me"

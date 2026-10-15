@@ -935,7 +935,10 @@ Event (mpsc) ──► drain_events() at frame start ──► merge into Accoun
   list's own view control, in the box's group — a cell's gap to its right —
   because it is about what the *column* shows, which is what the box is about
   too; the accent while any view is ticked, and a menu of them under an "All"
-  row, `filter_popup`), the group of mail actions
+  row, `filter_popup`), the **sort** cell (two arrows, one up and one down, right
+  after the filter and in the same group: which order the column is in, from
+  `sort_popup`, accent-coloured while it is anything but the default), the group
+  of mail actions
   (`titlebar_mail_actions`: reply, reply all, forward, label, flag, export,
   delete, one drawing function per glyph, each from a 24×24 outline through
   `glyph_point`), the
@@ -951,11 +954,12 @@ Event (mpsc) ──► drain_events() at frame start ──► merge into Accoun
   is collapsed and the list runs to the window's own edge. The box is the one
   thing the bar gives up as a window narrows: its own width, then its floor
   (`TITLEBAR_SEARCH_FLOOR`), then nothing, with the search popup still a Ctrl+F
-  away (`titlebar_search_width`). Its width is planned *first*, and the filter
-  cell is what fits in what the box leaves of its room: a bar with room for the
-  box but not for a cell beside it draws the box and no filter — the box's width
-  never depends on whether the filter is drawn, which is what keeps resizing a
-  window from flickering the two against each other.
+  away (`titlebar_search_width`). Its width is planned *first*, and the two
+  cells beside it are what fits in what the box leaves of its room — the filter
+  and then the sort, in that order, so a bar with room for one of them has the
+  filter: a bar with room for the box but not for a cell beside it draws the box
+  and neither. The box's width never depends on them, which is what keeps
+  resizing a window from flickering the three against each other.
   **The pane's run waits for a mail**: it is drawn only while one is open, or a
   selection is checked (which is what Delete takes), because seven dead glyphs
   over an empty pane said nothing and cluttered the bar. It comes and goes over
@@ -1536,6 +1540,28 @@ Event (mpsc) ──► drain_events() at frame start ──► merge into Accoun
   folder is empty." and a search's "No hit matches this filter." — and
   **select-all takes what the list shows** (`ListRows::shown_indices`), never
   mail the filter has hidden.
+- **The list sort is two independent choices, in one menu.** The title bar's
+  sort cell (`sort_popup`) holds the *order* — "Newest on top" (the default, the
+  order the folder arrives in) and "Oldest on top" — and the *key* — date,
+  sender, subject — as two groups under their own small headings, each a choice
+  of one drawn as a row with the tick at its end (`menu_row`, the same row the
+  filter menu uses). The two are one comparison
+  (`ListSort::compare`): the key decides, the order group turns it round, and
+  where the mail sits is the tie-break — which is what keeps two mails equal by
+  the key in the folder's order instead of swapping between frames, and what
+  makes the default a no-op on the list as it already is. The keys are what a
+  row *shows* (`SortKey`): a conversation's row is sorted by its newest mail's
+  date and sender and by its own subject, and names are compared
+  case-insensitively the way a reader would.
+  **It is a view of the column like the filter**, and the two share a cell's
+  worth of state: the derived rows carry both (`ListRows::filters` and
+  `ListRows::sort`), so a change derives them again, the flat list is drawn in the
+  order `flat_order` worked out rather than reordering the folder's own slice,
+  and the label view's matches are sorted in their derivation (whose key carries
+  the sort too) with its own total order behind them, since a label spans every
+  folder and account at once. **A search's hits keep the query's order**: they
+  are ranked, and relevance is what a search is for — the sort is about the
+  lists that are the mailbox itself.
 - Folders are custom rows — kind icon, name (elided with an ellipsis), unread
   count right-aligned — because the whole row should be the click target and
   carry the selection highlight, which `selectable_label` cannot do once an
