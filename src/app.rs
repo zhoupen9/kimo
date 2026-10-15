@@ -38,9 +38,6 @@ use crate::sync::{self, Event, Job, SentCopy};
 use crate::theme::{self, ColorScheme, Theme};
 use crate::threads::{self, Thread};
 
-/// Below this window width the navigation bar collapses automatically.
-const NAV_AUTO_COLLAPSE_WIDTH: f32 = 640.0;
-
 /// How long the search popup waits after the last keystroke before asking the
 /// database: long enough to swallow a burst of typing, short enough to feel
 /// immediate. Enter skips the wait.
@@ -540,6 +537,25 @@ pub struct KimoApp {
     account_form: AccountForm,
     confirm_delete: Option<String>,
     nav_collapsed: bool,
+    /// The reading pane's width as its splitter left it — the width to
+    /// bring the pane back to when a narrow window stops capping it
+    /// (`plan_columns`): egui remembers only what a panel last rendered
+    /// at, which while capped is the cap, so the uncapped width is the
+    /// app's own to keep.
+    pane_width: f32,
+    /// Whether the pane is being capped this frame: egui's memory then
+    /// holds the capped width, and `pane_width` above is what it is
+    /// restored from the moment the cap lifts.
+    pane_capped: bool,
+    /// Whether the pane is a popup over the list this frame — the window
+    /// cannot hold the two content columns side by side even at their
+    /// minimums (`ColumnPlan::popup`). Set by `ui`, read by
+    /// `mail_content`, which is the pane either way.
+    pane_popup: bool,
+    /// Whether the list is wider than the window this frame
+    /// (`ColumnPlan::list_scrolls`): the rows keep the list's minimum and
+    /// the column scrolls sideways. Set by `ui`, read by `mail_list`.
+    list_scrolls: bool,
     /// Accounts whose section in the navigation column is collapsed; an
     /// account is expanded unless its id is in here. Deliberately not
     /// persisted: which accounts you are reading is a per-session thing.
@@ -1418,6 +1434,13 @@ impl KimoApp {
             account_form: AccountForm::default(),
             confirm_delete: None,
             nav_collapsed: false,
+            // The pane's remembered width starts at its default; the first
+            // frame adopts whatever egui has stored, and every frame after
+            // that follows the splitter (see `ui`).
+            pane_width: CONTENT_DEFAULT_WIDTH,
+            pane_capped: false,
+            pane_popup: false,
+            list_scrolls: false,
             collapsed_accounts: HashSet::new(),
             was_narrow: false,
             folder_icons,
@@ -3938,111 +3961,117 @@ impl KimoApp {
         };
         let rows_top = LIST_PADDING.top as f32 + if select_all { SELECT_ALL_HEIGHT } else { 0.0 };
         let select_all_id = row_widget_id("select-all", account, folder, "");
-        let list = egui::ScrollArea::vertical()
-            .auto_shrink([false, false])
-            .show_viewport(ui, |ui, viewport| {
-                egui::Frame::new().inner_margin(margin).show(ui, |ui| {
-                    // No gap between rows: the two pixels that separate two
-                    // mails are the rows' own edges, so the layout must not
-                    // add space of its own between them.
-                    ui.spacing_mut().item_spacing.y = 0.0;
-                    let count = rows.rows.len();
-                    virtual_rows(
-                        ui,
-                        viewport,
-                        rows_top,
-                        MESSAGE_ROW_HEIGHT,
-                        count,
-                        |ui, drawn| {
-                            for index in drawn {
-                                let first = index == 0;
-                                match rows.rows[index] {
-                                    ListRow::Thread { thread } => {
-                                        let conversation = &rows.threads[thread];
-                                        let open = self.open_threads.contains(&conversation.key);
-                                        let drawn = self.thread_row(
-                                            ui,
-                                            conversation,
-                                            messages,
-                                            open,
-                                            first,
+        // A window narrower than the list's minimum does not crush the rows
+        // further: they keep the minimum and the column scrolls sideways
+        // instead — the same answer the reading pane gives a mail wider than
+        // itself. The bar is the scroll area's own, so it appears only while
+        // the window really is too narrow.
+        let scrolls = self.list_scrolls;
+        let list = if scrolls {
+            egui::ScrollArea::both()
+        } else {
+            egui::ScrollArea::vertical()
+        }
+        .auto_shrink([false, false])
+        .show_viewport(ui, |ui, viewport| {
+            egui::Frame::new().inner_margin(margin).show(ui, |ui| {
+                // The list's own width is its minimum; the window's is what
+                // scrolls over it (see `virtual_rows`, which lays the rows
+                // out at the width this leaves them).
+                if scrolls {
+                    ui.set_min_width(LIST_MIN_WIDTH);
+                }
+                // No gap between rows: the two pixels that separate two
+                // mails are the rows' own edges, so the layout must not
+                // add space of its own between them.
+                ui.spacing_mut().item_spacing.y = 0.0;
+                let count = rows.rows.len();
+                virtual_rows(
+                    ui,
+                    viewport,
+                    rows_top,
+                    MESSAGE_ROW_HEIGHT,
+                    count,
+                    |ui, drawn| {
+                        for index in drawn {
+                            let first = index == 0;
+                            match rows.rows[index] {
+                                ListRow::Thread { thread } => {
+                                    let conversation = &rows.threads[thread];
+                                    let open = self.open_threads.contains(&conversation.key);
+                                    let drawn =
+                                        self.thread_row(ui, conversation, messages, open, first);
+                                    // The row's own delete button takes the
+                                    // mail the row speaks for, the box
+                                    // checks every mail the conversation
+                                    // holds, the chevron opens and closes
+                                    // them in the list, and the row opens
+                                    // the conversation in the pane — or, in
+                                    // select mode, leaves it. A click on one
+                                    // is not a click on another.
+                                    if drawn.delete.clicked() {
+                                        deleted =
+                                            row_delete_target(rows.rows[index], rows, messages)
+                                                .map(|msg| MailKey::new(account, folder, &msg.uid));
+                                    } else if drawn.checkbox.clicked() {
+                                        checked = Some(
+                                            conversation
+                                                .messages
+                                                .iter()
+                                                .map(|&index| {
+                                                    MailKey::new(
+                                                        account,
+                                                        folder,
+                                                        &messages[index].uid,
+                                                    )
+                                                })
+                                                .collect(),
                                         );
-                                        // The row's own delete button takes the
-                                        // mail the row speaks for, the box
-                                        // checks every mail the conversation
-                                        // holds, the chevron opens and closes
-                                        // them in the list, and the row opens
-                                        // the conversation in the pane — or, in
-                                        // select mode, leaves it. A click on one
-                                        // is not a click on another.
-                                        if drawn.delete.clicked() {
-                                            deleted =
-                                                row_delete_target(rows.rows[index], rows, messages)
-                                                    .map(|msg| {
-                                                        MailKey::new(account, folder, &msg.uid)
-                                                    });
-                                        } else if drawn.checkbox.clicked() {
-                                            checked = Some(
-                                                conversation
-                                                    .messages
-                                                    .iter()
-                                                    .map(|&index| {
-                                                        MailKey::new(
-                                                            account,
-                                                            folder,
-                                                            &messages[index].uid,
-                                                        )
-                                                    })
-                                                    .collect(),
-                                            );
-                                        } else if drawn
-                                            .chevron
-                                            .is_some_and(|chevron| chevron.clicked())
-                                        {
-                                            toggled = Some(conversation.key.clone());
-                                        } else if drawn.row.clicked() {
-                                            if self.select_mode {
-                                                leave_select = true;
-                                            } else {
-                                                clicked =
-                                                    Some(messages[conversation.newest].clone());
-                                            }
+                                    } else if drawn.chevron.is_some_and(|chevron| chevron.clicked())
+                                    {
+                                        toggled = Some(conversation.key.clone());
+                                    } else if drawn.row.clicked() {
+                                        if self.select_mode {
+                                            leave_select = true;
+                                        } else {
+                                            clicked = Some(messages[conversation.newest].clone());
                                         }
                                     }
-                                    ListRow::Message { index, in_thread } => {
-                                        let place = if in_thread {
-                                            RowPlace::InThread
+                                }
+                                ListRow::Message { index, in_thread } => {
+                                    let place = if in_thread {
+                                        RowPlace::InThread
+                                    } else {
+                                        RowPlace::Plain
+                                    };
+                                    let drawn =
+                                        self.message_row(ui, &messages[index], first, place);
+                                    if drawn.delete.clicked() {
+                                        deleted = Some(MailKey::new(
+                                            account,
+                                            folder,
+                                            &messages[index].uid,
+                                        ));
+                                    } else if drawn.checkbox.clicked() {
+                                        checked = Some(vec![MailKey::new(
+                                            account,
+                                            folder,
+                                            &messages[index].uid,
+                                        )]);
+                                    } else if drawn.row.clicked() {
+                                        if self.select_mode {
+                                            leave_select = true;
                                         } else {
-                                            RowPlace::Plain
-                                        };
-                                        let drawn =
-                                            self.message_row(ui, &messages[index], first, place);
-                                        if drawn.delete.clicked() {
-                                            deleted = Some(MailKey::new(
-                                                account,
-                                                folder,
-                                                &messages[index].uid,
-                                            ));
-                                        } else if drawn.checkbox.clicked() {
-                                            checked = Some(vec![MailKey::new(
-                                                account,
-                                                folder,
-                                                &messages[index].uid,
-                                            )]);
-                                        } else if drawn.row.clicked() {
-                                            if self.select_mode {
-                                                leave_select = true;
-                                            } else {
-                                                clicked = Some(messages[index].clone());
-                                            }
+                                            clicked = Some(messages[index].clone());
                                         }
                                     }
                                 }
                             }
-                        },
-                    );
-                });
+                        }
+                    },
+                );
             });
+        });
         // The select-all row is drawn after the rows, over the top of the
         // viewport: the list scrolls under it, so the one control that is about
         // the whole list is there whether the list is at its top or its foot.
@@ -5202,7 +5231,18 @@ impl KimoApp {
         // card instead of dragging the card off the pane's edge with it.
         let card_left = panel.left() + CONTENT_GUTTER;
         let card_right = panel.right() - CONTENT_GUTTER;
-        let card_top = panel.top() + CONTENT_GUTTER;
+        // In the popup layout the cards start under the back band, which is
+        // the pane's fixed space where the column's first card spends the
+        // floating bar's height as scroll space instead: the back button
+        // cannot scroll away with the mail, so the room it takes is not the
+        // mail's to scroll (see the `add_space` on the first card below).
+        let card_top = panel.top()
+            + CONTENT_GUTTER
+            + if self.pane_popup {
+                TITLEBAR_HEIGHT + POPUP_BACK_HEIGHT
+            } else {
+                0.0
+            };
         let card_bottom = panel.bottom() - CONTENT_GUTTER;
         let inner = egui::Rect::from_min_max(
             egui::pos2(card_left, card_top),
@@ -5254,7 +5294,13 @@ impl KimoApp {
                         // The room is asked for as it is: nothing has been laid
                         // out above this card, so there is no item spacing
                         // under it to make up for (see the gap below).
-                        ui.add_space(TITLEBAR_HEIGHT);
+                        //
+                        // The popup layout asks for none of it: the back band
+                        // above the cards is the fixed space the bar's height
+                        // became there (see `card_top`).
+                        if !self.pane_popup {
+                            ui.add_space(TITLEBAR_HEIGHT);
+                        }
                     } else {
                         // The chrome showing between two cards of a conversation.
                         ui.add_space(
@@ -5281,6 +5327,32 @@ impl KimoApp {
                     scheme.content,
                 ),
             );
+        }
+
+        // The popup's way back to the list. In the column layout the way back
+        // is the list itself, always there on the left; here the list is
+        // under this pane, and closing the mail is what uncovers it. The
+        // button is drawn after the cards so it is on top of a mail scrolled
+        // up under it, and its band is chrome already — the pane painted the
+        // whole of itself — so there is nothing to draw but the button.
+        if self.pane_popup {
+            let band_top = panel.top() + TITLEBAR_HEIGHT;
+            let button = egui::Rect::from_min_size(
+                egui::pos2(
+                    panel.left() + CONTENT_GUTTER + 8.0,
+                    band_top + (POPUP_BACK_HEIGHT - POPUP_BACK_BUTTON.y) / 2.0,
+                ),
+                POPUP_BACK_BUTTON,
+            );
+            let back = ui
+                .put(
+                    button,
+                    egui::Button::new(egui::RichText::new("← Back").small()),
+                )
+                .on_hover_text("Back to the message list");
+            if back.clicked() {
+                self.selected_message = None;
+            }
         }
     }
 
@@ -6200,13 +6272,29 @@ impl KimoApp {
         // frame its clock needs, and what starts the sweep when it is up.
         self.pump_auto_sync(ctx);
 
-        // Collapse the nav bar automatically when the window becomes narrow;
-        // re-expanding is a manual choice and stays until the next crossing.
-        let narrow = ctx.viewport_rect().width() < NAV_AUTO_COLLAPSE_WIDTH;
-        if narrow && !self.was_narrow {
+        // The columns give way to a narrowing window in one order
+        // (`plan_columns`): the navigation collapses first, then the reading
+        // pane is capped at what leaves the list its minimum, then the pane
+        // becomes a popup over the list, and the list itself never narrows
+        // past its rows — a window narrower than that scrolls it sideways.
+        // The thresholds are the columns' own widths rather than constants:
+        // what the splitters left the two panels at, plus the list's minimum,
+        // is the total the three need, and the navigation is the one column
+        // whose width the two content columns can have for themselves.
+        let window = ctx.viewport_rect().width();
+        let nav_width = panel_width(ctx, "nav")
+            .unwrap_or(NAV_DEFAULT_WIDTH)
+            .max(NAV_MIN_WIDTH);
+        let plan = plan_columns(window, nav_width, self.pane_width, self.nav_collapsed);
+        // Collapse the navigation when the window crosses into having less
+        // than the three columns need; re-expanding is a manual choice and
+        // stays until the next crossing.
+        if plan.collapses_nav && !self.was_narrow {
             self.nav_collapsed = true;
         }
-        self.was_narrow = narrow;
+        self.was_narrow = plan.collapses_nav;
+        self.pane_popup = plan.popup;
+        self.list_scrolls = plan.list_scrolls;
 
         // The chrome — title bar, navigation, and the gutter the reading
         // pane's card floats in — is the scheme's panel color; the message list
@@ -6222,14 +6310,45 @@ impl KimoApp {
         // own business — the list's top padding scrolls away with its rows
         // (`LIST_PADDING`), the navigation and the reading pane are inset by
         // the bar's height.
-        egui::Panel::right("mail_content")
-            .resizable(true)
-            .min_size(280.0)
-            .default_size(460.0)
-            .show_separator_line(false)
-            // No frame: the gutter and the card are painted in mail_content.
-            .frame(egui::Frame::NONE)
-            .show(ui, |ui| self.mail_content(ui));
+        // The reading pane: a column beside the list, or — when the window
+        // cannot hold even the two minimums side by side — a popup over it
+        // (`mail_content` draws both shapes, and the band with the back
+        // button is its own).
+        if !plan.popup {
+            let mut pane = egui::Panel::right("mail_content")
+                .min_size(CONTENT_MIN_WIDTH)
+                .default_size(CONTENT_DEFAULT_WIDTH)
+                .show_separator_line(false)
+                // No frame: the gutter and the card are painted in mail_content.
+                .frame(egui::Frame::NONE);
+            match plan.pane_max {
+                // The window has less than the pane's remembered width beside
+                // the list's minimum, so the pane takes what there is. It is
+                // placed at the cap outright rather than merely clamped by it:
+                // clamped, egui would remember the narrowest width the cap
+                // reached and sit there while the window widens through the
+                // same phase. The cap is not a split the user can make — the
+                // window is the one making it — so the splitter is off too.
+                Some(cap) => {
+                    set_panel_width(ctx, "mail_content", cap);
+                    pane = pane.max_size(cap).resizable(false);
+                    self.pane_capped = true;
+                }
+                None => {
+                    // The cap has lifted, and what egui remembers is the last
+                    // width it capped at: back to the remembered one, which
+                    // the frames below then keep following the splitter.
+                    if self.pane_capped {
+                        set_panel_width(ctx, "mail_content", self.pane_width);
+                        self.pane_capped = false;
+                    }
+                    if let Some(width) = panel_width(ctx, "mail_content") {
+                        self.pane_width = width.max(CONTENT_MIN_WIDTH);
+                    }
+                }
+            }
+            pane.show(ui, |ui| self.mail_content(ui));
+        }
         // The navigation slides out instead of vanishing: `show_collapsible`
         // lays the column out at its full width and slides it off toward the
         // window's edge, clipped, so the folder rows keep their layout as it
@@ -6245,14 +6364,20 @@ impl KimoApp {
         // is a copy, so that a splitter drag past the minimum keeps clamping
         // there the way it always has instead of shutting the column by
         // itself.
-        let mut expanded = !self.nav_collapsed;
-        egui::Panel::left("nav")
-            .resizable(true)
-            .min_size(150.0)
-            .default_size(200.0)
-            .show_separator_line(false)
-            .drag_to_open(false)
-            .show_collapsible(ui, &mut expanded, |ui| self.nav(ui));
+        // In the popup layout the navigation is not shown at all: a window
+        // that cannot hold the two content columns side by side has nothing
+        // left for a third. The flag survives, and the column is back the
+        // moment the window can hold it again.
+        if !plan.popup {
+            let mut expanded = !self.nav_collapsed;
+            egui::Panel::left("nav")
+                .resizable(true)
+                .min_size(NAV_MIN_WIDTH)
+                .default_size(NAV_DEFAULT_WIDTH)
+                .show_separator_line(false)
+                .drag_to_open(false)
+                .show_collapsible(ui, &mut expanded, |ui| self.nav(ui));
+        }
         // No padding on the frame: the column's padding lives inside its scroll
         // area (see folder_messages), so the scroll bar can sit on the column's
         // edge instead of on the padding. The column's own rect — what the two
@@ -6267,24 +6392,56 @@ impl KimoApp {
             .show(ui, |ui| self.mail_list(ui));
         let list_column = self.list_column;
 
+        // The popup pane, over the list a click on one of its mails opened.
+        // An area rather than a panel, and one shown after the list so it is
+        // above it; the title bar is moved above it in turn — a new area is
+        // otherwise born above the bar, and the window's own buttons belong
+        // on top whatever the layout below them is. The modals stay above it
+        // too (egui keeps them in the foreground layer).
+        if plan.popup && self.open_conversation().is_some() {
+            let rect = ctx.viewport_rect();
+            egui::Area::new(egui::Id::new("mail-popup"))
+                .order(egui::Order::Middle)
+                .fixed_pos(rect.min)
+                .movable(false)
+                .show(ctx, |ui| {
+                    ui.scope_builder(egui::UiBuilder::new().max_rect(rect), |ui| {
+                        self.mail_content(ui);
+                    });
+                });
+            ctx.move_to_top(egui::LayerId::new(
+                egui::Order::Middle,
+                egui::Id::new("titlebar"),
+            ));
+        } else if plan.popup {
+            // Nothing is open over the list, and the pane's placeholder —
+            // the thing that resets its scroll offset — never draws in this
+            // layout. Reset it here, so the bar is not glass over a list
+            // that never scrolled.
+            self.mail_scroll = 0.0;
+        }
+
         // egui paints a brighter line along a panel boundary while its splitter
         // is hovered or dragged, and this UI wants the splitters invisible: put
         // those two pixels back to the chrome every frame, so a hovered
         // splitter looks exactly like a resting one. Painted after the panels,
         // so it lands on top of whatever they drew there; the list's own
-        // hairlines sit a pixel inside the column and are untouched.
-        let splitter = ctx.layer_painter(egui::LayerId::background());
-        let splitter_stroke = egui::Stroke::new(1.0_f32, scheme.panel);
-        splitter.vline(
-            list_column.left() - 0.5,
-            list_column.y_range(),
-            splitter_stroke,
-        );
-        splitter.vline(
-            list_column.right() + 0.5,
-            list_column.y_range(),
-            splitter_stroke,
-        );
+        // hairlines sit a pixel inside the column and are untouched. The popup
+        // layout has no splitters — its one boundary is the window's edge.
+        if !plan.popup {
+            let splitter = ctx.layer_painter(egui::LayerId::background());
+            let splitter_stroke = egui::Stroke::new(1.0_f32, scheme.panel);
+            splitter.vline(
+                list_column.left() - 0.5,
+                list_column.y_range(),
+                splitter_stroke,
+            );
+            splitter.vline(
+                list_column.right() + 0.5,
+                list_column.y_range(),
+                splitter_stroke,
+            );
+        }
 
         // The title bar, over the columns it belongs to: the list scrolls
         // under it and it is glass while it does (`titlebar_area`). Drawn
@@ -6463,6 +6620,94 @@ const CONTENT_CARD_CORNER_RADIUS: u8 = 8;
 /// the chrome showing between them: a conversation is one card per mail
 /// (`mail_card`), each of them the card a mail on its own gets.
 const CONVERSATION_CARD_GAP: f32 = 12.0;
+
+/// The three columns' minimum widths, and the two the splitters start
+/// them at. The navigation and the reading pane are resizable panels, so
+/// theirs are the panels' own bounds; the message list is what they leave,
+/// so its minimum is one the app enforces itself (`plan_columns caps the
+/// pane at what leaves the list this much) and what a window narrower than
+/// it turns into a horizontal scrollbar instead (`mail_list).
+const NAV_MIN_WIDTH: f32 = 150.0;
+const NAV_DEFAULT_WIDTH: f32 = 200.0;
+const CONTENT_MIN_WIDTH: f32 = 280.0;
+const CONTENT_DEFAULT_WIDTH: f32 = 460.0;
+const LIST_MIN_WIDTH: f32 = 240.0;
+
+/// The band under the title bar that carries the popup pane's back button,
+/// and the button itself: the one way out of a mail to the list it covers
+/// (see `ColumnPlan::popup`).
+const POPUP_BACK_HEIGHT: f32 = TITLEBAR_HEIGHT;
+const POPUP_BACK_BUTTON: egui::Vec2 = egui::vec2(76.0, 28.0);
+
+/// What the three columns become at one window width — the plan a frame's
+/// layout is drawn from (`KimoApp::ui`). The columns give way to a
+/// narrowing window in one order, so that whatever it loses is the least
+/// useful thing it can spare: the navigation collapses first, then the
+/// reading pane is capped at what leaves the list its minimum, then the pane
+/// stops being a column at all and becomes a popup over the list, and the
+/// list itself never gets narrower than its rows can read — it scrolls
+/// sideways instead.
+///
+/// `nav` and `pane` are the widths to remember the two resizable columns
+/// by, what their splitters left them at; `nav_collapsed` says whether the
+/// navigation is taking room right now. The list is the remainder, so the
+/// one minimum it has is enforced here rather than by a panel of its own.
+struct ColumnPlan {
+    /// The reading pane is a popup over the list rather than a column beside
+    /// it: not even the two minimums fit side by side. A click on a mail
+    /// opens it, its back button closes it (`mail_content`).
+    popup: bool,
+    /// The widest the reading pane may be this frame: `None` when it keeps
+    /// its remembered width, and the room beside the list's minimum when the
+    /// window has less than that for it.
+    pane_max: Option<f32>,
+    /// The window is narrower than the list's minimum: the list keeps the
+    /// minimum and scrolls sideways rather than crushing its rows.
+    list_scrolls: bool,
+    /// The window has less than the three columns need with the list at its
+    /// minimum: the navigation gives way. This is the crossing `KimoApp::ui`
+    /// collapses it on — re-expanding stays a manual choice until the next
+    /// one.
+    collapses_nav: bool,
+}
+
+fn plan_columns(window: f32, nav: f32, pane: f32, nav_collapsed: bool) -> ColumnPlan {
+    // What the two content columns share once the navigation has had its
+    // width — none of it, when the navigation is collapsed.
+    let room = window - if nav_collapsed { 0.0 } else { nav };
+    // The pane's share is what is left beside the list's minimum, which is
+    // also the one place that minimum is enforced: the list is the remainder,
+    // and the pane is what the plan holds here.
+    let pane_room = room - LIST_MIN_WIDTH;
+    let popup = pane_room < CONTENT_MIN_WIDTH;
+    ColumnPlan {
+        popup,
+        pane_max: (!popup && pane_room < pane).then_some(pane_room),
+        list_scrolls: window < LIST_MIN_WIDTH,
+        collapses_nav: window < nav + pane + LIST_MIN_WIDTH,
+    }
+}
+
+/// A resizable panel's remembered width — what its splitter left it at, as
+/// egui kept it from the previous frame. A collapsed navigation keeps its
+/// own, because a panel that is not shown stores nothing.
+fn panel_width(ctx: &egui::Context, panel: &str) -> Option<f32> {
+    egui::PanelState::load(ctx, egui::Id::new(panel)).map(|state| state.outer_rect.width())
+}
+
+/// Place a panel at a width of the app's choosing: what a capped pane is
+/// held at while the cap lasts, and what it is brought back to once the cap
+/// lifts (`KimoApp::ui`) — egui on its own would only ever remember what a
+/// panel last rendered at. Only the size is meant; the position is a dummy.
+fn set_panel_width(ctx: &egui::Context, panel: &str, width: f32) {
+    let rect = egui::Rect::from_min_size(
+        egui::Pos2::ZERO,
+        egui::vec2(width, ctx.viewport_rect().height()),
+    );
+    ctx.data_mut(|data| {
+        data.insert_persisted(egui::Id::new(panel), egui::PanelState { outer_rect: rect })
+    });
+}
 /// The attachment cards under a mail's body: one card per file, as wide as the
 /// name and the type it carries want — never narrower than `ATTACHMENT_CARD_MIN_WIDTH`
 /// and never wider than the mail's own column — and the height of a line of the
@@ -6779,7 +7024,12 @@ fn virtual_rows<R>(
     let last = ((visible(viewport.max.y).ceil() as usize) + 1).min(total);
     let top = ui.max_rect().top() + first as f32 * row_height;
     let bottom = ui.max_rect().top() + last as f32 * row_height;
-    let rect = egui::Rect::from_x_y_ranges(ui.max_rect().x_range(), top..=bottom);
+    // The rows span the column — and, when the window is narrower than the
+    // list's minimum, the minimum the list keeps for itself (`set_min_width`
+    // in `mail_list`): the union, so a list that scrolls sideways lays its
+    // rows out at the width they scroll over rather than at the viewport's.
+    let xs = ui.max_rect().union(ui.min_rect()).x_range();
+    let rect = egui::Rect::from_x_y_ranges(xs, top..=bottom);
     ui.scope_builder(egui::UiBuilder::new().max_rect(rect), |rows_ui| {
         // Keep the widgets' auto ids stable as the list scrolls.
         rows_ui.skip_ahead_auto_ids(first);
@@ -9091,14 +9341,149 @@ mod tests {
             "the column reopened at a width of its own"
         );
     }
+    /// The columns give way to a narrowing window in one order, and each
+    /// boundary is where the plan says it is: the navigation collapses while
+    /// the list still has its minimum, the pane is capped beside that
+    /// minimum, the pane becomes a popup when not even the two minimums fit,
+    /// and the list itself scrolls rather than narrowing past its own.
+    #[test]
+    fn the_columns_give_way_in_one_order() {
+        let plan = |window: f32, collapsed: bool| plan_columns(window, 200.0, 460.0, collapsed);
+
+        // A wide window: everything as the splitters left it.
+        let wide = plan(1400.0, false);
+        assert!(!wide.popup);
+        assert!(wide.pane_max.is_none());
+        assert!(!wide.list_scrolls);
+        assert!(!wide.collapses_nav);
+
+        // One point below navigation + pane + the list's minimum, and the
+        // navigation is the column whose width the two others can have.
+        assert!(!plan(900.0, false).collapses_nav);
+        assert!(plan(899.0, false).collapses_nav);
+
+        // With it gone the list keeps its minimum while the window can spare
+        // it: at exactly pane + list the pane still keeps its own width,
+        assert!(plan(700.0, true).pane_max.is_none());
+        // and below that the pane is capped at the room beside the minimum,
+        assert_eq!(plan(699.0, true).pane_max, Some(459.0));
+        assert_eq!(plan(600.0, true).pane_max, Some(360.0));
+        // down to the two minimums side by side — and not one point further.
+        assert!(!plan(520.0, true).popup);
+        assert!(plan(519.0, true).popup);
+
+        // The popup boundary only moves with the navigation's own room: a
+        // window that cannot hold list and pane beside a navigation cannot
+        // hold them as the only two columns either.
+        assert!(plan(600.0, false).popup);
+
+        // The list itself never narrows past its minimum; it scrolls.
+        assert!(!plan(240.0, true).list_scrolls);
+        assert!(plan(239.0, true).list_scrolls);
+    }
+
+    /// The same order, live: a window crossing below what the three columns
+    /// need collapses the navigation, a narrower one caps the pane beside the
+    /// list's minimum, and widening again brings the pane back to the width
+    /// its splitter left it at — which egui on its own would have forgotten
+    /// in favour of the last width it was capped at.
+    #[test]
+    fn the_pane_is_capped_and_comes_back_at_its_own_width() {
+        let ctx = egui::Context::default();
+        crate::fonts::install(&ctx, None, None);
+        let mut app = app_with_messages(&ctx, 3);
+        let settle = |app: &mut KimoApp, width: f32| {
+            for _ in 0..30 {
+                run_app_frame_sized(&ctx, app, Vec::new(), egui::vec2(width, 900.0));
+            }
+        };
+
+        // Wide: the defaults, and the list is what the two panels leave.
+        settle(&mut app, 1400.0);
+        assert!(!app.nav_collapsed);
+        assert!(!app.pane_capped);
+        assert_eq!(app.pane_width, CONTENT_DEFAULT_WIDTH);
+        assert!((app.list_column.width() - 740.0).abs() < 0.5);
+
+        // One point below navigation + pane + the list's minimum: the
+        // navigation gives way, and the list keeps well more than its
+        // minimum rather than being crushed under the pane.
+        settle(&mut app, 899.0);
+        assert!(app.nav_collapsed);
+        assert!(!app.pane_capped);
+        assert!((app.list_column.width() - 439.0).abs() < 0.5);
+
+        // Narrower still: the pane is capped at what leaves the list its
+        // minimum, and the width to bring it back to is the app's own.
+        settle(&mut app, 600.0);
+        assert!(app.pane_capped);
+        assert!((app.list_column.width() - LIST_MIN_WIDTH).abs() < 0.5);
+        assert_eq!(app.pane_width, CONTENT_DEFAULT_WIDTH);
+
+        // Widening lifts the cap and restores the pane's own width. The
+        // navigation stays collapsed — re-expanding is a manual choice, the
+        // way it always was — so the list has everything but the pane.
+        settle(&mut app, 1400.0);
+        assert!(!app.pane_capped);
+        assert!((app.list_column.width() - 940.0).abs() < 0.5);
+        assert_eq!(app.pane_width, CONTENT_DEFAULT_WIDTH);
+    }
+
+    /// Below the two minimums side by side, the reading pane stops being a
+    /// column: the list has the window, a click on a mail opens the pane over
+    /// it, and the band under the title bar is the way back to the list.
+    #[test]
+    fn the_reading_pane_becomes_a_popup_over_the_list() {
+        let ctx = egui::Context::default();
+        crate::fonts::install(&ctx, None, None);
+        let mut app = app_with_messages(&ctx, 3);
+        for _ in 0..10 {
+            run_app_frame_sized(&ctx, &mut app, Vec::new(), egui::vec2(500.0, 900.0));
+        }
+        assert!(app.pane_popup);
+        assert!(app.nav_collapsed, "the navigation gave way long before");
+        // The list has the whole window — the pane over it is an overlay, not
+        // a column taking part of it.
+        assert!((app.list_column.width() - 500.0).abs() < 0.5);
+
+        // A click on a mail opens it, over the list and under the title bar,
+        // and the list's own rect is unchanged: nothing was taken from it.
+        click_at_sized(&ctx, &mut app, egui::pos2(250.0, 74.0), 500.0);
+        assert_eq!(app.selected_message.as_deref(), Some("0"));
+        assert!((app.list_column.width() - 500.0).abs() < 0.5);
+
+        // The back button in the band under the bar closes the mail, and the
+        // list is what is on screen again.
+        click_at_sized(&ctx, &mut app, egui::pos2(50.0, 60.0), 500.0);
+        assert!(
+            app.selected_message.is_none(),
+            "the way back closed the mail"
+        );
+
+        // Narrower than the list's own minimum, the list keeps that minimum
+        // and scrolls sideways instead of crushing its rows.
+        for _ in 0..5 {
+            run_app_frame_sized(&ctx, &mut app, Vec::new(), egui::vec2(200.0, 900.0));
+        }
+        assert!(app.list_scrolls);
+        assert!(app.pane_popup);
+    }
 
     /// One headless frame of an app under test, with the given input events.
     fn run_app_frame(ctx: &egui::Context, app: &mut KimoApp, events: Vec<egui::Event>) {
+        run_app_frame_sized(ctx, app, events, egui::vec2(1400.0, 900.0));
+    }
+
+    /// The same frame, in a window of the size given — what the layout tests
+    /// below resize the window with.
+    fn run_app_frame_sized(
+        ctx: &egui::Context,
+        app: &mut KimoApp,
+        events: Vec<egui::Event>,
+        size: egui::Vec2,
+    ) {
         let input = egui::RawInput {
-            screen_rect: Some(egui::Rect::from_min_size(
-                egui::Pos2::ZERO,
-                egui::vec2(1400.0, 900.0),
-            )),
+            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, size)),
             events,
             ..Default::default()
         };
@@ -9882,9 +10267,20 @@ mod tests {
     /// Click at a position the way a user does: the pointer moves there, then
     /// the button goes down and up.
     fn click_at(ctx: &egui::Context, app: &mut KimoApp, pos: egui::Pos2) {
-        run_app_frame(ctx, app, vec![egui::Event::PointerMoved(pos)]);
+        click_at_sized(ctx, app, pos, 1400.0);
+    }
+
+    /// A click in a window of the width given: the popup layout's tests click
+    /// in a window the column layout never sees.
+    fn click_at_sized(ctx: &egui::Context, app: &mut KimoApp, pos: egui::Pos2, width: f32) {
+        run_app_frame_sized(
+            ctx,
+            app,
+            vec![egui::Event::PointerMoved(pos)],
+            egui::vec2(width, 900.0),
+        );
         for pressed in [true, false] {
-            run_app_frame(
+            run_app_frame_sized(
                 ctx,
                 app,
                 vec![egui::Event::PointerButton {
@@ -9893,6 +10289,7 @@ mod tests {
                     pressed,
                     modifiers: egui::Modifiers::default(),
                 }],
+                egui::vec2(width, 900.0),
             );
         }
     }

@@ -525,9 +525,35 @@ Event (mpsc) ──► drain_events() at frame start ──► merge into Accoun
   because epaint panics on one that is dropped unapplied. Keep `egui`,
   `egui-winit`, `egui-wgpu` and `wgpu` in lockstep when bumping, and read the
   egui CHANGELOG before doing it.
-- Layout is a three-column mail client: left navigation (collapsible via
-  the title-bar toggle; auto-collapses when the window is narrower than
-  640px — see `NAV_AUTO_COLLAPSE_WIDTH`), the central column (while a search is
+- **The columns give way to a narrowing window in one order**
+  (`plan_columns`, read by `KimoApp::ui` every frame): the navigation
+  collapses first, then the reading pane is capped at what leaves the list
+  its `LIST_MIN_WIDTH` (240 pt), then the pane stops being a column and
+  becomes a popup over the list, and the list itself never narrows past its
+  minimum — a window narrower than that scrolls it sideways instead
+  (`mail_list` switches the scroll area to both axes, and the rows keep
+  their minimum width through `virtual_rows`, which lays them out at the
+  union of the viewport and the content's own min rect). The thresholds are
+  the columns' own widths rather than constants: the navigation collapses
+  on crossing below navigation + pane + the list's minimum, where the two
+  widths are what the splitters left the panels at (egui's `PanelState`,
+  read through `panel_width`). The pane's cap is placed by writing that
+  same state (`set_panel_width`) rather than only clamping it, so widening
+  through the cap follows the window back up; and the remembered width to
+  restore to is the app's own (`pane_width`), because egui on its own only
+  ever remembers what a panel last rendered at — the capped width. The
+  splitter is off while the cap holds: the window is the one making that
+  split. The popup layout (`ColumnPlan::popup`: not even the two minimums
+  fit side by side) shows the list alone, and a click on a mail opens the
+  pane over it as an `Area` — above the list, under the title bar (which
+  `move_to_top` keeps there; a new area is otherwise born above it) and
+  under the modals — with a back button in a fixed band under the bar
+  (`POPUP_BACK_HEIGHT`), the one way back to the list, closing the mail.
+  The navigation is not shown at all in that layout. Re-expanding the
+  navigation after any automatic collapse stays a manual choice, exactly as
+  it was when the threshold was a constant.
+  the title-bar toggle; auto-collapses when the window is narrower than the
+  three columns need — see the bullet above), the central column (while a search is
   active the list shows `search_results` instead of the selected folder, and
   `message_card` paints both kinds of row), and the reading pane on the right
   with a "No mail selected" placeholder. Collapsing the navigation — by the
