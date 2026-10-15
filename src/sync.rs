@@ -202,11 +202,20 @@ pub enum Event {
         account_id: String,
         folders: Vec<String>,
     },
+    /// One folder's mail as a fetch found it. `new_mail` is what tells the
+    /// window whether this batch is *news* — mail that arrived since the folder
+    /// was last fetched (an IMAP fetch resumed at the folder's mark, or POP3
+    /// UIDLs the database did not hold) — or mail the fetch went looking for:
+    /// a folder's first fill, the batch below it that `Load older mail` asked
+    /// for, or the copy of a mail that was just sent. It is what a desktop
+    /// notification is raised from (`crate::notify`), which is why a backfill
+    /// of fifty mails must not arrive as fifty notifications.
     Messages {
         account_id: String,
         folder: String,
         uidvalidity: Option<u32>,
         messages: Vec<MailMessage>,
+        new_mail: bool,
     },
     SyncDone {
         account_id: String,
@@ -807,6 +816,11 @@ fn fetch_folder_into(
             folder: folder.to_string(),
             uidvalidity: info.uidvalidity,
             messages,
+            // A fetch that resumed at the folder's mark asked for exactly the
+            // UIDs it did not have: what came back arrived since the last one.
+            // A folder filled for the first time (or after a UIDVALIDITY
+            // rotation) is the folder's backfill, not news.
+            new_mail: resume.is_some(),
         });
     }
     // The two marks the button is drawn from, written after the batch and its
@@ -885,6 +899,8 @@ fn load_older_imap(account: &Account, folder: &str, tx: &Sender<Event>) -> MailR
                     folder: folder.to_string(),
                     uidvalidity: info.uidvalidity,
                     messages,
+                    // Older mail: whatever the click was for, it is not news.
+                    new_mail: false,
                 });
             }
             more = low > oldest;
@@ -1368,6 +1384,8 @@ fn load_older_pop3(account: &Account, tx: &Sender<Event>) -> MailResult<()> {
                     folder: "INBOX".to_string(),
                     uidvalidity: None,
                     messages,
+                    // Older mail, like the IMAP half above.
+                    new_mail: false,
                 });
             }
             more = low > 1;
@@ -1428,6 +1446,10 @@ fn sync_pop3(account: &Account, tx: &Sender<Event>) -> MailResult<()> {
                 folder: "INBOX".to_string(),
                 uidvalidity: None,
                 messages,
+                // A warm drop's batch is the UIDLs the database did not have;
+                // the first sync of one is the window it chose to fetch, which
+                // is old mail however new it looks.
+                new_mail: !cold,
             });
         }
         let mark = db::folder_sync(&account.id, "INBOX")?;

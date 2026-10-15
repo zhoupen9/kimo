@@ -118,6 +118,11 @@ pub struct Settings {
     pub auto_sync: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auto_sync_minutes: Option<u32>,
+    /// Whether new mail raises a desktop notification
+    /// (`crate::notify`). Absent means the app's own default, which is on:
+    /// the feature is the point of the switch existing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub notifications: Option<bool>,
 }
 
 pub fn load_settings() -> Settings {
@@ -203,6 +208,7 @@ mod tests {
             mono_font: Some("DejaVu Sans Mono".into()),
             auto_sync: Some(true),
             auto_sync_minutes: Some(30),
+            notifications: Some(false),
         };
         let json = serde_json::to_string(&s).unwrap();
         let back: Settings = serde_json::from_str(&json).unwrap();
@@ -214,6 +220,7 @@ mod tests {
         assert_eq!(back.mono_font.as_deref(), Some("DejaVu Sans Mono"));
         assert_eq!(back.auto_sync, Some(true));
         assert_eq!(back.auto_sync_minutes, Some(30));
+        assert_eq!(back.notifications, Some(false));
         // settings.json with missing keys must still load.
         let missing: Settings = serde_json::from_str("{}").unwrap();
         assert_eq!(missing.theme, "");
@@ -224,6 +231,10 @@ mod tests {
         assert_eq!(missing.threaded, None, "absent means the app's default");
         assert_eq!(missing.auto_sync, None, "absent means the app's default");
         assert_eq!(missing.auto_sync_minutes, None);
+        assert_eq!(
+            missing.notifications, None,
+            "absent means the app's default, which is to announce"
+        );
         // An absent mode is not written back as one: the file stays a file
         // that says nothing, and the build decides what that means.
         let unset = Settings::default();

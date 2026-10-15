@@ -436,6 +436,67 @@ fn sent_notice(recipients: &[String], copy: &SentCopy) -> String {
     }
 }
 
+/// How many new mails one batch announces one by one. Past this a single
+/// notification counts them instead: a folder that catches up with thirty
+/// arrivals must not stack thirty popups on the desktop.
+const NOTIFY_MAX: usize = 3;
+
+/// One mail a fetch found *beyond a folder's mark* — the news a notification
+/// may be raised from (`Event::Messages`' `new_mail`). Only what a
+/// notification shows is kept: who it is from, what it is about, and the id
+/// that says whether the account already holds it under another mailbox.
+struct Arrival {
+    from: String,
+    subject: String,
+    message_id: String,
+}
+
+impl Arrival {
+    fn of(mail: &MailMessage) -> Self {
+        Arrival {
+            from: mail.from.clone(),
+            subject: mail.subject.clone(),
+            message_id: mail.message_id.clone(),
+        }
+    }
+}
+
+/// The notifications one batch of new mail raises: the mail itself when there
+/// are few, one line counting them when there are many. `(summary, body)`, the
+/// two lines a desktop notification shows.
+fn new_mail_notices(folder: &str, arrivals: &[Arrival]) -> Vec<(String, String)> {
+    if arrivals.len() <= NOTIFY_MAX {
+        return arrivals
+            .iter()
+            .map(|arrival| (arrival.from.clone(), arrival.subject.clone()))
+            .collect();
+    }
+    let body = arrivals
+        .iter()
+        .take(NOTIFY_MAX)
+        .map(|arrival| format!("{}: {}", arrival.from, arrival.subject))
+        .collect::<Vec<_>>()
+        .join("\n");
+    vec![(format!("{} new messages in {folder}", arrivals.len()), body)]
+}
+
+/// Whether new mail filed in a folder of this kind is announced. Not the
+/// folders the user's own copies live in (Sent, Drafts) and not the ones mail
+/// is filtered into rather than delivered to (Trash, Junk) — nor Gmail's All
+/// Mail and Starred, where every mail the account holds turns up a second
+/// time, so announcing them would double every arrival.
+fn announces_new_mail(kind: FolderKind) -> bool {
+    !matches!(
+        kind,
+        FolderKind::Sent
+            | FolderKind::Drafts
+            | FolderKind::Trash
+            | FolderKind::Junk
+            | FolderKind::AllMail
+            | FolderKind::Starred
+    )
+}
+
 pub struct KimoApp {
     ctx: egui::Context,
     tx: mpsc::Sender<Event>,
@@ -532,6 +593,10 @@ pub struct KimoApp {
     auto_sync: bool,
     auto_sync_every: Duration,
     auto_synced_at: Instant,
+    /// Whether new mail raises a desktop notification (Preferences → General).
+    /// On by default: it is what the feature is for, and the switch is there
+    /// for the session that does not want to be interrupted.
+    notifications: bool,
     /// Installed font families for the Appearance pickers; `None` while the
     /// worker scan (`Job::ScanFonts`) is still running.
     font_families: Option<Vec<FontFamily>>,
@@ -1373,6 +1438,9 @@ impl KimoApp {
             auto_sync: settings.auto_sync.unwrap_or(false),
             auto_sync_every: auto_sync_interval(settings.auto_sync_minutes),
             auto_synced_at: Instant::now(),
+            // And here too: a file that says nothing about notifications gets
+            // them, because that is what the app is for.
+            notifications: settings.notifications.unwrap_or(true),
             font_families: None,
             ui_font: settings.ui_font.clone(),
             mono_font: settings.mono_font.clone(),
@@ -1456,6 +1524,7 @@ impl KimoApp {
                 folder,
                 uidvalidity,
                 messages,
+                new_mail,
             } => {
                 // The worker has already stored this batch; what follows is
                 // the in-memory copy the list and the reading pane draw from.
@@ -1463,6 +1532,11 @@ impl KimoApp {
                 // generation is remembered for the selection below: the two
                 // cannot be touched in the same borrow of the state.
                 let mut rotated = false;
+                // The mail of a batch the fetch found beyond the folder's mark
+                // — the news a notification may be raised from. Collected here
+                // and announced below, because the state is borrowed until
+                // then.
+                let mut arrivals: Vec<Arrival> = Vec::new();
                 if let Some(state) = self.states.get_mut(&account_id) {
                     if state.mailbox.folders.iter().all(|f| f.name != folder) {
                         state.mailbox.folders.push(storage::Folder {
@@ -1505,7 +1579,15 @@ impl KimoApp {
                                 merged.seen = keep_seen;
                                 fc.messages[i] = merged;
                             }
-                            None => fc.messages.push(m),
+                            None => {
+                                // Mail that is *news*: what the fetch found
+                                // beyond the folder's mark, still unread, and
+                                // not already here under this folder's own uid.
+                                if new_mail && !m.seen {
+                                    arrivals.push(Arrival::of(&m));
+                                }
+                                fc.messages.push(m);
+                            }
                         }
                     }
                     sort_messages(&mut fc.messages);
@@ -1525,6 +1607,7 @@ impl KimoApp {
                     self.selected_mails
                         .retain(|key| !(key.account == account_id && key.folder == folder));
                 }
+                self.announce_new_mail(&account_id, &folder, arrivals);
             }
             Event::SyncDone { account_id } => {
                 if let Some(state) = self.states.get_mut(&account_id) {
@@ -1674,6 +1757,60 @@ impl KimoApp {
                 self.apply_fonts();
             }
         }
+    }
+
+    /// Raise the desktop notifications for one batch of arrived mail: one per
+    /// mail while there are few of them, one counting them when there are many
+    /// (`new_mail_notices`). Nothing is raised when the preference is off, when
+    /// the folder is one whose new mail is not announced (`announces_new_mail`),
+    /// or for a mail the account already holds under another folder.
+    ///
+    /// The work is `crate::notify`'s and it never happens here: `show` only posts
+    /// to the thread that talks to the notification daemon, so neither this
+    /// frame nor a sync job ever waits for one.
+    fn announce_new_mail(&self, account_id: &str, folder: &str, arrivals: Vec<Arrival>) {
+        if arrivals.is_empty() || !self.notifications {
+            return;
+        }
+        // The wire form is what the state and the database key a folder by;
+        // what is announced, and what the folder is recognized as, is the
+        // name a person reads.
+        let display = crate::protocol::imap::decode_mailbox_name(folder);
+        if !announces_new_mail(folders::kind_of(&display)) {
+            return;
+        }
+        let elsewhere = self.message_ids_elsewhere(account_id, folder);
+        let arrivals: Vec<Arrival> = arrivals
+            .into_iter()
+            .filter(|arrival| !elsewhere.contains(arrival.message_id.as_str()))
+            .collect();
+        let scale = self.ctx.pixels_per_point();
+        for (summary, body) in new_mail_notices(&display, &arrivals) {
+            crate::notify::show(&summary, &body, scale);
+        }
+    }
+
+    /// The `Message-ID`s the account holds under any folder but this one — the
+    /// one question that keeps a message its server files twice (Gmail's All
+    /// Mail, a label beside the Inbox) from being announced twice. Gathered in
+    /// one pass rather than asked per mail: a batch can hold hundreds of mails,
+    /// and every answer is about the same folders. Mail cached before Kimo kept
+    /// that header has no id, is not in the set, and is announced.
+    fn message_ids_elsewhere<'a>(&'a self, account_id: &str, folder: &str) -> HashSet<&'a str> {
+        self.states
+            .get(account_id)
+            .map(|state| {
+                state
+                    .mailbox
+                    .folders
+                    .iter()
+                    .filter(|other| other.name != folder)
+                    .flat_map(|other| other.messages.iter())
+                    .map(|mail| mail.message_id.as_str())
+                    .filter(|id| !id.is_empty())
+                    .collect()
+            })
+            .unwrap_or_default()
     }
 
     // ----- actions ----------------------------------------------------------
@@ -2350,6 +2487,7 @@ impl KimoApp {
             threaded: Some(self.threaded),
             auto_sync: Some(self.auto_sync),
             auto_sync_minutes: Some((self.auto_sync_every.as_secs() / SECS_PER_MINUTE) as u32),
+            notifications: Some(self.notifications),
         });
     }
 
@@ -5839,6 +5977,39 @@ impl KimoApp {
                 "The Debug working mode keeps Kimo off the network, so nothing is \
                  synced on a clock until the mode is Release."
             })
+            .small()
+            .weak(),
+        );
+
+        ui.add_space(12.0);
+        ui.separator();
+        ui.add_space(8.0);
+
+        ui.label(egui::RichText::new("Notifications").strong());
+        if ui
+            .checkbox(
+                &mut self.notifications,
+                "Show a desktop notification for new mail",
+            )
+            .changed()
+        {
+            self.persist_settings();
+        }
+        ui.label(
+            egui::RichText::new(
+                "A sync that finds mail which arrived since the last one announces it: \
+                 one notification per mail, or one counting them when a batch is large. \
+                 Mail in the folders it is filed into rather than delivered to — Sent, \
+                 Drafts, Trash, Junk, and Gmail's All Mail and Starred — stays quiet.",
+            )
+            .small()
+            .weak(),
+        );
+        ui.label(
+            egui::RichText::new(
+                "Linux desktops show these through org.freedesktop.Notifications on the \
+                 session bus; a session without a notification daemon simply stays quiet.",
+            )
             .small()
             .weak(),
         );
@@ -11181,6 +11352,8 @@ mod tests {
             // The fixture's folder is generation 1: this is a new one.
             uidvalidity: Some(2),
             messages: Vec::new(),
+            // A rotation refetches the folder whole; nothing about it is news.
+            new_mail: false,
         });
 
         assert!(
@@ -12883,5 +13056,88 @@ mod tests {
         assert_eq!(results_label(12), "12 results");
         // At the limit the database stopped asking, so the count is a floor.
         assert_eq!(results_label(SEARCH_LIMIT), "200+ results");
+    }
+
+    /// A batch of news is one notification per mail while there are few of
+    /// them, and one line counting them once there are many: forty popups is
+    /// not something a desktop should be asked to draw.
+    #[test]
+    fn a_batch_of_new_mail_becomes_one_notification_per_mail_or_a_count() {
+        let arrivals = |count: usize| -> Vec<Arrival> {
+            (0..count)
+                .map(|index| Arrival::of(&test_message(&index.to_string(), false)))
+                .collect()
+        };
+
+        let notices = new_mail_notices("INBOX", &arrivals(NOTIFY_MAX));
+        assert_eq!(notices.len(), NOTIFY_MAX);
+        assert_eq!(
+            notices[0],
+            ("Ada <ada@example.com>".to_string(), "Subject 0".to_string())
+        );
+
+        let notices = new_mail_notices("INBOX", &arrivals(NOTIFY_MAX + 1));
+        assert_eq!(notices.len(), 1, "one summary instead of four popups");
+        assert_eq!(notices[0].0, "4 new messages in INBOX");
+        assert_eq!(notices[0].1.lines().count(), NOTIFY_MAX);
+        assert!(notices[0].1.starts_with("Ada <ada@example.com>: Subject 0"));
+    }
+
+    /// The folders whose new mail is announced and the ones that stay quiet:
+    /// the user's own copies, the mailboxes mail is filtered into, and the
+    /// ones where a server shows every mail of the account again.
+    #[test]
+    fn only_delivered_mail_is_announced() {
+        for kind in [FolderKind::Inbox, FolderKind::Archive, FolderKind::Folder] {
+            assert!(announces_new_mail(kind), "{kind:?} is delivered mail");
+        }
+        for kind in [
+            FolderKind::Sent,
+            FolderKind::Drafts,
+            FolderKind::Trash,
+            FolderKind::Junk,
+            FolderKind::AllMail,
+            FolderKind::Starred,
+        ] {
+            assert!(!announces_new_mail(kind), "{kind:?} is not news");
+        }
+    }
+
+    /// A message the account already holds under another folder is not news a
+    /// second time: a server that files one mail in two mailboxes (Gmail's All
+    /// Mail, a label beside the Inbox) must not raise two notifications for it.
+    #[test]
+    fn a_mail_the_account_already_holds_elsewhere_is_not_announced_again() {
+        let ctx = egui::Context::default();
+        crate::fonts::install(&ctx, None, None);
+        let mut app = app_with_folders(&ctx, &[("INBOX", true, 1), ("Receipts", true, 1)]);
+        // Each fixture mail carries a Message-ID of its own, so the Inbox's
+        // mail — asked about the way a batch that just landed in the Inbox
+        // asks — is held nowhere else.
+        let inbox_id = app.states["acct"].mailbox.folders[0].messages[0]
+            .message_id
+            .clone();
+        assert!(!app
+            .message_ids_elsewhere("acct", "INBOX")
+            .contains(inbox_id.as_str()));
+
+        // One mail filed in both — a label beside the Inbox, or Gmail's All
+        // Mail — is held elsewhere whichever folder the batch came from, and it
+        // is the news of the first of them that is announced.
+        app.states.get_mut("acct").unwrap().mailbox.folders[1].messages[0].message_id =
+            inbox_id.clone();
+        assert!(app
+            .message_ids_elsewhere("acct", "INBOX")
+            .contains(inbox_id.as_str()));
+        assert!(app
+            .message_ids_elsewhere("acct", "Receipts")
+            .contains(inbox_id.as_str()));
+
+        // An id nobody holds, mail cached before the header was kept (no id at
+        // all), and a mail of another account: none of them is in the set.
+        let elsewhere = app.message_ids_elsewhere("acct", "INBOX");
+        assert!(!elsewhere.contains("nobody@example.com"));
+        assert!(!elsewhere.contains(""));
+        assert!(app.message_ids_elsewhere("other", "INBOX").is_empty());
     }
 }

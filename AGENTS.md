@@ -40,8 +40,9 @@ Kimo is a desktop **email client** GUI written in pure Rust:
   over IMAP when the server has one. There is no drafts folder, no outbox and
   no attachments — see hard rule 4 and the compose-window convention below.
 - **Tray icon:** `src/tray.rs` implements StatusNotifierItem by speaking the
-  D-Bus wire protocol directly on a `std::thread` — deliberately not zbus
-  (async executor, rule 2) or the GTK tray crates (C, rule 1). The icon is
+  D-Bus wire protocol directly (`src/dbus.rs`) on a `std::thread` —
+  deliberately not zbus (async executor, rule 2) or the GTK tray crates (C,
+  rule 1). The icon is
   `assets/app.png` (256px, rasterized from the multi-color `assets/app.svg`
   — regenerate with any svg→png tool, e.g.
   `rsvg-convert -w 256 -h 256 -o assets/app.png assets/app.svg`), embedded
@@ -53,10 +54,40 @@ Kimo is a desktop **email client** GUI written in pure Rust:
   the right-click menu is a minimal `com.canonical.dbusmenu`
   object at `/Menu` (Show / Quit) served by the same thread. Missing
   StatusNotifierWatcher disables the tray silently, and `IconPixmap` must
-  stay `a(iiay)` — hosts cannot read a bare byte array. The bus is silent
-  for hours at a time, so reads go through `read_full`: an idle read-timeout
-  expiry must never end the thread (`read_exact` turned it into a fatal
-  `WouldBlock`, and the icon vanished 30s after startup).
+  stay `a(iiay)` — hosts cannot read a bare byte array. The session bus is
+  silent for hours at a time, so `dbus`'s reads ride out an idle read-timeout
+  expiry instead of failing on it (`read_exact` turned it into a fatal
+  `WouldBlock`, and the icon vanished 30s after startup) — one rule for both
+  D-Bus threads.
+- **Desktop notifications:** `src/notify.rs` announces new mail through the
+  freedesktop `org.freedesktop.Notifications` interface — the same raw-D-Bus
+  choice as the tray, made on the shared wire layer in `src/dbus.rs` and for
+  the same two reasons (no `zbus` async executor, rule 2; no C, rule 1).
+  Showing one is a blocking call, so it runs on one dedicated `std::thread`
+  that owns the connection: `notify::show` only posts to it, whether the
+  caller is the UI or a sync worker (rule 3). The icon is the brand PNG the
+  tray serves and the title bar draws, written out as a `48 · scale` px file
+  under the resource cache and handed to the daemon as an `image-path` hint:
+  48 logical points, which is a real 96 px bitmap on a 2× screen instead of an
+  upscaled one. `image-data` is deliberately *not* used — daemons disagree
+  about the byte order of its pixels — and the app icon itself is the `kimo`
+  name the desktop file installs, with a `desktop-entry` hint so a shell can
+  file the notification under Kimo's own entry.
+  What is announced is only news: `Event::Messages` carries `new_mail`, true
+  for a fetch that resumed at the folder's mark (IMAP) or found UIDLs the
+  database did not hold (POP3), and never for a folder's first fill,
+  `Load older mail` or the copy of a mail that was just sent. The app then
+  drops what is not worth a popup: mail already read, folders whose mail is
+  not *delivered* (Sent, Drafts, Trash, Junk, and Gmail's All Mail and
+  Starred, where every mail of the account turns up a second time), and a mail
+  the account already holds under another mailbox (the same `Message-ID`).
+  Up to `NOTIFY_MAX` (3) arrivals in one batch are one notification each;
+  more become a single one counting them, so catching up with forty mails is
+  one popup and not forty. Preferences → General has the switch
+  (`notifications` in `settings.json`, absent meaning on), and a session with
+  no notification daemon is simply quiet. `cargo test notify_probe --
+  --ignored` under `dbus-run-session` with `dbus-monitor` watching is how the
+  wire form is checked by hand.
 - **Packaging:** `packaging/linux/kimo.desktop` is the launcher entry for the
   `kimo` app_id, to be installed as
   `~/.local/share/applications/kimo.desktop`. The icon on its own
@@ -145,7 +176,9 @@ src/css.rs              tiny CSS subset (decls, tag/class/id selectors) for HTML
 src/folders.rs          folder kind (name → special mailbox, incl. CJK) + embedded row icons
 src/glass.rs            the floating title bar's frosted backdrop (wgpu passes + a paint callback)
 src/render_bench.rs     test-only: times both HTML renderers for the same bodies (bench_render)
-src/tray.rs             StatusNotifierItem over raw D-Bus (session bus, std::thread) + svg→ARGB icon
+src/dbus.rs             the session bus: D-Bus wire protocol (marshalling, framing, the connection)
+src/tray.rs             StatusNotifierItem over the session bus (std::thread) + svg→ARGB icon
+src/notify.rs           new-mail notifications over the session bus (std::thread) + their 48·scale icon
 src/sync.rs             Job/Event enums, worker threads, per-protocol sync logic
 src/protocol/mod.rs     protocol modules
 src/protocol/stream.rs  TcpStream/TLS transport (MailStream, STARTTLS upgrade, buffered Conn)
@@ -203,7 +236,11 @@ Event (mpsc) ──► drain_events() at frame start ──► merge into Accoun
   has been fetched before, and a folder that fails does not cost the others
   theirs (the first error is reported at the end). A folder the user never
   opened has no mark and waits for its first click, which is where its backfill
-  happens; a warm folder with nothing new neither writes nor emits. The working
+  happens; a warm folder with nothing new neither writes nor emits. Each
+  batch it emits carries `new_mail` — true only for mail the fetch found
+  beyond the folder's mark, so a backfill, a `Load older mail` and the copy
+  of a mail just sent are all false — which is what a desktop notification is
+  raised from (see the notifications bullet above). The working
   mode (Preferences → General; `settings.json`'s `working_mode`, absent meaning
   the build) can switch the automatic half of that off: in **Debug** neither the
   startup sweep nor the fetch-on-first-open happens, the cached mail still loads
@@ -383,7 +420,9 @@ Event (mpsc) ──► drain_events() at frame start ──► merge into Accoun
   syncing bullet above), `threaded` (whether the message list groups mail into
   conversations; absent means the app's own default, which is on), `auto_sync`
   and `auto_sync_minutes` (the automatic sync's switch and its interval, both
-  absent by default — see the automatic-sync bullet below), and the font
+  absent by default — see the automatic-sync bullet below), `notifications`
+  (whether new mail is announced on the desktop; absent means on, see the
+  notifications bullet above), and the font
   families picked in Preferences →
   Appearance (`ui_font`, `mono_font`; absent means egui's built-in font plus
   the CJK fallback). Family *names* are stored, not paths, so the file survives font
@@ -392,6 +431,12 @@ Event (mpsc) ──► drain_events() at frame start ──► merge into Accoun
   is ignored on load — do not reuse that name. The palette that the theme
   resolves to is *not* in this file; it is a compiled-in default, see the
   color-scheme bullet under Conventions.
+- `~/.local/share/kimo/cache/notify/icon-<px>.png` — the brand icon a
+  notification hands the daemon through its `image-path` hint, one file per
+  pixel size (`48 · screen scale`, see the notifications bullet above). It
+  never changes once written, so a restart — or a daemon that still has the
+  path loaded — reuses it; a session that cannot write it announces without an
+  image rather than not at all.
 - `~/.local/share/kimo/cache/resources/<sha1hex>.bin` — fetched remote
   mail resources, keyed by the SHA-1 of their URL. The rest of that directory
   is what the pre-database layout left behind: `<account-id>.json` mail
@@ -1392,4 +1437,12 @@ Do not "fix" these casually — they are known:
   flag is the only truth (`seen` only ever grows). Sync used to refresh the
   newest batch for free by refetching it; now that a warm sync fetches nothing
   it already has, mail read in another client keeps the unread mark it had here.
-- No IDLE/push for IMAP; sync is manual or on-startup.
+- No IDLE/push for IMAP; sync is manual or on-startup. A desktop
+  notification is therefore only ever raised by a sync that ran, and never for
+  mail that arrived while the app was closed until the next one asks for it:
+  `Job::Sync` at startup, the title-bar button, the automatic sync, or the
+  first click on a folder. A notification does nothing when it is clicked —
+  the default action would mean listening for the daemon's `ActionInvoked`
+  signal, which this client does not do — and its icon is scaled for the
+  monitor the window is on, so a notification a multi-monitor daemon draws on
+  another screen keeps that scale.

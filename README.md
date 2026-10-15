@@ -20,6 +20,9 @@ rustls with the `ring` crypto provider and Mozilla's root certificates.
 - Folder listing (IMAP), folder selection and per-folder caches
 - Optional automatic sync: every account on a clock you set in Preferences →
   General (off by default, 1–1440 minutes)
+- Desktop notifications when a sync finds new mail (Linux, through the
+  session bus's `org.freedesktop.Notifications`), showing the app's own icon
+  at the screen's scale factor; the switch is in Preferences → General
 - Message list with unread markers and text preview, grouped into
   conversations: one row per thread — its newest mail, how many it holds and a
   paperclip — with the chevron at its left opening the thread's mails in the
