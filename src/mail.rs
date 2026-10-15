@@ -195,7 +195,7 @@ const PREVIEW_CHARS: usize = 140;
 
 /// Plain text out of an HTML body, for list previews: concatenates text
 /// nodes (bounded), skipping style/script/head/title subtrees.
-fn html_to_plain(html: &str) -> String {
+pub(crate) fn html_to_plain(html: &str) -> String {
     let frag = scraper::Html::parse_fragment(html);
     let mut text = String::new();
     for node in frag.tree.root().descendants() {

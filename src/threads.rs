@@ -196,7 +196,7 @@ const SUBJECT_PREFIXES: [&str; 11] = [
 /// One prefix off the front of `text`, if one is there: the word, an optional
 /// counter (`re[2]:`, `re(2):`), and the colon. A colon further in than a
 /// prefix can reach (`Note: the plan`) is not a prefix at all.
-fn strip_subject_prefix(text: &str) -> Option<&str> {
+pub(crate) fn strip_subject_prefix(text: &str) -> Option<&str> {
     // The full-width colon too: a CJK client writes 答复： as often as 答复: —
     // and it is three bytes, so where the rest of the subject starts is the
     // colon plus its own width, not plus one.

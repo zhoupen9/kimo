@@ -309,6 +309,50 @@ fn select_all_tooltip(state: CheckState, listed: usize) -> String {
     }
 }
 
+/// What a compose card is: a fresh mail, or one of the three ways of
+/// answering another. Nothing about the card depends on it but its heading
+/// — the fields are the same fields — and what the three are prefilled
+/// with is the constructors' own (`ComposeDraft::reply` and its two).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum ComposeKind {
+    New,
+    Reply,
+    ReplyAll,
+    Forward,
+}
+
+impl ComposeKind {
+    fn label(self) -> &'static str {
+        match self {
+            ComposeKind::New => "New mail",
+            ComposeKind::Reply => "Reply",
+            ComposeKind::ReplyAll => "Reply all",
+            ComposeKind::Forward => "Forward",
+        }
+    }
+}
+
+/// What a compose card's own buttons said: nothing, Discard (the draft goes
+/// with the card), or Send (the caller's to act on, the draft back in
+/// place).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum ComposeOutcome {
+    Shown,
+    Discard,
+    Send,
+}
+
+/// Where a compose card is shown. The title bar's mail actions bring theirs
+/// up as a popup over everything, the way the pen's new mail always has;
+/// the buttons on a mail's own header open theirs *on the spot*: one more
+/// card of the reading pane, right under the mail they answer
+/// (`compose_inline_card`), which stays on screen above its answer.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum ComposeSpot {
+    Pane,
+    Popup,
+}
+
 /// A mail being written in the compose window.
 ///
 /// Nothing about it is persisted: the draft is exactly as long-lived as the
@@ -318,6 +362,9 @@ fn select_all_tooltip(state: CheckState, listed: usize) -> String {
 /// server has it. The fields are here rather than in widgets' own state because
 /// a window that is closed and opened again must start empty.
 struct ComposeDraft {
+    /// What the card is — the heading, and nothing else (see
+    /// [`ComposeKind`]).
+    kind: ComposeKind,
     /// The account the mail would go out from, as the window's From list has
     /// it. `None`, with no account configured, is the one case the window
     /// says so instead of offering a choice.
@@ -342,6 +389,7 @@ impl ComposeDraft {
     /// A new, empty draft written from `from` — see `compose_from`.
     fn new(from: Option<String>) -> Self {
         Self {
+            kind: ComposeKind::New,
             from,
             to: String::new(),
             cc: String::new(),
@@ -352,6 +400,76 @@ impl ComposeDraft {
             sending: false,
             error: None,
         }
+    }
+
+    /// The three drafts that answer a mail, made of it: the account they go
+    /// out from, the two address fields the kind decides, the answered
+    /// subject and the quoted original underneath what the sender writes.
+    fn prefilled(
+        kind: ComposeKind,
+        from: Option<String>,
+        to: String,
+        cc: String,
+        subject: String,
+        body: String,
+    ) -> Self {
+        Self {
+            kind,
+            from,
+            to,
+            cc,
+            bcc: String::new(),
+            subject,
+            body,
+            focus: true,
+            sending: false,
+            error: None,
+        }
+    }
+
+    /// A reply to `mail`: to its sender alone, the subject answered, the
+    /// original quoted below.
+    fn reply(mail: &MailMessage, from: Option<String>) -> Self {
+        Self::prefilled(
+            ComposeKind::Reply,
+            from,
+            mail.from.clone(),
+            String::new(),
+            answer_subject("Re", &mail.subject),
+            quoted_body(mail),
+        )
+    }
+
+    /// A reply to everyone `mail` was sent to: its sender, and every other
+    /// recipient beside the one address that is the user's own — a reply
+    /// all that sends the sender their own mail is no reply at all.
+    fn reply_all(mail: &MailMessage, from: Option<String>, self_addr: &str) -> Self {
+        let others = outgoing::parse_addresses(&mail.to)
+            .into_iter()
+            .filter(|addr| !addr.eq_ignore_ascii_case(self_addr))
+            .collect::<Vec<_>>()
+            .join(", ");
+        Self::prefilled(
+            ComposeKind::ReplyAll,
+            from,
+            mail.from.clone(),
+            others,
+            answer_subject("Re", &mail.subject),
+            quoted_body(mail),
+        )
+    }
+
+    /// A forward of `mail`: to nobody in particular — that is the sender's
+    /// to choose — the subject passed on, the whole original quoted.
+    fn forward(mail: &MailMessage, from: Option<String>) -> Self {
+        Self::prefilled(
+            ComposeKind::Forward,
+            from,
+            String::new(),
+            String::new(),
+            answer_subject("Fwd", &mail.subject),
+            quoted_body(mail),
+        )
     }
 
     /// What the three address fields hold, parsed: what the mail's envelope is
@@ -374,6 +492,47 @@ fn compose_from(accounts: &[Account], selected: Option<&str>) -> Option<String> 
         .filter(|id| accounts.iter().any(|account| account.id == *id))
         .map(str::to_string)
         .or_else(|| accounts.first().map(|account| account.id.clone()))
+}
+
+/// The subject of a mail that answers or passes on another: the prefix,
+/// unless the subject already carries one — `Re: Re:` helps nobody, and the
+/// prefixes other clients write (`答复:`, `FWD:`) are prefixes all the same
+/// (`threads::strip_subject_prefix`, the threading's own table).
+fn answer_subject(prefix: &str, subject: &str) -> String {
+    let subject = subject.trim();
+    if subject.is_empty() || threads::strip_subject_prefix(subject).is_some() {
+        subject.to_string()
+    } else {
+        format!("{prefix}: {subject}")
+    }
+}
+
+/// The original mail as the bottom half of a reply or a forward: who wrote
+/// it and when, and their text a line at a time. The compose card is plain
+/// text — hard rule 4 — so the quote is plain text too, whatever the mail
+/// itself was written in: the text part if it has one, the HTML rendered
+/// down to words if it does not.
+fn quoted_body(mail: &MailMessage) -> String {
+    let plain = if mail.body_text.trim().is_empty() {
+        mail.body_html
+            .as_deref()
+            .map(crate::mail::html_to_plain)
+            .unwrap_or_default()
+    } else {
+        mail.body_text.clone()
+    };
+    let when = if mail.date.is_empty() {
+        "an unknown date"
+    } else {
+        mail.date.as_str()
+    };
+    let mut out = format!("On {when}, {} wrote:\n", mail.from);
+    for line in plain.lines() {
+        out.push_str("> ");
+        out.push_str(line);
+        out.push('\n');
+    }
+    out
 }
 
 /// Why the compose window's Send cannot be pressed, or `None` when it can.
@@ -527,6 +686,15 @@ pub struct KimoApp {
     /// Send hands it to a worker (`send_draft`): nothing about it is persisted,
     /// so a card that is closed is a mail that was never written.
     compose: Option<ComposeDraft>,
+    /// Where the compose card is shown (`ComposeSpot`): the popup the pen
+    /// and the title bar's mail actions bring up, or the pane a mail's own
+    /// header opens it on. Only meaningful while `compose` is `Some`.
+    compose_spot: ComposeSpot,
+    /// The mail the compose answers, when it answers one (`compose_about`):
+    /// the pane's spot puts its card right under this mail, and once the
+    /// mail has left the pane the draft moves to the popup (`ui`). Only
+    /// meaningful while `compose` is `Some`.
+    compose_anchor: Option<MailKey>,
     /// Whether the preferences modal is open.
     show_preferences: bool,
     /// Which preferences page is selected.
@@ -1428,6 +1596,8 @@ impl KimoApp {
             show_search: false,
             search_focus: false,
             compose: None,
+            compose_spot: ComposeSpot::Popup,
+            compose_anchor: None,
             show_preferences: false,
             prefs_tab: PrefsTab::Accounts,
             show_account_form: false,
@@ -3241,11 +3411,17 @@ impl KimoApp {
                 match action {
                     MailAction::Export => self.export_selected_message(),
                     MailAction::Delete => self.delete_selected_message(),
-                    MailAction::Reply
-                    | MailAction::ReplyAll
-                    | MailAction::Forward
-                    | MailAction::Label
-                    | MailAction::Flag => {}
+                    // The bar's three answers to a mail come up as popups
+                    // over everything (`ComposeSpot::Popup`); the mail's own
+                    // header opens the same three on the spot, in the pane
+                    // the mail is in. The bar answers the mail the pane is
+                    // showing — the header, the mail it sits on.
+                    MailAction::Reply | MailAction::ReplyAll | MailAction::Forward => {
+                        if let Some(mail) = self.selected_mail().cloned() {
+                            self.compose_about(action, ComposeSpot::Popup, &mail);
+                        }
+                    }
+                    MailAction::Label | MailAction::Flag => {}
                 }
             }
         }
@@ -3471,7 +3647,76 @@ impl KimoApp {
                 &self.accounts,
                 self.selected_account.as_deref(),
             )));
+            self.compose_spot = ComposeSpot::Popup;
+            self.compose_anchor = None;
         }
+    }
+
+    /// Open a compose about `mail` — from the title bar, as a popup over
+    /// everything (`ComposeSpot::Popup`), or from the mail's own header, on
+    /// the spot in the pane (`ComposeSpot::Pane`, the card right under that
+    /// mail). The header's cells pass the mail they sit on; the bar's pass
+    /// the one the pane is showing. A draft already on its way out is left
+    /// alone: its Send is in flight, and the event that closes it is owed
+    /// the draft it knows. Any other draft is replaced — the click is the
+    /// user's, and the new one is what they asked for. The anchor records
+    /// which mail the draft answers (`compose_anchor`): the pane puts its
+    /// card right under that mail, and `ui` moves the draft to the popup
+    /// window once that mail has left the pane.
+    fn compose_about(&mut self, action: MailAction, spot: ComposeSpot, mail: &MailMessage) {
+        if self.compose.as_ref().is_some_and(|draft| draft.sending) {
+            return;
+        }
+        let from = compose_from(&self.accounts, self.selected_account.as_deref());
+        // The one address a reply all must not put in Cc: the account's own.
+        let self_addr = from
+            .as_ref()
+            .and_then(|id| self.accounts.iter().find(|account| &account.id == id))
+            .map(|account| account.username.clone())
+            .unwrap_or_default();
+        let draft = match action {
+            MailAction::Reply => ComposeDraft::reply(mail, from),
+            MailAction::ReplyAll => ComposeDraft::reply_all(mail, from, &self_addr),
+            MailAction::Forward => ComposeDraft::forward(mail, from),
+            _ => return,
+        };
+        self.compose_anchor = self
+            .selected_account
+            .as_deref()
+            .zip(self.selected_folder.as_deref())
+            .map(|(account, folder)| MailKey::new(account, folder, &mail.uid));
+        self.compose = Some(draft);
+        self.compose_spot = spot;
+    }
+
+    /// The mail the reading pane shows, for the actions about it — the title
+    /// bar's and the header's. A uid the folder no longer holds is no mail
+    /// at all, which is `has_selected_message`'s own question.
+    fn selected_mail(&self) -> Option<&MailMessage> {
+        let uid = self.selected_message.as_deref()?;
+        self.current_folder()?
+            .messages
+            .iter()
+            .find(|mail| mail.uid == uid)
+    }
+
+    /// Whether the mail a pane compose answers is on the pane: part of the
+    /// conversation it shows, in the account and folder it shows them of. A
+    /// uid on its own would not say it — uids are a folder's own numbering,
+    /// and another folder has uids of its own — so the account and the
+    /// folder say it too.
+    fn compose_anchor_on_pane(&self) -> bool {
+        let Some(anchor) = self.compose_anchor.as_ref() else {
+            return false;
+        };
+        if self.selected_account.as_deref() != Some(anchor.account.as_str())
+            || self.selected_folder.as_deref() != Some(anchor.folder.as_str())
+        {
+            return false;
+        }
+        self.open_conversation().is_some_and(|conversation| {
+            conversation.messages.iter().any(|mail| mail.uid == anchor.uid)
+        })
     }
 
     /// The search popup, opened from the title-bar magnifier or Ctrl+F: the
@@ -3701,11 +3946,41 @@ impl KimoApp {
     /// throws it away, so `ModalResponse::should_close` is ignored and Discard
     /// is the way out.
     fn compose_window(&mut self, ctx: &egui::Context) {
-        // Taken out for the closure, which edits the draft while reading the
-        // account list, and put back unless the draft was discarded — or taken
-        // away by the send that went out (see `send_draft`).
-        let Some(mut draft) = self.compose.take() else {
+        let Some(heading) = self.compose.as_ref().map(|draft| draft.kind.label()) else {
             return;
+        };
+        let mut outcome = ComposeOutcome::Shown;
+        let _ = egui::Modal::new(egui::Id::new("compose")).show(ctx, |ui| {
+            ui.set_width(COMPOSE_WIDTH);
+            ui.heading(heading);
+            ui.separator();
+            outcome = self.compose_card(ui, COMPOSE_WIDTH);
+        });
+        self.settle_compose_outcome(outcome);
+    }
+
+    /// What the card's own buttons said, wherever the card was drawn: Discard
+    /// closes the draft, Send hands it to a worker, and nothing is nothing.
+    fn settle_compose_outcome(&mut self, outcome: ComposeOutcome) {
+        match outcome {
+            ComposeOutcome::Discard => self.compose = None,
+            ComposeOutcome::Send => self.send_draft(),
+            ComposeOutcome::Shown => {}
+        }
+    }
+
+    /// The compose card — the From list, the address fields, the body, the
+    /// footer — drawn into `ui` at `width` points. The popup's window
+    /// (`compose_window`) and the pane's card under the mail it answers
+    /// (`compose_inline_card`) are the same card; only the container differs.
+    ///
+    /// The draft is taken out for the card — the closure edits it while
+    /// reading the account list — and put back unless the card was
+    /// discarded. Send is returned for the caller to act on: the draft is
+    /// back in place by then, which is what `send_draft` reads.
+    fn compose_card(&mut self, ui: &mut egui::Ui, width: f32) -> ComposeOutcome {
+        let Some(mut draft) = self.compose.take() else {
+            return ComposeOutcome::Shown;
         };
         let accounts: Vec<(String, String, String)> = self
             .accounts
@@ -3731,14 +4006,10 @@ impl KimoApp {
 
         let mut discard = false;
         let mut send = false;
-        let _ = egui::Modal::new(egui::Id::new("compose")).show(ctx, |ui| {
-            ui.set_width(COMPOSE_WIDTH);
-            ui.heading("New mail");
-            ui.separator();
-
-            // The card is a fixed width, so the boxes get a constant: what the
-            // label column and the gap beside it leave.
-            let field_width = COMPOSE_WIDTH - COMPOSE_LABEL_WIDTH - ui.spacing().item_spacing.x;
+        {
+            // The card is laid out at the caller's width, so the boxes get a
+            // constant: what the label column and the gap beside it leave.
+            let field_width = width - COMPOSE_LABEL_WIDTH - ui.spacing().item_spacing.x;
             let field = |ui: &mut egui::Ui, label: &str, value: &mut String, hint: &str| {
                 ui.horizontal(|ui| {
                     ui.add_sized(
@@ -3867,18 +4138,23 @@ impl KimoApp {
                     }
                 });
             });
-        });
+        }
 
         // Discarded: the draft goes with the card. There is no other copy of it
         // and nowhere it could have been saved to. A discarded card cannot be a
         // sending one — Discard is drawn disabled while a mail is in flight —
         // and the draft is put back for any other frame.
+        let outcome = if send {
+            ComposeOutcome::Send
+        } else if discard {
+            ComposeOutcome::Discard
+        } else {
+            ComposeOutcome::Shown
+        };
         if !discard {
             self.compose = Some(draft);
         }
-        if send {
-            self.send_draft();
-        }
+        outcome
     }
 
     /// The middle column while no search is active: the selected folder's mail.
@@ -5167,7 +5443,9 @@ impl KimoApp {
     /// stacked with chrome showing between them, rather than one card holding a
     /// card per mail: the pane's own surface, once per mail, so a thread reads
     /// as the mails it is made of and each of them sits on the pane the way a
-    /// mail of its own does.
+    /// mail of its own does. The compose a mail's own header opens sits in
+    /// the same stack — the card right under the mail it answers
+    /// (`compose_inline_card`).
     ///
     /// The cards share the pane's scroll container: the headers, the rule and
     /// the body of a mail are one column on its card, so the scroll bar runs
@@ -5266,11 +5544,26 @@ impl KimoApp {
                     .vertical_scroll_offset(0.0)
                     .horizontal_scroll_offset(0.0);
             }
+            // A compose opened on the spot sits in this stack, as one more
+            // card right under the mail it answers (`compose_about`, called
+            // from the mail's own header). `ui` keeps the card and its mail
+            // together: a draft whose mail has left the pane moves to the
+            // popup window before the pane draws (`compose_anchor_on_pane`),
+            // so the uid waited for here is a uid of this conversation.
+            let answer_under = if self.compose.is_some() && self.compose_spot == ComposeSpot::Pane
+            {
+                self.compose_anchor
+                    .as_ref()
+                    .map(|anchor| anchor.uid.clone())
+            } else {
+                None
+            };
             let output = scroll.show(ui, |ui| {
                 // One card per mail, oldest first — a mail of its own is
-                // the same card, drawn once. `add_space` leaves egui's own item
-                // spacing on top of what it is asked for, so every room asked
-                // for here is the room wanted minus that spacing.
+                // the same card, drawn once. `add_space` leaves egui's own
+                // item spacing on top of what it is asked for, so the room
+                // between two cards asks for the gap minus that
+                // (`pane_card_gap`).
                 for (index, mail) in conversation.messages.iter().enumerate() {
                     if index == 0 {
                         // The pane's first card starts *below* the floating title
@@ -5288,11 +5581,16 @@ impl KimoApp {
                         ui.add_space(TITLEBAR_HEIGHT);
                     } else {
                         // The chrome showing between two cards of a conversation.
-                        ui.add_space(
-                            (CONVERSATION_CARD_GAP - ui.spacing().item_spacing.y).max(0.0),
-                        );
+                        ui.add_space(pane_card_gap(ui));
                     }
                     cards.push(self.mail_card(ui, mail));
+                    if answer_under.as_deref() == Some(mail.uid.as_str()) {
+                        // The answer to this mail, with the pane's own gap
+                        // above it; the thread's next mail, if any, adds its
+                        // own below.
+                        ui.add_space(pane_card_gap(ui));
+                        cards.push(self.compose_inline_card(ui));
+                    }
                 }
             });
             // Scrolled away from the top, the bar floats over the cards.
@@ -5314,47 +5612,103 @@ impl KimoApp {
             );
         }
 
-        // The popup's way back to the list. In the column layout the way back
-        // is the list itself, always there on the left; here the list is
-        // under this pane, and closing the mail is what uncovers it. The
-        // button is no bar and no part of the mail: a round, chevron-only
-        // cell floating over the first card's top-left corner, under the
-        // title bar, drawn after the cards so a mail scrolled up under it
-        // goes beneath it. What makes it read as floating — as a thing on
-        // top of the mail rather than a hole in it — is the shadow behind
-        // it, the window's own, the same one the `Load older mail` button
-        // floats on. Its rest treatment is the attachment card's (`card`
-        // fill, border hairline), and the glyph is the thread rows' chevron
-        // mirrored (`paint_back_chevron`).
-        if self.pane_popup {
-            let centre = egui::pos2(
-                panel.left() + POPUP_BACK_MARGIN + POPUP_BACK_DIAMETER / 2.0,
-                panel.top() + TITLEBAR_HEIGHT + POPUP_BACK_MARGIN + POPUP_BACK_DIAMETER / 2.0,
-            );
-            let rect = egui::Rect::from_center_size(centre, egui::Vec2::splat(POPUP_BACK_DIAMETER));
-            let back = ui
-                .interact(rect, egui::Id::new("popup-back"), egui::Sense::click())
-                .on_hover_text("Back to the message list");
-            let painter = ui.painter();
-            // The shadow first, so the button sits on it and not in it.
-            painter.add(
-                ui.visuals()
-                    .window_shadow
-                    .as_shape(rect, POPUP_BACK_DIAMETER / 2.0),
-            );
-            let fill = if back.hovered() {
-                scheme.hover
-            } else {
-                scheme.card
-            };
-            painter.circle_filled(centre, POPUP_BACK_DIAMETER / 2.0, fill);
-            painter.circle_stroke(
-                centre,
-                POPUP_BACK_DIAMETER / 2.0,
-                egui::Stroke::new(1.0_f32, scheme.border),
-            );
-            paint_back_chevron(painter, centre, scheme.text);
-            if back.clicked() {
+        self.popup_back(ui, panel);
+    }
+
+    /// The compose card as one more card of the pane's stack, right under
+    /// the mail it answers (`mail_content`): the popup's own card
+    /// (`compose_card`) on the pane's surface, at the pane's width rather
+    /// than the popup's fixed one. The mail it answers stays on screen above
+    /// it, and the card scrolls with the thread it belongs to; its body
+    /// scrolls on its own (`COMPOSE_BODY_HEIGHT`), so the card is bounded
+    /// and the pane's scroll stays the mail's. Reserved as a shape here and
+    /// filled in below like a mail's card, because the card's height is only
+    /// known once it has been laid out.
+    fn compose_inline_card(&mut self, ui: &mut egui::Ui) -> (egui::layers::ShapeIdx, egui::Rect) {
+        let where_to_put = ui.painter().add(egui::Shape::Noop);
+        let mut outcome = ComposeOutcome::Shown;
+        let laid_out = egui::Frame::new()
+            .inner_margin(egui::Margin {
+                left: CONTENT_PADDING_I8,
+                right: CONTENT_PADDING_I8,
+                top: CONTENT_PADDING_I8,
+                bottom: CONTENT_PADDING_I8,
+            })
+            .show(ui, |ui| {
+                let width = ui.available_width();
+                ui.set_min_width(width);
+                let heading = self
+                    .compose
+                    .as_ref()
+                    .map(|draft| draft.kind.label())
+                    .unwrap_or("New mail");
+                ui.heading(heading);
+                ui.separator();
+                outcome = self.compose_card(ui, width);
+            })
+            .response
+            .rect;
+        self.settle_compose_outcome(outcome);
+        (where_to_put, laid_out)
+    }
+
+    /// The popup layout's floating back button, whatever the pane is showing:
+    /// the way out of the pane to the list under it. A compose open on the
+    /// spot goes with it — the card was opened under its mail, and the mail
+    /// is what is being left. In the column layout there is no button at
+    /// all: the way back is the list itself, always there on the left.
+    ///
+    /// The button is no bar and no part of the mail: a round, chevron-only
+    /// cell floating over the first card's top-left corner, under the title
+    /// bar, drawn after whatever the pane drew so a mail scrolled up under it
+    /// goes beneath it. What makes it read as floating — as a thing on top of
+    /// the pane rather than a hole in it — is the shadow behind it, the
+    /// window's own, the same one the `Load older mail` button floats on. Its
+    /// rest treatment is the attachment card's (`card` fill, border hairline),
+    /// and the glyph is the thread rows' chevron mirrored
+    /// (`paint_back_chevron`).
+    fn popup_back(&mut self, ui: &egui::Ui, panel: egui::Rect) {
+        if !self.pane_popup {
+            return;
+        }
+        let scheme = theme::of(ui.ctx());
+        let centre = egui::pos2(
+            panel.left() + POPUP_BACK_MARGIN + POPUP_BACK_DIAMETER / 2.0,
+            panel.top() + TITLEBAR_HEIGHT + POPUP_BACK_MARGIN + POPUP_BACK_DIAMETER / 2.0,
+        );
+        let rect = egui::Rect::from_center_size(centre, egui::Vec2::splat(POPUP_BACK_DIAMETER));
+        let back = ui
+            .interact(rect, egui::Id::new("popup-back"), egui::Sense::click())
+            .on_hover_text("Back to the message list");
+        let painter = ui.painter();
+        // The shadow first, so the button sits on it and not in it.
+        painter.add(
+            ui.visuals()
+                .window_shadow
+                .as_shape(rect, POPUP_BACK_DIAMETER / 2.0),
+        );
+        let fill = if back.hovered() {
+            scheme.hover
+        } else {
+            scheme.card
+        };
+        painter.circle_filled(centre, POPUP_BACK_DIAMETER / 2.0, fill);
+        painter.circle_stroke(
+            centre,
+            POPUP_BACK_DIAMETER / 2.0,
+            egui::Stroke::new(1.0_f32, scheme.border),
+        );
+        paint_back_chevron(painter, centre, scheme.text);
+        if back.clicked() {
+            // A compose open on the spot goes with the view it was opened in:
+            // its mail is on the pane above it. A draft already on its way
+            // out is not thrown away by it — its Send is owed an event, and
+            // the button waits for it.
+            let composing = self.compose.is_some() && self.compose_spot == ComposeSpot::Pane;
+            if !composing || !self.compose.as_ref().is_some_and(|draft| draft.sending) {
+                if composing {
+                    self.compose = None;
+                }
                 self.selected_message = None;
             }
         }
@@ -5403,6 +5757,59 @@ impl KimoApp {
         // widens the ui as it is drawn, and the cards belong to the mail, not
         // to what the mail overflowed by.
         let column = ui.available_width();
+        // The mail's own actions, the title bar's run brought down onto the
+        // mail itself: reply, reply all and forward open their compose right
+        // here — the card comes up under this mail (`ComposeSpot::Pane`) —
+        // and delete takes this one mail, the same `Job::DeleteMessage` the
+        // row's own button sends. The cells are the bar's own
+        // (`titlebar_button` and its glyphs), so the two runs read as one
+        // family; the row runs from the card's right edge, delete outermost
+        // as it is in the bar.
+        let mut answer = None;
+        let mut delete = false;
+        // `Align::Min` for the vertical: the row hugs the top of the card
+        // (the bar's own Center is what centres its cells in the bar's 40 pt
+        // — here it would centre them in the whole pane).
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Min), |ui| {
+            ui.spacing_mut().item_spacing.x = TITLEBAR_BUTTON_GAP;
+            for action in [
+                MailAction::Delete,
+                MailAction::Forward,
+                MailAction::ReplyAll,
+                MailAction::Reply,
+            ] {
+                let response = titlebar_button(ui, true);
+                let color = ui.visuals().text_color();
+                let painter = ui.painter();
+                match action {
+                    MailAction::Reply => paint_reply_icon(painter, response.rect, color),
+                    MailAction::ReplyAll => paint_reply_all_icon(painter, response.rect, color),
+                    MailAction::Forward => paint_forward_icon(painter, response.rect, color),
+                    MailAction::Delete => {
+                        paint_delete_icon(painter, response.rect, color, MAIL_ACTION_GLYPH)
+                    }
+                    _ => unreachable!("the four the header draws"),
+                }
+                if response.on_hover_text(action.tooltip()).clicked() {
+                    if action == MailAction::Delete {
+                        delete = true;
+                    } else {
+                        answer = Some(action);
+                    }
+                }
+            }
+        });
+        if let Some(action) = answer {
+            self.compose_about(action, ComposeSpot::Pane, msg);
+        }
+        if delete {
+            let (Some(account_id), Some(folder)) =
+                (self.selected_account.clone(), self.selected_folder.clone())
+            else {
+                return;
+            };
+            self.delete_mail(&account_id, &folder, &msg.uid);
+        }
         ui.heading(msg.subject.as_str());
         ui.label(
             egui::RichText::new(format!("From: {}", msg.from))
@@ -6300,6 +6707,17 @@ impl KimoApp {
         self.pane_popup = plan.popup;
         self.list_scrolls = plan.list_scrolls;
 
+        // A compose opened on the spot stays in the pane while the mail it
+        // answers is on it; once that mail has left — another folder opened,
+        // the mail deleted — the draft moves to the popup window rather than
+        // sitting in a pane it no longer belongs to (`compose_anchor_on_pane`).
+        if self.compose.is_some()
+            && self.compose_spot == ComposeSpot::Pane
+            && !self.compose_anchor_on_pane()
+        {
+            self.compose_spot = ComposeSpot::Popup;
+        }
+
         // The chrome — title bar, navigation, and the gutter the reading
         // pane's card floats in — is the scheme's panel color; the message list
         // and the card are the lighter content surface.
@@ -6455,8 +6873,9 @@ impl KimoApp {
 
         // The compose modal: over the columns and the bar, and under any modal
         // opened after it (egui stacks the foreground layer in the order its
-        // areas are shown).
-        if self.compose.is_some() {
+        // areas are shown). Only the popup spot has a window of its own —
+        // the pane spot is a card of the pane (`compose_inline_card`).
+        if self.compose.is_some() && self.compose_spot == ComposeSpot::Popup {
             self.compose_window(ctx);
         }
 
@@ -6907,6 +7326,13 @@ fn titlebar_fit(room: f32, actions: f32) -> TitlebarFit {
 fn clip_to(ui: &mut egui::Ui, rect: egui::Rect) {
     let clip = ui.clip_rect().intersect(rect);
     ui.set_clip_rect(clip);
+}
+
+/// The chrome showing between two cards of the reading pane, a mail's and
+/// the compose's alike: the room `add_space` is asked for is the room wanted
+/// minus the item spacing it adds on top of what it is given.
+fn pane_card_gap(ui: &egui::Ui) -> f32 {
+    (CONVERSATION_CARD_GAP - ui.spacing().item_spacing.y).max(0.0)
 }
 
 /// One button in the title bar: a `TITLEBAR_BUTTON_SIZE` square, centred in the
@@ -10499,17 +10925,7 @@ mod tests {
         // A frame to settle the columns: the list's own edge is what tells the
         // pane's cards apart from the surface the list is drawn on.
         let _ = frame_shapes_at(&ctx, &mut app, 1400.0);
-        let content = theme::of(&ctx).content;
-        let cards_of = |app: &mut KimoApp| {
-            let pane_left = app.list_column.right();
-            let mut cards: Vec<egui::Rect> =
-                fills_in_color(&frame_shapes_at(&ctx, app, 1400.0), content)
-                    .into_iter()
-                    .filter(|rect| rect.center().x > pane_left)
-                    .collect();
-            cards.sort_by(|a, b| a.top().total_cmp(&b.top()));
-            cards
-        };
+        let cards_of = |app: &mut KimoApp| pane_cards(&ctx, app);
 
         let cards = cards_of(&mut app);
         assert_eq!(cards.len(), 2, "one card per mail: {cards:?}");
@@ -13589,5 +14005,244 @@ mod tests {
         assert!(!elsewhere.contains("nobody@example.com"));
         assert!(!elsewhere.contains(""));
         assert!(app.message_ids_elsewhere("other", "INBOX").is_empty());
+    }
+
+    /// One mail to answer, with everything the three composes read out of it:
+    /// a sender, two recipients (one of them the user), a dated subject and
+    /// a two-line body.
+    fn mail_to_answer() -> MailMessage {
+        MailMessage {
+            uid: "0".to_string(),
+            subject: "The report".to_string(),
+            from: "Ada <ada@example.com>".to_string(),
+            to: "me@example.com, Bob <bob@example.com>".to_string(),
+            date: "Tue, 2026-01-01".to_string(),
+            timestamp: Some(1_700_000_000),
+            seen: false,
+            message_id: "m0".to_string(),
+            in_reply_to: Vec::new(),
+            references: Vec::new(),
+            body_text: "Here it is.\nSecond line.".to_string(),
+            body_html: None,
+            preview: "Here it is.".to_string(),
+            attachments: Vec::new(),
+            inline_images: Vec::new(),
+        }
+    }
+
+    /// Where a mail's header action cells sit, on the pane's first card: the
+    /// row above the subject, right-aligned against the card's own padding,
+    /// delete outermost as the title bar has it. `from_right` counts cells
+    /// from the right: 0 delete, 1 forward, 2 reply all, 3 reply.
+    fn header_action_center(from_right: usize) -> egui::Pos2 {
+        let stride = TITLEBAR_BUTTON_SIZE + TITLEBAR_BUTTON_GAP;
+        egui::pos2(
+            1400.0
+                - CONTENT_GUTTER
+                - CONTENT_PADDING.x
+                - TITLEBAR_BUTTON_SIZE / 2.0
+                - stride * from_right as f32,
+            TITLEBAR_HEIGHT + CONTENT_GUTTER + CONTENT_PADDING.y + TITLEBAR_BUTTON_SIZE / 2.0,
+        )
+    }
+
+    /// The three composes that answer a mail are made of it: a reply is
+    /// addressed to its sender alone, a reply all to everyone but the user's
+    /// own address, a forward to nobody until the sender chooses — and all
+    /// three carry the original quoted under the new text, with the subject
+    /// prefixed unless it already carries a prefix of its own.
+    #[test]
+    fn the_answers_to_a_mail_are_made_of_it() {
+        let mail = mail_to_answer();
+        let quote =
+            "On Tue, 2026-01-01, Ada <ada@example.com> wrote:\n> Here it is.\n> Second line.\n";
+
+        let reply = ComposeDraft::reply(&mail, Some("acct".to_string()));
+        assert_eq!(reply.kind, ComposeKind::Reply);
+        assert_eq!(reply.to, "Ada <ada@example.com>");
+        assert_eq!(reply.cc, "");
+        assert_eq!(reply.subject, "Re: The report");
+        assert_eq!(reply.body, quote);
+
+        let all = ComposeDraft::reply_all(&mail, Some("acct".to_string()), "me@example.com");
+        assert_eq!(all.kind, ComposeKind::ReplyAll);
+        assert_eq!(all.to, "Ada <ada@example.com>");
+        assert_eq!(
+            all.cc, "bob@example.com",
+            "the user's own address is not sent their own mail"
+        );
+        assert_eq!(all.subject, "Re: The report");
+
+        let forward = ComposeDraft::forward(&mail, Some("acct".to_string()));
+        assert_eq!(forward.kind, ComposeKind::Forward);
+        assert_eq!(forward.to, "");
+        assert_eq!(forward.cc, "");
+        assert_eq!(forward.subject, "Fwd: The report");
+        assert_eq!(forward.body, quote);
+
+        // A subject that already answers is not prefixed again — whatever
+        // prefix the sender's client wrote.
+        assert_eq!(answer_subject("Re", "Re: The report"), "Re: The report");
+        assert_eq!(answer_subject("Re", "答复: 报告"), "答复: 报告");
+        assert_eq!(answer_subject("Fwd", "The report"), "Fwd: The report");
+    }
+
+    /// A mail's own header answers it where the mail is: the reply cell opens
+    /// the compose in the pane itself, prefilled from the mail — a card right
+    /// under it, so the pane keeps the mail on screen and says both things at
+    /// once. The title bar's cell opens the same draft as a popup over
+    /// everything.
+    #[test]
+    fn a_mails_header_answers_it_where_the_mail_is() {
+        let ctx = egui::Context::default();
+        crate::fonts::install(&ctx, None, None);
+        let mut app = app_with_messages(&ctx, 3);
+        app.selected_message = Some("0".to_string());
+        run_app_frame(&ctx, &mut app, Vec::new());
+
+        // The reply cell, on the mail's header: the card comes up under the
+        // mail.
+        click_at(&ctx, &mut app, header_action_center(3));
+        let draft = app.compose.as_ref().expect("the reply opened a draft");
+        assert_eq!(app.compose_spot, ComposeSpot::Pane);
+        assert_eq!(draft.kind, ComposeKind::Reply);
+        assert_eq!(draft.to, "Ada <ada@example.com>");
+        assert_eq!(draft.subject, "Re: Subject 0");
+        assert_eq!(
+            draft.body,
+            "On 2026-01-01, Ada <ada@example.com> wrote:\n> body\n"
+        );
+
+        // The pane says both things at once: the mail above, the card's
+        // heading under it.
+        let texts = frame_texts(&ctx, &mut app);
+        assert!(texts.iter().any(|text| text == "Subject 0"));
+        assert!(texts.iter().any(|text| text == "Reply"));
+
+        // The title bar's cell opens the same three as popups — the same
+        // draft, another container.
+        let mail = app.selected_mail().cloned().expect("the mail to answer");
+        app.compose_about(MailAction::ReplyAll, ComposeSpot::Popup, &mail);
+        assert_eq!(app.compose_spot, ComposeSpot::Popup);
+        assert_eq!(
+            app.compose.as_ref().expect("draft").kind,
+            ComposeKind::ReplyAll
+        );
+    }
+
+    /// The header's delete cell takes the one mail whose header it is on: a
+    /// delete job is what the click starts — the same `Job::DeleteMessage`
+    /// the row's own button and the title bar's Delete send, which is
+    /// bracketed by `SyncStarted` and reaches a server the fixture does not
+    /// have. That the job started is what is observable here.
+    #[test]
+    fn the_headers_delete_cell_takes_that_one_mail() {
+        let ctx = egui::Context::default();
+        crate::fonts::install(&ctx, None, None);
+        let mut app = app_with_messages(&ctx, 3);
+        app.selected_message = Some("1".to_string());
+        run_app_frame(&ctx, &mut app, Vec::new());
+        while app.rx.try_recv().is_ok() {}
+
+        click_at(&ctx, &mut app, header_action_center(0));
+        assert!(
+            sync_starts_within(&mut app, Duration::from_secs(5)),
+            "the delete cell started a delete job"
+        );
+    }
+
+    /// The reading pane's cards, top to bottom: the content-colored fills that
+    /// span the pane, gutter to gutter — the mails' cards and, while a compose
+    /// is open on the spot, the answer's own under its mail.
+    fn pane_cards(ctx: &egui::Context, app: &mut KimoApp) -> Vec<egui::Rect> {
+        let pane_left = app.list_column.right();
+        let mut cards: Vec<egui::Rect> =
+            fills_in_color(&frame_shapes_at(ctx, app, 1400.0), theme::of(ctx).content)
+                .into_iter()
+                .filter(|rect| {
+                    rect.center().x > pane_left
+                        && rect.left() <= pane_left + CONTENT_GUTTER + 0.5
+                        && rect.right() >= 1400.0 - CONTENT_GUTTER - 0.5
+                })
+                .collect();
+        cards.sort_by(|a, b| a.top().total_cmp(&b.top()));
+        cards
+    }
+
+    /// The answer a mail's header opens is one more card of the pane, right
+    /// under the mail it answers: the conversation stays whole on screen and
+    /// the card sits in it — here between the mail answered and the rest of
+    /// the thread, a card gap from each. And it is the clicked mail's answer,
+    /// not the conversation's opened mail's: the header the click was on is
+    /// the mail the draft is made of.
+    #[test]
+    fn the_answer_sits_right_under_the_mail_it_answers() {
+        let ctx = egui::Context::default();
+        crate::fonts::install(&ctx, None, None);
+        let mut app = app_with_one_conversation(&ctx);
+        app.selected_message = Some("3".to_string());
+        // A frame to settle the columns; then the conversation is two cards.
+        let _ = pane_cards(&ctx, &mut app);
+        assert_eq!(
+            pane_cards(&ctx, &mut app).len(),
+            2,
+            "the conversation is a card per mail"
+        );
+
+        // The oldest mail's reply cell — the conversation was opened on the
+        // newest, and the answer is the oldest's own.
+        click_at(&ctx, &mut app, header_action_center(3));
+        let draft = app.compose.as_ref().expect("the reply opened a draft");
+        assert_eq!(app.compose_spot, ComposeSpot::Pane);
+        assert_eq!(
+            app.compose_anchor.as_ref().expect("the draft knows its mail").uid,
+            "1"
+        );
+        assert!(
+            draft.body.contains("body of 1"),
+            "the draft quotes the mail whose header was clicked: {}",
+            draft.body
+        );
+
+        // The card sits between the two mails, a card gap from each.
+        let cards = pane_cards(&ctx, &mut app);
+        assert_eq!(cards.len(), 3, "the answer is a card of the pane: {cards:?}");
+        assert!(
+            (cards[1].top() - cards[0].bottom() - CONVERSATION_CARD_GAP).abs() < 0.5,
+            "the answer is right under the mail it answers: {cards:?}"
+        );
+        assert!(
+            (cards[2].top() - cards[1].bottom() - CONVERSATION_CARD_GAP).abs() < 0.5,
+            "the thread goes on under the answer: {cards:?}"
+        );
+
+        // And everything the pane held is still on it.
+        let texts = frame_texts(&ctx, &mut app);
+        for expected in ["body of 1", "body of 3", "Reply"] {
+            assert!(
+                texts.iter().any(|text| text == expected),
+                "{expected} is on the pane: {texts:?}"
+            );
+        }
+    }
+
+    /// A compose opened on the spot stays while its mail is on the pane; once
+    /// the mail has left it — another folder opened under it, whose own first
+    /// move is to drop the selection — the draft moves to the popup window:
+    /// still a draft, in the container that needs no mail under it.
+    #[test]
+    fn an_answer_leaves_the_pane_with_its_mail() {
+        let ctx = egui::Context::default();
+        crate::fonts::install(&ctx, None, None);
+        let mut app = app_with_messages(&ctx, 3);
+        app.selected_message = Some("0".to_string());
+        run_app_frame(&ctx, &mut app, Vec::new());
+        click_at(&ctx, &mut app, header_action_center(3));
+        assert_eq!(app.compose_spot, ComposeSpot::Pane);
+
+        app.selected_message = None;
+        run_app_frame(&ctx, &mut app, Vec::new());
+        assert_eq!(app.compose_spot, ComposeSpot::Popup);
+        assert!(app.compose.is_some(), "the move kept the draft");
     }
 }

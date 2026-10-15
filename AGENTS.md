@@ -1168,16 +1168,45 @@ Event (mpsc) ──► drain_events() at frame start ──► merge into Accoun
   type and size under it. A part with no file name is not an attachment at all
   (`mail::collect_attachments`), and a mail cached before v6 is the name alone:
   no second line, rather than a separator with nothing after it.
-- The compose window (`compose_window`, opened by the title bar's pen) is an
-  `egui::Modal`, like the search popup and Preferences: a card `COMPOSE_WIDTH`
-  wide in the foreground layer, whose backdrop dims the columns and the bar and
-  takes their clicks, so a mail is written with the rest of the app out of the
-  way. There is one of it — `KimoApp::compose` holds the draft, and the button
-  leaves an open card alone rather than resetting what has been typed into it.
+- The compose card comes in two containers (`ComposeSpot`) and is one card
+  (`compose_card`). The title bar's pen — and its reply, reply all and
+  forward — bring it up as the `egui::Modal` it always was (`compose_window`):
+  a card `COMPOSE_WIDTH` wide in the foreground layer, whose backdrop dims the
+  columns and the bar and takes their clicks, so a mail is written with the
+  rest of the app out of the way. The reply, reply all, forward and delete
+  cells on a mail's own header (`mail_sheet` — the title bar's own cells and
+  glyphs, right-aligned above the subject, delete outermost) open the same
+  three *on the spot*: one more card of the reading pane, right under the
+  mail answered (`compose_inline_card` — the pane's own surface at the pane's
+  width, a card gap above it), and the mail stays on screen above its answer
+  until the card is done — sent or discarded, or, in the popup layout, backed
+  out of by the floating back button, which closes the card with the view it
+  was opened in (a draft whose Send is in flight is owed its event, and the
+  button waits for it). The card answers the mail whose header was clicked —
+  in a conversation that need not be the mail the pane was opened on — and
+  `compose_anchor` holds which mail that is; a draft whose mail has left the
+  pane (another folder opened, the mail deleted) moves to the popup window
+  rather than sitting under mail it was never about (`compose_anchor_on_pane`,
+  from `ui`). There is one draft at a time — `KimoApp::compose` holds it —
+  and the pen leaves an open card alone rather than resetting what has been
+  typed into it; the three answers do not (the click is the user's asking for
+  another draft), except a draft already on its way out, which no click
+  replaces: its Send is owed an event.
+  **The three that answer a mail are made of it** (`ComposeDraft::reply`,
+  `reply_all`, `forward`): a reply is addressed to the sender alone, a reply
+  all to the sender and every other recipient — the account's own address
+  excluded, so nobody is sent their own mail — and a forward to nobody until
+  the sender chooses. All three quote the original under the new text
+  (`quoted_body`: who wrote it and when, their text a `>` line at a time —
+  the text part, or the HTML rendered down to words, because the card is
+  plain text), and prefix the subject (`answer_subject`) unless it already
+  carries a prefix, whatever prefix the sender's client wrote
+  (`threads::strip_subject_prefix`'s table, the threading's own).
   From is the configured accounts, defaulting to the one whose mail is open and
   falling back to the first (`compose_from`); To, Cc, Bcc, Subject and the body
-  are plain strings in `ComposeDraft`, deliberately not widget state: a card
-  opened again must start empty. The boxes are a fixed label column plus what
+  are plain strings in `ComposeDraft`, deliberately not widget state: what a
+  card opens with is the draft's own — nothing, for a new mail; the mail it
+  answers, for the three. The boxes are a fixed label column plus what
   `COMPOSE_WIDTH` leaves, the body is `COMPOSE_BODY_HEIGHT` tall and scrolls
   inside that rather than growing the card, and the first frame puts the
   keyboard in To.
@@ -1419,9 +1448,10 @@ Do not "fix" these casually — they are known:
   the mail, and a failed send keeps the draft in the card but nowhere else — no
   outbox, queue or retry, no DKIM, and no OAuth2: submission authenticates with
   `AUTH PLAIN`/`AUTH LOGIN` over TLS, or not at all when the server asks for no
-  login. The title bar's reply / reply all / forward / label / flag buttons are
-  still drawn but not wired to anything (export, delete and the compose pen are
-  wired; see those bullets above).
+  login. The title bar's label and flag buttons are still drawn but not wired
+  to anything (reply, reply all and forward open the compose popup, and the
+  mail's own header answers on the spot; export, delete and the compose pen
+  are wired; see those bullets above).
 - Credentials in plain text in `mail.db` (mode 0600, see above); no
   OAuth2/XOAUTH2. The database is not encrypted, and the app never renames or
   deletes it on its own: a corrupt file is the user's to move aside.
