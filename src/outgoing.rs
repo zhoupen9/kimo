@@ -8,9 +8,13 @@
 //! cannot carry (a CR or an LF), and the body has to survive every server
 //! between here and the recipient.
 
+use std::fs;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use base64::Engine as _;
+
+use crate::error::{MailError, MailResult};
 
 /// A mail being sent: what the compose card holds, as the worker needs it.
 /// Everything in it is already parsed — the addresses have been through
@@ -29,6 +33,10 @@ pub struct Outgoing {
     pub bcc: Vec<String>,
     pub subject: String,
     pub body: String,
+    /// The files that go with it, in the order they were attached. Read by the
+    /// worker at send time (`load_attachments`), so what goes out is the file as
+    /// it is when the mail leaves rather than as it was when it was chosen.
+    pub attachments: Vec<OutgoingAttachment>,
 }
 
 impl Outgoing {
@@ -53,6 +61,128 @@ impl Outgoing {
             .filter(|addr| !is_address(addr))
             .map(String::as_str)
             .collect()
+    }
+}
+
+/// A file to send with the mail, as the draft named it: the card keeps the
+/// *path* rather than the bytes — a draft is edited on the UI thread, which
+/// reads no files — and the worker that sends the mail reads it
+/// (`load_attachments`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OutgoingAttachment {
+    /// Where the file is. Read at send time rather than at attach time, so a
+    /// file that grows or is replaced in between goes out as it is when the mail
+    /// does.
+    pub path: PathBuf,
+    /// The name the part carries: the file's own, which is what the recipient
+    /// sees and what their client writes to disk.
+    pub name: String,
+    /// What the file is, as far as its name says (`content_type_of`).
+    pub content_type: &'static str,
+}
+
+impl OutgoingAttachment {
+    /// The file at `path` as an attachment. An error when there is no file
+    /// there — or when it is a directory: the card says so rather than putting a
+    /// part in the mail that cannot be sent.
+    pub fn of(path: PathBuf) -> MailResult<Self> {
+        // The path is in the reason, the way it is when the file cannot be read
+        // at send time: "No such file or directory" on its own does not say which
+        // file the card is talking about.
+        let metadata = fs::metadata(&path)
+            .map_err(|error| MailError::Storage(format!("{}: {error}", path.display())))?;
+        if !metadata.is_file() {
+            return Err(MailError::Storage(format!(
+                "{} is not a file",
+                path.display()
+            )));
+        }
+        let name = path
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| path.display().to_string());
+        Ok(Self {
+            content_type: content_type_of(&name),
+            name,
+            path,
+        })
+    }
+
+    /// How big the file is now, for the size the card's row shows. `None` when
+    /// it cannot be asked — it has gone, or it cannot be read — which the row
+    /// draws as nothing rather than as a zero.
+    pub fn size(&self) -> Option<u64> {
+        fs::metadata(&self.path).ok().map(|metadata| metadata.len())
+    }
+}
+
+/// A file read and ready to be encoded: what `render` takes, and what the worker
+/// produces from the draft's paths. The split between this and
+/// `OutgoingAttachment` is the whole reason the two types exist — reading a file
+/// is I/O, and the only thread that may do it is the one that sends the mail.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LoadedAttachment {
+    pub name: String,
+    pub content_type: &'static str,
+    pub bytes: Vec<u8>,
+}
+
+/// Read every file the draft named. The first that cannot be read stops the
+/// send, with the path and the reason: a mail that goes out without the file its
+/// writer attached is worse than one that does not go out at all.
+pub fn load_attachments(files: &[OutgoingAttachment]) -> MailResult<Vec<LoadedAttachment>> {
+    let mut loaded = Vec::with_capacity(files.len());
+    for file in files {
+        let bytes = fs::read(&file.path)
+            .map_err(|error| MailError::Storage(format!("{}: {error}", file.path.display())))?;
+        loaded.push(LoadedAttachment {
+            name: file.name.clone(),
+            content_type: file.content_type,
+            bytes,
+        });
+    }
+    Ok(loaded)
+}
+
+/// What a file is, as far as its name says: a small table of the kinds people
+/// actually attach, and `application/octet-stream` for everything else — the
+/// honest answer for a file nobody has read. The extension is matched
+/// case-insensitively, and the last one wins: a `.tar.gz` is a gzip.
+pub fn content_type_of(name: &str) -> &'static str {
+    let extension = name
+        .rsplit_once('.')
+        .map(|(_, extension)| extension.to_lowercase());
+    match extension.as_deref() {
+        Some("txt") | Some("log") => "text/plain; charset=utf-8",
+        Some("md") => "text/markdown; charset=utf-8",
+        Some("csv") => "text/csv; charset=utf-8",
+        Some("json") => "application/json",
+        Some("xml") => "application/xml",
+        Some("html") | Some("htm") => "text/html; charset=utf-8",
+        Some("pdf") => "application/pdf",
+        Some("png") => "image/png",
+        Some("jpg") | Some("jpeg") => "image/jpeg",
+        Some("gif") => "image/gif",
+        Some("webp") => "image/webp",
+        Some("svg") => "image/svg+xml",
+        Some("zip") => "application/zip",
+        Some("gz") | Some("tgz") => "application/gzip",
+        Some("tar") => "application/x-tar",
+        Some("mp3") => "audio/mpeg",
+        Some("ogg") | Some("oga") => "audio/ogg",
+        Some("wav") => "audio/wav",
+        Some("mp4") | Some("m4v") => "video/mp4",
+        Some("webm") => "video/webm",
+        Some("doc") => "application/msword",
+        Some("docx") => "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        Some("xls") => "application/vnd.ms-excel",
+        Some("xlsx") => "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        Some("ppt") => "application/vnd.ms-powerpoint",
+        Some("pptx") => "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+        Some("eml") => "message/rfc822",
+        Some("ics") => "text/calendar; charset=utf-8",
+        Some("vcf") => "text/vcard; charset=utf-8",
+        _ => "application/octet-stream",
     }
 }
 
@@ -116,7 +246,7 @@ pub fn is_address(addr: &str) -> bool {
 /// `now` is the `Date:` header's instant in unix seconds, and it feeds the
 /// `Message-ID` too: nothing here reads the clock, so a test can pin the whole
 /// message.
-pub fn render(mail: &Outgoing, now: i64) -> Vec<u8> {
+pub fn render(mail: &Outgoing, attachments: &[LoadedAttachment], now: i64) -> Vec<u8> {
     let mut out = String::new();
     push_header(&mut out, "From", &from_header(mail));
     push_header(&mut out, "To", &mail.to.join(", "));
@@ -127,13 +257,120 @@ pub fn render(mail: &Outgoing, now: i64) -> Vec<u8> {
     push_header(&mut out, "Date", &crate::mail::rfc5322_date(now));
     push_header(&mut out, "Message-ID", &message_id(mail, now));
     push_header(&mut out, "MIME-Version", "1.0");
-    push_header(&mut out, "Content-Type", "text/plain; charset=utf-8");
-    push_header(&mut out, "Content-Transfer-Encoding", "base64");
     // The blank line between the headers and the body, which is the only line
     // in the message that means something by being empty.
+    let body = body_base64(&mail.body);
+    if attachments.is_empty() {
+        push_header(&mut out, "Content-Type", "text/plain; charset=utf-8");
+        push_header(&mut out, "Content-Transfer-Encoding", "base64");
+        out.push_str("\r\n");
+        out.push_str(&body);
+        return out.into_bytes();
+    }
+    // With files on it the mail is `multipart/mixed`: the text is one part and
+    // each file another, which is what every client expects of a mail with
+    // attachments — and what keeps the text readable on its own for a client
+    // that shows the first part of a multipart body.
+    let boundary = boundary(mail, now);
+    push_header(
+        &mut out,
+        "Content-Type",
+        &format!("multipart/mixed; boundary=\"{boundary}\""),
+    );
     out.push_str("\r\n");
-    out.push_str(&body_base64(&mail.body));
+    // What a client that cannot read MIME at all shows instead of the parts:
+    // the convention every mail with attachments has carried for thirty years.
+    out.push_str("This is a message in MIME format.\r\n");
+    push_part(
+        &mut out,
+        &boundary,
+        "Content-Type: text/plain; charset=utf-8\r\nContent-Transfer-Encoding: base64\r\n",
+        &body,
+    );
+    for attachment in attachments {
+        let headers = format!(
+            "Content-Type: {}\r\nContent-Transfer-Encoding: base64\r\nContent-Disposition: {}\r\n",
+            attachment.content_type,
+            disposition(attachment),
+        );
+        push_part(
+            &mut out,
+            &boundary,
+            &headers,
+            &base64_lines(&attachment.bytes),
+        );
+    }
+    out.push_str(&format!("--{boundary}--\r\n"));
     out.into_bytes()
+}
+
+/// One part of a multipart body: the boundary line, the part's own headers, the
+/// blank line that ends them, and the body. Every boundary has to be preceded by
+/// a CRLF, so one is added when the body does not end with one — an empty body
+/// has none at all.
+fn push_part(out: &mut String, boundary: &str, headers: &str, body: &str) {
+    out.push_str("--");
+    out.push_str(boundary);
+    out.push_str("\r\n");
+    out.push_str(headers);
+    out.push_str("\r\n");
+    out.push_str(body);
+    if !body.ends_with("\r\n") {
+        out.push_str("\r\n");
+    }
+}
+
+/// The boundary between the parts: the mail's own id with everything that is not
+/// a letter or a digit turned into a dot. It carries underscores, and the base64
+/// alphabet has none — so no encoded part can contain the boundary, which is the
+/// one thing a boundary has to be able to say.
+fn boundary(mail: &Outgoing, now: i64) -> String {
+    // The message id's own random part and nothing else: a boundary has to be
+    // unique within one message rather than an address, and a short one keeps
+    // the header that carries it on a single line.
+    let stamp = message_id(mail, now)
+        .split('@')
+        .next()
+        .and_then(|head| head.rsplit('.').next())
+        .unwrap_or("parts")
+        .to_string();
+    format!("=_kimo_{stamp}_=_")
+}
+
+/// How a part says it is a file rather than something to show: its name, as a
+/// quoted string when that can hold it — and, when it cannot (a name with
+/// anything but ASCII in it), the RFC 2231 form beside it, which is what a
+/// client that knows about it reads. Both are written: the quoted one is what an
+/// old client shows, and a name reduced to underscores is worse than a name a
+/// modern client reads right.
+fn disposition(attachment: &LoadedAttachment) -> String {
+    let quoted = attachment.name.replace('\\', "\\\\").replace('"', "\\\"");
+    if quoted.is_ascii() {
+        return format!("attachment; filename=\"{quoted}\"");
+    }
+    let fallback: String = quoted
+        .chars()
+        .map(|c| if c.is_ascii() { c } else { '_' })
+        .collect();
+    format!(
+        "attachment; filename=\"{fallback}\"; filename*=utf-8''{}",
+        percent_encoded(&attachment.name)
+    )
+}
+
+/// `text` with everything but the unreserved characters percent-encoded, which is
+/// the form RFC 2231's `filename*` carries a name in.
+fn percent_encoded(text: &str) -> String {
+    let mut out = String::new();
+    for byte in text.as_bytes() {
+        let c = *byte as char;
+        if c.is_ascii_alphanumeric() || "-._~".contains(c) {
+            out.push(c);
+        } else {
+            out.push_str(&format!("%{byte:02X}"));
+        }
+    }
+    out
 }
 
 /// `Name <addr>`, with the name an encoded word when it cannot be a plain
@@ -233,13 +470,18 @@ fn push_header(out: &mut String, name: &str, value: &str) {
 /// with a dot is no longer special — though the SMTP client stuffs it anyway,
 /// because that is the transport's job and not the message's.
 fn body_base64(body: &str) -> String {
-    let normalized = crlf(body);
-    let encoded = base64::engine::general_purpose::STANDARD.encode(normalized.as_bytes());
+    base64_lines(crlf(body).as_bytes())
+}
+
+/// Bytes as base64, wrapped into 76-column lines — the width a body is meant to
+/// stay inside — each ending with CRLF. The last line ends with one too, which
+/// is what lets a part's body be followed straight by the next boundary.
+fn base64_lines(bytes: &[u8]) -> String {
+    let encoded = base64::engine::general_purpose::STANDARD.encode(bytes);
     let mut out = String::with_capacity(encoded.len() + encoded.len() / 76 + 2);
-    let bytes = encoded.as_bytes();
     let mut start = 0;
-    while start < bytes.len() {
-        let end = (start + 76).min(bytes.len());
+    while start < encoded.len() {
+        let end = (start + 76).min(encoded.len());
         // Base64 is ASCII, so a 76-column cut is always a character boundary.
         out.push_str(&encoded[start..end]);
         out.push_str("\r\n");
@@ -310,6 +552,7 @@ mod tests {
             bcc: Vec::new(),
             subject: "Hello".to_string(),
             body: "Hi there!\n\nBye.\n".to_string(),
+            attachments: Vec::new(),
         }
     }
 
@@ -321,6 +564,123 @@ mod tests {
             .decode(cleaned)
             .expect("the body is base64");
         String::from_utf8(bytes).expect("the body is utf-8")
+    }
+
+    /// A mail with files on it is `multipart/mixed`: the text is one part, each
+    /// file another, and every part is base64 with the disposition that names the
+    /// file — which is what makes a recipient's client show it as an attachment
+    /// rather than as pages of base64 in the middle of the letter.
+    #[test]
+    fn a_mail_with_files_is_multipart() {
+        let files = vec![LoadedAttachment {
+            name: "report.pdf".to_string(),
+            content_type: "application/pdf",
+            bytes: b"%PDF-1.4 hello".to_vec(),
+        }];
+        // Unfolded first: a long header is written across two lines, and what
+        // this asks is what the header *says*.
+        let raw = String::from_utf8(render(&mail(), &files, 0))
+            .unwrap()
+            .replace("\r\n ", " ");
+        let boundary = raw
+            .lines()
+            .find_map(|line| line.strip_prefix("Content-Type: multipart/mixed; boundary=\""))
+            .and_then(|rest| rest.strip_suffix('"'))
+            .expect("the mail says what its boundary is");
+        assert!(
+            boundary.contains('_'),
+            "the base64 alphabet has no underscore, so no part can contain it: {boundary}"
+        );
+        assert_eq!(
+            raw.matches(&format!("--{boundary}\r\n")).count(),
+            2,
+            "one boundary per part"
+        );
+        assert!(
+            raw.ends_with(&format!("--{boundary}--\r\n")),
+            "and a last one"
+        );
+
+        // The letter is still the letter: its own part, its own headers, and the
+        // text the writer typed when the part is decoded.
+        let text_part = raw
+            .split(&format!("--{boundary}\r\n"))
+            .nth(1)
+            .expect("the text part");
+        assert!(text_part.starts_with("Content-Type: text/plain; charset=utf-8\r\n"));
+        let body = text_part.split("\r\n\r\n").nth(1).expect("the part's body");
+        assert_eq!(decode(body), "Hi there!\r\n\r\nBye.\r\n");
+
+        // And the file: its name, its type, and its own bytes.
+        assert!(raw.contains("Content-Disposition: attachment; filename=\"report.pdf\"\r\n"));
+        assert!(raw.contains("Content-Type: application/pdf\r\n"));
+        let encoded = base64::engine::general_purpose::STANDARD.encode(b"%PDF-1.4 hello");
+        assert!(raw.contains(&encoded), "the file's bytes, base64");
+    }
+
+    /// A name that is not ASCII is written twice: the plain form with the name
+    /// reduced to what a quoted string can hold, which is what an old client
+    /// shows, and the RFC 2231 form, which is what a client that knows about it
+    /// reads.
+    #[test]
+    fn a_name_that_is_not_ascii_is_written_twice() {
+        let files = vec![LoadedAttachment {
+            name: "发票.pdf".to_string(),
+            content_type: "application/pdf",
+            bytes: vec![1, 2, 3],
+        }];
+        let raw = String::from_utf8(render(&mail(), &files, 0)).unwrap();
+        assert!(raw.contains("filename=\"__.pdf\""), "{raw}");
+        assert!(
+            raw.contains("filename*=utf-8''%E5%8F%91%E7%A5%A8.pdf"),
+            "{raw}"
+        );
+    }
+
+    /// What a file is, as far as its name says: the extension decides, case and
+    /// all, and a name nobody recognizes is a stream of bytes.
+    #[test]
+    fn a_files_type_comes_from_its_name() {
+        assert_eq!(content_type_of("report.pdf"), "application/pdf");
+        assert_eq!(content_type_of("PHOTO.JPG"), "image/jpeg");
+        assert_eq!(content_type_of("notes.TXT"), "text/plain; charset=utf-8");
+        assert_eq!(content_type_of("archive.tar.gz"), "application/gzip");
+        assert_eq!(
+            content_type_of("sheet.xlsx"),
+            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        );
+        assert_eq!(content_type_of("no-extension"), "application/octet-stream");
+        assert_eq!(content_type_of(""), "application/octet-stream");
+    }
+
+    /// The files are read when the mail is sent rather than when they are
+    /// attached — the card holds paths — and a file that has gone in between
+    /// stops the send with its path in the reason, because a mail that goes out
+    /// without the file its writer attached is worse than one that does not go
+    /// out at all.
+    #[test]
+    fn the_files_are_read_when_the_mail_is_sent() {
+        let dir = std::env::temp_dir().join("kimo-outgoing-files");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("notes.txt");
+        std::fs::write(&path, b"a note").unwrap();
+
+        let file = OutgoingAttachment::of(path.clone()).unwrap();
+        assert_eq!(file.name, "notes.txt");
+        assert_eq!(file.content_type, "text/plain; charset=utf-8");
+        assert_eq!(file.size(), Some(6));
+        let loaded = load_attachments(std::slice::from_ref(&file)).unwrap();
+        assert_eq!(loaded[0].bytes, b"a note");
+        assert_eq!(loaded[0].name, "notes.txt");
+
+        std::fs::remove_file(&path).unwrap();
+        let error = load_attachments(&[file]).unwrap_err().to_string();
+        assert!(error.contains("notes.txt"), "{error}");
+
+        // A directory is not a file to attach, and the card is where that is
+        // said — not the send, a minute later.
+        assert!(OutgoingAttachment::of(dir.clone()).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -379,7 +739,7 @@ mod tests {
         mail.body = "本月项目进展：一切正常。\n下一行。\n".to_string();
         mail.cc = vec!["carol@example.com".to_string()];
         mail.bcc = vec!["dave@example.com".to_string()];
-        let raw = render(&mail, 1_791_504_000);
+        let raw = render(&mail, &[], 1_791_504_000);
         let text = String::from_utf8(raw.clone()).expect("the message is 7-bit clean");
         assert!(text.contains("Subject: =?UTF-8?B?"), "an encoded subject");
         assert!(
@@ -403,7 +763,7 @@ mod tests {
 
     #[test]
     fn an_ascii_mail_writes_the_headers_a_reader_expects() {
-        let raw = render(&mail(), 1_791_504_000);
+        let raw = render(&mail(), &[], 1_791_504_000);
         let text = String::from_utf8(raw).unwrap();
         let (headers, body) = text
             .split_once("\r\n\r\n")
@@ -442,7 +802,7 @@ mod tests {
     fn a_body_is_carried_whole_whatever_its_line_endings() {
         let mut mail = mail();
         mail.body = "first\n.second\r\nthird\rfourth".to_string();
-        let raw = String::from_utf8(render(&mail, 0)).unwrap();
+        let raw = String::from_utf8(render(&mail, &[], 0)).unwrap();
         let body = raw.split_once("\r\n\r\n").unwrap().1;
         assert_eq!(decode(body), "first\r\n.second\r\nthird\r\nfourth");
     }
@@ -453,7 +813,7 @@ mod tests {
         mail.subject =
             "A subject long enough that it has to be folded somewhere sensible and must still read back exactly as typed"
                 .to_string();
-        let raw = render(&mail, 0);
+        let raw = render(&mail, &[], 0);
         let text = String::from_utf8(raw.clone()).unwrap();
         for line in text.split("\r\n\r\n").next().unwrap().split("\r\n") {
             assert!(line.len() <= 78, "{} columns: {line}", line.len());
@@ -468,7 +828,7 @@ mod tests {
     fn a_long_encoded_subject_folds_into_words_a_reader_joins() {
         let mut mail = mail();
         mail.subject = "日".repeat(60);
-        let raw = render(&mail, 0);
+        let raw = render(&mail, &[], 0);
         let text = String::from_utf8(raw.clone()).unwrap();
         for line in text.split("\r\n\r\n").next().unwrap().split("\r\n") {
             assert!(line.len() <= 78, "{} columns: {line}", line.len());
@@ -490,7 +850,7 @@ mod tests {
             ["bob@example.com", "carol@example.com", "dave@example.com"]
         );
         assert!(mail.invalid().is_empty());
-        let raw = String::from_utf8(render(&mail, 0)).unwrap();
+        let raw = String::from_utf8(render(&mail, &[], 0)).unwrap();
         assert!(raw.contains("Cc: carol@example.com"));
         assert!(!raw.contains("dave@example.com"), "bcc is not a header");
 
@@ -517,7 +877,7 @@ mod tests {
     fn a_from_with_no_name_is_just_the_address() {
         let mut mail = mail();
         mail.from_name = "  ".to_string();
-        let raw = String::from_utf8(render(&mail, 0)).unwrap();
+        let raw = String::from_utf8(render(&mail, &[], 0)).unwrap();
         assert!(raw.starts_with("From: ada@example.com\r\n"));
     }
 }

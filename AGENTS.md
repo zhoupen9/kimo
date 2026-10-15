@@ -33,12 +33,34 @@ Kimo is a desktop **email client** GUI written in pure Rust:
 - **Charsets:** mail-parser is built with the `full_encoding` feature
   (pulling in `encoding_rs`, pure Rust) so GB2312/GBK/GB18030/Big5/
   Shift-JIS/… mail decodes to proper UTF-8 instead of Latin-1 mojibake.
+- **The file dialog is the desktop's, not Kimo's.** There is no file-picker
+  crate: the dialog is asked for over D-Bus from the compositor's own portal
+  (`src/portal.rs`, `org.freedesktop.portal.FileChooser.Open`), which keeps the
+  dependency list as it is — no GTK, no portal crate with an async runtime behind
+  it — and is the only thing that works under Wayland, where winit 0.30 delivers
+  no drag-and-drop events at all. It is a `Job` because the call does not return
+  until the user has answered, and the answer arrives as a `Response` signal on
+  the request object the reply named (read in whichever order the two come: a
+  portal that refuses at once sends the signal first). Two things about the wire
+  that cost a debugging session and are worth keeping: **the connection greets
+  the bus (`Hello`) before anything else**, because a bus answers anything sent
+  before the greeting with an error and then *closes the connection* — which
+  arrives as "bus closed the connection" and looks nothing like a missing
+  greeting; and **the chooser's method is `OpenFile`** on the current interface
+  (`version` 4), with `Open` kept as the fallback for a portal that predates the
+  rename, taken on `UnknownMethod` alone. The developer test
+  (`cargo test -- --ignored the_desktop_answers_a_chooser_call`) walks the whole
+  path against the real portal on a session that has one: it opens the dialog and
+  closes the request the moment the reply names it.
 - **Sending is SMTP submission.** The compose card's Send hands its draft to
   a worker (`Job::SendMessage`), which speaks `EHLO`/`STARTTLS`/`AUTH`/`MAIL
   FROM`/`RCPT TO`/`DATA` through `src/protocol/smtp.rs`, and the message itself
   is built by `src/outgoing.rs`. A copy goes into the account's Sent mailbox
-  over IMAP when the server has one. There is no drafts folder, no outbox and
-  no attachments — see hard rule 4 and the compose-window convention below.
+  over IMAP when the server has one. A mail with files on it goes out as
+  `multipart/mixed` — the text is one part and each file another, all base64 —
+  and the files are read by the worker as it sends, never by the UI thread. There
+  is no drafts folder and no outbox — see hard rule 4 and the compose-window
+  convention below.
 - **Tray icon:** `src/tray.rs` implements StatusNotifierItem by speaking the
   D-Bus wire protocol directly (`src/dbus.rs`) on a `std::thread` —
   deliberately not zbus (async executor, rule 2) or the GTK tray crates (C,
@@ -131,8 +153,8 @@ Kimo is a desktop **email client** GUI written in pure Rust:
    one thing it writes besides the mail itself is the copy in the account's
    Sent mailbox (`APPEND`, IMAP accounts only). Deliberately still out of
    scope, each its own decision by the project owner: drafts of any kind
-   (nothing about a draft is persisted), an outbox/queue or any retry, file
-   attachments, HTML bodies, DKIM or any signing, and OAuth2/XOAUTH2 — SMTP
+   (nothing about a draft is persisted), an outbox/queue or any retry, HTML
+   bodies, DKIM or any signing, and OAuth2/XOAUTH2 — SMTP
    authentication is `AUTH PLAIN`/`AUTH LOGIN` over TLS.
 5. **Keep the dependency tree small.** Every new crate needs a concrete
    justification; prefer std where reasonable.
@@ -167,6 +189,7 @@ src/db.rs               the mail database: schema + migrations, accounts, folder
 src/search.rs           mail search: the CJK bigram index, the FTS5 query builder and the filters they run against
 src/threads.rs          mail grouped into conversations: the message list's own model of a folder
 src/theme.rs            theme choice + the light/dark color schemes and their egui Visuals
+src/portal.rs           the desktop's own file dialog, asked for over D-Bus (XDG portal)
 src/mail.rs             raw RFC 5322 bytes → MailMessage (mail-parser; HTML kept, attachments
                         as name/type/size, one part back out for a download)
 src/outgoing.rs         the mail being sent: addresses, headers, encoding → RFC 5322 bytes
@@ -1684,10 +1707,66 @@ Do not "fix" these casually — they are known:
   mail carries any more stays in the column), nothing is labelled in bulk
   (select mode leaves Delete as its one live action, and the label cell on a
   mail's head is about that mail), and the filter is in memory only.
-- A written mail goes out over SMTP and no further: no attachments (there is
-  nothing to pick a file with — a native dialog is a dependency, and a portal on
-  Wayland), no HTML body (the card is a text box, so the mail is `text/plain;
-  charset=utf-8`, base64-encoded), no drafts — closing the card is the end of
+- **A mail can carry files, and the card is where they are chosen.** Two ways
+  in, and one area that says both (`attach_card`): **a click opens the desktop's
+  own dialog** (`crate::portal`: the XDG portal's
+  `org.freedesktop.portal.FileChooser.OpenFile` over D-Bus, which runs the dialog
+  in the *compositor's* process — nothing is linked in, and it is the one way
+  that works on Wayland at all), and **a file dragged from a file manager** lands
+  on the window (egui's `dropped_files`, read in `KimoApp::ui` rather than in the
+  card: a drop belongs to the frame, and one that arrives with no card open
+  *starts* a card with the file on it, which is what dropping a file on a mail
+  client means). The area replaces the button, path box and Attach button that
+  used to say the same thing — the dialog is the way in, and a typed path was
+  only ever the fallback for a session with no dialog to open. What a file that
+  cannot be attached has to say — a directory, something that has gone, a desktop
+  with no portal — is drawn under the area, never beside it.
+  ```
+  Files  [ file card  ✕ ]  [ file card  ✕ ]
+         [ Click to select files, or drag files here ]
+  ```
+  **A file is a card**, the reading pane's own (`attachment_card`, drawn here
+  with a click that takes the file off the mail rather than fetching it, which is
+  the one thing the tooltip's last line varies by), wrapped across the field
+  column; the same file twice is two parts, because a mail may carry one file
+  under two names. Each of those cards carries a
+  **small round cross** in its right-hand gutter — the room for it is part of the
+  card’s own width, so a long name is cut before it, never under it — and the
+  cross is a widget of its own: the treatment the row delete button gets (muted
+  until the pointer is on the button, then the scheme’s `danger_hover` fill with
+  the glyph in `on_danger`), the tooltip "Take this file off the mail", and a hit
+  box of its own beside the card’s body, which does the same thing and says so.
+  The reading pane’s cards have **no** cross (`removable: false`): a mail’s own
+  attachment is not Kimo’s to take away. On a Wayland session the drag half of the area’s sentence is a
+  promise the platform does not keep: winit 0.30 has no drag-and-drop in its
+  Wayland backend, so no `HoveredFile` or `DroppedFile` ever reaches the window
+  and the card's "Drop the files here" state cannot appear. The dialog is
+  therefore the way in that has to work.
+  **The draft holds paths, not bytes** (`outgoing::OutgoingAttachment`: the path,
+  the name, and the `Content-Type` its extension suggests, `content_type_of`), and
+  the worker reads them as it sends (`load_attachments`): the UI thread reads no
+  files at all (rule 3), and what goes out is the file as it is when the mail
+  leaves rather than as it was when it was chosen. A file that cannot be read
+  stops the send with its path in the reason — a mail that goes out without the
+  file its writer attached is worse than one that does not go out — and the same
+  failure is what the SMTP send and the Sent copy both see, because the message
+  is rendered once (`send_message`) and the same bytes are delivered and filed.
+- **A mail with files on it is `multipart/mixed`.** `outgoing::render` writes the
+  headers it always did and then, instead of a bare `text/plain` body, a boundary
+  and one part per thing: the letter first — so a client that shows only the
+  first part of a multipart body still shows the letter — then a part per file,
+  each with its `Content-Type`, `Content-Transfer-Encoding: base64` and a
+  `Content-Disposition` that names it. The boundary carries an underscore
+  (`=_kimo_<id>_=_`), and the base64 alphabet has none, so no encoded part can
+  contain it — which is the one thing a boundary has to be able to say. A name
+  that is not ASCII is written twice: a quoted form with the name reduced, which
+  is what an old client shows, and RFC 2231's `filename*=utf-8''…`, which is what
+  a client that knows about it reads. The files are read whole into memory —
+  there is no streaming and no size cap — which is the price of the rest of the
+  app being the same.
+- A written mail goes out over SMTP and no further: no HTML body (the card is a
+  text box, so the letter is `text/plain; charset=utf-8`, base64-encoded), no
+  drafts — closing the card is the end of
   the mail, and a failed send keeps the draft in the card but nowhere else — no
   outbox, queue or retry, no DKIM, and no OAuth2: submission authenticates with
   `AUTH PLAIN`/`AUTH LOGIN` over TLS, or not at all when the server asks for no

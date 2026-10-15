@@ -18,6 +18,7 @@ mod mail;
 mod models;
 mod notify;
 mod outgoing;
+mod portal;
 mod protocol;
 mod threads;
 // Test-only measurement harness for the two HTML renderers; see the file.

@@ -508,6 +508,30 @@ impl Bus {
         member: &str,
         args: &[Value],
     ) -> Result<Message, String> {
+        let serial = self.call_no_reply(destination, path, interface, member, args)?;
+        loop {
+            let reply = self.read_message()?;
+            if reply.reply_serial == Some(serial) {
+                return Ok(reply);
+            }
+            // Skip anything not addressed to this call.
+        }
+    }
+
+    /// Send a call and answer with its serial, without waiting for the reply —
+    /// which is what a caller that may be answered by a *signal* needs, and the
+    /// portals are exactly that: `FileChooser.Open` returns the object its answer
+    /// will arrive on, and the answer itself is a signal that may even come
+    /// first. A call that waited for the reply in here would read that signal
+    /// and drop it.
+    pub(crate) fn call_no_reply(
+        &mut self,
+        destination: &str,
+        path: &str,
+        interface: &str,
+        member: &str,
+        args: &[Value],
+    ) -> Result<u32, String> {
         let (signature, body) = build_body(args);
         let mut fields = vec![
             (FIELD_DESTINATION, Value::Str(destination.to_string())),
@@ -521,13 +545,7 @@ impl Bus {
         let serial = self.next_serial();
         let msg = build_message(MSG_METHOD_CALL, serial, &fields, &body);
         self.writer.write_all(&msg).map_err(|e| e.to_string())?;
-        loop {
-            let reply = self.read_message()?;
-            if reply.reply_serial == Some(serial) {
-                return Ok(reply);
-            }
-            // Skip anything not addressed to this call.
-        }
+        Ok(serial)
     }
 
     /// Send a message that is not a call: the replies `tray::serve` writes.

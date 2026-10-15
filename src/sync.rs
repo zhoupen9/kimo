@@ -198,6 +198,11 @@ pub enum Job {
     /// Remove an account: its row, its folders and, through the cascades, every
     /// message cached for it.
     DeleteAccount { account_id: String },
+    /// Ask the desktop for the files to attach to the mail being written: the
+    /// XDG portal's own file chooser, which runs in the *compositor's* process
+    /// (`crate::portal`). It is a job because the call does not come back until
+    /// the user has answered the dialog, and the UI thread waits for nothing.
+    PickFiles,
     /// Download and decode a remote image referenced by HTML mail.
     FetchImage { url: String },
     /// Download a remote stylesheet referenced by HTML mail.
@@ -224,6 +229,17 @@ pub enum Job {
 pub enum Event {
     SyncStarted {
         account_id: String,
+    },
+    /// The files the desktop's file dialog came back with: empty when it was
+    /// cancelled, which is not a failure and says nothing on screen.
+    FilesChosen {
+        files: Vec<PathBuf>,
+    },
+    /// And why it could not be opened at all — a session with no portal, a bus
+    /// that is not there. The card says so beside its own path box, which is
+    /// exactly what that box is for.
+    FileChoiceFailed {
+        error: String,
     },
     Folders {
         account_id: String,
@@ -399,6 +415,22 @@ pub fn spawn(job: Job, ctx: egui::Context, tx: Sender<Event>) {
                 },
             };
             let _ = tx.send(event);
+            ctx.request_repaint();
+        }
+        Job::PickFiles => {
+            // Not bracketed with SyncStarted/SyncDone: no account is being
+            // fetched, and the card that asked is on screen waiting for the
+            // dialog.
+            match crate::portal::open_files() {
+                Ok(files) => {
+                    let _ = tx.send(Event::FilesChosen { files });
+                }
+                Err(error) => {
+                    let _ = tx.send(Event::FileChoiceFailed {
+                        error: error.to_string(),
+                    });
+                }
+            }
             ctx.request_repaint();
         }
         Job::MarkSeen {
@@ -614,7 +646,8 @@ pub fn spawn(job: Job, ctx: egui::Context, tx: Sender<Event>) {
                 | Job::LoadOlder { .. }
                 | Job::SetLabels { .. }
                 | Job::DeleteAccount { .. }
-                | Job::SetFlag { .. } => unreachable!(),
+                | Job::SetFlag { .. }
+                | Job::PickFiles => unreachable!(),
             };
             let _ = tx.send(Event::SyncStarted {
                 account_id: account_id.clone(),
@@ -653,7 +686,8 @@ pub fn spawn(job: Job, ctx: egui::Context, tx: Sender<Event>) {
                 | Job::LoadOlder { .. }
                 | Job::SetLabels { .. }
                 | Job::DeleteAccount { .. }
-                | Job::SetFlag { .. } => unreachable!(),
+                | Job::SetFlag { .. }
+                | Job::PickFiles => unreachable!(),
             };
             let _ = match result {
                 Ok(()) => tx.send(Event::SyncDone { account_id }),
@@ -1254,10 +1288,15 @@ fn send_message(
         ));
     };
     let recipients: Vec<String> = mail.recipients().into_iter().map(str::to_string).collect();
+    // The files are read here, on the worker: the card holds their paths
+    // (`OutgoingAttachment`) and the UI thread reads no files at all. One that
+    // cannot be read stops the send — a mail that goes out without the file its
+    // writer attached is worse than one that does not go out.
+    let attachments = crate::outgoing::load_attachments(&mail.attachments)?;
     // The bytes are built once, and the same ones go to the server and — when
     // there is somewhere to keep it — into the Sent mailbox: a copy that
     // differs from what was delivered is worse than no copy at all.
-    let raw = crate::outgoing::render(mail, unix_now());
+    let raw = crate::outgoing::render(mail, &attachments, unix_now());
     let mut client = SmtpClient::connect(&smtp.host, smtp.port, smtp.tls)?;
     // No username is a submission server that wants no login — a local relay,
     // or a server that authenticates by address alone.
@@ -1700,6 +1739,7 @@ mod tests {
             bcc: Vec::new(),
             subject: "Invoice 42".to_string(),
             body: "Please pay it.\n".to_string(),
+            attachments: Vec::new(),
         };
 
         let (tx, rx) = std::sync::mpsc::channel();

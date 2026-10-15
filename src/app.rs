@@ -25,6 +25,7 @@
 //! not.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::path::PathBuf;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
@@ -32,7 +33,7 @@ use crate::folders::{self, FolderKind};
 use crate::fonts::FontFamily;
 use crate::glass::Glass;
 use crate::models::{Account, Attachment, MailMessage, Protocol, SmtpLogin, SmtpSettings, TlsMode};
-use crate::outgoing::{self, Outgoing};
+use crate::outgoing::{self, Outgoing, OutgoingAttachment};
 use crate::search::{Scope, SearchHit, SearchQuery, SEARCH_LIMIT};
 use crate::storage::{self, Settings};
 use crate::sync::{self, Event, Job, SentCopy};
@@ -298,6 +299,14 @@ struct ComposeDraft {
     bcc: String,
     subject: String,
     body: String,
+    /// The files that would go out with the mail, in the order they were
+    /// attached: the card draws a row per file, and the worker reads them when
+    /// the mail is sent (`outgoing::OutgoingAttachment`).
+    attachments: Vec<OutgoingAttachment>,
+    /// What went wrong with the last file that was asked for — a path that is
+    /// not there, a directory, or a desktop with no dialog to open — shown under
+    /// the card until the next file is attached.
+    attach_error: Option<String>,
     /// Set on the first frame the window is shown, so the To field takes the
     /// keyboard without a click.
     focus: bool,
@@ -320,6 +329,8 @@ impl ComposeDraft {
             bcc: String::new(),
             subject: String::new(),
             body: String::new(),
+            attachments: Vec::new(),
+            attach_error: None,
             focus: true,
             sending: false,
             error: None,
@@ -345,6 +356,8 @@ impl ComposeDraft {
             bcc: String::new(),
             subject,
             body,
+            attachments: Vec::new(),
+            attach_error: None,
             focus: true,
             sending: false,
             error: None,
@@ -428,6 +441,24 @@ fn answer_subject(prefix: &str, subject: &str) -> String {
         subject.to_string()
     } else {
         format!("{prefix}: {subject}")
+    }
+}
+
+/// Put one file on the draft, or say why it cannot be: what a drop on the card
+/// and a path typed into its box both come to. The refusal — a path that is not
+/// there, a directory — is kept in the draft for the card to draw beside the
+/// box, and the mail is not sent with a part that cannot be read.
+fn attach_file(draft: &mut ComposeDraft, path: PathBuf) -> bool {
+    match OutgoingAttachment::of(path) {
+        Ok(file) => {
+            draft.attachments.push(file);
+            draft.attach_error = None;
+            true
+        }
+        Err(problem) => {
+            draft.attach_error = Some(problem.to_string());
+            false
+        }
     }
 }
 
@@ -747,6 +778,11 @@ pub struct KimoApp {
     /// Bumped whenever `open_threads` changes, so the derived rows know they
     /// are stale without comparing the whole set.
     open_rev: u64,
+    /// True while the desktop's file dialog is open for the compose card: asked
+    /// for by the card's button, answered by `Event::FilesChosen` or
+    /// `Event::FileChoiceFailed`, and what the card is drawn from meanwhile — the
+    /// button says the dialog is up and cannot be pressed twice.
+    picking_files: bool,
     /// The order the message list is drawn in (the title bar's sort cell): which
     /// way round it runs, and by which of the three keys. Beside the filter,
     /// which is the other thing about the column that is the window's rather
@@ -2051,6 +2087,7 @@ impl KimoApp {
             threaded: settings.threaded.unwrap_or(true),
             open_threads: HashSet::new(),
             open_rev: 0,
+            picking_files: false,
             list_filters: ListFilters::default(),
             list_sort: ListSort::default(),
             list_rows: None,
@@ -2268,6 +2305,27 @@ impl KimoApp {
             // taken is numbered.
             Event::MessageExported { path } | Event::AttachmentDownloaded { path } => {
                 self.notice = Some((format!("Saved to {}", path.display()), Instant::now()));
+            }
+            Event::FilesChosen { files } => {
+                // The dialog came back: the card is the one that asked, so the
+                // files go on whatever draft is open — and nowhere if the card
+                // was closed while the dialog was up, because the draft it was
+                // asking for is gone with it.
+                self.picking_files = false;
+                for path in files {
+                    if let Some(draft) = self.compose.as_mut() {
+                        attach_file(draft, path);
+                    }
+                }
+                // Empty is the dialog cancelled: no error, and nothing to say.
+                self.ctx.request_repaint();
+            }
+            Event::FileChoiceFailed { error } => {
+                self.picking_files = false;
+                if let Some(draft) = self.compose.as_mut() {
+                    draft.attach_error = Some(error);
+                }
+                self.ctx.request_repaint();
             }
             Event::MessageSent {
                 recipients, copy, ..
@@ -4264,6 +4322,36 @@ impl KimoApp {
     /// Open the compose window on an empty draft. A window that is already open
     /// is left alone: the button is not a reset, and the draft in it is the
     /// only copy of what has been typed.
+    /// Files the desktop dropped on the window this frame go on the mail being
+    /// written — and a drop with nothing being written starts a card with them
+    /// on it, which is what dropping a file on a mail client means.
+    ///
+    /// The *window's* input rather than the card's, because a drop belongs to
+    /// the frame and this is the one place every frame passes through: read
+    /// inside the card, a drop with no card open would land nowhere at all.
+    /// (On a Wayland session no drop ever arrives — winit 0.30 has no
+    /// drag-and-drop there — so the card's dialog button is the one way in that
+    /// always works; see `crate::portal`.)
+    fn attach_dropped(&mut self) {
+        let dropped: Vec<PathBuf> = self.ctx.input(|input| {
+            input
+                .raw
+                .dropped_files
+                .iter()
+                .map(|file| file.path().to_path_buf())
+                .collect()
+        });
+        if dropped.is_empty() {
+            return;
+        }
+        self.open_compose();
+        if let Some(draft) = self.compose.as_mut() {
+            for path in dropped {
+                attach_file(draft, path);
+            }
+        }
+    }
+
     fn open_compose(&mut self) {
         if self.compose.is_none() {
             self.compose = Some(ComposeDraft::new(compose_from(
@@ -4544,6 +4632,10 @@ impl KimoApp {
             bcc,
             subject: draft.subject.clone(),
             body: draft.body.clone(),
+            // The paths, not the bytes: the worker reads them as it sends
+            // (`outgoing::load_attachments`), so the UI thread never touches a
+            // file.
+            attachments: draft.attachments.clone(),
         });
         if let Some(draft) = self.compose.as_mut() {
             draft.sending = true;
@@ -4632,6 +4724,11 @@ impl KimoApp {
 
         let mut discard = false;
         let mut send = false;
+        // What the card's attachment rows ask for, applied once it has been
+        // drawn: one file taken back off, and whether the card's own area was
+        // clicked for the desktop's dialog.
+        let mut remove: Option<usize> = None;
+        let mut pick = false;
         {
             // The card is laid out at the caller's width, so the boxes get a
             // constant: what the label column and the gap beside it leave.
@@ -4704,6 +4801,86 @@ impl KimoApp {
             field(ui, "Bcc", &mut draft.bcc, "name@example.com");
             field(ui, "Subject", &mut draft.subject, "Subject");
 
+            // The files that would go out with the mail, as the reading pane
+            // draws them, and the two ways to add one: the desktop's own dialog,
+            // which is the compositor's and needs nothing linked in, and a path
+            // typed into the box beside it — for a session with no portal to ask,
+            // and for a file that is easier to name than to find. A drop is the
+            // third way, and the window's rather than the card's (see `ui`):
+            // on Wayland winit delivers no drops at all, so what a drop does is
+            // decided where the whole window's input is read.
+            let row_label = |ui: &mut egui::Ui, label: &str| {
+                ui.add_sized(
+                    [COMPOSE_LABEL_WIDTH, COMPOSE_FIELD_HEIGHT],
+                    egui::Label::new(label).halign(egui::Align::RIGHT),
+                );
+            };
+            // While files are over the window the box says what a drop would do.
+            let hovering = ui.ctx().input(|input| !input.raw.hovered_files.is_empty());
+            ui.horizontal_top(|ui| {
+                row_label(ui, "Files");
+                ui.vertical(|ui| {
+                    ui.set_width(field_width);
+                    // The files as the reading pane draws them: the same card,
+                    // because a file is the same thing in both places — and a
+                    // click takes it off this mail, which is what the card's
+                    // own tooltip says here (`attachment_card`).
+                    if !draft.attachments.is_empty() {
+                        ui.spacing_mut().item_spacing = egui::Vec2::splat(ATTACHMENT_CARD_GAP);
+                        ui.horizontal_wrapped(|ui| {
+                            for (index, file) in draft.attachments.iter().enumerate() {
+                                let attachment = Attachment {
+                                    name: file.name.clone(),
+                                    content_type: file.content_type.to_string(),
+                                    size: file.size().unwrap_or(0),
+                                };
+                                let card = attachment_card(
+                                    ui,
+                                    &attachment,
+                                    field_width,
+                                    "Click to take it off this mail",
+                                    true,
+                                );
+                                let taken = card.card.clicked()
+                                    || card.close.is_some_and(|close| close.clicked());
+                                if taken && !sending {
+                                    remove = Some(index);
+                                }
+                            }
+                        });
+                        ui.add_space(4.0);
+                    }
+                    // One area in place of the three controls this used to take
+                    // — a button, a path box and a second button — because the
+                    // dialog is the way in and the path box was only ever the
+                    // fallback for a session that has no dialog to open.
+                    let text = if self.picking_files {
+                        "Choosing files…"
+                    } else if hovering {
+                        "Drop the files here"
+                    } else {
+                        "Click to select files, or drag files here"
+                    };
+                    let area = attach_card(
+                        ui,
+                        field_width,
+                        text,
+                        hovering || self.picking_files,
+                        !sending,
+                    );
+                    if area.clicked() && !sending && !self.picking_files {
+                        pick = true;
+                    }
+                    if let Some(error) = &draft.attach_error {
+                        ui.label(
+                            egui::RichText::new(error)
+                                .small()
+                                .color(theme::of(ui.ctx()).danger),
+                        );
+                    }
+                });
+            });
+
             ui.add_space(6.0);
             // The body is a fixed height and scrolls on its own once the
             // mail outgrows it: the card never grows with the draft.
@@ -4764,6 +4941,21 @@ impl KimoApp {
                     }
                 });
             });
+        }
+
+        // A file taken back off the mail is dropped here rather than inside the
+        // drawing above: the borrow the cards hold is over, and the run must not
+        // be drawn from a half-changed list.
+        if let Some(index) = remove {
+            draft.attachments.remove(index);
+            draft.attach_error = None;
+        }
+        // The desktop's dialog is a job of its own: it does not come back until
+        // the user has answered, so nothing here waits for it — the answer
+        // arrives as an event (`Event::FilesChosen`).
+        if pick {
+            self.picking_files = true;
+            sync::spawn(Job::PickFiles, self.ctx.clone(), self.tx.clone());
         }
 
         // Discarded: the draft goes with the card. There is no other copy of it
@@ -7351,7 +7543,9 @@ impl KimoApp {
             ui.spacing_mut().item_spacing = egui::Vec2::splat(ATTACHMENT_CARD_GAP);
             ui.horizontal_wrapped(|ui| {
                 for (index, attachment) in msg.attachments.iter().enumerate() {
-                    if attachment_card(ui, attachment, column).clicked() {
+                    let card =
+                        attachment_card(ui, attachment, column, "Click to fetch this file", false);
+                    if card.card.clicked() {
                         clicked = Some(index);
                     }
                 }
@@ -8124,6 +8318,7 @@ impl KimoApp {
         let ctx = ui.ctx().clone();
         let ctx = &ctx;
         self.drain_events();
+        self.attach_dropped();
         self.apply_theme(ctx);
         // The automatic sync is a frame's business too: it is what asks for the
         // frame its clock needs, and what starts the sweep when it is up.
@@ -8672,6 +8867,10 @@ const ATTACHMENT_META_FONT_SIZE: f32 = 9.0;
 const ATTACHMENT_CARD_GAP: f32 = 8.0;
 const ATTACHMENT_CARDS_TOP_GAP: f32 = 18.0;
 const ATTACHMENT_CARD_CORNER_RADIUS: u8 = 6;
+/// The cross a compose card's file is taken off with: a circle of this size, its
+/// own corner radius (half of it — a circle), and the round cross glyph inside.
+const ATTACHMENT_CLOSE_SIZE: f32 = 18.0;
+const ATTACHMENT_CLOSE_RADIUS: u8 = 9;
 const ATTACHMENT_CARD_PADDING: f32 = 12.0;
 const ATTACHMENT_GLYPH: f32 = 22.0;
 const ATTACHMENT_LINE_GAP: f32 = 2.0;
@@ -8697,6 +8896,11 @@ const COMPOSE_WIDTH: f32 = 560.0;
 const COMPOSE_LABEL_WIDTH: f32 = 56.0;
 const COMPOSE_FIELD_HEIGHT: f32 = 22.0;
 const COMPOSE_BODY_HEIGHT: f32 = 320.0;
+/// The area the compose card's attach target takes: one line of text, the width
+/// of the field column, and the corner radius the cards under it use.
+const ATTACH_CARD_HEIGHT: f32 = 46.0;
+const ATTACH_CARD_CORNER_RADIUS: u8 = 6;
+const ATTACH_CARD_TEXT_SIZE: f32 = 13.0;
 
 /// Where the title bar's groups are laid out. The window controls and the cog
 /// are the bar's right end, so they are placed from the window's own right
@@ -9559,7 +9763,90 @@ fn truncate_galley(
 /// there — and it is a real one now: the bytes are on the server, and a click
 /// fetches them (see the attachment-card convention in AGENTS.md). The hover
 /// text is what shows a name the column had to cut.
-fn attachment_card(ui: &mut egui::Ui, attachment: &Attachment, column: f32) -> egui::Response {
+/// The compose card's own way to a file: one area the width of the field column
+/// that says what it does. A click on it opens the desktop's dialog
+/// (`crate::portal`), and files dragged from a file manager land on the *window*
+/// and are attached by `KimoApp::attach_dropped` — so what this draws is one
+/// target for both, rather than the button and the path box it used to take to
+/// say the same thing.
+///
+/// `ready` is the state the whole card is drawn from: files are over the window,
+/// or the dialog is open, and the card says so in the accent colour rather than
+/// only in its text.
+fn attach_card(
+    ui: &mut egui::Ui,
+    width: f32,
+    text: &str,
+    ready: bool,
+    enabled: bool,
+) -> egui::Response {
+    let scheme = theme::of(ui.ctx());
+    let (rect, response) =
+        ui.allocate_exact_size(egui::vec2(width, ATTACH_CARD_HEIGHT), egui::Sense::click());
+    if !ui.is_rect_visible(rect) {
+        return response;
+    }
+    let hovered = response.hovered();
+    let stroke = if ready || (hovered && enabled) {
+        scheme.accent
+    } else {
+        scheme.border
+    };
+    ui.painter().rect_filled(
+        rect,
+        ATTACH_CARD_CORNER_RADIUS,
+        if ready || (hovered && enabled) {
+            scheme.hover
+        } else {
+            scheme.card
+        },
+    );
+    ui.painter().rect_stroke(
+        rect,
+        ATTACH_CARD_CORNER_RADIUS,
+        egui::Stroke::new(1.0_f32, stroke),
+        egui::StrokeKind::Inside,
+    );
+    let color = if ready {
+        scheme.accent
+    } else {
+        scheme.text_weak
+    };
+    let font = egui::FontId::proportional(ATTACH_CARD_TEXT_SIZE);
+    let galley = ui
+        .ctx()
+        .fonts_mut(|fonts| fonts.layout_no_wrap(text.to_string(), font, color));
+    let at = rect.center() - galley.size() / 2.0;
+    ui.painter().galley(at, galley, color);
+    if enabled {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+        response.on_hover_text("Files dropped anywhere on the window are attached to this mail")
+    } else {
+        response
+    }
+}
+
+/// What an attachment card's click targets came to: the card itself, and — where
+/// the card is on the compose form — the small cross in its corner, which is the
+/// same thing said out loud rather than left to a click on the card's body.
+struct AttachmentCard {
+    card: egui::Response,
+    close: Option<egui::Response>,
+}
+
+/// `action` is the last line of the card's tooltip: what a click on it would do,
+/// which is not the same in the two places the card is drawn — in the reading
+/// pane it fetches the file, and in the compose card it takes the file off the
+/// mail. `removable` draws the cross a file that has not been sent yet can be
+/// taken off with, and reserves the room for it: a mail's own attachment is not
+/// Kimo's to take away, so the reading pane's cards have no cross at all.
+fn attachment_card(
+    ui: &mut egui::Ui,
+    attachment: &Attachment,
+    column: f32,
+    action: &str,
+    removable: bool,
+) -> AttachmentCard {
     let scheme = theme::of(ui.ctx());
     let name_font = egui::FontId::proportional(ATTACHMENT_NAME_FONT_SIZE);
     let meta_font = egui::FontId::proportional(ATTACHMENT_META_FONT_SIZE);
@@ -9578,7 +9865,12 @@ fn attachment_card(ui: &mut egui::Ui, attachment: &Attachment, column: f32) -> e
         .size()
         .x
         .max(meta.as_ref().map_or(0.0, |meta| meta.size().x));
-    let chrome = ATTACHMENT_GLYPH + ATTACHMENT_CARD_PADDING * 3.0;
+    let close_room = if removable {
+        ATTACHMENT_CLOSE_SIZE + ATTACHMENT_CARD_PADDING
+    } else {
+        0.0
+    };
+    let chrome = ATTACHMENT_GLYPH + ATTACHMENT_CARD_PADDING * 3.0 + close_room;
     let width = (text + chrome).clamp(
         ATTACHMENT_CARD_MIN_WIDTH,
         column.max(ATTACHMENT_CARD_MIN_WIDTH),
@@ -9588,7 +9880,10 @@ fn attachment_card(ui: &mut egui::Ui, attachment: &Attachment, column: f32) -> e
         egui::Sense::click(),
     );
     if !ui.is_rect_visible(rect) {
-        return response;
+        return AttachmentCard {
+            card: response,
+            close: None,
+        };
     }
     let hovered = response.hovered();
     ui.painter().rect_filled(
@@ -9616,7 +9911,7 @@ fn attachment_card(ui: &mut egui::Ui, attachment: &Attachment, column: f32) -> e
     // What both lines are drawn in. Only a column too narrow for the name cuts
     // it — the one case the width above could not answer — and the tooltip then
     // carries the whole of it.
-    let room = (rect.right() - ATTACHMENT_CARD_PADDING - left).max(1.0);
+    let room = (rect.right() - ATTACHMENT_CARD_PADDING - left - close_room).max(1.0);
     let name = if name.size().x > room {
         truncate_galley(
             ui.ctx(),
@@ -9669,12 +9964,46 @@ fn attachment_card(ui: &mut egui::Ui, attachment: &Attachment, column: f32) -> e
             .galley(egui::pos2(left, y), meta, scheme.text_weak);
     }
 
+    // The cross, where this card is one a file can be taken off again. It is a
+    // widget of its own rather than part of the card's own click — the card's
+    // click does the same thing here, and says so in its tooltip — and it takes
+    // the treatment the row delete button gets: muted until the pointer is on
+    // the button itself, then the scheme's danger fill and the glyph in
+    // `on_danger`, because what it does cannot be undone by anything but
+    // attaching the file again.
+    let close = removable.then(|| {
+        let centre = egui::pos2(
+            rect.right() - ATTACHMENT_CARD_PADDING - ATTACHMENT_CLOSE_SIZE / 2.0,
+            rect.center().y,
+        );
+        let rect = egui::Rect::from_center_size(centre, egui::Vec2::splat(ATTACHMENT_CLOSE_SIZE));
+        let close = ui.interact(rect, response.id.with("close"), egui::Sense::click());
+        if close.hovered() {
+            ui.painter()
+                .rect_filled(rect, ATTACHMENT_CLOSE_RADIUS, scheme.danger_hover);
+            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+        }
+        paint_close_icon(
+            ui.painter(),
+            rect,
+            if close.hovered() {
+                scheme.on_danger
+            } else {
+                scheme.text_weak
+            },
+        );
+        close.on_hover_text("Take this file off the mail")
+    });
+
     let hover = if meta_text.is_empty() {
-        attachment.name.clone()
+        format!("{}\n{action}", attachment.name)
     } else {
-        format!("{}\n{meta_text}", attachment.name)
+        format!("{}\n{meta_text}\n{action}", attachment.name)
     };
-    response.on_hover_text(hover)
+    AttachmentCard {
+        card: response.on_hover_text(hover),
+        close,
+    }
 }
 
 /// A card's second line: the MIME type and the size, whichever of the two the
@@ -12358,6 +12687,19 @@ mod tests {
             widest > narrowest + 20.0,
             "the name is what a card is as wide as: {cards:?}"
         );
+
+        // No cross on any of them: a mail's own attachment is not Kimo's to take
+        // away, so the reading pane's cards are the ones the compose form's are
+        // shaped like and nothing more (`attachment_card`).
+        let shapes = frame_shapes_at(&ctx, &mut app, 1400.0);
+        let area = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1400.0, 900.0));
+        let strokes = stroke_centres(&shapes, area);
+        for card in &cards {
+            assert!(
+                !strokes.iter().any(|centre| card.contains(*centre)),
+                "the pane's cards carry no button: {card:?} {strokes:?}"
+            );
+        }
     }
     /// Clicking an attachment card starts a download: the app finds the account
     /// and the mail the pane is showing, and hands the worker the part's place
@@ -14771,6 +15113,104 @@ mod tests {
         {
             out.push(bounds);
         }
+    }
+
+    /// Where every straight stroke the frame drew is centred. A cross drawn by
+    /// `paint_close_icon` is two strokes whose midpoints are the same point, so
+    /// a button of that shape — and only that shape — is found by asking for it
+    /// rather than by working out where it ought to be.
+    fn stroke_centres(shapes: &[egui::epaint::ClippedShape], area: egui::Rect) -> Vec<egui::Pos2> {
+        let mut out = Vec::new();
+        for clipped in shapes {
+            collect_stroke_centres(&clipped.shape, area, &mut out);
+        }
+        out
+    }
+
+    fn collect_stroke_centres(shape: &egui::Shape, area: egui::Rect, out: &mut Vec<egui::Pos2>) {
+        match shape {
+            egui::Shape::LineSegment { points, .. } => {
+                let centre = egui::pos2(
+                    (points[0].x + points[1].x) / 2.0,
+                    (points[0].y + points[1].y) / 2.0,
+                );
+                if area.contains(centre) {
+                    out.push(centre);
+                }
+            }
+            egui::Shape::Vec(shapes) => {
+                for shape in shapes {
+                    collect_stroke_centres(shape, area, out);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// The rects of the attachment cards a frame drew: a card's chrome is a
+    /// rounded rect exactly one card high with a border on it.
+    fn attachment_card_rects(
+        shapes: &[egui::epaint::ClippedShape],
+        area: egui::Rect,
+    ) -> Vec<egui::Rect> {
+        let mut out = Vec::new();
+        for clipped in shapes {
+            collect_card_rects(&clipped.shape, area, &mut out);
+        }
+        out
+    }
+
+    fn collect_card_rects(shape: &egui::Shape, area: egui::Rect, out: &mut Vec<egui::Rect>) {
+        match shape {
+            egui::Shape::Rect(rect) => {
+                if rect.stroke.width > 0.0
+                    && (rect.rect.height() - ATTACHMENT_CARD_HEIGHT).abs() < 0.5
+                    && area.intersects(rect.rect)
+                {
+                    out.push(rect.rect);
+                }
+            }
+            egui::Shape::Vec(shapes) => {
+                for shape in shapes {
+                    collect_card_rects(shape, area, out);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// A dropped file, as the window hands it to egui: what a test drops on the
+    /// compose card. The backend owns the real one (`egui::DroppedFile`), and all
+    /// this asks of it is where the file is and what is in it.
+    #[derive(Debug)]
+    struct DroppedFile(std::path::PathBuf);
+
+    impl egui::DroppedFile for DroppedFile {
+        fn path(&self) -> &std::path::Path {
+            &self.0
+        }
+
+        fn bytes(&self) -> Result<Vec<u8>, String> {
+            std::fs::read(&self.0).map_err(|error| error.to_string())
+        }
+    }
+
+    /// Drop files on the window: one frame with them in the input, the way a
+    /// file manager hands them over.
+    fn drop_files(ctx: &egui::Context, app: &mut KimoApp, paths: Vec<std::path::PathBuf>) {
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1400.0, 900.0),
+            )),
+            dropped_files: paths
+                .into_iter()
+                .map(|path| std::sync::Arc::new(DroppedFile(path)) as egui::DroppedFileHandle)
+                .collect(),
+            ..Default::default()
+        };
+        let mut output = ctx.run_ui(input, |ui| app.ui(ui));
+        output.textures_delta.clear();
     }
 
     /// Every mail shown, in the folder's own order: what the list is derived from
@@ -17288,6 +17728,25 @@ mod tests {
         shot(&mut app, "ui-filter-flagged.png", &mut textures);
         app.set_list_filters(ListFilters::default());
 
+        // And the compose card with a file on it: the row the attachment takes,
+        // its size, the Remove, and the box that is the other way in.
+        {
+            app.compose = Some(ComposeDraft::new(Some("acct".to_string())));
+            if let Some(draft) = app.compose.as_mut() {
+                draft.to = "bob@example.com".to_string();
+                draft.subject = "The report".to_string();
+                draft.body = "Here it is.\n".to_string();
+                let path = std::env::temp_dir().join("kimo-dump-report.pdf");
+                let _ = std::fs::write(&path, vec![b'%'; 4096]);
+                let _ = attach_file(draft, path);
+            }
+            for _ in 0..4 {
+                collect_frame(&ctx, &mut app, &mut textures, Vec::new());
+            }
+            shot(&mut app, "ui-compose-files.png", &mut textures);
+            app.compose = None;
+        }
+
         // And the sort cell's menu: the order group above the by group, each a
         // choice of one and ticked at the end of the row in force.
         let sort_cell = titlebar_sort_rect(&ctx, &mut app, 1400.0).center();
@@ -18058,6 +18517,114 @@ mod tests {
                 "{sort:?}"
             );
         }
+    }
+
+    /// A file dropped on the compose card is attached to the draft: the card
+    /// draws the name and the size, a path typed into its box is the other way
+    /// in, a path that is not a file says so rather than attaching nothing, and
+    /// a row's own Remove takes that one back off.
+    #[test]
+    fn a_file_dropped_on_the_compose_card_is_attached() {
+        let ctx = egui::Context::default();
+        crate::fonts::install(&ctx, None, None);
+        let mut app = app_with_messages(&ctx, 1);
+        app.open_compose();
+        // The card is an `Area` like every other popup: it lays itself out on
+        // the frame it is opened on, so the frame a drop lands in is the next
+        // one.
+        run_app_frame(&ctx, &mut app, Vec::new());
+
+        let dir = std::env::temp_dir().join("kimo-compose-drop");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("report.pdf");
+        std::fs::write(&path, b"a report").unwrap();
+
+        drop_files(&ctx, &mut app, vec![path.clone()]);
+        let draft = app.compose.as_ref().expect("the card is open");
+        assert_eq!(draft.attachments.len(), 1, "the drop attached it");
+        assert_eq!(draft.attachments[0].name, "report.pdf");
+        assert!(draft.attach_error.is_none(), "{:?}", draft.attach_error);
+
+        // The card says what it holds.
+        let texts = frame_texts(&ctx, &mut app);
+        assert!(texts.iter().any(|run| run == "report.pdf"), "{texts:?}");
+        assert!(
+            texts.iter().any(|run| run == "application/pdf · 8 B"),
+            "the card's second line, as the reading pane draws it: {texts:?}"
+        );
+
+        // The card that says what to do with a file is one area, and it says both
+        // ways in: a click opens the desktop's dialog, and a file dragged from a
+        // file manager lands on the window and is attached by `attach_dropped`.
+        let texts = frame_texts(&ctx, &mut app);
+        assert!(
+            texts
+                .iter()
+                .any(|run| run == "Click to select files, or drag files here"),
+            "{texts:?}"
+        );
+        // And while the desktop's dialog is open, the card says so — and nothing
+        // else on it can be pressed.
+        app.picking_files = true;
+        let texts = frame_texts(&ctx, &mut app);
+        assert!(
+            texts.iter().any(|run| run == "Choosing files…"),
+            "{texts:?}"
+        );
+        app.picking_files = false;
+
+        // A path that is not a file says so — under the card, where the reason
+        // for the last file that did not attach is drawn — and attaches nothing.
+        // (Reached through `attach_file` rather than by clicking the card: a
+        // click opens the desktop's dialog, which is not a test's business.)
+        let missing = dir.join("gone.pdf");
+        let draft = app.compose.as_mut().expect("open");
+        assert!(!attach_file(draft, missing.clone()), "nothing was attached");
+        assert_eq!(draft.attachments.len(), 1, "the file that was there stays");
+        let texts = frame_texts(&ctx, &mut app);
+        assert!(
+            texts.iter().any(|run| run.contains("gone.pdf")),
+            "the reason names the path: {texts:?}"
+        );
+
+        // And a path that is a file goes on: the same file twice is two parts, in
+        // the order they were attached.
+        let draft = app.compose.as_mut().expect("open");
+        assert!(attach_file(draft, path.clone()), "the file attaches");
+        assert_eq!(draft.attachments.len(), 2);
+        assert!(draft.attach_error.is_none(), "and the refusal is gone");
+
+        // Every file card carries a small cross in its right-hand gutter — two
+        // strokes whose midpoints are the button's centre — and a click on the
+        // cross takes that file off the mail. It is found by the strokes it drew
+        // rather than by working out where it ought to be.
+        let shapes = frame_shapes_at(&ctx, &mut app, 1400.0);
+        let area = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1400.0, 900.0));
+        let cards = attachment_card_rects(&shapes, area);
+        assert_eq!(cards.len(), 2, "one card per file: {cards:?}");
+        let centres = stroke_centres(&shapes, area);
+        let crosses: Vec<egui::Pos2> = cards
+            .iter()
+            .filter_map(|card| {
+                let wanted = egui::pos2(
+                    card.right() - ATTACHMENT_CARD_PADDING - ATTACHMENT_CLOSE_SIZE / 2.0,
+                    card.center().y,
+                );
+                centres
+                    .iter()
+                    .copied()
+                    .find(|centre| centre.distance(wanted) < 1.0)
+            })
+            .collect();
+        assert_eq!(crosses.len(), 2, "a cross on each card: {centres:?}");
+
+        click_at(&ctx, &mut app, crosses[0]);
+        assert_eq!(
+            app.compose.as_ref().expect("open").attachments.len(),
+            1,
+            "the cross took that one off, and the other stays"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// The four views ask a row the four things a list can answer, and "to me"
