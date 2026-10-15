@@ -547,11 +547,15 @@ Event (mpsc) ──► drain_events() at frame start ──► merge into Accoun
   fit side by side) shows the list alone, and a click on a mail opens the
   pane over it as an `Area` — above the list, under the title bar (which
   `move_to_top` keeps there; a new area is otherwise born above it) and
-  under the modals — with a back button in a fixed band under the bar
-  (`POPUP_BACK_HEIGHT`), the one way back to the list, closing the mail.
+  under the modals — with a round, chevron-only back button floating over
+  the mail's top-left corner (`POPUP_BACK_DIAMETER`), shadowed with the
+  window's own shadow — the same one the `Load older mail` button floats on —
+  so it reads as on top of the mail rather than as a hole in it; it is the one
+  way back to the list, and closing the mail is what it does.
   The navigation is not shown at all in that layout. Re-expanding the
   navigation after any automatic collapse stays a manual choice, exactly as
   it was when the threshold was a constant.
+- Layout is a three-column mail client: left navigation (collapsible via
   the title-bar toggle; auto-collapses when the window is narrower than the
   three columns need — see the bullet above), the central column (while a search is
   active the list shows `search_results` instead of the selected folder, and

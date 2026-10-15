@@ -5231,18 +5231,7 @@ impl KimoApp {
         // card instead of dragging the card off the pane's edge with it.
         let card_left = panel.left() + CONTENT_GUTTER;
         let card_right = panel.right() - CONTENT_GUTTER;
-        // In the popup layout the cards start under the back band, which is
-        // the pane's fixed space where the column's first card spends the
-        // floating bar's height as scroll space instead: the back button
-        // cannot scroll away with the mail, so the room it takes is not the
-        // mail's to scroll (see the `add_space` on the first card below).
-        let card_top = panel.top()
-            + CONTENT_GUTTER
-            + if self.pane_popup {
-                TITLEBAR_HEIGHT + POPUP_BACK_HEIGHT
-            } else {
-                0.0
-            };
+        let card_top = panel.top() + CONTENT_GUTTER;
         let card_bottom = panel.bottom() - CONTENT_GUTTER;
         let inner = egui::Rect::from_min_max(
             egui::pos2(card_left, card_top),
@@ -5293,14 +5282,10 @@ impl KimoApp {
                         // card: the mail still passes under the glass.
                         // The room is asked for as it is: nothing has been laid
                         // out above this card, so there is no item spacing
-                        // under it to make up for (see the gap below).
-                        //
-                        // The popup layout asks for none of it: the back band
-                        // above the cards is the fixed space the bar's height
-                        // became there (see `card_top`).
-                        if !self.pane_popup {
-                            ui.add_space(TITLEBAR_HEIGHT);
-                        }
+                        // under it to make up for (see the gap below). The
+                        // popup layout is no different: its back button
+                        // floats over this room rather than claiming it.
+                        ui.add_space(TITLEBAR_HEIGHT);
                     } else {
                         // The chrome showing between two cards of a conversation.
                         ui.add_space(
@@ -5332,24 +5317,43 @@ impl KimoApp {
         // The popup's way back to the list. In the column layout the way back
         // is the list itself, always there on the left; here the list is
         // under this pane, and closing the mail is what uncovers it. The
-        // button is drawn after the cards so it is on top of a mail scrolled
-        // up under it, and its band is chrome already — the pane painted the
-        // whole of itself — so there is nothing to draw but the button.
+        // button is no bar and no part of the mail: a round, chevron-only
+        // cell floating over the first card's top-left corner, under the
+        // title bar, drawn after the cards so a mail scrolled up under it
+        // goes beneath it. What makes it read as floating — as a thing on
+        // top of the mail rather than a hole in it — is the shadow behind
+        // it, the window's own, the same one the `Load older mail` button
+        // floats on. Its rest treatment is the attachment card's (`card`
+        // fill, border hairline), and the glyph is the thread rows' chevron
+        // mirrored (`paint_back_chevron`).
         if self.pane_popup {
-            let band_top = panel.top() + TITLEBAR_HEIGHT;
-            let button = egui::Rect::from_min_size(
-                egui::pos2(
-                    panel.left() + CONTENT_GUTTER + 8.0,
-                    band_top + (POPUP_BACK_HEIGHT - POPUP_BACK_BUTTON.y) / 2.0,
-                ),
-                POPUP_BACK_BUTTON,
+            let centre = egui::pos2(
+                panel.left() + POPUP_BACK_MARGIN + POPUP_BACK_DIAMETER / 2.0,
+                panel.top() + TITLEBAR_HEIGHT + POPUP_BACK_MARGIN + POPUP_BACK_DIAMETER / 2.0,
             );
+            let rect = egui::Rect::from_center_size(centre, egui::Vec2::splat(POPUP_BACK_DIAMETER));
             let back = ui
-                .put(
-                    button,
-                    egui::Button::new(egui::RichText::new("← Back").small()),
-                )
+                .interact(rect, egui::Id::new("popup-back"), egui::Sense::click())
                 .on_hover_text("Back to the message list");
+            let painter = ui.painter();
+            // The shadow first, so the button sits on it and not in it.
+            painter.add(
+                ui.visuals()
+                    .window_shadow
+                    .as_shape(rect, POPUP_BACK_DIAMETER / 2.0),
+            );
+            let fill = if back.hovered() {
+                scheme.hover
+            } else {
+                scheme.card
+            };
+            painter.circle_filled(centre, POPUP_BACK_DIAMETER / 2.0, fill);
+            painter.circle_stroke(
+                centre,
+                POPUP_BACK_DIAMETER / 2.0,
+                egui::Stroke::new(1.0_f32, scheme.border),
+            );
+            paint_back_chevron(painter, centre, scheme.text);
             if back.clicked() {
                 self.selected_message = None;
             }
@@ -6633,11 +6637,14 @@ const CONTENT_MIN_WIDTH: f32 = 280.0;
 const CONTENT_DEFAULT_WIDTH: f32 = 460.0;
 const LIST_MIN_WIDTH: f32 = 240.0;
 
-/// The band under the title bar that carries the popup pane's back button,
-/// and the button itself: the one way out of a mail to the list it covers
-/// (see `ColumnPlan::popup`).
-const POPUP_BACK_HEIGHT: f32 = TITLEBAR_HEIGHT;
-const POPUP_BACK_BUTTON: egui::Vec2 = egui::vec2(76.0, 28.0);
+/// The popup pane's back button: a round, chevron-only cell floating over
+/// the mail (see `mail_content`) — its diameter, how far it keeps from the
+/// window's edge under the title bar, and the chevron it carries with the
+/// stroke that chevron draws with.
+const POPUP_BACK_DIAMETER: f32 = 36.0;
+const POPUP_BACK_MARGIN: f32 = 10.0;
+const POPUP_BACK_CHEVRON: f32 = 12.0;
+const POPUP_BACK_STROKE: f32 = 1.5;
 
 /// What the three columns become at one window width — the plan a frame's
 /// layout is drawn from (`KimoApp::ui`). The columns give way to a
@@ -8196,6 +8203,24 @@ fn paint_chevron(
     painter.add(egui::Shape::line(points, egui::Stroke::new(1.0_f32, color)));
 }
 
+/// The left-pointing chevron of the popup's back button: the thread rows'
+/// chevron (`paint_chevron`) mirrored, drawn with the stroke the title bar's
+/// glyph outlines use. Chevrons are the app's `back / open` glyph — the
+/// thread rows' opens a conversation, this one leaves the popup pane — so
+/// the one shape is what both of them draw.
+fn paint_back_chevron(painter: &egui::Painter, centre: egui::Pos2, color: egui::Color32) {
+    let half = POPUP_BACK_CHEVRON / 2.0;
+    let points = vec![
+        egui::pos2(centre.x + half * 0.45, centre.y - half),
+        egui::pos2(centre.x - half * 0.55, centre.y),
+        egui::pos2(centre.x + half * 0.45, centre.y + half),
+    ];
+    painter.add(egui::Shape::line(
+        points,
+        egui::Stroke::new(POPUP_BACK_STROKE, color),
+    ));
+}
+
 /// The paperclip a message row draws when the mail has parts: the wire of a
 /// clip, drawn as the one path it is — down, a half turn, up, over the top,
 /// down, and a wide half turn back up — the way the title bar's outlines are
@@ -9452,9 +9477,37 @@ mod tests {
         assert_eq!(app.selected_message.as_deref(), Some("0"));
         assert!((app.list_column.width() - 500.0).abs() < 0.5);
 
-        // The back button in the band under the bar closes the mail, and the
-        // list is what is on screen again.
-        click_at_sized(&ctx, &mut app, egui::pos2(50.0, 60.0), 500.0);
+        // The way back is a round button floating over the mail's top-left
+        // corner — a circle where the plan puts it, and a blurred shape
+        // behind it: the shadow is what makes it read as floating rather
+        // than as a hole in the mail.
+        let shapes = frame_shapes_at(&ctx, &mut app, 500.0);
+        let centre = egui::pos2(
+            POPUP_BACK_MARGIN + POPUP_BACK_DIAMETER / 2.0,
+            TITLEBAR_HEIGHT + POPUP_BACK_MARGIN + POPUP_BACK_DIAMETER / 2.0,
+        );
+        assert!(
+            shapes.iter().any(|clipped| match &clipped.shape {
+                egui::Shape::Circle(circle) =>
+                    circle.center.distance(centre) < 1.0
+                        && (circle.radius - POPUP_BACK_DIAMETER / 2.0).abs() < 1.0,
+                _ => false,
+            }),
+            "the back button is a circle where the popup puts it"
+        );
+        let button = egui::Rect::from_center_size(centre, egui::Vec2::splat(POPUP_BACK_DIAMETER));
+        assert!(
+            shapes.iter().any(|clipped| match &clipped.shape {
+                egui::Shape::Rect(shadow) =>
+                    shadow.blur_width > 0.0 && shadow.rect.intersects(button),
+                _ => false,
+            }),
+            "a blurred shape behind the button is its shadow"
+        );
+
+        // A click on it closes the mail, and the list is what is on screen
+        // again.
+        click_at_sized(&ctx, &mut app, centre, 500.0);
         assert!(
             app.selected_message.is_none(),
             "the way back closed the mail"
