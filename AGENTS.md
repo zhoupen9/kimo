@@ -884,6 +884,10 @@ Event (mpsc) ──► drain_events() at frame start ──► merge into Accoun
   so its box takes the whole thread in or out at once; checking a mail in the
   list *under* it is still one mail at a time, and the conversation's box then
   says `Partial` rather than lying about what is in.
+  Select-all takes what the list shows rather than what the folder holds: a
+  view filter that hides mail must not have it checked by a click on that row
+  (`ListRows::shown_indices`; the label and search lists do the same over their own
+  rows).
   In select mode the mail actions' Delete is the only live cell
   (`mail_action_enabled`): reply, reply all, forward, label, flag and export are
   all about the one mail the reading pane shows, which is not what the click was
@@ -927,7 +931,11 @@ Event (mpsc) ──► drain_events() at frame start ──► merge into Accoun
   touches it, which is what says the pen is writing on the page rather than
   lying on top of it), the search box (a field with the magnifier inside
   it, one widget,
-  whose click opens the search popup), the group of mail actions
+  whose click opens the search popup), the **filter** cell (a funnel, the
+  list's own view control, in the box's group — a cell's gap to its right —
+  because it is about what the *column* shows, which is what the box is about
+  too; the accent while any view is ticked, and a menu of them under an "All"
+  row, `filter_popup`), the group of mail actions
   (`titlebar_mail_actions`: reply, reply all, forward, label, flag, export,
   delete, one drawing function per glyph, each from a 24×24 outline through
   `glyph_point`), the
@@ -943,7 +951,11 @@ Event (mpsc) ──► drain_events() at frame start ──► merge into Accoun
   is collapsed and the list runs to the window's own edge. The box is the one
   thing the bar gives up as a window narrows: its own width, then its floor
   (`TITLEBAR_SEARCH_FLOOR`), then nothing, with the search popup still a Ctrl+F
-  away (`titlebar_search_width`).
+  away (`titlebar_search_width`). Its width is planned *first*, and the filter
+  cell is what fits in what the box leaves of its room: a bar with room for the
+  box but not for a cell beside it draws the box and no filter — the box's width
+  never depends on whether the filter is drawn, which is what keeps resizing a
+  window from flickering the two against each other.
   **The pane's run waits for a mail**: it is drawn only while one is open, or a
   selection is checked (which is what Delete takes), because seven dead glyphs
   over an empty pane said nothing and cluttered the bar. It comes and goes over
@@ -1049,9 +1061,10 @@ Event (mpsc) ──► drain_events() at frame start ──► merge into Accoun
   right end — the sync cell, a gap, the cog, a gap, the three window controls,
   ending `TITLEBAR_EDGE_MARGIN` short of the window's edge, the count coming
   from `titlebar`'s own button list so the two cannot drift — while the two
-  middle groups are placed from the columns below them (`titlebar_anchors`),
-  which is what makes the bar read as a map of what is under it rather than as a
-  row of things that happen to be in it. Those two rects are a cell's own band rather than the
+  middle groups are placed from the columns below them (`titlebar_anchors`) —
+  the box and the filter cell as one group, the pane's run as another — which is
+  what makes the bar read as a map of what is under it rather than as a row of
+  things that happen to be in it. Those two rects are a cell's own band rather than the
   bar's full height, since a button is 32 pt in a 40 pt bar; `content` is the
   one rect that is the bar's own shape. Every group is
   drawn in a rect of its own, its own `UiBuilder::max_rect` and its own
@@ -1483,6 +1496,46 @@ Event (mpsc) ──► drain_events() at frame start ──► merge into Accoun
   a folder click, and opening a mail from the filtered list, deliberately leave
   the filter alone: the pane's folder is where the mail it shows is filed, not
   what the list is showing.
+- **The list filter is a set of optional views, and they are an AND.** The title
+  bar's filter cell opens a menu over whatever the column lists —
+  `ListFilter::Unread`, `Flagged`, `ToMe`, `HasFiles`, each an independent row
+  (ticking one never takes another off, and the menu stays open across ticks) —
+  and a mail is listed only while it passes **every** ticked view
+  (`ListFilters::matches`, an `all` over the set). A row is drawn by the app rather
+  than by a stock checkbox (`filter_menu_row`): **the view's own mark at the left,
+  its name, and the tick at the row's *end***, where a menu's check belongs — a
+  checkbox puts its box in front of the name, which is where the mark goes. The
+  marks are the list's own where the list has one (the flag, the paperclip),
+  and an envelope, an envelope with the new-mail pip, and a person for the
+  rest, all in the 24×24 outline style the whole icon set is drawn in. No tick at all is the menu's
+  own **All** row: it is drawn ticked exactly while the set is empty and ticking
+  it clears the rest, so "all mail" is the absence of views rather than one of
+  them. The cell is accent-coloured while any view is ticked and its tooltip
+  names them ("showing unread + flagged mail"). It applies
+  to all three lists the column can show: a folder's mail (filtered before the
+  conversations are built, so a conversation's own row speaks for the mails
+  that are left — `thread_of_shown` — and the reading pane shows those same
+  mails, since `open_conversation` reads the derived threads), a label filter's
+  matches and a search's hits. The search popup's own "Only" boxes are the other
+  layer: those narrow the *query*, in the database, and a query filter and a
+  view filter together are an AND.
+  **The predicates are one function over four facts** (`ListFilter::matches` over
+  `FilterFacts`), because all three rows can answer them: a folder row from
+  `MailMessage`, a hit from `SearchHit`, a label row from `LabelledMail` — which
+  is why both of the latter carry the `To` header. "To me" is a substring test
+  against the accounts' own addresses (`KimoApp::my_addresses`: each account's
+  username *when it is an email address*, the rule the compose applies to what a
+  mail is sent as), so an account whose username is a bare login leaves the
+  question unanswerable and the menu row says so rather than filtering to
+  nothing. **The derived rows carry the set they were built with**
+  (`ListRows::filters`, beside `threaded` and the revisions), so a change derives
+  them again and a frame that changed nothing derives nothing; the hits and the
+  label matches are filtered as they are drawn, since neither is cached for the
+  frame. A view that hides every mail leaves the column saying which kind of
+  empty it is — "No mail matches this filter." against the folder's own "This
+  folder is empty." and a search's "No hit matches this filter." — and
+  **select-all takes what the list shows** (`ListRows::shown_indices`), never
+  mail the filter has hidden.
 - Folders are custom rows — kind icon, name (elided with an ellipsis), unread
   count right-aligned — because the whole row should be the click target and
   carry the selection highlight, which `selectable_label` cannot do once an

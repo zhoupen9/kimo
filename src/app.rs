@@ -747,6 +747,12 @@ pub struct KimoApp {
     /// Bumped whenever `open_threads` changes, so the derived rows know they
     /// are stale without comparing the whole set.
     open_rev: u64,
+    /// The views the message list is narrowed to (the title bar's filter cell):
+    /// optional, and an AND — see `ListFilters`. A view of the column rather than
+    /// part of a query, so it applies to a folder's mail, a label's matches and
+    /// a search's hits alike. In memory only, like the open conversations: what
+    /// the window is doing now, not a setting.
+    list_filters: ListFilters,
     /// The list as it is drawn, derived from the folder's mail rather than
     /// built on every frame — see [`ListRows`].
     list_rows: Option<ListRows>,
@@ -794,13 +800,16 @@ pub struct KimoApp {
 /// is the shape the list had before conversations.
 fn list_rows_of(
     threads: &[Thread],
-    count: usize,
+    shown: &[bool],
     open: &HashSet<String>,
     threaded: bool,
 ) -> Vec<ListRow> {
     if !threaded {
-        return (0..count)
-            .map(|index| ListRow::Message {
+        return shown
+            .iter()
+            .enumerate()
+            .filter(|(_, shown)| **shown)
+            .map(|(index, _)| ListRow::Message {
                 index,
                 in_thread: false,
             })
@@ -827,6 +836,68 @@ fn list_rows_of(
         }
     }
     rows
+}
+
+/// The facts a filter asks a row about (`FilterFacts`), read off each of the
+/// three things a list can hold: the folder's mail, a search's hit, and the
+/// labelled view's own copy of a mail. One conversion each, so what a filter is
+/// asked is the same question wherever the row came from.
+fn mail_facts(mail: &MailMessage) -> FilterFacts<'_> {
+    FilterFacts {
+        seen: mail.seen,
+        flagged: mail.flagged,
+        to: &mail.to,
+        attachments: mail.attachments.len(),
+    }
+}
+
+fn hit_facts(hit: &SearchHit) -> FilterFacts<'_> {
+    FilterFacts {
+        seen: hit.seen,
+        flagged: hit.flagged,
+        to: &hit.to,
+        attachments: hit.attachments,
+    }
+}
+
+fn labelled_facts(mail: &LabelledMail) -> FilterFacts<'_> {
+    FilterFacts {
+        seen: mail.seen,
+        flagged: mail.flagged,
+        to: &mail.to,
+        attachments: mail.attachments,
+    }
+}
+
+/// One conversation, trimmed to the mail a filter lets through — `None` when it
+/// has none left, which is a conversation the list does not show at all.
+///
+/// The thread's own row speaks for the mails under it: its date, its unread
+/// count, its paperclip and its flag are all about the mail that is left, so
+/// they are recomputed over it. The key and the subject stay the
+/// conversation's own — the open/closed set and the reading pane are keyed by
+/// the key, and a conversation keeps its subject whatever part of it is shown.
+/// `thread.messages` is oldest first, and so is what comes back: the last mail
+/// kept is the one the row speaks for, the first is the oldest.
+fn thread_of_shown(thread: Thread, messages: &[MailMessage], shown: &[bool]) -> Option<Thread> {
+    let kept: Vec<usize> = thread
+        .messages
+        .iter()
+        .copied()
+        .filter(|&index| shown[index])
+        .collect();
+    let &newest = kept.last()?;
+    Some(Thread {
+        messages: kept.clone(),
+        key: thread.key,
+        subject: thread.subject,
+        newest,
+        unread: kept.iter().filter(|&&index| !messages[index].seen).count(),
+        has_attachments: kept
+            .iter()
+            .any(|&index| !messages[index].attachments.is_empty()),
+        flagged: kept.iter().any(|&index| messages[index].flagged),
+    })
 }
 
 /// What the reading pane shows: the mails of one conversation, oldest first,
@@ -923,8 +994,177 @@ struct ListRows {
     rev: u64,
     open_rev: u64,
     threaded: bool,
+    /// What the column was filtered to when these were derived: a different set
+    /// of views is a different list, and one that would show mail the rows do
+    /// not.
+    filters: ListFilters,
     threads: Vec<Thread>,
     rows: Vec<ListRow>,
+}
+
+/// One view of the message list, offered as a checkbox in the title bar's
+/// filter menu. They are *optional* and they are an AND: any number of them can
+/// be ticked, and a mail is listed only while it passes every one — which is
+/// what `ListFilters` holds.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ListFilter {
+    Unread,
+    Flagged,
+    ToMe,
+    HasFiles,
+}
+
+impl ListFilter {
+    /// The four, in the order the menu draws them under their "All" row.
+    const ALL: [ListFilter; 4] = [
+        ListFilter::Unread,
+        ListFilter::Flagged,
+        ListFilter::ToMe,
+        ListFilter::HasFiles,
+    ];
+
+    /// What the menu's row and the cell's tooltip call it.
+    fn label(self) -> &'static str {
+        match self {
+            ListFilter::Unread => "Unread",
+            ListFilter::Flagged => "Flagged",
+            ListFilter::ToMe => "To me",
+            ListFilter::HasFiles => "Has files",
+        }
+    }
+
+    /// The line the menu row's tooltip carries: what ticking it leaves in the
+    /// list.
+    fn note(self) -> &'static str {
+        match self {
+            ListFilter::Unread => "Only mail that has not been read",
+            ListFilter::Flagged => "Only mail you have flagged",
+            ListFilter::ToMe => "Only mail addressed to one of your accounts",
+            ListFilter::HasFiles => "Only mail that carries an attachment",
+        }
+    }
+
+    /// Whether one row passes this view. The facts are what all three lists can
+    /// answer about their mail — `MailMessage`, `SearchHit` and `LabelledMail`
+    /// each carry them — and `me` is the accounts' own addresses
+    /// (`KimoApp::my_addresses`), which is what `ToMe` is asked against.
+    fn matches(self, facts: FilterFacts<'_>, me: &[String]) -> bool {
+        match self {
+            ListFilter::Unread => !facts.seen,
+            ListFilter::Flagged => facts.flagged,
+            ListFilter::ToMe => addressed_to(facts.to, me),
+            ListFilter::HasFiles => facts.attachments > 0,
+        }
+    }
+}
+
+/// The views the message list is narrowed to, as a set: the title bar's filter
+/// cell's state.
+///
+/// They are optional and they are an AND — a mail is listed only while it passes
+/// every view that is ticked — and an **empty set is all mail**, which is what
+/// the menu's own "All" row is: it is drawn ticked exactly while nothing else
+/// is, and ticking it clears the rest. A view of the column rather than part of
+/// a query: the mail is all there, some of it hidden, so the set applies to
+/// whatever the column lists (a folder's mail, a label's matches, a search's
+/// hits), while the search popup's "Only" boxes are the other layer and narrow
+/// the query itself.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct ListFilters(Vec<ListFilter>);
+
+impl ListFilters {
+    /// Whether nothing is ticked: every mail the column holds is listed.
+    fn is_all(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    fn contains(&self, filter: ListFilter) -> bool {
+        self.0.contains(&filter)
+    }
+
+    /// Tick a view, or untick it — the checkbox the menu draws. The set keeps
+    /// the menu's own order, so what is derived from it does not depend on the
+    /// order the boxes were ticked in.
+    fn toggle(&mut self, filter: ListFilter) {
+        if let Some(index) = self.0.iter().position(|held| *held == filter) {
+            self.0.remove(index);
+            return;
+        }
+        self.0.push(filter);
+        self.0.sort_by_key(|held| {
+            ListFilter::ALL
+                .iter()
+                .position(|candidate| candidate == held)
+                .unwrap_or(usize::MAX)
+        });
+    }
+
+    /// Untick everything: what the menu's "All" row does.
+    fn clear(&mut self) {
+        self.0.clear();
+    }
+
+    /// Whether one row passes every ticked view — the AND the menu promises, and
+    /// nothing at all while none is ticked.
+    fn matches(&self, facts: FilterFacts<'_>, me: &[String]) -> bool {
+        self.0.iter().all(|filter| filter.matches(facts, me))
+    }
+
+    /// What the cell's tooltip says: all mail, or the views in force by name.
+    fn summary(&self) -> String {
+        if self.is_all() {
+            return "all mail".to_string();
+        }
+        let names: Vec<String> = self
+            .0
+            .iter()
+            .map(|filter| filter.label().to_lowercase())
+            .collect();
+        names.join(" + ")
+    }
+}
+
+/// The four things a filter asks a row: the marks the list draws and the header
+/// "to me" is matched against. `Copy` because the set of views asks every one of
+/// them about the same row.
+#[derive(Clone, Copy)]
+struct FilterFacts<'a> {
+    seen: bool,
+    flagged: bool,
+    /// The `To` header as the sender wrote it — display names, several
+    /// addresses, or a bare address — which is all the app keeps of it.
+    to: &'a str,
+    attachments: usize,
+}
+
+/// Whether a `To` header names one of the addresses: a substring test, the way
+/// the search popup's own `To` filter matches (`LIKE %address%`), because what
+/// is stored is the display form rather than a parsed list.
+fn addressed_to(to: &str, me: &[String]) -> bool {
+    let to = to.to_lowercase();
+    me.iter()
+        .any(|address| to.contains(&address.to_lowercase()))
+}
+
+impl ListRows {
+    /// The folder's mail this list shows, by index — every row's own mail, a
+    /// conversation's whole set included, deduplicated and in the folder's
+    /// order. What select-all takes and what the count in its band is about:
+    /// mail a filter hides is not in the list to be checked.
+    fn shown_indices(&self) -> Vec<usize> {
+        let mut indices = Vec::new();
+        for row in &self.rows {
+            match row {
+                ListRow::Message { index, .. } => indices.push(*index),
+                ListRow::Thread { thread } => {
+                    indices.extend(self.threads[*thread].messages.iter().copied());
+                }
+            }
+        }
+        indices.sort_unstable();
+        indices.dedup();
+        indices
+    }
 }
 
 /// One label as the navigation column draws it: the user's own name for it, how
@@ -945,6 +1185,9 @@ struct LabelledMail {
     folder: String,
     uid: String,
     from: String,
+    /// The `To` header as it was written, for the list filter's "to me" — the
+    /// same field a search hit carries.
+    to: String,
     subject: String,
     date: String,
     timestamp: Option<i64>,
@@ -1638,6 +1881,7 @@ impl KimoApp {
             threaded: settings.threaded.unwrap_or(true),
             open_threads: HashSet::new(),
             open_rev: 0,
+            list_filters: ListFilters::default(),
             list_rows: None,
             select_mode: false,
             selected_mails: HashSet::new(),
@@ -3072,11 +3316,13 @@ impl KimoApp {
         );
         // The room the box has: up to whatever stands next to it on the right —
         // the pane's run, or the window controls when the run is not drawn.
+        // (What the box leaves there is the filter cell's room, and the plan has
+        // already decided whether either of them is drawn.)
         let next = anchors
             .actions
             .map_or(rects.sync.left(), |actions| actions.left());
         let mut box_end: Option<f32> = None;
-        if let Some(box_width) = titlebar_search_width(next - anchors.search - TITLEBAR_GROUP_GAP) {
+        if let Some(box_width) = anchors.search_width {
             let middle = egui::Rect::from_min_max(
                 egui::pos2(anchors.search, bar.top()),
                 egui::pos2(anchors.search + box_width, bar.bottom()),
@@ -3198,6 +3444,34 @@ impl KimoApp {
             box_end = Some(box_rect.right());
         }
 
+        // --- the filter cell: the search box's own companion ---
+        // The list's view control, in the box's group rather than with the pane's
+        // actions: it is about what the column *shows*, which is what the box is
+        // about too. It says its state the way the magnifier does — the accent
+        // while any view is ticked — and its menu is the views as checkboxes.
+        if let Some(filter) = anchors.filter {
+            ui.scope_builder(
+                egui::UiBuilder::new()
+                    .max_rect(filter)
+                    .layout(egui::Layout::left_to_right(egui::Align::Center)),
+                |row| {
+                    clip_to(row, filter);
+                    let response = titlebar_button(row, true);
+                    // The accent while any view is ticked, the bar's text colour
+                    // while none is — the way the magnifier says a query is on.
+                    let color = if self.list_filters.is_all() {
+                        visuals.text_color()
+                    } else {
+                        scheme.accent
+                    };
+                    paint_filter_icon(row.painter(), response.rect, color, MAIL_ACTION_GLYPH);
+                    let response = response
+                        .on_hover_text(format!("Filter — showing {}", self.list_filters.summary()));
+                    self.filter_popup(&response);
+                },
+            );
+        }
+
         // --- the pane's mail actions ---
         // The pane's own row, drawn only while there is a mail to act on, or a
         // selection — which is what Delete takes, and the one action that stays
@@ -3241,7 +3515,9 @@ impl KimoApp {
             // The box is drawn: two stretches, one on each side of it.
             Some(end) => {
                 free.push((left_end, anchors.search));
-                free.push((end, next));
+                // The box and the filter cell are one group, so what is left of
+                // the bar starts after whichever of them ends last.
+                free.push((anchors.filter.map_or(end, |filter| filter.right()), next));
             }
             // No box — not even a narrow one: one stretch from the first group
             // to whatever comes next.
@@ -4325,7 +4601,7 @@ impl KimoApp {
         // the fetch — is an empty one, and gets the same placeholder. The check
         // stands on its own because what follows holds borrows of the state it
         // reads, and the placeholder writes back to `self`.
-        let drawable = self
+        let listed = self
             .selected_account
             .as_deref()
             .zip(self.selected_folder.as_deref())
@@ -4333,13 +4609,24 @@ impl KimoApp {
                 self.folder_messages_of(account_id, folder)
                     .is_some_and(|messages| !messages.is_empty())
             });
-        if !drawable {
+        // A folder with mail in it can still have nothing to show: the column's
+        // filter is what decides that (`ListRows::rows`), and an empty list is
+        // the placeholder's business rather than a card with no rows on it.
+        let shown = self
+            .list_rows
+            .as_ref()
+            .is_some_and(|rows| !rows.rows.is_empty());
+        if !listed || !shown {
             self.list_scroll = 0.0;
             ui.centered_and_justified(|ui| {
-                let text = if self.selected_folder_synced() {
-                    "This folder is empty."
+                let text = if !listed {
+                    if self.selected_folder_synced() {
+                        "This folder is empty."
+                    } else {
+                        "Not fetched yet — click Sync in the title bar."
+                    }
                 } else {
-                    "Not fetched yet — click Sync in the title bar."
+                    "No mail matches this filter."
                 };
                 ui.label(egui::RichText::new(text).weak().heading());
             });
@@ -4504,12 +4791,15 @@ impl KimoApp {
         // Its keys are the folder's mail and not the rows the viewport shows.
         if select_all {
             let band = select_all_band(list.inner_rect);
-            let state = select_all_state(self.selected_mails.len(), messages.len());
-            if self.select_all_row(ui, band, state, messages.len(), select_all_id) {
+            // What the list shows rather than what the folder holds: a filter
+            // that hides mail must not have it checked by a click on this row.
+            let shown = rows.shown_indices();
+            let state = select_all_state(self.selected_mails.len(), shown.len());
+            if self.select_all_row(ui, band, state, shown.len(), select_all_id) {
                 select_all_clicked = Some(
-                    messages
+                    shown
                         .iter()
-                        .map(|msg| MailKey::new(account, folder, &msg.uid))
+                        .map(|&index| MailKey::new(account, folder, &messages[index].uid))
                         .collect(),
                 );
             }
@@ -4586,7 +4876,8 @@ impl KimoApp {
                 && rows.folder == folder
                 && rows.rev == rev
                 && rows.open_rev == self.open_rev
-                && rows.threaded == self.threaded;
+                && rows.threaded == self.threaded
+                && rows.filters == self.list_filters;
             if fresh {
                 return;
             }
@@ -4601,9 +4892,26 @@ impl KimoApp {
         // The mail is borrowed from the state and the model lives on `self`, so
         // what is derived is built from its own borrow and handed over once it
         // is owned.
+        let filters = self.list_filters.clone();
+        let me = self.my_addresses();
         let derived = self.folder_messages_of(&account, &folder).map(|messages| {
+            // What the column's filter lets through, in the folder's own order:
+            // the conversations are trimmed to it and the flat list is drawn
+            // from it, so both shapes of the list show the same mail.
+            let shown: Vec<bool> = messages
+                .iter()
+                .map(|mail| filters.matches(mail_facts(mail), &me))
+                .collect();
             let threads = threads::group(messages);
-            let rows = list_rows_of(&threads, messages.len(), &open, self.threaded);
+            let threads = if filters.is_all() {
+                threads
+            } else {
+                threads
+                    .into_iter()
+                    .filter_map(|thread| thread_of_shown(thread, messages, &shown))
+                    .collect()
+            };
+            let rows = list_rows_of(&threads, &shown, &open, self.threaded);
             (threads, rows)
         });
         self.list_rows = derived.map(|(threads, rows)| ListRows {
@@ -4612,9 +4920,25 @@ impl KimoApp {
             rev,
             open_rev: self.open_rev,
             threaded: self.threaded,
+            filters,
             threads,
             rows,
         });
+    }
+
+    /// The addresses the accounts are *of*: each account's username, when that
+    /// is an email address — the same rule the compose applies when it says what
+    /// a mail would be sent as (`crate::outgoing::is_address`). An account whose
+    /// username is a bare login has no address Kimo can name, and so contributes
+    /// none: it is what the list filter's "to me" is asked against, and what its
+    /// menu says when there is nothing to ask.
+    fn my_addresses(&self) -> Vec<String> {
+        self.accounts
+            .iter()
+            .map(|account| account.username.trim())
+            .filter(|username| crate::outgoing::is_address(username))
+            .map(str::to_string)
+            .collect()
     }
 
     /// The label group's rows and the mail the filter selects, derived when
@@ -4665,6 +4989,7 @@ impl KimoApp {
                         folder: folder.name.clone(),
                         uid: message.uid.clone(),
                         from: message.from.clone(),
+                        to: message.to.clone(),
                         subject: message.subject.clone(),
                         date: message.date.clone(),
                         timestamp: message.timestamp,
@@ -4932,6 +5257,85 @@ impl KimoApp {
             let name = std::mem::take(&mut self.label_draft);
             self.set_label_on_mail(key, name.trim(), true);
         }
+    }
+
+    /// The filter menu: the four views of the list as checkboxes, under the "All"
+    /// row that is the way out of every one of them. Ticking a box narrows the
+    /// list, unticking it widens the list again, and the menu stays open across
+    /// ticks — the views are optional and they are an AND, so picking several is
+    /// the point (like the label popup, and unlike a menu of one choice).
+    ///
+    /// Anchored to the cell that opened it (`Popup::menu`). "All" is not one of
+    /// the views: it is drawn ticked exactly while none is, and ticking it clears
+    /// the rest (`ListFilters::clear`). "To me" is a question about an address the
+    /// accounts have, so a session whose accounts are all bare logins has nothing
+    /// to ask — the box says so rather than filtering to nothing.
+    fn filter_popup(&mut self, response: &egui::Response) {
+        let me = self.my_addresses();
+        // The boxes are drawn from a copy and written back once the menu has
+        // closed: the views are an AND, so ticking one never takes another off —
+        // except "All", which is the empty set and clears them.
+        let mut filters = self.list_filters.clone();
+        let mut changed = false;
+        egui::Popup::menu(response)
+            .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
+            .width(FILTER_POPUP_WIDTH)
+            .show(|ui| {
+                ui.set_min_width(FILTER_POPUP_WIDTH);
+                ui.spacing_mut().item_spacing.y = FILTER_ROW_GAP;
+                // "All" is not one of the views: it is the absence of them, drawn
+                // ticked exactly while none is, and ticking it clears the rest.
+                if filter_menu_row(ui, FilterIcon::All, "All", filters.is_all(), true)
+                    .on_hover_text("Every mail in the list")
+                    .clicked()
+                {
+                    filters.clear();
+                    changed = true;
+                }
+                for filter in ListFilter::ALL {
+                    // "To me" is a question about an address the accounts have:
+                    // a session whose accounts are all bare logins has nothing to
+                    // ask, and the row says so rather than filtering to nothing.
+                    let asked = filter != ListFilter::ToMe || !me.is_empty();
+                    let row = filter_menu_row(
+                        ui,
+                        filter.icon(),
+                        filter.label(),
+                        filters.contains(filter),
+                        asked,
+                    );
+                    let row = if asked {
+                        row.on_hover_text(filter.note())
+                    } else {
+                        row.on_disabled_hover_text(
+                            "No account of yours has an email address as its username",
+                        )
+                    };
+                    if row.clicked() {
+                        filters.toggle(filter);
+                        changed = true;
+                    }
+                }
+            });
+        if changed && filters != self.list_filters {
+            self.set_list_filters(filters);
+        }
+    }
+
+    /// Show a different set of views of the message list: an empty set is all
+    /// mail, and each ticked view narrows it further — the AND the menu's boxes
+    /// are.
+    ///
+    /// The derived rows carry the set they were built with
+    /// (`ListRows::filters`), so the next frame derives them again; the frame is
+    /// asked for here because a tick on a menu box is the last thing that happens
+    /// in this one.
+    fn set_list_filters(&mut self, filters: ListFilters) {
+        if self.list_filters == filters {
+            return;
+        }
+        self.list_filters = filters;
+        self.ctx.request_repaint();
     }
 
     /// The folder the list is showing, as `(account, folder)`: what a folder
@@ -5259,6 +5663,28 @@ impl KimoApp {
             });
             return None;
         }
+        // The column's own filter over the hits, beside the query's: the popup's
+        // "Only" boxes narrow the query in the database, this narrows the view
+        // of what came back, and the two together are an AND.
+        let me = self.my_addresses();
+        let shown: Vec<usize> = self
+            .search_hits
+            .iter()
+            .enumerate()
+            .filter(|(_, hit)| self.list_filters.matches(hit_facts(hit), &me))
+            .map(|(index, _)| index)
+            .collect();
+        if shown.is_empty() {
+            ui.centered_and_justified(|ui| {
+                ui.label(
+                    egui::RichText::new("No hit matches this filter.")
+                        .weak()
+                        .heading(),
+                );
+            });
+            self.list_scroll = 0.0;
+            return None;
+        }
         // A hit is what a click landed on, opened once the list has been drawn:
         // `open_hit` walks the account state, which the rows are borrowing. A
         // click on a hit's box checks it instead (and a click on the row itself
@@ -5292,10 +5718,10 @@ impl KimoApp {
                         viewport,
                         rows_top,
                         MESSAGE_ROW_HEIGHT,
-                        hits.len(),
+                        shown.len(),
                         |ui, rows| {
                             for index in rows {
-                                let hit = &hits[index];
+                                let hit = &hits[shown[index]];
                                 let drawn = self.search_row(ui, hit, index == 0);
                                 if drawn.delete.clicked() {
                                     deleted =
@@ -5323,11 +5749,16 @@ impl KimoApp {
         // in.
         if select_all {
             let band = select_all_band(list.inner_rect);
-            let state = select_all_state(self.selected_mails.len(), hits.len());
-            if self.select_all_row(ui, band, state, hits.len(), select_all_id) {
+            // The hits the filter shows, not every hit the query returned.
+            let state = select_all_state(self.selected_mails.len(), shown.len());
+            if self.select_all_row(ui, band, state, shown.len(), select_all_id) {
                 select_all_clicked = Some(
-                    hits.iter()
-                        .map(|hit| MailKey::new(&hit.account_id, &hit.folder, &hit.uid))
+                    shown
+                        .iter()
+                        .map(|&index| {
+                            let hit = &hits[index];
+                            MailKey::new(&hit.account_id, &hit.folder, &hit.uid)
+                        })
                         .collect(),
                 );
             }
@@ -5404,6 +5835,26 @@ impl KimoApp {
             return None;
         }
         let matches = &view.matches;
+        // The column's own filter over the label's mail: the label says what the
+        // mail carries, the filter says which of it the column shows.
+        let me = self.my_addresses();
+        let shown: Vec<usize> = matches
+            .iter()
+            .enumerate()
+            .filter(|(_, mail)| self.list_filters.matches(labelled_facts(mail), &me))
+            .map(|(index, _)| index)
+            .collect();
+        if shown.is_empty() {
+            ui.centered_and_justified(|ui| {
+                ui.label(
+                    egui::RichText::new("No mail matches this filter.")
+                        .weak()
+                        .heading(),
+                );
+            });
+            self.list_scroll = 0.0;
+            return None;
+        }
         let list = egui::ScrollArea::vertical()
             .auto_shrink([false, false])
             .show_viewport(ui, |ui, viewport| {
@@ -5414,10 +5865,10 @@ impl KimoApp {
                         viewport,
                         rows_top,
                         MESSAGE_ROW_HEIGHT,
-                        matches.len(),
+                        shown.len(),
                         |ui, rows| {
                             for index in rows {
-                                let mail = &matches[index];
+                                let mail = &matches[shown[index]];
                                 let drawn = self.labelled_row(ui, mail, index == 0);
                                 if drawn.delete.clicked() {
                                     deleted = Some(MailKey::new(
@@ -5445,12 +5896,16 @@ impl KimoApp {
             });
         if select_all {
             let band = select_all_band(list.inner_rect);
-            let state = select_all_state(self.selected_mails.len(), matches.len());
-            if self.select_all_row(ui, band, state, matches.len(), select_all_id) {
+            // The mail the filter shows, not every mail the labels selected.
+            let state = select_all_state(self.selected_mails.len(), shown.len());
+            if self.select_all_row(ui, band, state, shown.len(), select_all_id) {
                 select_all_clicked = Some(
-                    matches
+                    shown
                         .iter()
-                        .map(|mail| MailKey::new(&mail.account_id, &mail.folder, &mail.uid))
+                        .map(|&index| {
+                            let mail = &matches[index];
+                            MailKey::new(&mail.account_id, &mail.folder, &mail.uid)
+                        })
                         .collect(),
                 );
             }
@@ -7741,6 +8196,22 @@ const LABEL_GROUP_GAP: f32 = 10.0;
 /// new-label box want, and no taller than this before the labels scroll — a
 /// user with fifty labels should not get a menu taller than the window.
 const LABEL_POPUP_WIDTH: f32 = 220.0;
+/// The filter menu: a row per view, each the view's own mark, its name, and the
+/// tick at the end that says whether it is one of the views in force.
+const FILTER_POPUP_WIDTH: f32 = 240.0;
+/// The room a menu row takes, the gap between two of them, and how far the row's
+/// content stays clear of its own ends — the mark's inset and the tick's, which
+/// are one number so the two line up down the menu.
+const FILTER_ROW_HEIGHT: f32 = 26.0;
+const FILTER_ROW_GAP: f32 = 1.0;
+const FILTER_ROW_INSET: f32 = 8.0;
+/// The mark at a row's left, the room between it and the name, and the tick at
+/// the row's end.
+const FILTER_ICON_SIZE: f32 = 16.0;
+const FILTER_ICON_GAP: f32 = 10.0;
+const FILTER_TICK_SIZE: f32 = 14.0;
+/// The hover fill a row takes under the pointer, rounded like the bar's cells.
+const FILTER_ROW_CORNER_RADIUS: u8 = 4;
 const LABEL_POPUP_MAX_HEIGHT: f32 = 240.0;
 const LABEL_POPUP_FIELD_WIDTH: f32 = 120.0;
 
@@ -8040,6 +8511,12 @@ struct TitlebarAnchors {
     /// clear of the first group — a collapsed navigation column puts the list at
     /// the window's edge, and the box may not land on the brand.
     search: f32,
+    /// How wide the plan makes the box (`titlebar_search_width`), or `None` when
+    /// the bar has no room for it at all.
+    search_width: Option<f32>,
+    /// The filter cell beside the box — the two are one group, a bar's own cell
+    /// apart — or `None` when the room the box leaves is too little for it.
+    filter: Option<egui::Rect>,
     /// The mail actions' rect — the reading pane's own row, as wide as the run —
     /// or `None` when the pane has no room for it beside the window controls.
     actions: Option<egui::Rect>,
@@ -8078,14 +8555,34 @@ fn titlebar_anchors(
         // there its edge is behind the first group and there is nothing to hang
         // over.
         && (pane_left < first_end + TITLEBAR_GROUP_GAP || left >= pane_left - MAIL_ACTION_OVERHANG);
-    TitlebarAnchors {
-        search: list_left.max(first_end + TITLEBAR_GROUP_GAP),
-        actions: fits.then(|| {
+    let actions = fits.then(|| {
+        egui::Rect::from_min_size(
+            egui::pos2(left, bar.center().y - TITLEBAR_BUTTON_SIZE / 2.0),
+            egui::vec2(width, TITLEBAR_BUTTON_SIZE),
+        )
+    });
+    // The box's own width is planned first, exactly as it was before there was a
+    // filter to sit beside it: the box is the list's, and a bar that cannot hold
+    // both holds the box. What the box leaves is the filter cell's room — the
+    // two are one group, a cell's gap apart — and a bar with too little of it
+    // for the cell does not draw one.
+    let search = list_left.max(first_end + TITLEBAR_GROUP_GAP);
+    let next = actions.map_or(cluster_left, |actions| actions.left());
+    let search_width = titlebar_search_width(next - search - TITLEBAR_GROUP_GAP);
+    let filter = search_width.and_then(|width| {
+        let left = search + width + TITLEBAR_BUTTON_GAP;
+        (left + TITLEBAR_BUTTON_SIZE + TITLEBAR_GROUP_GAP <= next + 0.5).then(|| {
             egui::Rect::from_min_size(
                 egui::pos2(left, bar.center().y - TITLEBAR_BUTTON_SIZE / 2.0),
-                egui::vec2(width, TITLEBAR_BUTTON_SIZE),
+                egui::vec2(TITLEBAR_BUTTON_SIZE, TITLEBAR_BUTTON_SIZE),
             )
-        }),
+        })
+    });
+    TitlebarAnchors {
+        search,
+        search_width,
+        filter,
+        actions,
     }
 }
 
@@ -9815,6 +10312,193 @@ fn paint_flag_icon(p: &egui::Painter, rect: egui::Rect, color: egui::Color32, si
     ));
 }
 
+/// Filter: a funnel, the one glyph of the bar's set that is not about a mail —
+/// it says which mail the *list* is showing. Drawn like the rest: one stroked
+/// path inside the 24×24 outline the set shares.
+fn paint_filter_icon(p: &egui::Painter, rect: egui::Rect, color: egui::Color32, size: f32) {
+    let g = |x: f32, y: f32| outline_point(rect.center(), x, y, size);
+    let stroke = egui::Stroke::new(1.5_f32, color);
+    p.add(egui::Shape::line(
+        vec![
+            g(4.0, 6.0),
+            g(20.0, 6.0),
+            g(14.0, 13.0),
+            g(14.0, 20.0),
+            g(10.0, 20.0),
+            g(10.0, 13.0),
+            g(4.0, 6.0),
+        ],
+        stroke,
+    ));
+}
+
+/// What one of the filter menu's rows draws at its left: a mark per view, and
+/// the "All" row's own. The two that the list already draws somewhere are the
+/// same functions — the flag and the paperclip — so the menu and the list say
+/// the same thing with the same shape.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum FilterIcon {
+    All,
+    Unread,
+    Flagged,
+    ToMe,
+    HasFiles,
+}
+
+impl ListFilter {
+    fn icon(self) -> FilterIcon {
+        match self {
+            ListFilter::Unread => FilterIcon::Unread,
+            ListFilter::Flagged => FilterIcon::Flagged,
+            ListFilter::ToMe => FilterIcon::ToMe,
+            ListFilter::HasFiles => FilterIcon::HasFiles,
+        }
+    }
+}
+
+/// One filter menu row's glyph, in the 24×24 outline style the whole icon set is
+/// drawn in, at `FILTER_ICON_SIZE`.
+fn paint_filter_menu_icon(
+    p: &egui::Painter,
+    icon: FilterIcon,
+    rect: egui::Rect,
+    color: egui::Color32,
+) {
+    let size = FILTER_ICON_SIZE;
+    let g = |x: f32, y: f32| outline_point(rect.center(), x, y, size);
+    let stroke = egui::Stroke::new(1.5_f32 * size / MAIL_ACTION_GLYPH, color);
+    match icon {
+        // The whole mailbox: an envelope, the one mark that means *mail* rather
+        // than something about it.
+        FilterIcon::All | FilterIcon::Unread => {
+            p.add(egui::Shape::line(
+                vec![
+                    g(3.0, 5.0),
+                    g(21.0, 5.0),
+                    g(21.0, 16.0),
+                    g(3.0, 16.0),
+                    g(3.0, 5.0),
+                ],
+                stroke,
+            ));
+            // The flap, from the top corners down to the middle.
+            p.add(egui::Shape::line(
+                vec![g(3.0, 6.5), g(12.0, 12.0), g(21.0, 6.5)],
+                stroke,
+            ));
+            if icon == FilterIcon::Unread {
+                // A mail that has not been read: the envelope with the new-mail
+                // pip at its lower corner, the one part of this set that is
+                // filled.
+                p.circle_filled(g(19.5, 19.5), 3.0 * size / 24.0, color);
+            }
+        }
+        // The list's own mark for a flagged mail, at the menu's size.
+        FilterIcon::Flagged => paint_flag_icon(p, rect, color, size),
+        // Addressed to me: a person — a head and the shoulders under it.
+        FilterIcon::ToMe => {
+            p.circle_stroke(g(12.0, 8.0), 3.6 * size / 24.0, stroke);
+            p.add(egui::Shape::line(
+                vec![
+                    g(5.0, 19.5),
+                    g(5.0, 17.0),
+                    g(8.0, 14.0),
+                    g(16.0, 14.0),
+                    g(19.0, 17.0),
+                    g(19.0, 19.5),
+                ],
+                stroke,
+            ));
+        }
+        // What the mail carries, in the list's own paperclip.
+        FilterIcon::HasFiles => paint_clip_icon(p, rect, color),
+    }
+}
+
+/// One row of the filter menu: the view's mark at its left, the name, and — at
+/// the row's *end*, where a menu's tick belongs — the check when the view is one
+/// of those in force. The whole row is the target, not only the words, and the
+/// row is the app's own drawing rather than a stock widget: a checkbox puts its
+/// box in front of the name, which is where the mark goes.
+///
+/// `enabled` is false for a view the session cannot answer — "To me" without an
+/// address to match — and such a row neither fills under the pointer nor
+/// responds to it.
+fn filter_menu_row(
+    ui: &mut egui::Ui,
+    icon: FilterIcon,
+    label: &str,
+    ticked: bool,
+    enabled: bool,
+) -> egui::Response {
+    let scheme = theme::of(ui.ctx());
+    let sense = if enabled {
+        egui::Sense::click()
+    } else {
+        egui::Sense::hover()
+    };
+    let (rect, response) =
+        ui.allocate_exact_size(egui::vec2(ui.available_width(), FILTER_ROW_HEIGHT), sense);
+    let color = if enabled {
+        scheme.text
+    } else {
+        scheme.text_weak
+    };
+    if response.hovered() {
+        ui.painter().rect_filled(
+            rect,
+            egui::CornerRadius::same(FILTER_ROW_CORNER_RADIUS),
+            scheme.hover,
+        );
+    }
+    let icon_rect = egui::Rect::from_center_size(
+        egui::pos2(
+            rect.left() + FILTER_ROW_INSET + FILTER_ICON_SIZE / 2.0,
+            rect.center().y,
+        ),
+        egui::Vec2::splat(FILTER_ICON_SIZE),
+    );
+    paint_filter_menu_icon(ui.painter(), icon, icon_rect, color);
+    // The name, in the interface font the rest of the menu's text is drawn in.
+    let font = ui
+        .style()
+        .text_styles
+        .get(&egui::TextStyle::Body)
+        .cloned()
+        .unwrap_or_else(|| egui::FontId::proportional(14.0));
+    ui.painter().text(
+        egui::pos2(icon_rect.right() + FILTER_ICON_GAP, rect.center().y),
+        egui::Align2::LEFT_CENTER,
+        label,
+        font,
+        color,
+    );
+    if ticked {
+        // The tick is the row's state, and it is the accent's — the colour the
+        // bar's own cell takes while any view is on.
+        let tick = egui::Rect::from_center_size(
+            egui::pos2(
+                rect.right() - FILTER_ROW_INSET - FILTER_TICK_SIZE / 2.0,
+                rect.center().y,
+            ),
+            egui::Vec2::splat(FILTER_TICK_SIZE),
+        );
+        paint_check_icon(ui.painter(), tick, scheme.accent);
+    }
+    response.on_hover_cursor(egui::CursorIcon::PointingHand)
+}
+
+/// The tick a menu row carries at its end when its view is on: one stroke, the
+/// way the rest of the set is drawn.
+fn paint_check_icon(p: &egui::Painter, rect: egui::Rect, color: egui::Color32) {
+    let g = |x: f32, y: f32| outline_point(rect.center(), x, y, FILTER_TICK_SIZE);
+    let stroke = egui::Stroke::new(1.5_f32 * FILTER_TICK_SIZE / MAIL_ACTION_GLYPH, color);
+    p.add(egui::Shape::line(
+        vec![g(5.0, 12.5), g(10.0, 17.5), g(19.0, 6.5)],
+        stroke,
+    ));
+}
+
 /// Export: an arrow coming down into an open tray, the file leaving the app.
 /// It is the one glyph of the set that points into something rather than along
 /// the mail (reply, forward) or at the mail (label, flag, delete), which is
@@ -11425,6 +12109,7 @@ mod tests {
             uid: "0".to_string(),
             subject: "Subject 0".to_string(),
             from: "Ada <ada@example.com>".to_string(),
+            to: "me@example.com".to_string(),
             date: "2026-01-01".to_string(),
             timestamp: Some(1_700_000_000),
             seen: false,
@@ -11786,7 +12471,7 @@ mod tests {
 
         let closed: std::collections::HashSet<String> = std::collections::HashSet::new();
         assert_eq!(
-            list_rows_of(&threads, mails.len(), &closed, true),
+            list_rows_of(&threads, &all_shown(&mails), &closed, true),
             vec![
                 ListRow::Thread { thread: 0 },
                 // A conversation of one is a mail, and is drawn like one: no
@@ -11802,7 +12487,7 @@ mod tests {
         let open: std::collections::HashSet<String> =
             [threads[0].key.clone()].into_iter().collect();
         assert_eq!(
-            list_rows_of(&threads, mails.len(), &open, true),
+            list_rows_of(&threads, &all_shown(&mails), &open, true),
             vec![
                 ListRow::Thread { thread: 0 },
                 ListRow::Message {
@@ -11826,7 +12511,7 @@ mod tests {
 
         // Not threading: every mail is a row of its own.
         assert_eq!(
-            list_rows_of(&threads, mails.len(), &open, false),
+            list_rows_of(&threads, &all_shown(&mails), &open, false),
             (0..mails.len())
                 .map(|index| ListRow::Message {
                     index,
@@ -12755,6 +13440,7 @@ mod tests {
             uid: "7".to_string(),
             subject: "Subject 7".to_string(),
             from: "Ada <ada@example.com>".to_string(),
+            to: "me@example.com".to_string(),
             date: "2026-01-01".to_string(),
             timestamp: Some(1_700_000_000),
             seen: false,
@@ -12976,6 +13662,7 @@ mod tests {
                 timestamp: Some(1_700_000_000),
                 seen: false,
                 flagged: false,
+                to: "me@example.com".to_string(),
                 attachments: 0,
                 snippet: "a line with report in it".to_string(),
             },
@@ -12989,6 +13676,7 @@ mod tests {
                 timestamp: Some(1_700_000_000),
                 seen: false,
                 flagged: false,
+                to: "me@example.com".to_string(),
                 attachments: 0,
                 snippet: "another line with report in it".to_string(),
             },
@@ -13002,6 +13690,7 @@ mod tests {
                 timestamp: Some(1_700_000_000),
                 seen: false,
                 flagged: false,
+                to: "me@example.com".to_string(),
                 attachments: 0,
                 snippet: "a third line with report in it".to_string(),
             },
@@ -13183,6 +13872,7 @@ mod tests {
                 timestamp: Some(1_700_000_000),
                 seen: false,
                 flagged: false,
+                to: "me@example.com".to_string(),
                 attachments: 0,
                 snippet: "a line with report in it".to_string(),
             }],
@@ -13484,6 +14174,7 @@ mod tests {
             uid: "7".to_string(),
             subject: "Subject 7".to_string(),
             from: "Ada <ada@example.com>".to_string(),
+            to: "me@example.com".to_string(),
             date: "2026-01-01".to_string(),
             timestamp: Some(1_700_000_000),
             seen: false,
@@ -13697,6 +14388,13 @@ mod tests {
         {
             out.push(bounds);
         }
+    }
+
+    /// Every mail shown: what the list is derived from with no filter on, for
+    /// the tests that drive `list_rows_of` themselves — the filter's own tests go
+    /// through the app, which builds this mask from `ListFilter::matches`.
+    fn all_shown(mails: &[MailMessage]) -> Vec<bool> {
+        vec![true; mails.len()]
     }
 
     /// Every rectangle one frame filled in a given color, however deeply egui
@@ -14016,6 +14714,34 @@ mod tests {
             940.0 - actions.left()
         );
 
+        // The filter cell is the box's own companion: a cell's gap to its right,
+        // inside the room the box's plan left for it.
+        let filter = anchors
+            .filter
+            .expect("the bar has room for the filter at 1400 pt");
+        assert_eq!(anchors.search_width, Some(TITLEBAR_SEARCH_WIDTH));
+        assert_eq!(
+            filter.left(),
+            anchors.search + TITLEBAR_SEARCH_WIDTH + TITLEBAR_BUTTON_GAP
+        );
+        assert_eq!(filter.width(), TITLEBAR_BUTTON_SIZE);
+        assert!(
+            filter.right() + TITLEBAR_GROUP_GAP <= cluster_left(1400.0) + 0.5,
+            "the filter stays clear of the bar's right end: {filter:?}"
+        );
+
+        // A bar with room for the box but none for a cell beside it: the box is
+        // what is kept — it is the list's own, and its width is planned first —
+        // and the filter is not drawn at all rather than squeezed or drawn over
+        // its neighbours.
+        let anchors = titlebar_anchors(bar(506.0), first_end, 0.0, 0.0, 312.0);
+        assert_eq!(anchors.search_width, Some(TITLEBAR_SEARCH_WIDTH));
+        assert!(
+            anchors.filter.is_none(),
+            "no room for a cell beside the box: {:?}",
+            anchors.filter
+        );
+
         // A collapsed navigation column puts the list at the window's edge: the
         // box follows it and stops clear of the first group instead of landing
         // on the brand.
@@ -14037,6 +14763,21 @@ mod tests {
             "a {} pt pane is no room for the run: {:?}",
             CONTENT_MIN_WIDTH,
             anchors.actions
+        );
+        assert!(
+            anchors.filter.is_some(),
+            "the box's companion is not the pane's: it survives where the run cannot"
+        );
+
+        // A window whose pane has no room for the run at all (the navigation
+        // collapsed, the list at its minimum) still has room for the filter: it
+        // is the box's, and it is the last of the middle band to go.
+        let anchors = titlebar_anchors(bar(600.0), first_end, 0.0, 240.0, cluster_left(600.0));
+        assert!(anchors.actions.is_none());
+        assert_eq!(anchors.search_width, Some(TITLEBAR_SEARCH_WIDTH));
+        assert!(
+            anchors.filter.is_some(),
+            "a 600 pt window still holds the box and its filter"
         );
 
         // The popup layout: the pane is the whole window, so its edge is behind
@@ -14063,6 +14804,12 @@ mod tests {
             let anchors =
                 titlebar_anchors(bar(1400.0), first_end, 0.0, pane_left, cluster_left(1400.0));
             assert!(anchors.search >= first_end + TITLEBAR_GROUP_GAP);
+            if let Some(filter) = anchors.filter {
+                assert!(
+                    filter.left() >= first_end + TITLEBAR_GROUP_GAP,
+                    "{filter:?}"
+                );
+            }
             if let Some(actions) = anchors.actions {
                 assert!(
                     actions.left() >= first_end + TITLEBAR_GROUP_GAP,
@@ -15781,7 +16528,30 @@ mod tests {
         click_at(ctx, app, row.center());
     }
 
-    /// Where one of the title bar's mail action cells sits: the bar's own
+    /// Where the bar's filter cell sits: the search box's own group, a cell's gap
+    /// to its right (`titlebar_anchors`). Runs a frame, so the columns the plan
+    /// is measured against are the ones the bar itself read.
+    fn titlebar_filter_rect(ctx: &egui::Context, app: &mut KimoApp, width: f32) -> egui::Rect {
+        frame_shapes_at(ctx, app, width);
+        let bar = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(width, TITLEBAR_HEIGHT));
+        let rects = titlebar_rects(bar, 3);
+        let pane_left = if app.pane_popup {
+            0.0
+        } else {
+            app.list_column.right()
+        };
+        titlebar_anchors(
+            bar,
+            first_group_end(),
+            app.list_column.left(),
+            pane_left,
+            rects.sync.left(),
+        )
+        .filter
+        .expect("the bar draws a filter cell here")
+    }
+
+    /// Where one of the title bar's mail action cells sits: the bar's own    /// Where one of the title bar's mail action cells sits: the bar's own
     /// arithmetic, from the search box the run is laid out after onwards
     /// (`titlebar_rects`, `titlebar_anchors`).
     fn titlebar_action_center(
@@ -15971,8 +16741,9 @@ mod tests {
 
     /// Developer tool (there is no compositor at hand in a test): draw a few
     /// frames — the labelled list and card, the label filter and popup, the
-    /// flagged list, the bar with and without a mail open in the pane, and
-    /// Preferences → General — and write them out as PNGs, so the layout can be
+    /// flagged list, the list filter's menu and the list it leaves, the bar with
+    /// and without a mail open in the pane, and Preferences → General — and
+    /// write them out as PNGs, so the layout can be
     /// looked at. `KIMO_UI_DUMP` picks the directory (default `target`) and
     /// `KIMO_UI_WIDTH` the window's width (default 1400).
     ///
@@ -16041,6 +16812,47 @@ mod tests {
             collect_frame(&ctx, &mut app, &mut textures, Vec::new());
         }
         shot(&mut app, "ui-flag.png", &mut textures);
+
+        // And the filter: the checklist over the list it narrows — every box
+        // clear but "All" — then two of them ticked, then the list itself with
+        // the menu out of the way and the cell in the accent that says a view is
+        // on.
+        let filter_cell = titlebar_filter_rect(&ctx, &mut app, 1400.0).center();
+        dump_click(&ctx, &mut app, &mut textures, filter_cell);
+        for _ in 0..2 {
+            collect_frame(&ctx, &mut app, &mut textures, Vec::new());
+        }
+        shot(&mut app, "ui-filter-menu.png", &mut textures);
+        // The boxes are independent, and a tick leaves the menu open: the
+        // picture is of the AND before it is applied to the list.
+        let tick = |app: &mut KimoApp, textures: &mut HashMap<_, _>, label: &str| {
+            let shapes = collect_frame(&ctx, app, textures, Vec::new());
+            let area = egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(dump_width(), DUMP_HEIGHT as f32),
+            );
+            let row = text_boxes_of(&shapes, area, label)
+                .into_iter()
+                .next()
+                .unwrap_or_else(|| panic!("the menu draws no {label} row"));
+            dump_click(&ctx, app, textures, row.center());
+        };
+        tick(&mut app, &mut textures, "Unread");
+        tick(&mut app, &mut textures, "Has files");
+        for _ in 0..2 {
+            collect_frame(&ctx, &mut app, &mut textures, Vec::new());
+        }
+        shot(&mut app, "ui-filter-and.png", &mut textures);
+        // The menu goes before the picture of the list itself: in the app it
+        // closes on a click outside, and what is being looked at here is what
+        // the list became — one view, the folder's own.
+        egui::Popup::close_all(&ctx);
+        app.set_list_filters(ListFilters(vec![ListFilter::Flagged]));
+        for _ in 0..2 {
+            collect_frame(&ctx, &mut app, &mut textures, Vec::new());
+        }
+        shot(&mut app, "ui-filter-flagged.png", &mut textures);
+        app.set_list_filters(ListFilters::default());
 
         // The bar with nothing open in the pane first: the pane's run is not
         // there at all rather than there and dimmed, and the chrome it would
@@ -16402,6 +17214,273 @@ mod tests {
         assert!(
             !text_boxes_of(&shapes, nav_column(&app), "Receipts").is_empty(),
             "the group has the new label"
+        );
+    }
+
+    /// The filter cell sits in the search box's own group and its menu is the
+    /// views of the list as checkboxes — an AND between them, so ticking one
+    /// never takes another off and unticking one widens the list again — with
+    /// the "All" row as the way out of every view at once.
+    #[test]
+    fn the_filter_cell_narrows_the_list() {
+        let ctx = egui::Context::default();
+        crate::fonts::install(&ctx, None, None);
+        let mut app = app_with_messages(&ctx, 3);
+        // Mail "0" is unread, flagged and carries a file; "1" is read; "2" is
+        // plain unread. The three marks between them are what the views are
+        // about, and the subjects are what the rows say.
+        {
+            let state = app.states.get_mut("acct").expect("the fixture account");
+            let mails = &mut state.mailbox.folders[0].messages;
+            mails[1].seen = true;
+            mails[0].flagged = true;
+            mails[0].attachments = vec![Attachment {
+                name: "report.pdf".to_string(),
+                content_type: "application/pdf".to_string(),
+                size: 1024,
+            }];
+            state.folders_changed();
+        }
+        let drawn =
+            |texts: &[String], uid: &str| texts.iter().any(|run| run == &format!("Subject {uid}"));
+
+        let texts = frame_texts(&ctx, &mut app);
+        assert!(
+            drawn(&texts, "0") && drawn(&texts, "1") && drawn(&texts, "2"),
+            "every mail is in the list while no filter is on: {texts:?}"
+        );
+
+        // The cell opens the menu, which is the views as rows under their "All"
+        // one. It is an `Area` like the label popup's: it lays itself out on the
+        // frame the click landed on and draws on the next one, so the shapes the
+        // rows are found in are the frame after that.
+        let open_menu = |ctx: &egui::Context, app: &mut KimoApp| {
+            let cell = titlebar_filter_rect(ctx, app, 1400.0);
+            click_at(ctx, app, cell.center());
+            let _ = frame_shapes_at(ctx, app, 1400.0);
+            frame_shapes_at(ctx, app, 1400.0)
+        };
+        // The menu hangs under the cell, at the left of the window rather than
+        // in the middle column: its rows are found where they are drawn — and
+        // they stay there, because a tick does not close the menu.
+        let menu_area = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1400.0, 900.0));
+        let tick = |ctx: &egui::Context, app: &mut KimoApp, label: &str| {
+            let shapes = frame_shapes_at(ctx, app, 1400.0);
+            let row = text_boxes_of(&shapes, menu_area, label);
+            assert_eq!(row.len(), 1, "the menu draws one {label} row");
+            click_at(ctx, app, row[0].center());
+        };
+        let shapes = open_menu(&ctx, &mut app);
+        assert_eq!(
+            text_boxes_of(&shapes, menu_area, "All").len(),
+            1,
+            "the menu's way out of every view"
+        );
+        for filter in ListFilter::ALL {
+            assert_eq!(
+                text_boxes_of(&shapes, menu_area, filter.label()).len(),
+                1,
+                "the menu offers {}",
+                filter.label()
+            );
+        }
+
+        // A row is its view's own mark at the left, the name, and the tick at its
+        // *end* — where a menu's check belongs — and nothing is ticked yet.
+        let row_parts = |shapes: &[egui::epaint::ClippedShape], label: &str| {
+            let text = text_boxes_of(shapes, menu_area, label)[0];
+            // The row's own ends, measured from where its name starts: the mark
+            // is the inset, the icon and the gap to the left of it, and the
+            // popup's width reaches its right end.
+            let row_left = text.left() - (FILTER_ROW_INSET + FILTER_ICON_SIZE + FILTER_ICON_GAP);
+            let icon = egui::Rect::from_min_max(
+                egui::pos2(row_left, text.top() - 4.0),
+                egui::pos2(text.left() - 2.0, text.bottom() + 4.0),
+            );
+            let tail = egui::Rect::from_min_max(
+                egui::pos2(text.right() + 2.0, text.top() - 4.0),
+                egui::pos2(row_left + FILTER_POPUP_WIDTH, text.bottom() + 4.0),
+            );
+            (icon, tail)
+        };
+        for filter in ListFilter::ALL {
+            let (icon, tail) = row_parts(&shapes, filter.label());
+            assert!(
+                !glyph_colors_in(&shapes, icon).is_empty(),
+                "the {} row carries a mark of its own",
+                filter.label()
+            );
+            assert!(
+                glyph_colors_in(&shapes, tail).is_empty(),
+                "and no tick while it is off: {:?}",
+                glyph_colors_in(&shapes, tail)
+            );
+        }
+
+        // Unread: the read mail is not in the list any more.
+        tick(&ctx, &mut app, "Unread");
+        assert!(app.list_filters.contains(ListFilter::Unread));
+        let scheme = theme::of(&ctx);
+        // The menu is an `Area` that fades in, and a shape's colour carries that
+        // fade: the tick's own colour is the one the frame after it draws.
+        for _ in 0..16 {
+            run_app_frame(&ctx, &mut app, Vec::new());
+        }
+        let shapes = frame_shapes_at(&ctx, &mut app, 1400.0);
+        let (_, tail) = row_parts(&shapes, "Unread");
+        assert!(
+            glyph_colors_in(&shapes, tail).contains(&scheme.accent),
+            "the tick is at the end of the row, in the accent: {:?}",
+            glyph_colors_in(&shapes, tail)
+        );
+        let texts = frame_texts(&ctx, &mut app);
+        assert!(
+            drawn(&texts, "0") && drawn(&texts, "2") && !drawn(&texts, "1"),
+            "the read mail is filtered out: {texts:?}"
+        );
+
+        // Flagged as well: the views are an AND, so what is left is the one mail
+        // that is both — unread *and* flagged, which is also the one with a file.
+        tick(&ctx, &mut app, "Flagged");
+        assert!(
+            app.list_filters.contains(ListFilter::Flagged)
+                && app.list_filters.contains(ListFilter::Unread)
+        );
+        let texts = frame_texts(&ctx, &mut app);
+        assert!(
+            drawn(&texts, "0") && !drawn(&texts, "1") && !drawn(&texts, "2"),
+            "only the mail that passes both views is listed: {texts:?}"
+        );
+
+        // Unticking one widens the list again rather than switching views: the
+        // flag is off, and what is left is the unread view — which the flagged
+        // mail is still part of, with the other unread one.
+        tick(&ctx, &mut app, "Flagged");
+        assert!(!app.list_filters.contains(ListFilter::Flagged));
+        let texts = frame_texts(&ctx, &mut app);
+        assert!(
+            drawn(&texts, "0") && drawn(&texts, "2") && !drawn(&texts, "1"),
+            "the unread view alone: the read mail is still out: {texts:?}"
+        );
+
+        // And "All" is the way out of every view at once.
+        tick(&ctx, &mut app, "All");
+        assert!(app.list_filters.is_all());
+        let texts = frame_texts(&ctx, &mut app);
+        assert!(
+            drawn(&texts, "0") && drawn(&texts, "1") && drawn(&texts, "2"),
+            "every mail is back: {texts:?}"
+        );
+    }
+
+    /// The four views ask a row the four things a list can answer, and "to me"
+    /// reads the `To` header as the sender wrote it — the address is somewhere
+    /// in it, whatever else is there — against the accounts' own addresses. The
+    /// set they go into is the AND the menu promises.
+    #[test]
+    fn the_list_filter_predicates() {
+        let me = vec!["me@example.com".to_string()];
+        let facts = |seen, flagged, to: &'static str, attachments| FilterFacts {
+            seen,
+            flagged,
+            to,
+            attachments,
+        };
+        assert!(ListFilter::Unread.matches(facts(false, false, "x@y", 0), &me));
+        assert!(!ListFilter::Unread.matches(facts(true, false, "x@y", 0), &me));
+        assert!(ListFilter::Flagged.matches(facts(true, true, "x@y", 0), &me));
+        assert!(!ListFilter::Flagged.matches(facts(true, false, "x@y", 0), &me));
+        assert!(ListFilter::HasFiles.matches(facts(true, false, "x@y", 2), &me));
+        assert!(!ListFilter::HasFiles.matches(facts(true, false, "x@y", 0), &me));
+        assert!(ListFilter::ToMe.matches(facts(true, false, "Ada <ME@example.com>", 0), &me));
+        assert!(ListFilter::ToMe.matches(facts(true, false, "a@x, me@example.com", 0), &me));
+        assert!(!ListFilter::ToMe.matches(facts(true, false, "someone@elsewhere.com", 0), &me));
+        // An account with no address of its own leaves the question unanswerable
+        // — which is what the menu row says rather than filtering to nothing.
+        assert!(!ListFilter::ToMe.matches(facts(true, false, "me@example.com", 0), &[]));
+        for filter in ListFilter::ALL {
+            assert!(!filter.label().is_empty());
+            assert!(!filter.note().is_empty());
+        }
+
+        // The set they go into is the AND the menu promises: an empty one is
+        // every mail, each tick narrows it further, and unticking widens it
+        // again without disturbing the views that are left.
+        let mut filters = ListFilters::default();
+        assert!(filters.is_all());
+        assert!(filters.matches(facts(true, false, "x@y", 0), &me));
+        filters.toggle(ListFilter::Unread);
+        filters.toggle(ListFilter::HasFiles);
+        assert!(!filters.is_all());
+        assert!(filters.contains(ListFilter::Unread) && filters.contains(ListFilter::HasFiles));
+        assert!(filters.matches(facts(false, false, "x@y", 1), &me));
+        assert!(
+            !filters.matches(facts(false, false, "x@y", 0), &me),
+            "unread but with nothing attached"
+        );
+        assert!(
+            !filters.matches(facts(true, false, "x@y", 1), &me),
+            "attached but read"
+        );
+        filters.toggle(ListFilter::Unread);
+        assert!(!filters.contains(ListFilter::Unread));
+        assert!(filters.matches(facts(true, false, "x@y", 1), &me));
+        // The set keeps the menu's order, whatever order the boxes were ticked.
+        filters.toggle(ListFilter::ToMe);
+        filters.toggle(ListFilter::Unread);
+        assert_eq!(
+            filters.0,
+            vec![ListFilter::Unread, ListFilter::ToMe, ListFilter::HasFiles]
+        );
+        filters.clear();
+        assert!(filters.is_all());
+    }
+
+    /// A view that hides every mail leaves the column saying so: the list is
+    /// empty because of the filter, which is not the same thing as a folder with
+    /// no mail in it.
+    #[test]
+    fn a_filter_that_matches_nothing_says_so() {
+        let ctx = egui::Context::default();
+        crate::fonts::install(&ctx, None, None);
+        let mut app = app_with_messages(&ctx, 2);
+        app.set_list_filters(ListFilters(vec![ListFilter::Flagged]));
+        let texts = frame_texts(&ctx, &mut app);
+        assert!(
+            texts
+                .iter()
+                .any(|run| run == "No mail matches this filter."),
+            "the list says why it is empty: {texts:?}"
+        );
+        assert!(
+            !texts.iter().any(|run| run == "Subject 0"),
+            "and draws no row at all: {texts:?}"
+        );
+
+        // The same for a search's hits, which the column's filter narrows
+        // without touching the query: it says the hit was filtered out, not that
+        // nothing matched.
+        app.set_list_filters(ListFilters::default());
+        app.search.text = "report".to_string();
+        app.search_hits = vec![SearchHit {
+            account_id: "acct".to_string(),
+            folder: "INBOX".to_string(),
+            uid: "0".to_string(),
+            subject: "Subject 0".to_string(),
+            from: "Ada <ada@example.com>".to_string(),
+            to: "someone@elsewhere.com".to_string(),
+            date: "2026-01-01".to_string(),
+            timestamp: Some(1_700_000_000),
+            seen: false,
+            flagged: false,
+            attachments: 0,
+            snippet: "a line with report in it".to_string(),
+        }];
+        app.set_list_filters(ListFilters(vec![ListFilter::HasFiles]));
+        let texts = frame_texts(&ctx, &mut app);
+        assert!(
+            texts.iter().any(|run| run == "No hit matches this filter."),
+            "a filtered-out hit is not an empty query: {texts:?}"
         );
     }
 

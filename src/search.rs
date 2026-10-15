@@ -164,6 +164,10 @@ pub struct SearchHit {
     pub uid: String,
     pub subject: String,
     pub from: String,
+    /// The `To` header as it was written: the list filter's "to me" is the one
+    /// thing the row asks of it, and the hit carries it like the fields a card
+    /// draws.
+    pub to: String,
     pub date: String,
     pub timestamp: Option<i64>,
     pub seen: bool,
@@ -363,7 +367,7 @@ pub fn run(conn: &rusqlite::Connection, query: &SearchQuery) -> MailResult<Vec<S
     }
     let expression = fts_expression(&query.text);
     let mut sql = String::from(
-        "SELECT m.account_id, m.folder, m.uid, m.subject, m.from_addr, m.date_header,
+        "SELECT m.account_id, m.folder, m.uid, m.subject, m.from_addr, m.to_addr, m.date_header,
                 m.ts, m.seen, m.flagged, m.body_text, m.preview,
                 (SELECT COUNT(*) FROM attachments a WHERE a.message_id = m.id)
            FROM messages m",
@@ -432,12 +436,13 @@ pub fn run(conn: &rusqlite::Connection, query: &SearchQuery) -> MailResult<Vec<S
             row.get::<_, String>(3)?,
             row.get::<_, String>(4)?,
             row.get::<_, String>(5)?,
-            row.get::<_, Option<i64>>(6)?,
-            row.get::<_, i64>(7)?,
+            row.get::<_, String>(6)?,
+            row.get::<_, Option<i64>>(7)?,
             row.get::<_, i64>(8)?,
-            row.get::<_, String>(9)?,
+            row.get::<_, i64>(9)?,
             row.get::<_, String>(10)?,
-            row.get::<_, i64>(11)?,
+            row.get::<_, String>(11)?,
+            row.get::<_, i64>(12)?,
         ))
     })?;
     let mut hits = Vec::new();
@@ -448,6 +453,7 @@ pub fn run(conn: &rusqlite::Connection, query: &SearchQuery) -> MailResult<Vec<S
             uid,
             subject,
             from,
+            to,
             date,
             timestamp,
             seen,
@@ -462,6 +468,7 @@ pub fn run(conn: &rusqlite::Connection, query: &SearchQuery) -> MailResult<Vec<S
             uid,
             subject,
             from,
+            to,
             date,
             timestamp,
             seen: seen != 0,
