@@ -604,7 +604,13 @@ Event (mpsc) ──► drain_events() at frame start ──► merge into Accoun
   the glass. **A conversation is that card once per mail** — not a card
   holding a card per mail — stacked oldest first with `CONVERSATION_CARD_GAP`
   of chrome showing between two of them, so every mail of a thread sits on the
-  pane the way a mail on its own does. Each card is drawn by the pane and not
+  pane the way a mail on its own does. **A mail's head is its sender**: the
+  list's own avatar in front of the name (`AVATAR_DIAMETER`, with the sender's
+  `sender_color` and `sender_initial` — the same circle the rows draw), the
+  mail's four actions at that row's right end (`mail_sheet`, the bar's cells in
+  a smaller square, `CARD_ACTION_SIZE`, drawn `text_weak` until the pointer
+  brings one to the text color), and the
+  subject, the addresses and the date under it. Each card is drawn by the pane and not
   by a frame around its mail: `mail_card` reserves the shape and the pane
   fills it in from the pane's own left edge to its right one, because a card is
   the pane's surface — a mail wider than the pane scrolls sideways over its
@@ -1175,7 +1181,7 @@ Event (mpsc) ──► drain_events() at frame start ──► merge into Accoun
   columns and the bar and takes their clicks, so a mail is written with the
   rest of the app out of the way. The reply, reply all, forward and delete
   cells on a mail's own header (`mail_sheet` — the title bar's own cells and
-  glyphs, right-aligned above the subject, delete outermost) open the same
+  glyphs, at the right end of the card's head row, delete outermost) open the same
   three *on the spot*: one more card of the reading pane, right under the
   mail answered (`compose_inline_card` — the pane's own surface at the pane's
   width, a card gap above it), and the mail stays on screen above its answer

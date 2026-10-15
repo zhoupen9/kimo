@@ -3382,9 +3382,15 @@ impl KimoApp {
             };
             let painter = row.painter();
             match action {
-                MailAction::Reply => paint_reply_icon(painter, response.rect, color),
-                MailAction::ReplyAll => paint_reply_all_icon(painter, response.rect, color),
-                MailAction::Forward => paint_forward_icon(painter, response.rect, color),
+                MailAction::Reply => {
+                    paint_reply_icon(painter, response.rect, color, MAIL_ACTION_GLYPH)
+                }
+                MailAction::ReplyAll => {
+                    paint_reply_all_icon(painter, response.rect, color, MAIL_ACTION_GLYPH)
+                }
+                MailAction::Forward => {
+                    paint_forward_icon(painter, response.rect, color, MAIL_ACTION_GLYPH)
+                }
                 MailAction::Label => paint_label_icon(painter, response.rect, color),
                 MailAction::Flag => paint_flag_icon(painter, response.rect, color),
                 MailAction::Export => paint_export_icon(painter, response.rect, color),
@@ -3715,7 +3721,10 @@ impl KimoApp {
             return false;
         }
         self.open_conversation().is_some_and(|conversation| {
-            conversation.messages.iter().any(|mail| mail.uid == anchor.uid)
+            conversation
+                .messages
+                .iter()
+                .any(|mail| mail.uid == anchor.uid)
         })
     }
 
@@ -4625,7 +4634,7 @@ impl KimoApp {
         );
         // The label takes the rows' own text left, so it reads as a line of the
         // list rather than as something floating beside it.
-        let text_left = centre.x + AVATAR_DIAMETER / 2.0 + 10.0;
+        let text_left = centre.x + AVATAR_DIAMETER / 2.0 + AVATAR_TEXT_GAP;
         let label = select_all_label(state);
         let galley = truncate_galley(
             ui.ctx(),
@@ -5550,8 +5559,7 @@ impl KimoApp {
             // together: a draft whose mail has left the pane moves to the
             // popup window before the pane draws (`compose_anchor_on_pane`),
             // so the uid waited for here is a uid of this conversation.
-            let answer_under = if self.compose.is_some() && self.compose_spot == ComposeSpot::Pane
-            {
+            let answer_under = if self.compose.is_some() && self.compose_spot == ComposeSpot::Pane {
                 self.compose_anchor
                     .as_ref()
                     .map(|anchor| anchor.uid.clone())
@@ -5746,9 +5754,12 @@ impl KimoApp {
         (where_to_put, laid_out)
     }
 
-    /// What one mail says and nothing around it: the headers, the rule under
-    /// them, the body and the cards of what it came with. The pane pads every
-    /// card (`mail_card`), which is why the padding is not here.
+    /// What one mail says and nothing around it: its head — the sender first,
+    /// with the list's own avatar in front of the name and the mail's own
+    /// actions at that row's right end — then the subject, the addresses and
+    /// the date, the rule under them, the body, and the cards of what it came
+    /// with. The pane pads every card (`mail_card`), which is why the
+    /// padding is not here.
     fn mail_sheet(&mut self, ui: &mut egui::Ui, msg: &MailMessage) {
         ui.set_min_width(ui.available_width());
         // The mail's own column: the headers draw across it and so do the
@@ -5757,47 +5768,94 @@ impl KimoApp {
         // widens the ui as it is drawn, and the cards belong to the mail, not
         // to what the mail overflowed by.
         let column = ui.available_width();
-        // The mail's own actions, the title bar's run brought down onto the
-        // mail itself: reply, reply all and forward open their compose right
-        // here — the card comes up under this mail (`ComposeSpot::Pane`) —
-        // and delete takes this one mail, the same `Job::DeleteMessage` the
-        // row's own button sends. The cells are the bar's own
-        // (`titlebar_button` and its glyphs), so the two runs read as one
-        // family; the row runs from the card's right edge, delete outermost
-        // as it is in the bar.
+        // The mail's head: the sender first, with the list's own avatar in
+        // front of them, and the mail's own actions at that row's right end —
+        // the title bar's run brought down onto the mail itself. Reply, reply
+        // all and forward open their compose right here (the card comes up
+        // under this mail, `ComposeSpot::Pane`), and delete takes this one
+        // mail, the same `Job::DeleteMessage` the row's own button sends. The
+        // cells are the bar's own (`card_action_button` — the bar's button in a
+        // smaller square — and the bar's glyphs), so the two runs read as one
+        // family, delete outermost as it is in the bar. The cells are not the
+        // bar's size: on a card they share their row with the sender, and a
+        // 32 pt square would make the row read as a piece of the bar rather
+        // than of the mail.
+        //
+        // The row is laid out from its right end, so the actions take the room
+        // they need and the name is elided against what is left: laid out from
+        // the left, a long sender would push the actions off the card. The
+        // avatar is the message list's own — its circle, the sender's color on
+        // it and their initial — so a mail's head reads as one of the list's
+        // rows lifted onto the pane.
+        let scheme = theme::of(ui.ctx());
         let mut answer = None;
         let mut delete = false;
-        // `Align::Min` for the vertical: the row hugs the top of the card
-        // (the bar's own Center is what centres its cells in the bar's 40 pt
-        // — here it would centre them in the whole pane).
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Min), |ui| {
-            ui.spacing_mut().item_spacing.x = TITLEBAR_BUTTON_GAP;
-            for action in [
-                MailAction::Delete,
-                MailAction::Forward,
-                MailAction::ReplyAll,
-                MailAction::Reply,
-            ] {
-                let response = titlebar_button(ui, true);
-                let color = ui.visuals().text_color();
-                let painter = ui.painter();
-                match action {
-                    MailAction::Reply => paint_reply_icon(painter, response.rect, color),
-                    MailAction::ReplyAll => paint_reply_all_icon(painter, response.rect, color),
-                    MailAction::Forward => paint_forward_icon(painter, response.rect, color),
-                    MailAction::Delete => {
-                        paint_delete_icon(painter, response.rect, color, MAIL_ACTION_GLYPH)
+        let row_height = AVATAR_DIAMETER.max(CARD_ACTION_SIZE);
+        let (head, _) =
+            ui.allocate_exact_size(egui::vec2(column, row_height), egui::Sense::hover());
+        // A scope of the row's own height, so the two layouts inside it
+        // centre in the row — not in what the card has left below it.
+        ui.scope_builder(egui::UiBuilder::new().max_rect(head), |ui| {
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.spacing_mut().item_spacing.x = TITLEBAR_BUTTON_GAP;
+                for action in [
+                    MailAction::Delete,
+                    MailAction::Forward,
+                    MailAction::ReplyAll,
+                    MailAction::Reply,
+                ] {
+                    let response = card_action_button(ui, true);
+                    let color = card_action_color(scheme, response.hovered());
+                    let painter = ui.painter();
+                    match action {
+                        MailAction::Reply => {
+                            paint_reply_icon(painter, response.rect, color, CARD_ACTION_GLYPH)
+                        }
+                        MailAction::ReplyAll => {
+                            paint_reply_all_icon(painter, response.rect, color, CARD_ACTION_GLYPH)
+                        }
+                        MailAction::Forward => {
+                            paint_forward_icon(painter, response.rect, color, CARD_ACTION_GLYPH)
+                        }
+                        MailAction::Delete => {
+                            paint_delete_icon(painter, response.rect, color, CARD_ACTION_GLYPH)
+                        }
+                        _ => unreachable!("the four the head draws"),
                     }
-                    _ => unreachable!("the four the header draws"),
-                }
-                if response.on_hover_text(action.tooltip()).clicked() {
-                    if action == MailAction::Delete {
-                        delete = true;
-                    } else {
-                        answer = Some(action);
+                    if response.on_hover_text(action.tooltip()).clicked() {
+                        if action == MailAction::Delete {
+                            delete = true;
+                        } else {
+                            answer = Some(action);
+                        }
                     }
                 }
-            }
+                // What the actions leave of the row is the sender.
+                ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                    ui.spacing_mut().item_spacing.x = AVATAR_TEXT_GAP;
+                    let (avatar, _) = ui.allocate_exact_size(
+                        egui::Vec2::splat(AVATAR_DIAMETER),
+                        egui::Sense::hover(),
+                    );
+                    let painter = ui.painter();
+                    painter.circle_filled(
+                        avatar.center(),
+                        AVATAR_DIAMETER / 2.0,
+                        sender_color(scheme, &msg.from),
+                    );
+                    painter.text(
+                        avatar.center(),
+                        egui::Align2::CENTER_CENTER,
+                        sender_initial(&msg.from),
+                        egui::FontId::proportional(AVATAR_FONT_SIZE),
+                        scheme.avatar_text,
+                    );
+                    // A long sender is cut with an ellipsis: the head is one
+                    // row, and it is the actions' row.
+                    ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Truncate);
+                    ui.label(egui::RichText::new(msg.from.as_str()).strong());
+                });
+            });
         });
         if let Some(action) = answer {
             self.compose_about(action, ComposeSpot::Pane, msg);
@@ -5811,11 +5869,6 @@ impl KimoApp {
             self.delete_mail(&account_id, &folder, &msg.uid);
         }
         ui.heading(msg.subject.as_str());
-        ui.label(
-            egui::RichText::new(format!("From: {}", msg.from))
-                .small()
-                .weak(),
-        );
         if !msg.to.is_empty() {
             ui.label(
                 egui::RichText::new(format!("To: {}", msg.to))
@@ -6983,6 +7036,15 @@ const MAIL_ACTION_MIN_PADDING: f32 = 16.0;
 /// a 24×24 box, which `glyph_point` scales to this.
 const MAIL_ACTION_GLYPH: f32 = 18.0;
 
+/// The mail card's own action cells and the glyphs in them (`mail_sheet`'s
+/// head row): the title bar's run in a smaller square — `TITLEBAR_BUTTON_GAP`
+/// between the cells, as in the bar, and `titlebar_hover`'s fill under the
+/// pointer, since it is the same kind of cell on another surface. Smaller
+/// because on a card the four share their row with the sender, where in the
+/// bar they share theirs with the window's own controls.
+const CARD_ACTION_SIZE: f32 = 26.0;
+const CARD_ACTION_GLYPH: f32 = 15.0;
+
 /// How long the line above the message list stays there: long enough to read a
 /// path — or that a mail went out — and act on it, short enough not to become
 /// furniture. Whatever it says does not change when the line goes.
@@ -7349,6 +7411,38 @@ fn titlebar_button(ui: &mut egui::Ui, enabled: bool) -> egui::Response {
         egui::Sense::hover()
     };
     let (_, response) = ui.allocate_exact_size(egui::Vec2::splat(TITLEBAR_BUTTON_SIZE), sense);
+    if enabled {
+        titlebar_hover(ui, response)
+    } else {
+        response
+    }
+}
+
+/// The color a mail card's action glyph is drawn in: the scheme's weak text at
+/// rest, the normal text color under the pointer. On a card the four glyphs
+/// sit on the mail's own head, where the text color would make them the
+/// loudest thing on it; the pointer is what says which one is being read, and
+/// the hover fill is under it by then. A list row's own delete button draws
+/// the same way (`text_weak` until the pointer finds it).
+fn card_action_color(scheme: ColorScheme, hovered: bool) -> egui::Color32 {
+    if hovered {
+        scheme.text
+    } else {
+        scheme.text_weak
+    }
+}
+
+/// One of a mail card's own action cells (`mail_sheet`'s head row): the
+/// title bar's button in a smaller square — `CARD_ACTION_SIZE` against
+/// `TITLEBAR_BUTTON_SIZE` — with the same rest look and the same hover fill,
+/// the glyph being the caller's either way.
+fn card_action_button(ui: &mut egui::Ui, enabled: bool) -> egui::Response {
+    let sense = if enabled {
+        egui::Sense::click()
+    } else {
+        egui::Sense::hover()
+    };
+    let (_, response) = ui.allocate_exact_size(egui::Vec2::splat(CARD_ACTION_SIZE), sense);
     if enabled {
         titlebar_hover(ui, response)
     } else {
@@ -7776,6 +7870,9 @@ const MESSAGE_ROW_HEIGHT: f32 = 68.0;
 const SELECT_ALL_HEIGHT_I8: i8 = 32;
 const SELECT_ALL_HEIGHT: f32 = SELECT_ALL_HEIGHT_I8 as f32;
 const AVATAR_DIAMETER: f32 = 32.0;
+/// The room between an avatar and the name beside it — the message list's
+/// own gap, kept by the pane's sender row so the two read alike.
+const AVATAR_TEXT_GAP: f32 = 10.0;
 /// The checkbox a row draws where its avatar would be — select mode's control,
 /// and the way into the mode — with the room its click target keeps around the
 /// box on every side, which is also the rounded fill it shows under the
@@ -8739,9 +8836,11 @@ fn paint_compose_icon(p: &egui::Painter, rect: egui::Rect, color: egui::Color32)
 
 /// Reply: an arrow curving back to the left, its shaft turning down at the
 /// tail. Every part is an open path, so the glyph reads as a line drawing like
-/// the rest of the bar's icons.
-fn paint_reply_icon(p: &egui::Painter, rect: egui::Rect, color: egui::Color32) {
-    let g = |x: f32, y: f32| glyph_point(rect.center(), x, y);
+/// the rest of the bar's icons. `size` is the glyph's own, as in
+/// `paint_delete_icon`: the bar's cells draw it at `MAIL_ACTION_GLYPH`, the
+/// mail card's smaller ones at `CARD_ACTION_GLYPH`.
+fn paint_reply_icon(p: &egui::Painter, rect: egui::Rect, color: egui::Color32, size: f32) {
+    let g = |x: f32, y: f32| outline_point(rect.center(), x, y, size);
     let stroke = egui::Stroke::new(1.5_f32, color);
     p.add(egui::Shape::line(
         vec![g(20.0, 18.0), g(20.0, 16.0)],
@@ -8755,9 +8854,10 @@ fn paint_reply_icon(p: &egui::Painter, rect: egui::Rect, color: egui::Color32) {
     ));
 }
 
-/// Reply all: reply's arrow with a second head behind the first.
-fn paint_reply_all_icon(p: &egui::Painter, rect: egui::Rect, color: egui::Color32) {
-    let g = |x: f32, y: f32| glyph_point(rect.center(), x, y);
+/// Reply all: reply's arrow with a second head behind the first. Drawn at
+/// `size`, like `paint_reply_icon`.
+fn paint_reply_all_icon(p: &egui::Painter, rect: egui::Rect, color: egui::Color32, size: f32) {
+    let g = |x: f32, y: f32| outline_point(rect.center(), x, y, size);
     let stroke = egui::Stroke::new(1.5_f32, color);
     p.add(egui::Shape::line(
         vec![g(22.0, 18.0), g(22.0, 16.0)],
@@ -8775,9 +8875,10 @@ fn paint_reply_all_icon(p: &egui::Painter, rect: egui::Rect, color: egui::Color3
     ));
 }
 
-/// Forward: reply's arrow mirrored — it leaves to the right instead.
-fn paint_forward_icon(p: &egui::Painter, rect: egui::Rect, color: egui::Color32) {
-    let g = |x: f32, y: f32| glyph_point(rect.center(), x, y);
+/// Forward: reply's arrow mirrored — it leaves to the right instead. Drawn at
+/// `size`, like `paint_reply_icon`.
+fn paint_forward_icon(p: &egui::Painter, rect: egui::Rect, color: egui::Color32, size: f32) {
+    let g = |x: f32, y: f32| outline_point(rect.center(), x, y, size);
     let stroke = egui::Stroke::new(1.5_f32, color);
     p.add(egui::Shape::line(vec![g(4.0, 18.0), g(4.0, 16.0)], stroke));
     glyph_tail(p, g(4.0, 16.0), g(4.0, 12.0), g(8.0, 12.0), stroke);
@@ -11675,11 +11776,25 @@ mod tests {
         app.selected_mails
             .insert(MailKey::new("acct", "INBOX", "1"));
         assert!(
-            fill_under_the_pointer(&ctx, &mut app, 1400.0, cell(MailAction::Reply)).is_none(),
+            fill_under_the_pointer(
+                &ctx,
+                &mut app,
+                1400.0,
+                cell(MailAction::Reply),
+                TITLEBAR_BUTTON_SIZE
+            )
+            .is_none(),
             "a disabled action does not fill under the pointer"
         );
         assert!(
-            fill_under_the_pointer(&ctx, &mut app, 1400.0, cell(MailAction::Delete)).is_some(),
+            fill_under_the_pointer(
+                &ctx,
+                &mut app,
+                1400.0,
+                cell(MailAction::Delete),
+                TITLEBAR_BUTTON_SIZE
+            )
+            .is_some(),
             "Delete is the one left live in select mode"
         );
     }
@@ -12760,19 +12875,22 @@ mod tests {
         }
     }
 
-    /// What the pointer fills when it is put at `center`: the cell under it, if
-    /// the bar drew one. The pointer is moved in one frame and the shapes are
-    /// read from the next — egui hit-tests against the last frame's rects, so a
-    /// single frame would still be filling the cell the pointer left.
+    /// What the pointer fills when it is put at `center`: the `size`-square cell
+    /// under it, if the surface there drew one — the bar's cells at
+    /// `TITLEBAR_BUTTON_SIZE`, a mail card's at `CARD_ACTION_SIZE`. The pointer is
+    /// moved in one frame and the shapes are read from the next — egui
+    /// hit-tests against the last frame's rects, so a single frame would still
+    /// be filling the cell the pointer left.
     fn fill_under_the_pointer(
         ctx: &egui::Context,
         app: &mut KimoApp,
         width: f32,
         center: egui::Pos2,
+        size: f32,
     ) -> Option<egui::epaint::RectShape> {
         frame_shapes_with(ctx, app, width, vec![egui::Event::PointerMoved(center)]);
         let shapes = frame_shapes_with(ctx, app, width, Vec::new());
-        fills_of_size(&shapes, egui::Vec2::splat(TITLEBAR_BUTTON_SIZE))
+        fills_of_size(&shapes, egui::Vec2::splat(size))
             .into_iter()
             .find(|fill| fill.rect.center() == center)
     }
@@ -12947,8 +13065,9 @@ mod tests {
         }
 
         for center in cells {
-            let filled = fill_under_the_pointer(&ctx, &mut app, 1400.0, center)
-                .unwrap_or_else(|| panic!("nothing filled under {center:?}"));
+            let filled =
+                fill_under_the_pointer(&ctx, &mut app, 1400.0, center, TITLEBAR_BUTTON_SIZE)
+                    .unwrap_or_else(|| panic!("nothing filled under {center:?}"));
             assert_eq!(filled.rect.center(), center);
             assert_eq!(
                 filled.corner_radius,
@@ -14030,19 +14149,21 @@ mod tests {
         }
     }
 
-    /// Where a mail's header action cells sit, on the pane's first card: the
-    /// row above the subject, right-aligned against the card's own padding,
-    /// delete outermost as the title bar has it. `from_right` counts cells
-    /// from the right: 0 delete, 1 forward, 2 reply all, 3 reply.
+    /// Where a mail's action cells sit, on the pane's first card: the right
+    /// end of its head row — the sender's own row, above the subject —
+    /// against the card's own padding, delete outermost as the title bar has
+    /// it. `from_right` counts cells from the right: 0 delete, 1 forward,
+    /// 2 reply all, 3 reply.
     fn header_action_center(from_right: usize) -> egui::Pos2 {
-        let stride = TITLEBAR_BUTTON_SIZE + TITLEBAR_BUTTON_GAP;
+        let stride = CARD_ACTION_SIZE + TITLEBAR_BUTTON_GAP;
+        let row_height = AVATAR_DIAMETER.max(CARD_ACTION_SIZE);
         egui::pos2(
             1400.0
                 - CONTENT_GUTTER
                 - CONTENT_PADDING.x
-                - TITLEBAR_BUTTON_SIZE / 2.0
+                - CARD_ACTION_SIZE / 2.0
                 - stride * from_right as f32,
-            TITLEBAR_HEIGHT + CONTENT_GUTTER + CONTENT_PADDING.y + TITLEBAR_BUTTON_SIZE / 2.0,
+            TITLEBAR_HEIGHT + CONTENT_GUTTER + CONTENT_PADDING.y + row_height / 2.0,
         )
     }
 
@@ -14151,6 +14272,110 @@ mod tests {
         );
     }
 
+    /// A mail's head is its sender: the list's own avatar at the card's
+    /// top-left, the sender's name beside it, and the mail's four actions at
+    /// that row's right end — all of it above the subject, which is what the
+    /// row is there for. The address line the card used to draw is gone with
+    /// it: the sender is the head, not a `From:` label under one.
+    #[test]
+    fn a_mails_card_puts_its_sender_first_with_the_actions_on_that_row() {
+        let ctx = egui::Context::default();
+        crate::fonts::install(&ctx, None, None);
+        let mut app = app_with_messages(&ctx, 3);
+        app.selected_message = Some("0".to_string());
+        let shapes = frame_shapes_at(&ctx, &mut app, 1400.0);
+
+        // The avatar is the list's own circle, in the card's own padding —
+        // the row the action cells are centred in.
+        let pane = egui::Rect::from_min_max(
+            egui::pos2(app.list_column.right(), 0.0),
+            egui::pos2(1400.0, 900.0),
+        );
+        let avatars = avatars_in(&shapes, pane);
+        assert_eq!(avatars.len(), 1, "the head draws one avatar: {avatars:?}");
+        let (centre, diameter) = avatars[0];
+        assert!((diameter - AVATAR_DIAMETER).abs() < 0.5);
+        let card_top = TITLEBAR_HEIGHT + CONTENT_GUTTER;
+        assert!(
+            (centre.x - (pane.left() + CONTENT_GUTTER + CONTENT_PADDING.x + AVATAR_DIAMETER / 2.0))
+                .abs()
+                < 1.0
+                && (centre.y - (card_top + CONTENT_PADDING.y + AVATAR_DIAMETER / 2.0)).abs() < 1.0,
+            "the avatar starts the head row: {centre:?}"
+        );
+
+        // The sender is on the card; the `From:` line is not.
+        let texts = frame_texts(&ctx, &mut app);
+        assert!(
+            texts.iter().any(|text| text == "Ada <ada@example.com>"),
+            "the sender's own line is on the card: {texts:?}"
+        );
+        assert!(
+            !texts.iter().any(|text| text.starts_with("From: ")),
+            "the head is the sender, not a From: line: {texts:?}"
+        );
+
+        // The actions are cells of the card's own, smaller than the bar's:
+        // what the pointer fills under one is `CARD_ACTION_SIZE` square,
+        // where a title-bar cell fills the whole `TITLEBAR_BUTTON_SIZE`.
+        let scheme = theme::of(&ctx);
+        let cell = header_action_center(3);
+        let filled = fill_under_the_pointer(&ctx, &mut app, 1400.0, cell, CARD_ACTION_SIZE)
+            .unwrap_or_else(|| panic!("nothing filled under the reply cell at {cell:?}"));
+        assert_eq!(filled.rect.center(), cell);
+        assert_eq!(
+            filled.corner_radius,
+            egui::CornerRadius::same(TITLEBAR_BUTTON_CORNER_RADIUS),
+            "the card's cells fill the way the bar's do"
+        );
+
+        // And the glyph is weak at rest, the text color under the pointer:
+        // the four are on the mail's own head, so none of them shouts until
+        // the pointer says which one is being read.
+        let reply = egui::Rect::from_center_size(cell, egui::Vec2::splat(CARD_ACTION_SIZE));
+        let rest = glyph_colors_in(&shapes, reply);
+        assert!(
+            rest.contains(&scheme.text_weak) && !rest.contains(&scheme.text),
+            "the reply glyph is weak while the pointer is away: {rest:?}"
+        );
+        let hovered = glyph_colors_in(&frame_shapes_at(&ctx, &mut app, 1400.0), reply);
+        assert!(
+            hovered.contains(&scheme.text) && !hovered.contains(&scheme.text_weak),
+            "the pointer brings the reply glyph to the text color: {hovered:?}"
+        );
+    }
+
+    /// The colors a frame drew the line-drawing glyphs inside `rect` in: the
+    /// paths the app's icons are, with text and fills left out.
+    fn glyph_colors_in(
+        shapes: &[egui::epaint::ClippedShape],
+        rect: egui::Rect,
+    ) -> Vec<egui::Color32> {
+        let mut out = Vec::new();
+        for clipped in shapes {
+            collect_glyph_colors(&clipped.shape, rect, &mut out);
+        }
+        out
+    }
+
+    fn collect_glyph_colors(shape: &egui::Shape, rect: egui::Rect, out: &mut Vec<egui::Color32>) {
+        match shape {
+            egui::Shape::Path(path) if path.fill == egui::Color32::TRANSPARENT => {
+                if rect.contains_rect(egui::Rect::from_points(&path.points)) {
+                    if let egui::epaint::ColorMode::Solid(color) = path.stroke.color {
+                        out.push(color);
+                    }
+                }
+            }
+            egui::Shape::Vec(shapes) => {
+                for shape in shapes {
+                    collect_glyph_colors(shape, rect, out);
+                }
+            }
+            _ => {}
+        }
+    }
+
     /// The reading pane's cards, top to bottom: the content-colored fills that
     /// span the pane, gutter to gutter — the mails' cards and, while a compose
     /// is open on the spot, the answer's own under its mail.
@@ -14195,7 +14420,10 @@ mod tests {
         let draft = app.compose.as_ref().expect("the reply opened a draft");
         assert_eq!(app.compose_spot, ComposeSpot::Pane);
         assert_eq!(
-            app.compose_anchor.as_ref().expect("the draft knows its mail").uid,
+            app.compose_anchor
+                .as_ref()
+                .expect("the draft knows its mail")
+                .uid,
             "1"
         );
         assert!(
@@ -14206,7 +14434,11 @@ mod tests {
 
         // The card sits between the two mails, a card gap from each.
         let cards = pane_cards(&ctx, &mut app);
-        assert_eq!(cards.len(), 3, "the answer is a card of the pane: {cards:?}");
+        assert_eq!(
+            cards.len(),
+            3,
+            "the answer is a card of the pane: {cards:?}"
+        );
         assert!(
             (cards[1].top() - cards[0].bottom() - CONVERSATION_CARD_GAP).abs() < 0.5,
             "the answer is right under the mail it answers: {cards:?}"
