@@ -240,19 +240,16 @@ Event (mpsc) ──► drain_events() at frame start ──► merge into Accoun
   batch it emits carries `new_mail` — true only for mail the fetch found
   beyond the folder's mark, so a backfill, a `Load older mail` and the copy
   of a mail just sent are all false — which is what a desktop notification is
-  raised from (see the notifications bullet above). The working
-  mode (Preferences → General; `settings.json`'s `working_mode`, absent meaning
-  the build) can switch the automatic half of that off: in **Debug** neither the
-  startup sweep nor the fetch-on-first-open happens, the cached mail still loads
-  from the database, and only the title-bar Sync button — which only Debug
-  shows, since Release has nothing for it to add — and `Save & sync` in
-  Preferences reach the server. The button sweeps every account and, for the one
-  whose folder is open, fetches that folder even when it has no mark: the column
-  says "Not fetched yet — click Sync in the title bar" for exactly that folder,
-  and a folder with no mark is not part of a sweep — `sync_queue` is what puts
-  it first, so the message is not a lie in the one mode that shows the button. It is a per-installation setting rather than a
-  build flag so that a development build can be pointed at a real account
-  without a sync on every start.
+  raised from (see the notifications bullet above). **Syncing is the app's own
+  business, and there is no mode that switches it off**: the startup sweep and
+  the fetch-on-first-open always happen, and the title bar's Sync cell — always
+  there, beside the cog — asks for the same sweep at any time. It sweeps every
+  account and, for the one whose folder is open, fetches that folder even when
+  it has no mark: the column says "Not fetched yet — click Sync in the title
+  bar" for exactly that folder, and a folder with no mark is not part of a
+  sweep — `sync_queue` is what puts it first, so the message is not a lie.
+  The only sync nobody presses for is the clock in the automatic-sync bullet
+  below, and that is a preference which is off unless it is asked for.
 - Older mail is fetched on demand: the message list floats a `Load older mail`
   button over its foot when the list is at its end and the folder's marks say
   the server has mail below everything here, and one click is a `Job::LoadOlder`
@@ -421,8 +418,7 @@ Event (mpsc) ──► drain_events() at frame start ──► merge into Accoun
 - `~/.config/kimo/settings.json` — UI settings: the theme
   (`system`/`light`/`dark`; "system" resolves via GTK/KDE config files, no
   subprocesses or D-Bus), `html_renderer` (`egui`/`blitz`, absent means
-  `egui`), `working_mode` (`debug`/`release`, absent means the build — see the
-  syncing bullet above), `threaded` (whether the message list groups mail into
+  `egui`), `threaded` (whether the message list groups mail into
   conversations; absent means the app's own default, which is on), `auto_sync`
   and `auto_sync_minutes` (the automatic sync's switch and its interval, both
   absent by default — see the automatic-sync bullet below), `notifications`
@@ -917,17 +913,21 @@ Event (mpsc) ──► drain_events() at frame start ──► merge into Accoun
   rounded-rectangle outline whose top-right corner is left *open*, and the pen
   is the straight stroke that crosses exactly there: no stroke of the page ever
   touches it, which is what says the pen is writing on the page rather than
-  lying on top of it), the icon-only sync button (Debug mode only:
-  Release syncs on its own), the search box (a field with the magnifier inside
+  lying on top of it), the search box (a field with the magnifier inside
   it, one widget,
   whose click opens the search popup), the group of mail actions
   (`titlebar_mail_actions`: reply, reply all, forward, label, flag, export,
   delete, one drawing function per glyph, each from a 24×24 outline through
   `glyph_point`
   and placed `MAIL_ACTION_PADDING` to the right of the search box), the
+  icon-only **Sync now** cell, the
   preferences cog, drag area,
   double-click maximize, and the
-  minimize/maximize/close buttons sent as `ViewportCommand`s. Every button in
+  minimize/maximize/close buttons sent as `ViewportCommand`s. **Sync is not one
+  of the left group's cells**: it is about every account rather than about the
+  mail the pane shows, so it stands with the cog and the window controls, in a
+  rect of its own (`TitlebarRects::sync~) immediately left of the cog, and the
+  status strip's spinners and the middle group end where that cell begins. Every button in
   the bar is one hand-painted cell (`titlebar_button` + `titlebar_hover`): a
   `TITLEBAR_BUTTON_SIZE` (32 pt) square, centred in the bar's height,
   `TITLEBAR_BUTTON_GAP` (6 pt) from the next, flat at rest and filled under the
@@ -935,8 +935,8 @@ Event (mpsc) ──► drain_events() at frame start ──► merge into Accoun
   rather than the full-height square the bar's buttons used to fill. The left
   group, the mail actions and the window controls
   each set their row's `item_spacing.x` to that gap; the cells the bar places at
-  exact x positions rather than in a row — the cog and the window controls —
-  are filled through `titlebar_fill` instead. They are not `egui::Button`s for
+  exact x positions rather than in a row — the sync cell, the cog and the
+  window controls — are filled through `titlebar_fill` instead. They are not `egui::Button`s for
   that reason — a stock button draws a card-colored frame with a border, which
   in a title bar reads as a widget among window chrome. Don't re-enable system
   decorations.
@@ -1249,14 +1249,14 @@ Event (mpsc) ──► drain_events() at frame start ──► merge into Accoun
   refusal keeps the card (and the draft) with the server's words in it, ready
   to be sent again. Adding a way to keep a draft, attach a file or queue a send
   is a decision for the project owner, not an oversight to fix in passing.
-- **The automatic sync is a preference, and the working mode is its outer
-  switch**: `auto_sync` (off unless asked for) sweeps *every* account every
+- **The automatic sync is a preference, and it is the only switch**: the
+  preference `auto_sync` (off unless asked for) sweeps *every* account every
   `auto_sync_minutes` (15 by default, clamped to 1–1440) — `KimoApp::sync_all`,
-  the same sweep the title-bar Sync runs, so an account that is not configured
-  is not asked and a failed one reports itself like any other sync. It runs
-  only while `WorkingMode::syncs_automatically()` holds: a Debug session never
-  syncs on a clock, and the preferences page disables the two controls and says
-  so rather than leaving a switch that does nothing. `pump_auto_sync` is the
+  the same sweep the title-bar Sync cell runs, so an account that is not
+  configured is not asked and a failed one reports itself like any other sync.
+  What it adds to the startup sweep and the button is the clock and nothing
+  else, and the preferences page's controls are live whether or not it is on.
+  `pump_auto_sync` is the
   clock, called once a frame: `auto_sync_wait` is the whole decision (nothing
   while off, otherwise the interval left since the last sweep, never negative),
   and the wait it returns is what the app asks egui to repaint after — no other
@@ -1269,7 +1269,8 @@ Event (mpsc) ──► drain_events() at frame start ──► merge into Accoun
   starts fresh with the process.
 - `preferences_modal()` is the one place to configure Kimo: an
   `egui::Modal` (backdrop click or Escape closes it) with a sidebar of
-  pages — **General** (the working mode and the automatic sync), **Accounts**
+  pages — **General** (the mail list's threading, the automatic sync and the
+  notifications), **Accounts**
   (account list with
   use/edit/remove, and the add/edit account form in place of the list: it is
   pre-filled from the account it was opened on, and `Save & sync` updates that
@@ -1447,11 +1448,12 @@ Event (mpsc) ──► drain_events() at frame start ──► merge into Accoun
   layout has no golden tests. `blitz_render` has a developer tool for
   eyeballing fidelity without the GUI:
   `KIMO_RENDER_HTML=mail.html cargo test -- --ignored dump_render` writes
-  `mail.png` next to the input. `dump_label_ui` is the same idea for the app's
+  `mail.png` next to the input. `dump_ui` is the same idea for the app's
   own frames and needs no compositor at all:
-  `cargo test -- --ignored --nocapture dump_label_ui` drives the clicks
-  itself and rasterizes the frames — the columns, the card, the label popup —
-  straight from egui's own triangles into `target/ui-labels-*.png`
+  `cargo test -- --ignored --nocapture dump_ui` drives the clicks
+  itself and rasterizes the frames — the columns, the card, the label popup,
+  Preferences → General — straight from egui's own triangles into
+  `target/ui-*.png`
   (`KIMO_UI_DUMP` picks another directory), which is how a layout is looked at
   on a machine whose display is somebody else's. Its frames have to go through
   `collect_frame` or a glyph the frame was the first to draw comes out blank:

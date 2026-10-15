@@ -93,11 +93,6 @@ pub struct Settings {
     /// renderer, the default) or "blitz" (full CSS layout, rasterized).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub html_renderer: Option<String>,
-    /// How much Kimo does on its own: "debug" (no automatic syncing) or
-    /// "release" (syncs at startup and fetches a folder when it is first
-    /// opened). Absent means the build — see `KimoApp::working_mode`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub working_mode: Option<String>,
     /// Family name of the UI (proportional) font, as picked in
     /// Preferences → Appearance; absent means egui's built-in font.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -202,7 +197,6 @@ mod tests {
         let s = Settings {
             theme: "dark".into(),
             html_renderer: Some("blitz".into()),
-            working_mode: Some("debug".into()),
             ui_font: Some("DejaVu Sans".into()),
             threaded: Some(false),
             mono_font: Some("DejaVu Sans Mono".into()),
@@ -214,7 +208,6 @@ mod tests {
         let back: Settings = serde_json::from_str(&json).unwrap();
         assert_eq!(back.theme, "dark");
         assert_eq!(back.html_renderer.as_deref(), Some("blitz"));
-        assert_eq!(back.working_mode.as_deref(), Some("debug"));
         assert_eq!(back.ui_font.as_deref(), Some("DejaVu Sans"));
         assert_eq!(back.threaded, Some(false));
         assert_eq!(back.mono_font.as_deref(), Some("DejaVu Sans Mono"));
@@ -225,7 +218,6 @@ mod tests {
         let missing: Settings = serde_json::from_str("{}").unwrap();
         assert_eq!(missing.theme, "");
         assert_eq!(missing.html_renderer, None);
-        assert_eq!(missing.working_mode, None);
         assert_eq!(missing.ui_font, None);
         assert_eq!(missing.mono_font, None);
         assert_eq!(missing.threaded, None, "absent means the app's default");
@@ -235,17 +227,16 @@ mod tests {
             missing.notifications, None,
             "absent means the app's default, which is to announce"
         );
-        // An absent mode is not written back as one: the file stays a file
-        // that says nothing, and the build decides what that means.
-        let unset = Settings::default();
-        assert!(!serde_json::to_string(&unset)
-            .unwrap()
-            .contains("working_mode"));
-        // settings.json written when the web view renderer still existed
-        // carries a render_mode field; it is ignored, not an error.
+        // A key a version wrote and no setting stands behind any more — the
+        // web view renderer left a `render_mode` behind — is ignored rather
+        // than refused, so the file still loads, and it goes when the file is
+        // next written rather than being kept as something that does nothing.
         let legacy: Settings = serde_json::from_str(r#"{"theme":"light","render_mode":"web"}"#)
             .expect("unknown fields must be ignored");
         assert_eq!(legacy.theme, "light");
+        assert!(!serde_json::to_string(&legacy)
+            .unwrap()
+            .contains("render_mode"));
     }
 
     #[test]

@@ -2,9 +2,10 @@
 //! `sync::Event`s drained at the top of every frame; opening a socket happens
 //! only in worker threads.
 //!
-//! Layout: custom title bar on top (nav toggle, sync in Debug mode, search,
-//! then the mail actions — reply, reply all, forward, label, flag, export,
-//! delete — as one flat group a fixed gap to its right, then the preferences
+//! Layout: custom title bar on top (the brand, the nav toggle, the compose
+//! button and the search box, then the mail actions — reply, reply all,
+//! forward, label, flag, export, delete — as one flat group a fixed gap to its
+//! right, and at the right end the sync cell, the preferences
 //! cog and the window controls), then three columns — collapsible
 //! navigation (every account as a collapsible section of its folders), message
 //! list, reading pane.
@@ -90,87 +91,6 @@ impl HtmlRenderer {
                 "Full CSS layout rasterized by a browser engine: closest to the sender's design, but a static image."
             }
         }
-    }
-}
-
-/// How much Kimo does on its own.
-///
-/// `Release` is the ordinary client: it syncs every account at startup and
-/// fetches a folder the first time it is opened. `Debug` keeps every automatic
-/// sync off — for working on the app against a real account — leaving the
-/// title-bar Sync button, which only Debug shows, and `Save & sync` in
-/// Preferences as the only ways to reach the server. The choice lives in
-/// Preferences → General and is
-/// remembered in `settings.json`; a file that names no mode follows the build,
-/// so a debug build starts quiet and a release build behaves as it always has.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum WorkingMode {
-    Debug,
-    Release,
-}
-
-impl WorkingMode {
-    /// The modes, in the order the Preferences radios show them.
-    const ALL: [WorkingMode; 2] = [WorkingMode::Release, WorkingMode::Debug];
-
-    /// What a settings file that says nothing means: how this binary was built.
-    fn from_build() -> Self {
-        if cfg!(debug_assertions) {
-            WorkingMode::Debug
-        } else {
-            WorkingMode::Release
-        }
-    }
-
-    /// Short label for the Preferences radios.
-    fn label(self) -> &'static str {
-        match self {
-            WorkingMode::Debug => "Debug",
-            WorkingMode::Release => "Release",
-        }
-    }
-
-    /// Value stored in `settings.json`.
-    fn as_str(self) -> &'static str {
-        match self {
-            WorkingMode::Debug => "debug",
-            WorkingMode::Release => "release",
-        }
-    }
-
-    /// `None` for anything unrecognised, so a hand-edited file falls back to
-    /// the build instead of silently turning something off.
-    fn parse(value: &str) -> Option<Self> {
-        match value {
-            "debug" => Some(WorkingMode::Debug),
-            "release" => Some(WorkingMode::Release),
-            _ => None,
-        }
-    }
-
-    /// The mode a settings value names, or the build's when it names none.
-    fn from_settings(value: Option<&str>) -> Self {
-        value
-            .and_then(WorkingMode::parse)
-            .unwrap_or_else(WorkingMode::from_build)
-    }
-
-    /// One-line explanation shown under the mode radios.
-    fn description(self) -> &'static str {
-        match self {
-            WorkingMode::Debug => {
-                "No automatic syncing: mail is fetched only when you press Sync, or Save & sync for one account."
-            }
-            WorkingMode::Release => {
-                "Syncs every account at startup and fetches each folder the first time you open it."
-            }
-        }
-    }
-
-    /// Whether Kimo may start a sync nobody asked for. A mode that says no
-    /// still syncs from the title-bar button and from the account form.
-    fn syncs_automatically(self) -> bool {
-        matches!(self, WorkingMode::Release)
     }
 }
 
@@ -768,8 +688,6 @@ pub struct KimoApp {
     inline_textures: HashMap<String, Option<egui::TextureHandle>>,
     /// Which renderer the reading pane uses for HTML bodies.
     html_renderer: HtmlRenderer,
-    /// Whether Kimo may sync without being asked (Preferences → General).
-    working_mode: WorkingMode,
     /// Whether the automatic sync is switched on, how long between its sweeps,
     /// and when the last one ran — or when the app started, so the first is a
     /// full interval away. The preference is in minutes; the clock wants a
@@ -1581,21 +1499,21 @@ impl KimoApp {
         // picked families are applied when the result arrives.
         sync::spawn(Job::ScanFonts, app.ctx.clone(), app.tx.clone());
 
-        // The one sync nobody asks for. Debug mode skips it: the cached mail
-        // still loads from the database, and the title-bar button is there for
-        // when the network is wanted.
-        if app.working_mode.syncs_automatically() {
-            for account in app.accounts.clone() {
-                sync::spawn(
-                    Job::Sync {
-                        account,
-                        purge: false,
-                        folder: None,
-                    },
-                    app.ctx.clone(),
-                    app.tx.clone(),
-                );
-            }
+        // The one sync nobody asks for: every account is swept at startup, so
+        // the list is what the server has rather than what the last session
+        // left. The title-bar button asks for the same sweep whenever it is
+        // wanted, and a query nobody made is still nobody's — the automatic
+        // sync on a clock is the preference, and it is off unless asked for.
+        for account in app.accounts.clone() {
+            sync::spawn(
+                Job::Sync {
+                    account,
+                    purge: false,
+                    folder: None,
+                },
+                app.ctx.clone(),
+                app.tx.clone(),
+            );
         }
 
         app
@@ -1687,7 +1605,6 @@ impl KimoApp {
             stylesheets: HashMap::new(),
             inline_textures: HashMap::new(),
             html_renderer: HtmlRenderer::parse(settings.html_renderer.as_deref().unwrap_or("")),
-            working_mode: WorkingMode::from_settings(settings.working_mode.as_deref()),
             // Absent in settings.json means the app's own defaults: nothing
             // syncs on a timer until it is asked to, and `AUTO_SYNC_MINUTES`
             // apart when it is.
@@ -2115,10 +2032,10 @@ impl KimoApp {
     }
 
     /// The automatic sync: every `auto_sync_every`, and only while the
-    /// preference is on and the working mode allows a sync nobody asked for.
-    /// Nothing else asks for a frame minutes from now, so the wait is what keeps
-    /// the clock ticking — a frame with nothing to draw is not a frame the app
-    /// would otherwise be given.
+    /// preference is on — it is the one sync nobody asks for, and it is off
+    /// unless it was asked for once. Nothing else asks for a frame minutes from
+    /// now, so the wait is what keeps the clock ticking — a frame with nothing
+    /// to draw is not a frame the app would otherwise be given.
     ///
     /// A sweep that is already in flight is left to finish (a second one would
     /// fetch the same mail twice); the clock is set either way, so a busy
@@ -2126,7 +2043,7 @@ impl KimoApp {
     fn pump_auto_sync(&mut self, ctx: &egui::Context) {
         let now = Instant::now();
         let Some(wait) = auto_sync_wait(
-            self.auto_sync && self.working_mode.syncs_automatically(),
+            self.auto_sync,
             self.auto_synced_at,
             self.auto_sync_every,
             now,
@@ -2163,10 +2080,10 @@ impl KimoApp {
             },
             None => false,
         };
-        // A folder nobody has fetched is fetched on the click that opens it —
-        // unless the working mode keeps Kimo off the network, in which case the
-        // column says "Not fetched yet" and the title-bar Sync does the fetch.
-        if !needs_fetch || !self.working_mode.syncs_automatically() {
+        // A folder nobody has fetched is fetched on the click that opens it;
+        // until then the column says "Not fetched yet", which is also what the
+        // title-bar Sync is for.
+        if !needs_fetch {
             return;
         }
         if let Some(account) = self.accounts.iter().find(|a| a.id == account_id).cloned() {
@@ -2749,7 +2666,6 @@ impl KimoApp {
         let _ = storage::save_settings(&Settings {
             theme: self.theme.as_str().to_string(),
             html_renderer: Some(self.html_renderer.as_str().to_string()),
-            working_mode: Some(self.working_mode.as_str().to_string()),
             ui_font: self.ui_font.clone(),
             mono_font: self.mono_font.clone(),
             threaded: Some(self.threaded),
@@ -2974,11 +2890,10 @@ impl KimoApp {
 
     /// Custom window title bar (the window is created undecorated in
     /// `main.rs`). Left to right: the application mark, the nav collapse
-    /// toggle, the compose button, the sync button (Debug mode only), the
-    /// account status, the search box, then the group of mail actions — and,
-    /// at the window's own right end, the preferences cog and minimize /
-    /// maximize / close. The leftover space drags the window (double-click
-    /// toggles maximize).
+    /// toggle, the compose button, the account status, the search box, then the
+    /// group of mail actions — and, at the window's own right end, the sync
+    /// cell, the preferences cog and minimize / maximize / close. The leftover
+    /// space drags the window (double-click toggles maximize).
     ///
     /// The bar is laid out as groups, not as one long row of widgets: the
     /// window's own actions at the left, the cog and the window controls at
@@ -3072,38 +2987,24 @@ impl KimoApp {
                     // every account and its folders, so switching accounts is
                     // picking a folder there. The title bar keeps the global
                     // actions only (add/remove accounts lives in Preferences).
-                    //
-                    // Sync: icon-only, like the window controls — the tooltip
-                    // carries the label. Debug mode is the only one that shows
-                    // it: Release fetches on its own (at startup, and when a
-                    // folder is first opened), while Debug is the mode with no
-                    // automatic syncing, so that is where asking for one has to
-                    // be possible.
-                    if self.working_mode == WorkingMode::Debug {
-                        let sync = titlebar_button(row, true);
-                        paint_sync_icon(row.painter(), sync.rect, visuals.text_color());
-                        if sync.clicked() {
-                            self.sync_all();
-                        }
-                        sync.on_hover_text(
-                            "Sync all accounts — Debug mode does not sync on its own. The \
-                             folder you have open is fetched too, if it was never fetched.",
-                        );
-                    }
+                    // Sync is not one of these cells: it belongs with the cog
+                    // and the window controls at the right end (see below),
+                    // because it is about the whole app rather than about the
+                    // mail the pane shows.
 
                     row.min_rect().right()
                 },
             )
             .inner;
 
-        // --- account status: right-aligned against the cog ---
+        // --- account status: right-aligned against the sync cell ---
         // The spinner of a syncing account, the warning of one whose last sync
         // failed. Held to the right end rather than run after the actions, so
         // that one appearing never moves the search box — and so the strip's
         // own width is a known thing to fit the middle group around.
         let status = egui::Rect::from_min_max(
             egui::pos2(left_end, bar.top()),
-            egui::pos2(rects.cog.min.x.max(left_end), bar.bottom()),
+            egui::pos2(rects.sync.min.x.max(left_end), bar.bottom()),
         );
         let status_left = ui
             .scope_builder(
@@ -3134,7 +3035,7 @@ impl KimoApp {
             .inner;
         // Where the middle group has to stop: the status strip's own left
         // edge, with the item spacing between the two so they are not one
-        // thing — or the cog, when there is no status to show.
+        // thing — or the sync cell, when there is no status to show.
         let middle_right = (status_left
             - if status_left < status.right() {
                 ui.spacing().item_spacing.x
@@ -3331,18 +3232,41 @@ impl KimoApp {
             }
         }
 
-        // --- right group: the cog and the window controls ---
+        // --- right group: sync, the cog and the window controls ---
         // Fixed, and drawn last: they are what the rest of the bar is laid out
         // around, and the one thing a bar of any width keeps. The group's rect
-        // starts at the cog, so the clip is also what says which half of the
-        // bar a shape belongs to (see the no-overlap test in `tests`).
-        let right = egui::Rect::from_min_max(egui::pos2(rects.cog.left(), bar.top()), bar.max);
+        // starts at the sync cell, so the clip is also what says which half of
+        // the bar a shape belongs to (see the no-overlap test in `tests`).
+        let right = egui::Rect::from_min_max(egui::pos2(rects.sync.left(), bar.top()), bar.max);
         ui.scope_builder(
             egui::UiBuilder::new()
                 .max_rect(right)
                 .layout(egui::Layout::left_to_right(egui::Align::Center)),
             |row| {
                 clip_to(row, right);
+                // Sync now: the whole app's mail, from every account, on demand
+                // — what the app does at startup and what the automatic sync
+                // does on its clock, asked for by hand. The cell is the bar's
+                // own, placed at the exact rect the arithmetic carved for it
+                // like the cog and the window controls, and its glyph is the
+                // one the bar's left group used to carry.
+                let sync_resp = titlebar_hover(
+                    row,
+                    row.interact(
+                        rects.sync,
+                        egui::Id::new("titlebar-sync"),
+                        egui::Sense::click(),
+                    ),
+                );
+                paint_sync_icon(row.painter(), rects.sync, visuals.text_color());
+                if sync_resp.clicked() {
+                    self.sync_all();
+                }
+                sync_resp.on_hover_text(
+                    "Sync now — every account is asked for its mail, and the folder you have \
+                     open is fetched too if it was never fetched.",
+                );
+
                 let cog_resp = titlebar_hover(
                     row,
                     row.interact(
@@ -7032,8 +6956,8 @@ impl KimoApp {
         });
     }
 
-    /// Preferences → General: the working mode and the list's threading, both
-    /// persisted on change.
+    /// Preferences → General: the mail list, the automatic sync and the
+    /// notifications, all persisted on change.
     fn general_page(&mut self, ui: &mut egui::Ui) {
         ui.label(egui::RichText::new("Mail list").strong());
         if ui
@@ -7057,43 +6981,9 @@ impl KimoApp {
         ui.separator();
         ui.add_space(8.0);
 
-        ui.label(egui::RichText::new("Working mode").strong());
-        ui.horizontal(|ui| {
-            for mode in WorkingMode::ALL {
-                if ui.radio(self.working_mode == mode, mode.label()).clicked() {
-                    self.working_mode = mode;
-                    self.persist_settings();
-                }
-            }
-        });
-        ui.label(
-            egui::RichText::new(self.working_mode.description())
-                .small()
-                .weak(),
-        );
-        ui.add_space(4.0);
-        ui.label(
-            egui::RichText::new(
-                "A settings file that names no mode follows the build: debug builds start in Debug,                  release builds in Release.",
-            )
-            .small()
-            .weak(),
-        );
-
-        ui.add_space(12.0);
-        ui.separator();
-        ui.add_space(8.0);
-
         ui.label(egui::RichText::new("Automatic sync").strong());
-        // The working mode is the outer switch: a Debug session never syncs on
-        // its own, so the controls are disabled and the line under them says
-        // what they are waiting for rather than doing nothing quietly.
-        let allowed = self.working_mode.syncs_automatically();
         if ui
-            .add_enabled(
-                allowed,
-                egui::Checkbox::new(&mut self.auto_sync, "Sync mail automatically"),
-            )
+            .checkbox(&mut self.auto_sync, "Sync mail automatically")
             .changed()
         {
             // The clock starts now: switching it on does not mean syncing this
@@ -7103,7 +6993,7 @@ impl KimoApp {
         }
         let mut minutes = (self.auto_sync_every.as_secs() / SECS_PER_MINUTE) as u32;
         ui.horizontal(|ui| {
-            ui.add_enabled_ui(allowed && self.auto_sync, |ui| {
+            ui.add_enabled_ui(self.auto_sync, |ui| {
                 ui.label("Every");
                 if ui
                     .add(
@@ -7121,15 +7011,12 @@ impl KimoApp {
             });
         });
         ui.label(
-            egui::RichText::new(if allowed {
-                "Every account is asked for its mail on that clock, and only when \
-                 no sync is already running. Pressing Sync still fetches at once, \
-                 and a folder opened for the first time is still fetched when it is \
-                 opened."
-            } else {
-                "The Debug working mode keeps Kimo off the network, so nothing is \
-                 synced on a clock until the mode is Release."
-            })
+            egui::RichText::new(
+                "Every account is asked for its mail on that clock, and only while no \
+                 sync is already running. Kimo syncs once at startup either way, and \
+                 the title bar's Sync button asks for the same sweep at any time — as \
+                 does opening a folder that was never fetched.",
+            )
             .small()
             .weak(),
         );
@@ -7898,8 +7785,13 @@ const COMPOSE_BODY_HEIGHT: f32 = 320.0;
 struct TitlebarRects {
     /// Room for the bar's own content: the left group, the status strip, the
     /// search box, the mail actions and the drag surface. Empty — never inside
-    /// out — when the window controls and the cog are all the bar can hold.
+    /// out — when the sync cell, the cog and the window controls are all the
+    /// bar can hold.
     content: egui::Rect,
+    /// **Sync now**, immediately left of the cog: the one cell of the bar that
+    /// is about the whole app rather than about the mail the pane shows, which
+    /// is why it stands with the cog instead of with the left group.
+    sync: egui::Rect,
     /// The preferences cog, immediately left of the window controls.
     cog: egui::Rect,
     /// Minimize / maximize / close, ending at the window's right edge.
@@ -7922,11 +7814,13 @@ fn titlebar_rects(bar: egui::Rect, controls: usize) -> TitlebarRects {
     };
     let controls_left = bar.right() - TITLEBAR_EDGE_MARGIN - titlebar_cells_width(controls);
     let cog_left = controls_left - TITLEBAR_BUTTON_GAP - TITLEBAR_BUTTON_SIZE;
+    let sync_left = cog_left - TITLEBAR_BUTTON_GAP - TITLEBAR_BUTTON_SIZE;
     TitlebarRects {
         content: egui::Rect::from_min_max(
             bar.min,
-            egui::pos2(cog_left.clamp(bar.left(), bar.right()), bar.bottom()),
+            egui::pos2(sync_left.clamp(bar.left(), bar.right()), bar.bottom()),
         ),
+        sync: cell(sync_left, TITLEBAR_BUTTON_SIZE),
         cog: cell(cog_left, TITLEBAR_BUTTON_SIZE),
         controls: cell(
             controls_left,
@@ -8218,9 +8112,8 @@ fn auto_sync_interval(minutes: Option<u32>) -> Duration {
 }
 
 /// How long until the automatic sync is next due: `None` when it is not running
-/// at all — switched off in Preferences, or a working mode that keeps Kimo off
-/// the network — and zero from the moment the interval since the last sweep has
-/// passed, however long ago that was.
+/// at all — switched off in Preferences — and zero from the moment the interval
+/// since the last sweep has passed, however long ago that was.
 fn auto_sync_wait(enabled: bool, last: Instant, every: Duration, now: Instant) -> Option<Duration> {
     enabled.then(|| every.saturating_sub(now.saturating_duration_since(last)))
 }
@@ -10071,45 +9964,6 @@ mod tests {
         assert_eq!(HtmlRenderer::Simple.as_str(), "egui");
     }
 
-    #[test]
-    fn the_working_mode_round_trips_and_falls_back_to_the_build() {
-        // The two names the file may carry, and nothing else: a typo or a mode
-        // from a future version is no mode at all, so the build decides rather
-        // than some mode being silently switched off.
-        for mode in WorkingMode::ALL {
-            assert_eq!(WorkingMode::parse(mode.as_str()), Some(mode));
-        }
-        assert_eq!(WorkingMode::parse("debug"), Some(WorkingMode::Debug));
-        assert_eq!(WorkingMode::parse("release"), Some(WorkingMode::Release));
-        assert_eq!(WorkingMode::parse(""), None);
-        assert_eq!(WorkingMode::parse("Debug"), None);
-        assert_eq!(WorkingMode::parse("d3bug"), None);
-
-        assert_eq!(
-            WorkingMode::from_settings(None),
-            WorkingMode::from_build(),
-            "a file that names no mode follows the build"
-        );
-        assert_eq!(
-            WorkingMode::from_settings(Some("nonsense")),
-            WorkingMode::from_build()
-        );
-        assert_eq!(
-            WorkingMode::from_settings(Some("release")),
-            WorkingMode::Release
-        );
-
-        // Only Release reaches the network on its own.
-        assert!(!WorkingMode::Debug.syncs_automatically());
-        assert!(WorkingMode::Release.syncs_automatically());
-        let expected = if cfg!(debug_assertions) {
-            WorkingMode::Debug
-        } else {
-            WorkingMode::Release
-        };
-        assert_eq!(WorkingMode::from_build(), expected);
-    }
-
     /// The interval the preference asks for, and the clamp it is read through:
     /// nothing in settings.json — a hand-edited file included — gets a sweep
     /// every frame, or one a week.
@@ -10996,8 +10850,9 @@ mod tests {
     }
 
     /// The automatic sync is what its preference says: a sweep of every account
-    /// once the interval since the last one is up, nothing before that, and
-    /// nothing at all while the working mode keeps Kimo off the network.
+    /// once the interval since the last one is up, and nothing before that. The
+    /// preference is the whole switch — the title bar's Sync, and the startup
+    /// sweep, are not this clock.
     #[test]
     fn the_automatic_sync_sweeps_when_its_interval_is_up() {
         let ctx = egui::Context::default();
@@ -11008,7 +10863,6 @@ mod tests {
         // question here, not what the server answers.
         app.accounts[0].host = "127.0.0.1".to_string();
         app.accounts[0].port = 1;
-        app.working_mode = WorkingMode::Release;
         app.auto_sync_every = Duration::from_secs(10 * SECS_PER_MINUTE);
 
         // One frame with the clock where the case wants it: what is on the
@@ -11043,14 +10897,54 @@ mod tests {
             "the sweep starts once its interval is up"
         );
 
-        // And the Debug working mode has the last word, however the preference
-        // is set and however overdue the clock is.
-        app.working_mode = WorkingMode::Debug;
+        // And the preference has the last word: switched off, an overdue clock
+        // sweeps nothing, however long it has been overdue.
+        app.auto_sync = false;
         app.auto_synced_at = Instant::now() - Duration::from_secs(3600);
         frame(&mut app);
         assert!(
             !sync_starts_within(&mut app, Duration::from_millis(300)),
-            "the working mode keeps Kimo off the network"
+            "nothing sweeps on a clock nobody asked for"
+        );
+    }
+
+    /// The title bar's Sync asks for a sweep at any time — the app syncs at
+    /// startup on its own, and this is the same sweep by hand. It is what the
+    /// cell means now: "sync now", not "the mode that needs a manual sync".
+    #[test]
+    fn the_sync_cell_asks_for_a_sweep_at_any_time() {
+        let ctx = egui::Context::default();
+        crate::fonts::install(&ctx, None, None);
+        let mut app = app_with_messages(&ctx, 1);
+        // A port with nothing behind it, so the job fails at connect rather
+        // than reaching a server: that it *starts* is the question.
+        app.accounts[0].host = "127.0.0.1".to_string();
+        app.accounts[0].port = 1;
+        app.selected_message = Some("0".to_string());
+        run_app_frame(&ctx, &mut app, Vec::new());
+        while app.rx.try_recv().is_ok() {}
+
+        let bar = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1400.0, TITLEBAR_HEIGHT));
+        let rects = titlebar_rects(bar, 3);
+        // The cell is the bar's own kind of button: it fills under the pointer
+        // with the bar's rounded fill, like the cog beside it.
+        let filled = fill_under_the_pointer(
+            &ctx,
+            &mut app,
+            1400.0,
+            rects.sync.center(),
+            TITLEBAR_BUTTON_SIZE,
+        )
+        .unwrap_or_else(|| panic!("no sync cell at {:?}", rects.sync.center()));
+        assert_eq!(
+            filled.corner_radius,
+            egui::CornerRadius::same(TITLEBAR_BUTTON_CORNER_RADIUS)
+        );
+
+        click_at(&ctx, &mut app, rects.sync.center());
+        assert!(
+            sync_starts_within(&mut app, Duration::from_secs(5)),
+            "the sync cell starts a sweep"
         );
     }
     /// The attachment cards are one run across the mail's column, not one card
@@ -12542,7 +12436,7 @@ mod tests {
         let bar = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1400.0, TITLEBAR_HEIGHT));
         let rects = titlebar_rects(bar, 3);
         let actions = titlebar_cells_width(MailAction::ALL.len());
-        let fit = titlebar_fit(rects.cog.min.x - search.left(), actions);
+        let fit = titlebar_fit(rects.sync.min.x - search.left(), actions);
         assert!(fit.actions, "the bar gave the actions up at 1400 pt");
         let cell = |action: MailAction| {
             let index = MailAction::ALL
@@ -13706,9 +13600,10 @@ mod tests {
             );
             // No two groups overlap. Where the bar is too narrow to hold the
             // fixed ones at all, `content` is simply empty and the bar shows
-            // the cog and the window controls alone.
+            // the sync cell, the cog and the window controls alone.
             for (a, b) in [
-                (rects.content, rects.cog),
+                (rects.content, rects.sync),
+                (rects.sync, rects.cog),
                 (rects.cog, rects.controls),
                 (rects.content, rects.controls),
             ] {
@@ -13718,15 +13613,18 @@ mod tests {
                 );
             }
             // And while there is room for them, they are in that order: what
-            // the right end needs is the cog, the gap, the three controls and
-            // the margin from the window's edge.
+            // the right end needs is the sync cell, its gap, the cog, its gap,
+            // the three controls and the margin from the window's edge.
             let right_end = TITLEBAR_EDGE_MARGIN
+                + TITLEBAR_BUTTON_SIZE
+                + TITLEBAR_BUTTON_GAP
                 + TITLEBAR_BUTTON_SIZE
                 + TITLEBAR_BUTTON_GAP
                 + titlebar_cells_width(3);
             if bar(width).width() >= right_end {
                 assert!(
-                    rects.content.right() <= rects.cog.left()
+                    rects.content.right() <= rects.sync.left()
+                        && rects.sync.right() <= rects.cog.left()
                         && rects.cog.right() <= rects.controls.left(),
                     "{width} pt: the groups are out of order: {rects:?}"
                 );
@@ -13734,6 +13632,7 @@ mod tests {
             // The cells keep their size whatever the bar does: a window too
             // narrow to show them all cuts the ones at its edge off rather
             // than shrinking every control into an unclickable sliver.
+            assert_eq!(rects.sync.width(), TITLEBAR_BUTTON_SIZE, "{width} pt");
             assert_eq!(rects.cog.width(), TITLEBAR_BUTTON_SIZE, "{width} pt");
             assert_eq!(
                 rects.controls.width(),
@@ -13810,15 +13709,11 @@ mod tests {
         let pitch = TITLEBAR_BUTTON_SIZE + TITLEBAR_BUTTON_GAP;
         let middle = TITLEBAR_HEIGHT / 2.0;
 
-        // The left group: the brand icon, then the nav toggle, compose and —
-        // Debug mode's alone — sync, a cell every pitch after it.
+        // The left group: the brand icon, then the nav toggle and compose — the
+        // window's own actions, a cell every pitch after the icon. Sync is not
+        // one of them any more: it stands with the cog at the right end.
         let first_left = TITLEBAR_EDGE_MARGIN + BRAND_ICON_SIZE + TITLEBAR_BUTTON_GAP;
-        let left_cells = if app.working_mode == WorkingMode::Debug {
-            3
-        } else {
-            2
-        };
-        let mut cells: Vec<egui::Pos2> = (0..left_cells)
+        let mut cells: Vec<egui::Pos2> = (0..2)
             .map(|index| {
                 egui::pos2(
                     first_left + index as f32 * pitch + TITLEBAR_BUTTON_SIZE / 2.0,
@@ -13830,7 +13725,7 @@ mod tests {
         // The mail actions: the run starts where the search box ended, the
         // fit's clear chrome further right.
         let actions = titlebar_cells_width(MailAction::ALL.len());
-        let fit = titlebar_fit(rects.cog.min.x - search.left(), actions);
+        let fit = titlebar_fit(rects.sync.min.x - search.left(), actions);
         assert!(fit.actions, "the bar gave the actions up at 1400 pt");
         let left = search.right() + fit.padding;
         for index in 0..MailAction::ALL.len() {
@@ -13840,8 +13735,9 @@ mod tests {
             ));
         }
 
-        // The right end: the cog, then the three window controls, which end
-        // `TITLEBAR_EDGE_MARGIN` short of the window's own edge.
+        // The right end: sync, then the cog, then the three window controls,
+        // which end `TITLEBAR_EDGE_MARGIN` short of the window's own edge.
+        cells.push(rects.sync.center());
         cells.push(rects.cog.center());
         for index in 0..3 {
             cells.push(egui::pos2(
@@ -13865,9 +13761,9 @@ mod tests {
         // The run of actions is the width the fit planned: it ends before the
         // bar's right end begins.
         assert!(
-            left + actions <= rects.cog.min.x,
+            left + actions <= rects.sync.min.x,
             "the run draws {} pt into the bar's right end",
-            left + actions - rects.cog.min.x
+            left + actions - rects.sync.min.x
         );
     }
 
@@ -13989,13 +13885,14 @@ mod tests {
             let bar =
                 egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(width, TITLEBAR_HEIGHT));
             let rects = titlebar_rects(bar, 3);
-            // The bar's own right end: the cog and the window controls, from
-            // the cog's left edge to the window's corner. That is the rect the
-            // right group draws through — its cells are `TITLEBAR_BUTTON_SIZE`
-            // squares inside it — so a shape clipped to it is the group's own,
-            // and anything else that reaches into it is what this catches.
+            // The bar's own right end: the sync cell, the cog and the window
+            // controls, from the sync cell's left edge to the window's corner.
+            // That is the rect the right group draws through — its cells are
+            // `TITLEBAR_BUTTON_SIZE` squares inside it — so a shape clipped to it
+            // is the group's own, and anything else that reaches into it is what
+            // this catches.
             let right_end =
-                egui::Rect::from_min_max(egui::pos2(rects.cog.left(), bar.top()), bar.max);
+                egui::Rect::from_min_max(egui::pos2(rects.sync.left(), bar.top()), bar.max);
             for clipped in frame_shapes_at(&ctx, &mut app, width) {
                 // What the frame actually shows of the shape: the bar clips
                 // its groups, and egui clips the window.
@@ -14020,10 +13917,10 @@ mod tests {
                     continue;
                 }
                 assert!(
-                    visible.right() <= rects.cog.left() + 0.5,
+                    visible.right() <= rects.sync.left() + 0.5,
                     "at {width} pt the bar drew {visible:?} into the window controls, which \
                      start at {}: it was drawn through {clip:?}",
-                    rects.cog.left(),
+                    rects.sync.left(),
                     clip = clipped.clip_rect
                 );
             }
@@ -15432,7 +15329,7 @@ mod tests {
         let bar = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(width, TITLEBAR_HEIGHT));
         let rects = titlebar_rects(bar, 3);
         let cells = titlebar_cells_width(MailAction::ALL.len());
-        let fit = titlebar_fit(rects.cog.min.x - search.left(), cells);
+        let fit = titlebar_fit(rects.sync.min.x - search.left(), cells);
         assert!(fit.actions, "the bar gave the actions up at {width} pt");
         let index = MailAction::ALL
             .iter()
@@ -15581,13 +15478,14 @@ mod tests {
     }
 
     /// Developer tool (there is no compositor at hand in a test): draw a few
-    /// frames of the label UI and write them out as PNGs, so the layout can be
+    /// frames — the labelled list and card, the label filter and popup, and
+    /// Preferences → General — and write them out as PNGs, so the layout can be
     /// looked at. `KIMO_UI_DUMP` picks the directory (default `target`).
     ///
-    ///     cargo test -- --ignored --nocapture dump_label_ui
+    ///     cargo test -- --ignored --nocapture dump_ui
     #[test]
-    #[ignore = "developer tool: writes PNGs of the label UI and asserts nothing"]
-    fn dump_label_ui() {
+    #[ignore = "developer tool: writes PNGs of a few frames and asserts nothing"]
+    fn dump_ui() {
         let ctx = egui::Context::default();
         crate::fonts::install(&ctx, None, None);
         let mut app = app_with_two_accounts(&ctx, 3);
@@ -15620,6 +15518,17 @@ mod tests {
         shot(&mut app, "ui-labels-filter.png", &mut textures);
         dump_click(&ctx, &mut app, &mut textures, header_action_center(1));
         shot(&mut app, "ui-labels-popup.png", &mut textures);
+        // And Preferences → General, where the sync settings live. The label
+        // popup is dismissed first — a menu left open over the columns would be
+        // half the picture — and the modal itself is an `Area`, which lays
+        // itself out on the frame it is opened on and draws on the next: one
+        // frame first, or the picture would be of a window with no modal in it.
+        egui::Popup::close_all(&ctx);
+        app.show_preferences = true;
+        app.prefs_tab = PrefsTab::General;
+        collect_frame(&ctx, &mut app, &mut textures, Vec::new());
+        shot(&mut app, "ui-general.png", &mut textures);
+        app.show_preferences = false;
     }
 
     /// One headless frame of the app, rasterized straight from egui's own
