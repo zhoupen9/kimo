@@ -879,7 +879,9 @@ Event (mpsc) ──► drain_events() at frame start ──► merge into Accoun
   In select mode the mail actions' Delete is the only live cell
   (`mail_action_enabled`): reply, reply all, forward, label, flag and export are
   all about the one mail the reading pane shows, which is not what the click was
-  about, so they are drawn dimmed with a tooltip saying so. Delete takes the
+  about, so they are drawn dimmed with a tooltip saying so. A checked selection
+  is also the one thing that keeps the run on the bar with no mail open — the
+  pane's row waits for a mail otherwise (`titlebar_anchors`). Delete takes the
   selection — `delete_batches` groups the checked mail by account and folder,
   since a selection made over a search's hits spans folders, and each group is
   one `Job::DeleteMessage` on one connection — the rows go as the events come
@@ -906,8 +908,10 @@ Event (mpsc) ──► drain_events() at frame start ──► merge into Accoun
   embedded PNG the tray serves, downscaled once at startup because egui has
   no mipmaps to filter a 256 px source down to 18 pt), the nav collapse
   toggle, the compose button (the one mail action that needs no mail open, so
-  it sits beside the toggle rather than in the group on the right, which acts
-  on the mail in the reading pane; its glyph is a page with a pen writing on it
+  it sits beside the toggle rather than with the other actions over the reading
+  pane; **those three are the bar's first group**, and the one thing in the bar
+  that never gives way — compose is always available, so it is always there; its
+  glyph is a page with a pen writing on it
   — `paint_compose_icon`, one of the bar's own 24×24 outlines like the mail
   actions' below — where the icon set's pencil used to be. The page is a
   rounded-rectangle outline whose top-right corner is left *open*, and the pen
@@ -918,16 +922,39 @@ Event (mpsc) ──► drain_events() at frame start ──► merge into Accoun
   whose click opens the search popup), the group of mail actions
   (`titlebar_mail_actions`: reply, reply all, forward, label, flag, export,
   delete, one drawing function per glyph, each from a 24×24 outline through
-  `glyph_point`
-  and placed `MAIL_ACTION_PADDING` to the right of the search box), the
+  `glyph_point`), the
   icon-only **Sync now** cell, the
   preferences cog, drag area,
   double-click maximize, and the
-  minimize/maximize/close buttons sent as `ViewportCommand`s. **Sync is not one
-  of the left group's cells**: it is about every account rather than about the
-  mail the pane shows, so it stands with the cog and the window controls, in a
-  rect of its own (`TitlebarRects::sync~) immediately left of the cog, and the
-  status strip's spinners and the middle group end where that cell begins. Every button in
+  minimize/maximize/close buttons sent as `ViewportCommand`s.
+  **The two middle groups are anchored to the columns under them**, not to the
+  room left over (`titlebar_anchors`): the box starts at the message list's own
+  left edge and the run at the reading pane's, so each sits over the column it
+  belongs to and follows that column's splitter — and each is clamped clear of
+  the first group, which is what keeps the box off the brand when the navigation
+  is collapsed and the list runs to the window's own edge. The box is the one
+  thing the bar gives up as a window narrows: its own width, then its floor
+  (`TITLEBAR_SEARCH_FLOOR`), then nothing, with the search popup still a Ctrl+F
+  away (`titlebar_search_width`).
+  **The pane's run waits for a mail**: it is drawn only while one is open, or a
+  selection is checked (which is what Delete takes), because seven dead glyphs
+  over an empty pane said nothing and cluttered the bar. It comes and goes over
+  `MAIL_ACTION_FADE_TIME` rather than blinking, and it is given up — not
+  squeezed — when the pane has no room for it beside the window controls: it may
+  sit over the pane's own edge by up to `MAIL_ACTION_OVERHANG` (the card's
+  margin) and never within `MAIL_ACTION_EDGE_GAP` of the controls, and where it
+  cannot be this pane's run any more the mail's own card head carries the same
+  cells.
+  **Sync is not one of the first group's cells**: it is about every account
+  rather than about the mail the pane shows, so it stands with the cog and the
+  window controls, in a rect of its own (`TitlebarRects::sync`) immediately left
+  of the cog — **and it is where the app's sync state is shown**: a spinner in
+  place of the glyph while any account is syncing, a dot in the corner when one's
+  last sync failed, and the accounts' own words in the tooltip. That is what the
+  status strip beside it used to say, one glyph at a time. Folding it into the
+  cell a sweep is asked for from is what leaves the pane's run its room at the
+  default window width, and it means nothing in the bar moves or reflows when a
+  sync starts. Every button in
   the bar is one hand-painted cell (`titlebar_button` + `titlebar_hover`): a
   `TITLEBAR_BUTTON_SIZE` (32 pt) square, centred in the bar's height,
   `TITLEBAR_BUTTON_GAP` (6 pt) from the next, flat at rest and filled under the
@@ -967,14 +994,15 @@ Event (mpsc) ──► drain_events() at frame start ──► merge into Accoun
   The mail actions are the bar's own cells, seven of them in a run: the same
   squares the rest of the bar's buttons are, laid out by a scope of their own
   whose `item_spacing.x` is `TITLEBAR_BUTTON_GAP`. The run's width is one
-  function, `titlebar_cells_width`, which the fit plans the room with and the
-  bar draws it with — the window controls are measured with the same function,
-  so a cell cannot come out one size in one group and another size in the next.
-  A glyph is `MAIL_ACTION_GLYPH` (18 pt) off its 24×24 outline, which leaves it
-  7 pt of padding inside the cell. The run is deliberately not a framed group:
-  the bar stays chrome plus flat icons, and the seven are held together by the
-  clear chrome that sets them apart from the search box
-  (`MAIL_ACTION_PADDING`) rather than by a pill. The seven enable and disable
+  function, `titlebar_cells_width`, which places it over the reading pane and
+  which the window controls are measured with — so a cell cannot come out one
+  size in one group and another size in the next. A glyph is
+  `MAIL_ACTION_GLYPH` (18 pt) off its 24×24 outline, which leaves it 7 pt of
+  padding inside the cell. The run is deliberately not a framed group: the bar
+  stays chrome plus flat icons, and the seven are held together by the clear
+  chrome that sets them apart from the search box (`TITLEBAR_GROUP_GAP`) rather
+  than by a pill — the same gap, not an elastic one, because the two groups are
+  anchored to their columns now. The seven enable and disable
   together, on `mail_action_enabled`: in view mode that is
   `has_selected_message` — the reading pane's own lookup, so a uid the pane no
   longer shows counts as no mail — while select mode leaves Delete alone live
@@ -1006,11 +1034,13 @@ Event (mpsc) ──► drain_events() at frame start ──► merge into Accoun
   narrow window used to eat was the window controls: the row simply drew past
   the end of the bar, and the search box and the mail cells landed on
   minimize / maximize / close. `titlebar_rects` carves the bar into the room for
-  its own content (`content`: everything left of the cog) and the fixed right end
-  — the cog, a gap, the three window controls, ending `TITLEBAR_EDGE_MARGIN`
-  short of the window's edge, the count coming from `titlebar`'s own button
-  list so the two cannot drift — and `titlebar_fit` decides what the room
-  between them holds. Those two rects are a cell's own band rather than the
+  its own content (`content`: everything left of the sync cell) and the fixed
+  right end — the sync cell, a gap, the cog, a gap, the three window controls,
+  ending `TITLEBAR_EDGE_MARGIN` short of the window's edge, the count coming
+  from `titlebar`'s own button list so the two cannot drift — while the two
+  middle groups are placed from the columns below them (`titlebar_anchors`),
+  which is what makes the bar read as a map of what is under it rather than as a
+  row of things that happen to be in it. Those two rects are a cell's own band rather than the
   bar's full height, since a button is 32 pt in a 40 pt bar; `content` is the
   one rect that is the bar's own shape. Every group is
   drawn in a rect of its own, its own `UiBuilder::max_rect` and its own
@@ -1022,29 +1052,22 @@ Event (mpsc) ──► drain_events() at frame start ──► merge into Accoun
   drawing to it by sorting a frame's shapes by the clip they were drawn through,
   which is what tells the bar's right end from a widget that has wandered into
   it — what the old bar did at every width under about 970 pt.
-  The room is given up in one order (`titlebar_fit`, pinned by
-  `the_title_bar_gives_its_room_up_in_one_order`): the clear chrome in front of
-  the mail actions closes from `MAIL_ACTION_PADDING` down to
-  `MAIL_ACTION_MIN_PADDING` first, then the actions leave — as the one group
-  they are, because half a run of seven reads as a mistake rather than as a
-  smaller bar — and only then does the search box narrow, down to
-  `TITLEBAR_SEARCH_FLOOR` and no further, with the box itself the last thing to
-  go. The window's own buttons are what the bar keeps to the end, and every width
-  is monotone in the room, so resizing a window never flickers between two
-  shapes. The account status strip is right-aligned against the cog rather than
-  run after the actions, so a spinner appearing does not move the search box, and
-  the width it measures is what the middle group is fitted around; the actions
-  are placed at an exact x rather than by the row's item spacing, so the gap in
-  front of them is the fit's and not a leftover; and where the box really ended
-  (not where the arithmetic expected it to) is where they start, with the group
-  simply not drawn if the room has run out by then. The fit and the widget also
+  The box is the one thing given up, and in one order (`titlebar_search_width`,
+  pinned by `the_title_bar_gives_its_room_up_in_one_order`): its own width
+  while there is room, its floor while the room is short, and nothing below that,
+  with the search popup still a Ctrl+F away. Every width is monotone in the room,
+  so resizing a window never flickers between two shapes. The pane's run has its
+  own rule instead — it is not the room's leftovers, it is the pane's row: it is
+  placed at the pane's edge (or over it by no more than `MAIL_ACTION_OVERHANG`),
+  and given up when the window controls leave no room for it there, which the
+  mail's card head answers for. The plan and the widget also
   have to agree on what "the box's width" means: `TextEdit::desired_width` is the
   *whole* box in 0.36, the margins coming out of it rather than being added to
   it, which is why the rect the widget hands back — the frame, not the inner text
   rect — is used as the box as it is. Re-adding those margins, as the 0.31-era
   code did, puts the magnifier 22 pt left of the box, over the compose cell, and
   stretches the click target over it. The test named
-  `the_search_box_is_as_wide_as_the_fit_planned` is what keeps the fit's number
+  `the_search_box_is_as_wide_as_it_was_planned` is what keeps the plan's number
   and the widget's the same one.
 - The frosted backdrop is hand-written GPU code (`src/glass.rs`), because egui
   has no blur: nothing in the painter can sample what has already been drawn.
@@ -1266,7 +1289,12 @@ Event (mpsc) ──► drain_events() at frame start ──► merge into Accoun
   clock is reset by `sync_all` itself, so pressing Sync is not a reason to be
   swept a moment later. Changing the preference restarts the clock, and the
   preference is what `settings.json` keeps — the timer is not persisted and
-  starts fresh with the process.
+  starts fresh with the process. **A sweep shows itself in the sync cell**, not
+  in a strip of its own: a spinner takes the glyph's place while
+  `sync_in_flight` holds, a dot sits in the cell's corner while an account's last
+  sync stands failed, and the accounts' own words — "syncing…", the error — are
+  in the tooltip. What the bar shows of a sync is therefore in the control that
+  starts one, and nothing else in the bar has to move aside for it.
 - `preferences_modal()` is the one place to configure Kimo: an
   `egui::Modal` (backdrop click or Escape closes it) with a sidebar of
   pages — **General** (the mail list's threading, the automatic sync and the

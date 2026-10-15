@@ -2896,9 +2896,10 @@ impl KimoApp {
     /// space drags the window (double-click toggles maximize).
     ///
     /// The bar is laid out as groups, not as one long row of widgets: the
-    /// window's own actions at the left, the cog and the window controls at
-    /// the right, the status strip against them, and the search box and the
-    /// mail actions in the room between (`titlebar_rects`, `titlebar_fit`).
+    /// first group at the left — the brand, the nav toggle and the pen, which
+    /// never give way — the sync cell, the cog and the window controls at the
+    /// right, and the search box and the mail actions anchored to the columns
+    /// under them (`titlebar_rects`, `titlebar_anchors`).
     /// Every group is drawn inside a rect of its own, clipped to it, and two
     /// things follow from that: a bar too narrow for what it carries gives
     /// pieces up in a stated order instead of stacking them on top of one
@@ -2997,230 +2998,213 @@ impl KimoApp {
             )
             .inner;
 
-        // --- account status: right-aligned against the sync cell ---
-        // The spinner of a syncing account, the warning of one whose last sync
-        // failed. Held to the right end rather than run after the actions, so
-        // that one appearing never moves the search box — and so the strip's
-        // own width is a known thing to fit the middle group around.
-        let status = egui::Rect::from_min_max(
-            egui::pos2(left_end, bar.top()),
-            egui::pos2(rects.sync.min.x.max(left_end), bar.bottom()),
+        // --- the list's search box and the pane's mail actions ---
+        // The bar's two anchored groups (`titlebar_anchors`): the box sits at
+        // the message list's own left edge and the run at the reading pane's, so
+        // each is over the column it belongs to and follows that column's
+        // splitter. The first group is the one thing between them that never
+        // gives way — the compose button needs no mail open — and both anchors
+        // are clamped clear of it.
+        let pane_left = if self.pane_popup {
+            0.0
+        } else {
+            self.list_column.right()
+        };
+        let anchors = titlebar_anchors(
+            bar,
+            left_end,
+            self.list_column.left(),
+            pane_left,
+            rects.sync.left(),
         );
-        let status_left = ui
-            .scope_builder(
-                egui::UiBuilder::new()
-                    .max_rect(status)
-                    .layout(egui::Layout::right_to_left(egui::Align::Center)),
-                |row| {
-                    clip_to(row, status);
-                    let mut left = status.right();
-                    for account in &self.accounts {
-                        let Some(state) = self.states.get(&account.id) else {
-                            continue;
-                        };
-                        let response = if state.syncing {
-                            row.add(egui::Spinner::new().color(scheme.accent))
-                                .on_hover_text(format!("{}: syncing…", account.name))
-                        } else if let Some(err) = &state.error {
-                            row.label(egui::RichText::new("⚠").color(scheme.danger))
-                                .on_hover_text(format!("{}: {err}", account.name))
-                        } else {
-                            continue;
-                        };
-                        left = left.min(response.rect.left());
-                    }
-                    left
-                },
-            )
-            .inner;
-        // Where the middle group has to stop: the status strip's own left
-        // edge, with the item spacing between the two so they are not one
-        // thing — or the sync cell, when there is no status to show.
-        let middle_right = (status_left
-            - if status_left < status.right() {
-                ui.spacing().item_spacing.x
-            } else {
-                0.0
-            })
-        .max(left_end);
-
-        // --- middle group: the search box and the mail actions ---
-        // What the room between the left group and the status can hold. The
-        // bar gives that room up in one order (`titlebar_fit`): the clear
-        // chrome in front of the actions, then the actions themselves as the
-        // one group they are, and only then the box's own width.
-        //
-        // The run is `MailAction::ALL.len()` of the bar's own cells, which is
-        // what the fit has to find room for.
-        let actions_width = titlebar_cells_width(MailAction::ALL.len());
-        let mut middle_end = left_end;
-        if middle_right > left_end {
+        // The room the box has: up to whatever stands next to it on the right —
+        // the pane's run, or the window controls when the run is not drawn.
+        let next = anchors
+            .actions
+            .map_or(rects.sync.left(), |actions| actions.left());
+        let mut box_end: Option<f32> = None;
+        if let Some(box_width) = titlebar_search_width(next - anchors.search - TITLEBAR_GROUP_GAP) {
             let middle = egui::Rect::from_min_max(
-                egui::pos2(left_end, bar.top()),
-                egui::pos2(middle_right, bar.bottom()),
+                egui::pos2(anchors.search, bar.top()),
+                egui::pos2(anchors.search + box_width, bar.bottom()),
             );
-            let fit = titlebar_fit(middle.width(), actions_width);
-            if let Some(box_width) = fit.search {
-                // Search, as one box: the query with the magnifier inside
-                // its left edge, and the whole box is one click target —
-                // the glyph and the text open the same popup, which is
-                // where a query is typed (the scope, the filters and the
-                // count live there too). The field is non-interactive for
-                // that reason: a caret here would only fight the popup's
-                // own field for the keyboard, and would leave focus behind
-                // when the popup closes. The glyph takes the accent while a
-                // search is what the message list shows.
-                //
-                // The box's frame is stock `TextEdit` chrome, so its
-                // corner radius is the widget visuals' — rounded here in a
-                // scope, which leaves every other field in the app with
-                // egui's tighter default. The field is deliberately
-                // non-interactive and egui picks the visuals by `Sense`
-                // rather than by hover, so `noninteractive` is the slot it
-                // actually draws with; the rest are rounded as well, so that
-                // making the field live again would not square the corners.
-                //
-                // Its fill goes to glass with the bar: the fill keeps only
-                // part of the input color, so the blurred mail behind the
-                // bar shows through the box the way it shows through the
-                // bar itself. The stock frame is drawn from
-                // `Visuals::text_edit_bg_color`, which is why this is
-                // `background_color` and not another widget slot.
-                let box_rect = ui
-                    .scope_builder(
-                        egui::UiBuilder::new()
-                            .max_rect(middle)
-                            .layout(egui::Layout::left_to_right(egui::Align::Center)),
-                        |row| {
-                            clip_to(row, middle);
-                            let margin = SEARCH_BOX_MARGIN;
-                            let field = row
-                                .scope(|ui| {
-                                    let radius = egui::CornerRadius::same(SEARCH_BOX_CORNER_RADIUS);
-                                    let widgets = &mut ui.style_mut().visuals.widgets;
-                                    for widget in [
-                                        &mut widgets.noninteractive,
-                                        &mut widgets.inactive,
-                                        &mut widgets.hovered,
-                                        &mut widgets.active,
-                                        &mut widgets.open,
-                                    ] {
-                                        widget.corner_radius = radius;
-                                    }
-                                    let fill = scheme
-                                        .input
-                                        .gamma_multiply(1.0 - floating * (1.0 - GLASS_FIELD_ALPHA));
-                                    ui.add(
-                                        egui::TextEdit::singleline(&mut self.search.text)
-                                            .hint_text("Search mail…")
-                                            .interactive(false)
-                                            .background_color(fill)
-                                            // `desired_width` is the whole
-                                            // box — the margins are taken out
-                                            // of it, not added to it — which is
-                                            // the one thing the fit and the
-                                            // widget have to agree on.
-                                            .desired_width(box_width)
-                                            // The bar is taller than a text row, so the
-                                            // field is grown to a fixed height and the
-                                            // query (or the hint) is centred in it.
-                                            .min_size(egui::vec2(0.0, TITLEBAR_SEARCH_HEIGHT))
-                                            .vertical_align(egui::Align::Center)
-                                            .margin(margin),
-                                    )
-                                })
-                                .inner;
-                            // The widget's rect *is* the box: the whole frame,
-                            // margins included, which is the rect `desired_width`
-                            // sized and what the magnifier and the click target
-                            // are placed from. (`TextEdit` used to hand back the
-                            // inner text rect, which is where the margins came
-                            // off it; the 0.36 rewrite sizes the frame instead,
-                            // and re-adding them put the magnifier outside the
-                            // box and the click target over the compose cell.)
-                            let box_rect = field.rect;
-                            // Registered after the field, which is why the click is
-                            // the box's: it opens the popup wherever in the box it
-                            // lands, the magnifier included.
-                            let search = row
-                                .interact(
-                                    box_rect,
-                                    egui::Id::new("titlebar-search"),
-                                    egui::Sense::click(),
+            // Search, as one box: the query with the magnifier inside
+            // Search, as one box: the query with the magnifier inside
+            // its left edge, and the whole box is one click target —
+            // the glyph and the text open the same popup, which is
+            // where a query is typed (the scope, the filters and the
+            // count live there too). The field is non-interactive for
+            // that reason: a caret here would only fight the popup's
+            // own field for the keyboard, and would leave focus behind
+            // when the popup closes. The glyph takes the accent while a
+            // search is what the message list shows.
+            //
+            // The box's frame is stock `TextEdit` chrome, so its
+            // corner radius is the widget visuals' — rounded here in a
+            // scope, which leaves every other field in the app with
+            // egui's tighter default. The field is deliberately
+            // non-interactive and egui picks the visuals by `Sense`
+            // rather than by hover, so `noninteractive` is the slot it
+            // actually draws with; the rest are rounded as well, so that
+            // making the field live again would not square the corners.
+            //
+            // Its fill goes to glass with the bar: the fill keeps only
+            // part of the input color, so the blurred mail behind the
+            // bar shows through the box the way it shows through the
+            // bar itself. The stock frame is drawn from
+            // `Visuals::text_edit_bg_color`, which is why this is
+            // `background_color` and not another widget slot.
+            let box_rect = ui
+                .scope_builder(
+                    egui::UiBuilder::new()
+                        .max_rect(middle)
+                        .layout(egui::Layout::left_to_right(egui::Align::Center)),
+                    |row| {
+                        clip_to(row, middle);
+                        let margin = SEARCH_BOX_MARGIN;
+                        let field = row
+                            .scope(|ui| {
+                                let radius = egui::CornerRadius::same(SEARCH_BOX_CORNER_RADIUS);
+                                let widgets = &mut ui.style_mut().visuals.widgets;
+                                for widget in [
+                                    &mut widgets.noninteractive,
+                                    &mut widgets.inactive,
+                                    &mut widgets.hovered,
+                                    &mut widgets.active,
+                                    &mut widgets.open,
+                                ] {
+                                    widget.corner_radius = radius;
+                                }
+                                let fill = scheme
+                                    .input
+                                    .gamma_multiply(1.0 - floating * (1.0 - GLASS_FIELD_ALPHA));
+                                ui.add(
+                                    egui::TextEdit::singleline(&mut self.search.text)
+                                        .hint_text("Search mail…")
+                                        .interactive(false)
+                                        .background_color(fill)
+                                        // `desired_width` is the whole
+                                        // box — the margins are taken out
+                                        // of it, not added to it — which is
+                                        // the one thing the fit and the
+                                        // widget have to agree on.
+                                        .desired_width(box_width)
+                                        // The bar is taller than a text row, so the
+                                        // field is grown to a fixed height and the
+                                        // query (or the hint) is centred in it.
+                                        .min_size(egui::vec2(0.0, TITLEBAR_SEARCH_HEIGHT))
+                                        .vertical_align(egui::Align::Center)
+                                        .margin(margin),
                                 )
-                                .on_hover_cursor(egui::CursorIcon::PointingHand);
-                            if search.clicked() {
-                                self.open_search();
-                            }
-                            // Grey while nothing is being asked for — the magnifier
-                            // then matches the field's own hint text instead of
-                            // reading as a live control — and the accent while a query
-                            // is what the message list shows.
-                            let search_color = if self.search.is_active() {
-                                scheme.accent
-                            } else {
-                                visuals.weak_text_color()
-                            };
-                            let icon_rect = egui::Rect::from_center_size(
-                                egui::pos2(
-                                    box_rect.left() + SEARCH_ICON_INSET as f32 / 2.0,
-                                    box_rect.center().y,
-                                ),
-                                egui::vec2(SEARCH_ICON_SIZE, SEARCH_ICON_SIZE),
-                            );
-                            paint_search_icon(row.painter(), icon_rect, search_color);
-                            search.on_hover_text("Search mail — filters and scope (Ctrl+F)");
-                            box_rect
-                        },
-                    )
-                    .inner;
-                middle_end = box_rect.right();
+                            })
+                            .inner;
+                        // The widget's rect *is* the box: the whole frame,
+                        // margins included, which is the rect `desired_width`
+                        // sized and what the magnifier and the click target
+                        // are placed from. (`TextEdit` used to hand back the
+                        // inner text rect, which is where the margins came
+                        // off it; the 0.36 rewrite sizes the frame instead,
+                        // and re-adding them put the magnifier outside the
+                        // box and the click target over the compose cell.)
+                        let box_rect = field.rect;
+                        // Registered after the field, which is why the click is
+                        // the box's: it opens the popup wherever in the box it
+                        // lands, the magnifier included.
+                        let search = row
+                            .interact(
+                                box_rect,
+                                egui::Id::new("titlebar-search"),
+                                egui::Sense::click(),
+                            )
+                            .on_hover_cursor(egui::CursorIcon::PointingHand);
+                        if search.clicked() {
+                            self.open_search();
+                        }
+                        // Grey while nothing is being asked for — the magnifier
+                        // then matches the field's own hint text instead of
+                        // reading as a live control — and the accent while a query
+                        // is what the message list shows.
+                        let search_color = if self.search.is_active() {
+                            scheme.accent
+                        } else {
+                            visuals.weak_text_color()
+                        };
+                        let icon_rect = egui::Rect::from_center_size(
+                            egui::pos2(
+                                box_rect.left() + SEARCH_ICON_INSET as f32 / 2.0,
+                                box_rect.center().y,
+                            ),
+                            egui::vec2(SEARCH_ICON_SIZE, SEARCH_ICON_SIZE),
+                        );
+                        paint_search_icon(row.painter(), icon_rect, search_color);
+                        search.on_hover_text("Search mail — filters and scope (Ctrl+F)");
+                        box_rect
+                    },
+                )
+                .inner;
+            box_end = Some(box_rect.right());
+        }
 
-                // Mail actions, set well apart to the right of the search
-                // box: they act on the mail open in the reading pane, so the
-                // group is enabled by whether one is open there. They are
-                // placed at an exact x rather than run after the box — the gap
-                // in front of them is the fit's, not the row's item spacing —
-                // and from where the box actually came to rather than from
-                // where the arithmetic above expected it to end: the widget's
-                // own width is the truth, so a box wider than it was asked for
-                // pushes the group right instead of being drawn over. If the
-                // room then runs out, the group is simply not drawn: the bar's
-                // promise is that it fits what it draws, never that it draws
-                // everything.
-                let actions_left = box_rect.right() + fit.padding;
-                if fit.actions && actions_left + actions_width <= middle_right + 0.5 {
-                    let actions = egui::Rect::from_min_max(
-                        egui::pos2(actions_left, bar.top()),
-                        egui::pos2(middle_right, bar.bottom()),
-                    );
-                    ui.scope_builder(
-                        egui::UiBuilder::new()
-                            .max_rect(actions)
-                            .layout(egui::Layout::left_to_right(egui::Align::Center)),
-                        |row| {
-                            clip_to(row, actions);
-                            self.titlebar_mail_actions(row, &visuals);
-                        },
-                    );
-                    middle_end = actions_left + actions_width;
-                }
+        // --- the pane's mail actions ---
+        // The pane's own row, drawn only while there is a mail to act on, or a
+        // selection — which is what Delete takes, and the one action that stays
+        // live in select mode. Seven dead glyphs over a pane with no mail in it
+        // said nothing and cluttered the bar; the row comes and goes over
+        // `MAIL_ACTION_FADE_TIME` rather than blinking, because the mail being
+        // opened or closed is what the bar is following. The cells and glyphs are
+        // the bar's own, so the pane's card head — the same five cells brought
+        // down onto the mail — reads as this row's other half.
+        if let Some(actions) = anchors.actions {
+            let wanted = self.has_selected_message() || !self.selected_mails.is_empty();
+            let shown = ui.ctx().animate_bool_with_time(
+                egui::Id::new("titlebar-actions"),
+                wanted,
+                MAIL_ACTION_FADE_TIME,
+            );
+            if shown > 0.0 {
+                ui.scope_builder(
+                    egui::UiBuilder::new()
+                        .max_rect(actions)
+                        .layout(egui::Layout::left_to_right(egui::Align::Center)),
+                    |row| {
+                        clip_to(row, actions);
+                        self.titlebar_mail_actions(row, &visuals, shown);
+                    },
+                );
             }
         }
 
-        // --- drag surface: whatever is left of the bar ---
+        // --- drag surface: the chrome the bar has left ---
         // The window is undecorated, so this is what moves it (and what
-        // double-click maximizes it). A bar filled edge to edge by its groups
-        // simply has none — the window controls have the window's right end
-        // either way.
-        let drag_rect = egui::Rect::from_min_max(
-            egui::pos2((middle_end + 4.0).max(bar.left()), bar.top()),
-            egui::pos2(middle_right.max(middle_end), bar.bottom()),
-        );
-        if drag_rect.is_positive() {
+        // double-click maximizes it). With the groups anchored at both ends —
+        // the first group at the left, the list's box and the pane's run at
+        // their columns' edges — the bar has two stretches of it: the chrome
+        // over the navigation column, between the first group and the list's
+        // box, and the room between the box and the pane's run (or the window
+        // controls, when no run is drawn). A bar with no room to spare simply
+        // has none — the window controls have the window's right end either way.
+        let mut free: Vec<(f32, f32)> = Vec::new();
+        match box_end {
+            // The box is drawn: two stretches, one on each side of it.
+            Some(end) => {
+                free.push((left_end, anchors.search));
+                free.push((end, next));
+            }
+            // No box — not even a narrow one: one stretch from the first group
+            // to whatever comes next.
+            None => free.push((left_end, next)),
+        }
+        for (index, (from, to)) in free.iter().enumerate() {
+            if to - from <= 2.0 * TITLEBAR_GROUP_GAP {
+                continue;
+            }
+            let rect = egui::Rect::from_min_max(
+                egui::pos2(from + TITLEBAR_GROUP_GAP, bar.top()),
+                egui::pos2(to - TITLEBAR_GROUP_GAP, bar.bottom()),
+            );
             let drag = ui.interact(
-                drag_rect,
-                egui::Id::new("titlebar-drag"),
+                rect,
+                egui::Id::new(("titlebar-drag", index)),
                 egui::Sense::click_and_drag(),
             );
             if drag.drag_started() {
@@ -3248,8 +3232,33 @@ impl KimoApp {
                 // — what the app does at startup and what the automatic sync
                 // does on its clock, asked for by hand. The cell is the bar's
                 // own, placed at the exact rect the arithmetic carved for it
-                // like the cog and the window controls, and its glyph is the
-                // one the bar's left group used to carry.
+                // like the cog and the window controls.
+                //
+                // **It is also where the app's sync state is shown**: a spinner
+                // while any account is syncing, a dot while one's last sync
+                // stands failed, and the accounts' own words in the tooltip.
+                // That is what the strip beside it used to say, one letter at a
+                // time; the cell is the better place for it — it is the control
+                // a sweep is asked for from, it is always in the same place, and
+                // nothing else in the bar has to move aside for it.
+                let mut tooltip = String::from(
+                    "Sync now — every account is asked for its mail, and the folder you have \
+                     open is fetched too if it was never fetched.",
+                );
+                let mut failed = false;
+                for account in &self.accounts {
+                    let Some(state) = self.states.get(&account.id) else {
+                        continue;
+                    };
+                    if state.syncing {
+                        tooltip.push_str(&format!("\n{}: syncing…", account.name));
+                    }
+                    if let Some(error) = &state.error {
+                        failed = true;
+                        tooltip.push_str(&format!("\n{}: {error}", account.name));
+                    }
+                }
+                let syncing = self.sync_in_flight();
                 let sync_resp = titlebar_hover(
                     row,
                     row.interact(
@@ -3258,14 +3267,27 @@ impl KimoApp {
                         egui::Sense::click(),
                     ),
                 );
-                paint_sync_icon(row.painter(), rects.sync, visuals.text_color());
+                if syncing {
+                    row.put(
+                        rects.sync,
+                        egui::Spinner::new()
+                            .color(scheme.accent)
+                            .size(SYNC_SPINNER_SIZE),
+                    );
+                } else {
+                    paint_sync_icon(row.painter(), rects.sync, visuals.text_color());
+                }
+                if failed {
+                    row.painter().circle_filled(
+                        egui::pos2(rects.sync.right() - 7.0, rects.sync.top() + 7.0),
+                        SYNC_BADGE_RADIUS,
+                        scheme.danger,
+                    );
+                }
                 if sync_resp.clicked() {
                     self.sync_all();
                 }
-                sync_resp.on_hover_text(
-                    "Sync now — every account is asked for its mail, and the folder you have \
-                     open is fetched too if it was never fetched.",
-                );
+                sync_resp.on_hover_text(tooltip);
 
                 let cog_resp = titlebar_hover(
                     row,
@@ -3359,7 +3381,7 @@ impl KimoApp {
     /// framed widgets. They are the same cells the nav toggle, the compose and
     /// sync buttons, the cog and the window controls are; what makes this run a
     /// group of its own is the clear chrome in front of it
-    /// (`MAIL_ACTION_PADDING`), not a size or a fill only it has.
+    /// (`TITLEBAR_GROUP_GAP`), not a size or a fill only it has.
     ///
     /// Export and Delete are wired: Export hands the mail to
     /// `export_selected_message`, which has a worker write the server's own
@@ -3367,18 +3389,19 @@ impl KimoApp {
     /// `delete_selected_message`, which takes it off the server before it
     /// leaves the database. The other four are still drawn only — a click on
     /// one runs nothing, so they stay UI until the actions they name exist.
-    fn titlebar_mail_actions(&mut self, row: &mut egui::Ui, visuals: &egui::Visuals) {
+    fn titlebar_mail_actions(&mut self, row: &mut egui::Ui, visuals: &egui::Visuals, fade: f32) {
         // The run lays itself out: `TITLEBAR_BUTTON_GAP` between the cells, which
-        // is the gap `titlebar_cells_width` — and through it the fit — assumes.
+        // is the gap `titlebar_cells_width` assumes.
         row.spacing_mut().item_spacing.x = TITLEBAR_BUTTON_GAP;
         for action in MailAction::ALL {
             let enabled = self.mail_action_enabled(action);
-            let response = titlebar_button(row, enabled);
+            let response = titlebar_button_faded(row, enabled, fade);
             let color = if enabled {
                 visuals.text_color()
             } else {
                 visuals.weak_text_color()
-            };
+            }
+            .gamma_multiply(fade);
             let painter = row.painter();
             match action {
                 MailAction::Reply => {
@@ -7502,13 +7525,15 @@ const GLASS_ALPHA: f32 = 0.25;
 const GLASS_FIELD_ALPHA: f32 = 0.45;
 /// Width of the title bar's search box — the whole box, `SEARCH_BOX_MARGIN`
 /// included, which is what `TextEdit::desired_width` sizes and what
-/// `titlebar_fit` plans in. Fixed rather than filling: the bar also carries
-/// the drag surface, and it should not move around with the length of a query.
+/// `titlebar_search_width` plans in. Fixed rather than filling: the box is
+/// anchored where the message list starts (`titlebar_anchors`), and a box that
+/// widened with the window would read as part of the columns rather than as the
+/// list's own field.
 const TITLEBAR_SEARCH_WIDTH: f32 = 175.0;
 /// The narrowest the box is allowed to get before the bar gives it up
-/// altogether (`titlebar_fit`): below this it stops reading as a field. The
-/// margins come out of this width like anything else, so the query is left
-/// with most of it.
+/// altogether (`titlebar_search_width`): below this it stops reading as a
+/// field, and the search popup is still a Ctrl+F away. The margins come out of
+/// this width like anything else, so the query is left with most of it.
 const TITLEBAR_SEARCH_FLOOR: f32 = 96.0;
 /// The search box's own margins, *inside* that width: the magnifier's inset on
 /// the left, and a hair of room on the right so the query does not touch the
@@ -7526,16 +7551,35 @@ const TITLEBAR_SEARCH_HEIGHT: f32 = TITLEBAR_HEIGHT - 16.0;
 /// makes it read as the one field in the bar.
 const SEARCH_BOX_CORNER_RADIUS: u8 = 8;
 
-/// Clear chrome between the title bar's search box and the group of mail
-/// actions to its right: what sets the seven cells apart from the box as one
-/// group. It is the bar's first elastic, though — the middle group is laid out
-/// at exact x positions (`titlebar_fit`), not by the row's item spacing, so
-/// the gap is this wide only while there is room for it.
-const MAIL_ACTION_PADDING: f32 = 128.0;
-/// How far that gap may close before the bar gives up something else instead.
-/// A group that still reads as a group, because the gap only ever shrinks to
-/// this while the box is still at its full width.
-const MAIL_ACTION_MIN_PADDING: f32 = 16.0;
+/// The clear chrome the bar's anchored groups keep around themselves: between
+/// the first group and the search box, between the box and the mail actions, and
+/// between either of them and the drag surface. Not elastic — the groups are
+/// placed at their columns' own edges, so this is the same gap however wide the
+/// window is, and what gives way when the room runs out is the search box's
+/// width and then the box itself.
+const TITLEBAR_GROUP_GAP: f32 = 8.0;
+/// How close the mail actions may come to the window controls. The run is
+/// anchored to the reading pane; when the pane is wide enough to hold it beside
+/// the controls this is the clearance it keeps, and when it is not the run steps
+/// left over the pane's own edge instead — and no further than
+/// `MAIL_ACTION_OVERHANG`.
+const MAIL_ACTION_EDGE_GAP: f32 = 6.0;
+/// How far the mail actions may sit over the reading pane's own edge before the
+/// bar gives them up: the pane's card is inset from that edge by
+/// `CONTENT_GUTTER` plus `CONTENT_PADDING.x`, so a run that hangs over
+/// it is still over the pane's card and covers only the list's own margin. Past
+/// that the run is not this pane's any more, and the mail's own card head —
+/// which carries the same cells — is where the actions are.
+const MAIL_ACTION_OVERHANG: f32 = CONTENT_GUTTER + CONTENT_PADDING.x;
+/// How long the mail actions take to fade in and out with the mail they act on.
+/// The bar's own state-change time (`TITLEBAR_FLOAT_TIME`), because it is the
+/// same kind of change: what the bar shows following what the app has.
+const MAIL_ACTION_FADE_TIME: f32 = 0.16;
+/// The radius of the dot the sync cell carries while an account's last sync
+/// stands failed, and the size of the spinner it becomes while one is running:
+/// the cell is where a sweep is asked for, so it is where one is shown.
+const SYNC_BADGE_RADIUS: f32 = 3.0;
+const SYNC_SPINNER_SIZE: f32 = 20.0;
 /// How large the mail actions' glyphs are drawn. Their outlines are designed in
 /// a 24×24 box, which `glyph_point` scales to this.
 const MAIL_ACTION_GLYPH: f32 = 18.0;
@@ -7783,10 +7827,11 @@ const COMPOSE_BODY_HEIGHT: f32 = 320.0;
 /// is cut off at the window's edge like anything else off-screen.
 #[derive(Clone, Copy, Debug)]
 struct TitlebarRects {
-    /// Room for the bar's own content: the left group, the status strip, the
-    /// search box, the mail actions and the drag surface. Empty — never inside
-    /// out — when the sync cell, the cog and the window controls are all the
-    /// bar can hold.
+    /// Room for the bar's own content: the first group, the search box, the
+    /// mail actions and the drag surface. Empty — never inside out — when the
+    /// sync cell, the cog and the window controls are all the bar can hold.
+    /// Where the two middle groups go inside it is not this rect's business:
+    /// they are anchored to the columns below the bar (`titlebar_anchors`).
     content: egui::Rect,
     /// **Sync now**, immediately left of the cog: the one cell of the bar that
     /// is about the whole app rather than about the mail the pane shows, which
@@ -7829,91 +7874,89 @@ fn titlebar_rects(bar: egui::Rect, controls: usize) -> TitlebarRects {
     }
 }
 
-/// What the middle of the title bar holds in the room it was given: the width
-/// of the search box (the whole box, its margins included), whether the run of
-/// mail actions is drawn, and the clear chrome between the two.
-#[derive(Clone, Copy, Debug, PartialEq)]
-struct TitlebarFit {
-    /// The search box's width, or `None` when the bar is too narrow for it.
-    search: Option<f32>,
-    /// Whether the mail actions are drawn.
-    actions: bool,
-    /// The gap between the box and the actions (`MAIL_ACTION_PADDING`, down to
-    /// `MAIL_ACTION_MIN_PADDING` when the room is tight).
-    padding: f32,
+/// The width the bar gives the search box in the room that is left for it: its
+/// own width while there is room, as narrow as its floor while the room is
+/// short, and nothing at all below that. The box is the one thing the bar gives
+/// up — the first group never gives way, and the mail actions are the pane's own
+/// row rather than the room's leftovers — and the search popup stays a Ctrl+F
+/// away when it is gone.
+///
+/// Monotone in `room`, which is what keeps a window being resized from
+/// flickering between two shapes. Nothing here is a rect: the caller draws the
+/// box inside the room it was given and clips it to that room.
+fn titlebar_search_width(room: f32) -> Option<f32> {
+    if room >= TITLEBAR_SEARCH_WIDTH {
+        Some(TITLEBAR_SEARCH_WIDTH)
+    } else if room >= TITLEBAR_SEARCH_FLOOR {
+        Some(room)
+    } else {
+        None
+    }
 }
 
-impl TitlebarFit {
-    /// The width the group needs, actions included. The bar's own promise is
-    /// that this is never more than the room the fit was given; the drawing
-    /// checks the part it can measure (where the box really ended, against the
-    /// room the actions really have), and the tests pin the planning itself.
-    #[cfg(test)]
-    fn width(&self, actions: f32) -> f32 {
-        let mut width = self.search.unwrap_or(0.0);
-        if self.actions {
-            width += self.padding + actions;
-        }
-        width
+/// Where the bar's two column-anchored groups go.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct TitlebarAnchors {
+    /// The search box's left edge: the message list's own left edge, clamped
+    /// clear of the first group — a collapsed navigation column puts the list at
+    /// the window's edge, and the box may not land on the brand.
+    search: f32,
+    /// The mail actions' rect — the reading pane's own row, as wide as the run —
+    /// or `None` when the pane has no room for it beside the window controls.
+    actions: Option<egui::Rect>,
+}
+
+/// Place the two groups the bar anchors to the columns below it: the search box
+/// over the message list, the mail actions over the reading pane. Both edges are
+/// the columns' own (`KimoApp::list_column`), so both follow the splitters that
+/// move those columns, and both are clamped clear of the first group — the
+/// brand, the nav toggle and the pen, which never give way because the compose
+/// button needs no mail open.
+///
+/// The run is placed only where it belongs: at the pane's edge, or over it by no
+/// more than `MAIL_ACTION_OVERHANG` when the window controls leave no room
+/// there, and never within `MAIL_ACTION_EDGE_GAP` of those controls. A pane
+/// too narrow to hold the run beside them gives it up, and the mail's own card
+/// head — the same cells, on the mail itself — is where the actions are then.
+fn titlebar_anchors(
+    bar: egui::Rect,
+    first_end: f32,
+    list_left: f32,
+    pane_left: f32,
+    cluster_left: f32,
+) -> TitlebarAnchors {
+    let width = titlebar_cells_width(MailAction::ALL.len());
+    // The pane's edge, or as far left of it as the window controls leave — and
+    // in the popup layout, where the pane is the whole window, the first group's
+    // own end.
+    let preferred = pane_left.max(first_end + TITLEBAR_GROUP_GAP);
+    let left = preferred.min(cluster_left - MAIL_ACTION_EDGE_GAP - width);
+    let fits = left >= first_end + TITLEBAR_GROUP_GAP
+        && left + width + MAIL_ACTION_EDGE_GAP <= cluster_left + 0.5
+        // The pane's own run while the pane is a column of its own: one that
+        // hangs further over the pane's edge than the card's margin is over the
+        // list, and no longer this pane's. A popup pane is the whole window, so
+        // there its edge is behind the first group and there is nothing to hang
+        // over.
+        && (pane_left < first_end + TITLEBAR_GROUP_GAP || left >= pane_left - MAIL_ACTION_OVERHANG);
+    TitlebarAnchors {
+        search: list_left.max(first_end + TITLEBAR_GROUP_GAP),
+        actions: fits.then(|| {
+            egui::Rect::from_min_size(
+                egui::pos2(left, bar.center().y - TITLEBAR_BUTTON_SIZE / 2.0),
+                egui::vec2(width, TITLEBAR_BUTTON_SIZE),
+            )
+        }),
     }
 }
 
 /// The width of a run of `count` cells in the title bar: `TITLEBAR_BUTTON_SIZE`
 /// squares, `TITLEBAR_BUTTON_GAP` apart. Every run is measured with this — the
-/// mail actions (which the fit plans the room for) and the window controls
-/// (which are placed from the window's right edge) — so no run can disagree
-/// with the cells it draws.
+/// mail actions (which are placed at the reading pane's own edge), the window
+/// controls and the cells the sync and the cog are carved as — so no run can
+/// disagree with the cells it draws.
 fn titlebar_cells_width(count: usize) -> f32 {
     count as f32 * TITLEBAR_BUTTON_SIZE + count.saturating_sub(1) as f32 * TITLEBAR_BUTTON_GAP
-}
-
-/// Fit the middle group — the search box, the clear chrome and the run of mail
-/// actions — into `room` points.
-///
-/// The bar gives its room up in one order, so that what it loses is the least
-/// useful thing it can: the clear chrome in front of the actions closes from
-/// `MAIL_ACTION_PADDING` to `MAIL_ACTION_MIN_PADDING` first, then the actions
-/// leave — as the one group they are, because half a run of seven reads as a
-/// mistake rather than as a smaller bar — and only then does the search box
-/// narrow, down to `TITLEBAR_SEARCH_FLOOR` and no further. The box is the last
-/// thing to go, and the one thing the bar keeps to the end is the window's own
-/// buttons (`titlebar_rects`).
-///
-/// Every width is monotone in `room` — a wider bar never holds a narrower box,
-/// never loses the actions again — which is what keeps a window being resized
-/// from flickering between two shapes. Nothing here is a rect: the caller
-/// draws each group inside the room it was given, and clips it to that room.
-fn titlebar_fit(room: f32, actions: f32) -> TitlebarFit {
-    let widest = TITLEBAR_SEARCH_WIDTH;
-    let narrowest = TITLEBAR_SEARCH_FLOOR;
-    if room >= widest + MAIL_ACTION_MIN_PADDING + actions {
-        // Everything fits: the box at its width, the actions a clear gap away.
-        // The gap is what closes first, so the box and the seven cells are both
-        // still whole when they are at their closest.
-        let padding = (room - widest - actions).clamp(MAIL_ACTION_MIN_PADDING, MAIL_ACTION_PADDING);
-        return TitlebarFit {
-            search: Some(widest),
-            actions: true,
-            padding,
-        };
-    }
-    if room >= narrowest {
-        // No room for the group. The box takes back what the actions were
-        // using — the room is the box's now — and keeps as much of its own
-        // width as there is, down to its floor.
-        return TitlebarFit {
-            search: Some(room.min(widest)),
-            actions: false,
-            padding: 0.0,
-        };
-    }
-    // Not even the box: the bar keeps the window's own buttons and gives the
-    // rest of the room to the drag surface.
-    TitlebarFit {
-        search: None,
-        actions: false,
-        padding: 0.0,
-    }
 }
 
 /// Clip a Ui to the group rect it was given, so that neither what it draws nor
@@ -7941,6 +7984,12 @@ fn pane_card_gap(ui: &egui::Ui) -> f32 {
 /// actions' disabled cells neither sense clicks nor fill, while the rest of the
 /// bar is always live.
 fn titlebar_button(ui: &mut egui::Ui, enabled: bool) -> egui::Response {
+    titlebar_button_faded(ui, enabled, 1.0)
+}
+
+/// The same cell, drawn at `fade` of its strength — the bar's own cell, for the
+/// one run that has a state to come and go with (`titlebar_mail_actions`).
+fn titlebar_button_faded(ui: &mut egui::Ui, enabled: bool, fade: f32) -> egui::Response {
     let sense = if enabled {
         egui::Sense::click()
     } else {
@@ -7948,7 +7997,7 @@ fn titlebar_button(ui: &mut egui::Ui, enabled: bool) -> egui::Response {
     };
     let (_, response) = ui.allocate_exact_size(egui::Vec2::splat(TITLEBAR_BUTTON_SIZE), sense);
     if enabled {
-        titlebar_hover(ui, response)
+        titlebar_hover_faded(ui, response, fade)
     } else {
         response
     }
@@ -7992,8 +8041,19 @@ fn card_action_button(ui: &mut egui::Ui, enabled: bool) -> egui::Response {
 /// border, which in a title bar reads as a widget among window chrome. The
 /// glyph is the caller's, painted afterwards so the fill cannot cover it.
 fn titlebar_hover(ui: &egui::Ui, response: egui::Response) -> egui::Response {
+    titlebar_hover_faded(ui, response, 1.0)
+}
+
+/// The same fill at `fade` of its strength, for a cell that is fading in or
+/// out with the thing it acts on (`titlebar_mail_actions`): the fill and the
+/// glyph have to come and go together, or the pointer's cell would flash.
+fn titlebar_hover_faded(ui: &egui::Ui, response: egui::Response, fade: f32) -> egui::Response {
     if response.hovered() {
-        titlebar_fill(ui, response.rect, ui.visuals().widgets.hovered.bg_fill);
+        titlebar_fill(
+            ui,
+            response.rect,
+            ui.visuals().widgets.hovered.bg_fill.gamma_multiply(fade),
+        );
     }
     response
 }
@@ -12428,24 +12488,15 @@ mod tests {
         crate::fonts::install(&ctx, None, None);
         let mut app = app_with_messages(&ctx, 3);
         app.selected_message = Some("0".to_string());
-        frame_shapes_at(&ctx, &mut app, 1400.0);
-        let search = ctx
-            .read_response(egui::Id::new("titlebar-search"))
-            .expect("the bar drew no search box")
-            .rect;
-        let bar = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1400.0, TITLEBAR_HEIGHT));
-        let rects = titlebar_rects(bar, 3);
-        let actions = titlebar_cells_width(MailAction::ALL.len());
-        let fit = titlebar_fit(rects.sync.min.x - search.left(), actions);
-        assert!(fit.actions, "the bar gave the actions up at 1400 pt");
+        let actions = mail_action_rect(&ctx, &mut app, 1400.0)
+            .expect("the bar gave the actions up at 1400 pt");
         let cell = |action: MailAction| {
             let index = MailAction::ALL
                 .iter()
                 .position(|candidate| *candidate == action)
                 .expect("one of the seven");
             egui::pos2(
-                search.right()
-                    + fit.padding
+                actions.left()
                     + index as f32 * (TITLEBAR_BUTTON_SIZE + TITLEBAR_BUTTON_GAP)
                     + TITLEBAR_BUTTON_SIZE / 2.0,
                 TITLEBAR_HEIGHT / 2.0,
@@ -13680,15 +13731,17 @@ mod tests {
     /// Every button in the title bar is the same cell: a
     /// `TITLEBAR_BUTTON_SIZE` square, centred in the bar's height and
     /// `TITLEBAR_BUTTON_GAP` from the next one, whose hover fill is a small
-    /// rounded square. This walks the whole bar — the left group, the run of
-    /// mail actions, the cog and the window controls — and puts the pointer on
-    /// each cell in turn, which is also what says every one of them is a real
-    /// hit target rather than a glyph painted on the chrome.
+    /// rounded square. This walks the whole bar — the left group, the reading
+    /// pane's run of mail actions, the sync cell, the cog and the window
+    /// controls — and puts the pointer on each cell in turn, which is also what
+    /// says every one of them is a real hit target rather than a glyph painted
+    /// on the chrome.
     ///
-    /// The two runs are measured with `titlebar_cells_width`, which is what the
-    /// fit plans with and the bar draws with; the left group's cells are found
-    /// from the layout its row makes (the edge margin, the brand icon, then a
-    /// cell every pitch).
+    /// The runs are measured with `titlebar_cells_width`, which is what the
+    /// window controls are placed with and the bar draws the mail actions with;
+    /// the left group's cells are found from the layout its row makes (the edge
+    /// margin, the brand icon, then a cell every pitch), and the run of mail
+    /// actions from `titlebar_anchors`, which is where the bar places it.
     #[test]
     fn every_button_in_the_title_bar_is_the_same_cell() {
         let ctx = egui::Context::default();
@@ -13697,13 +13750,9 @@ mod tests {
         // The run is enabled by the mail the reading pane shows.
         app.selected_message = Some("0".to_string());
 
-        // One frame first: the run starts where the search box ended, and the
-        // box's rect is only known once the bar has drawn it.
+        // One frame first: the run is the reading pane's own row, and the
+        // pane's rect is only known once the columns have been laid out.
         frame_shapes_at(&ctx, &mut app, 1400.0);
-        let search = ctx
-            .read_response(egui::Id::new("titlebar-search"))
-            .expect("the bar drew no search box")
-            .rect;
         let bar = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1400.0, TITLEBAR_HEIGHT));
         let rects = titlebar_rects(bar, 3);
         let pitch = TITLEBAR_BUTTON_SIZE + TITLEBAR_BUTTON_GAP;
@@ -13722,15 +13771,20 @@ mod tests {
             })
             .collect();
 
-        // The mail actions: the run starts where the search box ended, the
-        // fit's clear chrome further right.
-        let actions = titlebar_cells_width(MailAction::ALL.len());
-        let fit = titlebar_fit(rects.sync.min.x - search.left(), actions);
-        assert!(fit.actions, "the bar gave the actions up at 1400 pt");
-        let left = search.right() + fit.padding;
+        // The mail actions: the run is the reading pane's own row, and its
+        // leftmost cell starts where the pane does.
+        let actions = titlebar_anchors(
+            bar,
+            first_group_end(),
+            app.list_column.left(),
+            app.list_column.right(),
+            rects.sync.left(),
+        )
+        .actions
+        .expect("the bar gave the actions up at 1400 pt");
         for index in 0..MailAction::ALL.len() {
             cells.push(egui::pos2(
-                left + index as f32 * pitch + TITLEBAR_BUTTON_SIZE / 2.0,
+                actions.left() + index as f32 * pitch + TITLEBAR_BUTTON_SIZE / 2.0,
                 middle,
             ));
         }
@@ -13758,109 +13812,149 @@ mod tests {
             );
         }
 
-        // The run of actions is the width the fit planned: it ends before the
-        // bar's right end begins.
+        // The run is the width of its cells, and it ends clear of the window
+        // controls whatever the window does.
+        assert_eq!(actions.width(), titlebar_cells_width(MailAction::ALL.len()));
         assert!(
-            left + actions <= rects.sync.min.x,
+            actions.right() + MAIL_ACTION_EDGE_GAP <= rects.sync.min.x + 0.5,
             "the run draws {} pt into the bar's right end",
-            left + actions - rects.sync.min.x
+            actions.right() + MAIL_ACTION_EDGE_GAP - rects.sync.min.x
         );
     }
 
-    /// What the bar gives up when it runs out of room, in the order it gives it
-    /// up — plus the rule that makes the whole thing safe: the fit never plans
-    /// a middle group wider than the room it was given. (The other half of that
-    /// rule is the clip every group is drawn through, `clip_to`.)
+    /// Where the bar's two anchored groups go, for every window shape that
+    /// matters: the box is the message list's, the run the reading pane's, both
+    /// clamped clear of the first group — and the run is given up rather than
+    /// drawn over the list when the pane has no room for it beside the window
+    /// controls.
+    #[test]
+    fn the_bar_anchors_the_list_and_the_pane() {
+        let bar = |width: f32| {
+            egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(width, TITLEBAR_HEIGHT))
+        };
+        let first_end = first_group_end();
+        let width = titlebar_cells_width(MailAction::ALL.len());
+        // What the bar's right end takes: the three window controls, the cog and
+        // the sync cell, with the gaps between them and the edge margin.
+        let cluster_left = |window: f32| titlebar_rects(bar(window), 3).sync.left();
+
+        // The default window (1400 pt, a 200 pt navigation column and a 460 pt
+        // pane): the box is the list's own edge, the run the pane's — and the
+        // pane is 6 pt too short to hold the run beside the window controls, so
+        // the run steps left over the pane's edge by less than the card's own
+        // margin rather than leaving the bar.
+        let anchors = titlebar_anchors(bar(1400.0), first_end, 200.0, 940.0, cluster_left(1400.0));
+        assert_eq!(anchors.search, 200.0, "the box is the list's left edge");
+        let actions = anchors.actions.expect("the run has room at 1400 pt");
+        assert_eq!(actions.width(), width);
+        assert_eq!(actions.right(), cluster_left(1400.0) - MAIL_ACTION_EDGE_GAP);
+        assert!(
+            actions.left() >= 940.0 - MAIL_ACTION_OVERHANG,
+            "the run hangs {} pt over the pane's edge, further than the card's margin",
+            940.0 - actions.left()
+        );
+
+        // A collapsed navigation column puts the list at the window's edge: the
+        // box follows it and stops clear of the first group instead of landing
+        // on the brand.
+        let anchors = titlebar_anchors(bar(1400.0), first_end, 0.0, 940.0, cluster_left(1400.0));
+        assert_eq!(anchors.search, first_end + TITLEBAR_GROUP_GAP);
+
+        // A narrow pane: too little room beside the window controls for the run,
+        // and too far from the pane for it to be the pane's. The mail's own card
+        // head carries the actions there.
+        let anchors = titlebar_anchors(
+            bar(1400.0),
+            first_end,
+            200.0,
+            1400.0 - CONTENT_MIN_WIDTH,
+            cluster_left(1400.0),
+        );
+        assert!(
+            anchors.actions.is_none(),
+            "a {} pt pane is no room for the run: {:?}",
+            CONTENT_MIN_WIDTH,
+            anchors.actions
+        );
+
+        // The popup layout: the pane is the whole window, so its edge is behind
+        // the first group and the run is the first thing after it.
+        let anchors = titlebar_anchors(bar(1400.0), first_end, 0.0, 0.0, cluster_left(1400.0));
+        assert_eq!(
+            anchors.actions.map(|rect| rect.left()),
+            Some(first_end + TITLEBAR_GROUP_GAP)
+        );
+        assert_eq!(anchors.search, first_end + TITLEBAR_GROUP_GAP);
+
+        // And a window too narrow for the run and the controls together: at
+        // 500 pt the controls start at 300, and the run needs 266 of the 112 pt
+        // that are left after the first group.
+        assert!(
+            titlebar_anchors(bar(500.0), first_end, 0.0, 0.0, cluster_left(500.0))
+                .actions
+                .is_none(),
+            "a 500 pt window has no room for the run beside the controls"
+        );
+        // Nothing ever overlaps the first group, whatever the anchors were
+        // handed — including a pane whose edge is left of it.
+        for pane_left in [0.0, 40.0, 104.0, 200.0, 900.0, 1300.0] {
+            let anchors =
+                titlebar_anchors(bar(1400.0), first_end, 0.0, pane_left, cluster_left(1400.0));
+            assert!(anchors.search >= first_end + TITLEBAR_GROUP_GAP);
+            if let Some(actions) = anchors.actions {
+                assert!(
+                    actions.left() >= first_end + TITLEBAR_GROUP_GAP,
+                    "{actions:?}"
+                );
+                assert!(
+                    actions.right() + MAIL_ACTION_EDGE_GAP <= cluster_left(1400.0) + 0.5,
+                    "{actions:?}"
+                );
+            }
+        }
+    }
+
+    /// The one thing the bar gives up when the room runs short is the search
+    /// box's width, and then the box itself: its own width while there is room
+    /// for it, its floor while the room is short, nothing below that — and never
+    /// narrower for a wider bar, which is what keeps a window being resized from
+    /// flickering between two shapes.
     #[test]
     fn the_title_bar_gives_its_room_up_in_one_order() {
-        let actions = titlebar_cells_width(MailAction::ALL.len());
         let widest = TITLEBAR_SEARCH_WIDTH;
         let narrowest = TITLEBAR_SEARCH_FLOOR;
 
-        // A bar with room to spare: the box at its full width, the actions a
-        // clear gap away, and the rest of the room left to the drag surface.
+        assert_eq!(titlebar_search_width(4000.0), Some(widest));
+        assert_eq!(titlebar_search_width(widest), Some(widest));
+        assert_eq!(titlebar_search_width(widest - 1.0), Some(widest - 1.0));
         assert_eq!(
-            titlebar_fit(4000.0, actions),
-            TitlebarFit {
-                search: Some(widest),
-                actions: true,
-                padding: MAIL_ACTION_PADDING,
-            }
-        );
-
-        // Narrower: the gap closes before anything is lost, and both the box
-        // and the seven cells are whole when the two are at their closest.
-        let tight = widest + MAIL_ACTION_MIN_PADDING + actions;
-        assert_eq!(
-            titlebar_fit(tight, actions),
-            TitlebarFit {
-                search: Some(widest),
-                actions: true,
-                padding: MAIL_ACTION_MIN_PADDING,
-            }
-        );
-
-        // Narrower still: the actions go, as the one group they are, and the
-        // box takes back the room they were using instead of being squeezed
-        // into what is left of it.
-        assert_eq!(
-            titlebar_fit(tight - 1.0, actions),
-            TitlebarFit {
-                search: Some(widest),
-                actions: false,
-                padding: 0.0,
-            }
-        );
-
-        // Then the box narrows — down to its floor, and no further.
-        assert_eq!(
-            titlebar_fit(narrowest + 30.0, actions).search,
+            titlebar_search_width(narrowest + 30.0),
             Some(narrowest + 30.0)
         );
-        assert_eq!(titlebar_fit(narrowest, actions).search, Some(narrowest));
-        assert_eq!(
-            titlebar_fit(narrowest - 1.0, actions),
-            TitlebarFit {
-                search: None,
-                actions: false,
-                padding: 0.0,
-            }
-        );
+        assert_eq!(titlebar_search_width(narrowest), Some(narrowest));
+        assert_eq!(titlebar_search_width(narrowest - 1.0), None);
 
-        // Every width in between, not just those: what the fit plans fits the
-        // room it was given, and neither the box nor the actions ever come back
-        // smaller for a wider bar (a window being resized from flickering
-        // between two shapes).
-        let mut previous = TitlebarFit {
-            search: Some(0.0),
-            actions: false,
-            padding: 0.0,
-        };
+        let mut previous = 0.0;
         for step in 0..6000 {
             let room = step as f32 / 4.0;
-            let fit = titlebar_fit(room, actions);
-            assert!(
-                fit.width(actions) <= room + 0.01,
-                "at {room} pt the fit plans more than the room: {fit:?}"
-            );
-            assert!(
-                fit.search.unwrap_or(0.0) >= previous.search.unwrap_or(0.0)
-                    && (fit.actions || !previous.actions),
-                "at {room} pt a wider bar lost something: {fit:?} after {previous:?}"
-            );
-            if fit.actions {
+            let width = titlebar_search_width(room);
+            if let Some(width) = width {
                 assert!(
-                    (MAIL_ACTION_MIN_PADDING..=MAIL_ACTION_PADDING).contains(&fit.padding),
-                    "at {room} pt the gap is not a gap: {fit:?}"
+                    (narrowest..=widest).contains(&width),
+                    "at {room} pt the box is not a box: {width}"
                 );
-            }
-            if let Some(search) = fit.search {
                 assert!(
-                    (narrowest..=widest).contains(&search),
-                    "at {room} pt the box is not a box: {fit:?}"
+                    width <= room + 0.01,
+                    "at {room} pt the box is wider than the room: {width}"
                 );
+                assert!(
+                    width >= previous,
+                    "at {room} pt a wider bar holds a narrower box: {width} after {previous}"
+                );
+                previous = width;
+            } else {
+                assert_eq!(previous, 0.0, "at {room} pt the box came back");
             }
-            previous = fit;
         }
     }
 
@@ -13927,32 +14021,242 @@ mod tests {
         }
     }
 
-    /// The box the fit plans for and the box the bar draws are the same box:
-    /// `titlebar_fit`'s search width is what the widget comes to, margins and
-    /// all. Two pieces of arithmetic decide that — the fit's constants, and
-    /// egui's `desired_width` — and they are not the same arithmetic, so this
-    /// is what keeps them from drifting. (`desired_width` is the *whole* box:
-    /// the margins come out of it, they are not added to it.)
+    /// The mail actions are the reading pane's, and they wait for a mail:
+    /// nothing while the pane is empty — not even dimmed cells — the run the
+    /// moment one is open, and nothing again when the pane is too narrow to hold
+    /// it beside the window controls, where the mail's own card head is what
+    /// carries the actions. Select mode is the exception to the first rule:
+    /// Delete takes the selection, so the run is there while something is
+    /// checked.
     #[test]
-    fn the_search_box_is_as_wide_as_the_fit_planned() {
+    fn the_mail_actions_are_the_panes_and_wait_for_a_mail() {
+        /// Enough frames for the run's fade (`MAIL_ACTION_FADE_TIME`) to have
+        /// finished at the `1/60` s a headless frame advances by.
+        const FADE_FRAMES: usize = 16;
+
+        let ctx = egui::Context::default();
+        crate::fonts::install(&ctx, None, None);
+        let mut app = app_with_messages(&ctx, 3);
+        let pitch = TITLEBAR_BUTTON_SIZE + TITLEBAR_BUTTON_GAP;
+        let cell = |actions: egui::Rect, index: usize| {
+            egui::pos2(
+                actions.left() + index as f32 * pitch + TITLEBAR_BUTTON_SIZE / 2.0,
+                TITLEBAR_HEIGHT / 2.0,
+            )
+        };
+        let index_of = |action: MailAction| {
+            MailAction::ALL
+                .iter()
+                .position(|candidate| *candidate == action)
+                .expect("one of the seven")
+        };
+
+        // No mail open: the pane has room for the run and the bar draws none of
+        // it — the first cell's place is chrome, not a button.
+        let actions = mail_action_rect(&ctx, &mut app, 1400.0).expect("the pane has room");
+        assert!(
+            fill_under_the_pointer(
+                &ctx,
+                &mut app,
+                1400.0,
+                cell(actions, 0),
+                TITLEBAR_BUTTON_SIZE
+            )
+            .is_none(),
+            "no mail open, no run"
+        );
+
+        // A mail open: the run fades in, and it is the bar's own cells.
+        app.selected_message = Some("0".to_string());
+        for _ in 0..FADE_FRAMES {
+            run_app_frame(&ctx, &mut app, Vec::new());
+        }
+        let filled = fill_under_the_pointer(
+            &ctx,
+            &mut app,
+            1400.0,
+            cell(actions, 0),
+            TITLEBAR_BUTTON_SIZE,
+        )
+        .unwrap_or_else(|| panic!("the run is there with a mail open"));
+        assert_eq!(filled.rect.center(), cell(actions, 0));
+
+        // A window whose pane has no room for the run beside the window
+        // controls — narrow enough that the navigation has collapsed and the
+        // list is at its minimum, so the pane is what is left — gives the run
+        // up: not one of its cells is drawn where the run would have been.
+        const NARROW: f32 = 600.0;
+        app.selected_message = None;
+        // The navigation column collapses on the way into a window this narrow,
+        // and the columns settle over the frames that follow: what the run has
+        // to fit into is the plan the window has *after* that, not the one the
+        // frame it arrived on was drawn from.
+        for _ in 0..FADE_FRAMES {
+            run_app_frame_sized(&ctx, &mut app, Vec::new(), egui::vec2(NARROW, 900.0));
+        }
+        assert!(
+            mail_action_rect(&ctx, &mut app, NARROW).is_none(),
+            "a {NARROW} pt window has no room for the run beside the controls"
+        );
+        app.selected_message = Some("0".to_string());
+        for _ in 0..FADE_FRAMES {
+            run_app_frame_sized(&ctx, &mut app, Vec::new(), egui::vec2(NARROW, 900.0));
+        }
+        let bar = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(NARROW, TITLEBAR_HEIGHT));
+        let rects = titlebar_rects(bar, 3);
+        let packed =
+            rects.sync.left() - MAIL_ACTION_EDGE_GAP - titlebar_cells_width(MailAction::ALL.len());
+        for index in 0..MailAction::ALL.len() {
+            let unheld = egui::pos2(
+                packed + index as f32 * pitch + TITLEBAR_BUTTON_SIZE / 2.0,
+                TITLEBAR_HEIGHT / 2.0,
+            );
+            assert!(
+                fill_under_the_pointer(&ctx, &mut app, NARROW, unheld, TITLEBAR_BUTTON_SIZE)
+                    .is_none(),
+                "the run is not drawn where the pane cannot hold it: {unheld:?}"
+            );
+        }
+        // The probe asks the right question: the bar's own cells are there at
+        // that width, so it is the run that is missing and not the pointer.
+        assert!(
+            fill_under_the_pointer(
+                &ctx,
+                &mut app,
+                NARROW,
+                egui::pos2(
+                    TITLEBAR_EDGE_MARGIN
+                        + BRAND_ICON_SIZE
+                        + TITLEBAR_BUTTON_GAP
+                        + TITLEBAR_BUTTON_SIZE / 2.0,
+                    TITLEBAR_HEIGHT / 2.0
+                ),
+                TITLEBAR_BUTTON_SIZE
+            )
+            .is_some(),
+            "the first group's cells are still the bar's"
+        );
+
+        // Select mode, nothing open in the pane, a mail checked: Delete is what
+        // the selection is for, so the run is there — and it is the only cell of
+        // the seven that answers.
+        app.selected_message = None;
+        app.select_mode = true;
+        app.selected_mails
+            .insert(MailKey::new("acct", "INBOX", "1"));
+        for _ in 0..FADE_FRAMES {
+            run_app_frame_sized(&ctx, &mut app, Vec::new(), egui::vec2(1400.0, 900.0));
+        }
+        let actions = mail_action_rect(&ctx, &mut app, 1400.0).expect("the pane has room");
+        assert!(
+            fill_under_the_pointer(
+                &ctx,
+                &mut app,
+                1400.0,
+                cell(actions, index_of(MailAction::Delete)),
+                TITLEBAR_BUTTON_SIZE
+            )
+            .is_some(),
+            "Delete is there for the selection"
+        );
+        assert!(
+            fill_under_the_pointer(
+                &ctx,
+                &mut app,
+                1400.0,
+                cell(actions, index_of(MailAction::Reply)),
+                TITLEBAR_BUTTON_SIZE
+            )
+            .is_none(),
+            "the rest are about the mail the pane shows"
+        );
+    }
+
+    /// The box the bar plans for and the box it draws are the same box:
+    /// `titlebar_search_width`'s answer is what the widget comes to, margins and
+    /// all, and it starts at the message list's own left edge. Two pieces of
+    /// arithmetic decide that — the plan's constants and egui's
+    /// `desired_width` — and they are not the same arithmetic, so this is what
+    /// keeps them from drifting. (`desired_width` is the *whole* box: the margins
+    /// come out of it, they are not added to it.)
+    #[test]
+    fn the_search_box_is_as_wide_as_it_was_planned() {
         let ctx = egui::Context::default();
         crate::fonts::install(&ctx, None, None);
         let mut app = app_with_messages(&ctx, 4);
-        let actions = titlebar_cells_width(MailAction::ALL.len());
 
-        // A window with room for the whole middle group: the box is at the
-        // width the fit gives a bar that has nothing to give up.
+        // A window with room for the whole bar: the box is at its own width.
         frame_shapes_at(&ctx, &mut app, 1400.0);
         let drawn = ctx
             .read_response(egui::Id::new("titlebar-search"))
             .expect("the bar drew no search box at 1400 pt")
             .rect;
-        let planned = titlebar_fit(4000.0, actions).search.unwrap();
+        let bar = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1400.0, TITLEBAR_HEIGHT));
+        let rects = titlebar_rects(bar, 3);
+        let pane_left = app.list_column.right();
+        let anchors = titlebar_anchors(
+            bar,
+            first_group_end(),
+            app.list_column.left(),
+            pane_left,
+            rects.sync.left(),
+        );
+        let next = anchors
+            .actions
+            .map_or(rects.sync.left(), |actions| actions.left());
+        let planned = titlebar_search_width(next - anchors.search - TITLEBAR_GROUP_GAP)
+            .expect("the bar planned no box at 1400 pt");
         assert!(
             (drawn.width() - planned).abs() < 0.5,
-            "the fit plans a {planned} pt box and the bar drew a {} pt one",
+            "the bar plans a {planned} pt box and drew a {} pt one",
             drawn.width()
         );
+        assert!(
+            (drawn.left() - anchors.search).abs() < 0.5,
+            "the box starts at the list's own edge: {drawn:?} against {}",
+            anchors.search
+        );
+    }
+
+    /// The search box is the message list's: it starts where the list starts and
+    /// follows the splitter that moves the list's left edge — and when the
+    /// navigation column is collapsed and the list runs to the window's own edge,
+    /// it stops clear of the first group instead of landing on the brand.
+    #[test]
+    fn the_search_box_follows_the_list() {
+        let ctx = egui::Context::default();
+        crate::fonts::install(&ctx, None, None);
+        let mut app = app_with_messages(&ctx, 4);
+
+        // A wider navigation column moves the list's left edge, and the box
+        // with it.
+        set_panel_width(&ctx, "nav", 260.0);
+        run_app_frame(&ctx, &mut app, Vec::new());
+        run_app_frame(&ctx, &mut app, Vec::new());
+        let drawn = ctx
+            .read_response(egui::Id::new("titlebar-search"))
+            .expect("the bar drew no search box")
+            .rect;
+        assert!(
+            (drawn.left() - app.list_column.left()).abs() < 1.0,
+            "the box is at the list's left edge: {drawn:?} against {:?}",
+            app.list_column
+        );
+
+        // Collapsed: the navigation slides out, the list takes the room over,
+        // and the box follows it — never onto the first group.
+        app.nav_collapsed = true;
+        for _ in 0..16 {
+            run_app_frame(&ctx, &mut app, Vec::new());
+            let drawn = ctx
+                .read_response(egui::Id::new("titlebar-search"))
+                .expect("the bar drew no search box");
+            assert!(
+                drawn.rect.left() >= first_group_end() + TITLEBAR_GROUP_GAP - 0.5,
+                "the box stays clear of the first group: {:?}",
+                drawn.rect
+            );
+        }
     }
 
     /// Dragging the splitter with the pointer, the way a user does: the pane
@@ -15314,34 +15618,57 @@ mod tests {
 
     /// Where one of the title bar's mail action cells sits: the bar's own
     /// arithmetic, from the search box the run is laid out after onwards
-    /// (`titlebar_rects`, `titlebar_fit`).
+    /// (`titlebar_rects`, `titlebar_anchors`).
     fn titlebar_action_center(
         ctx: &egui::Context,
         app: &mut KimoApp,
         action: MailAction,
         width: f32,
     ) -> egui::Pos2 {
-        frame_shapes_at(ctx, app, width);
-        let search = ctx
-            .read_response(egui::Id::new("titlebar-search"))
-            .expect("the bar drew no search box")
-            .rect;
-        let bar = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(width, TITLEBAR_HEIGHT));
-        let rects = titlebar_rects(bar, 3);
-        let cells = titlebar_cells_width(MailAction::ALL.len());
-        let fit = titlebar_fit(rects.sync.min.x - search.left(), cells);
-        assert!(fit.actions, "the bar gave the actions up at {width} pt");
+        let actions = mail_action_rect(ctx, app, width)
+            .unwrap_or_else(|| panic!("the bar drew no mail actions at {width} pt"));
         let index = MailAction::ALL
             .iter()
             .position(|candidate| *candidate == action)
             .expect("one of the seven");
         egui::pos2(
-            search.right()
-                + fit.padding
+            actions.left()
                 + index as f32 * (TITLEBAR_BUTTON_SIZE + TITLEBAR_BUTTON_GAP)
                 + TITLEBAR_BUTTON_SIZE / 2.0,
             TITLEBAR_HEIGHT / 2.0,
         )
+    }
+
+    /// Where the first group ends: the brand icon, the nav toggle and the pen,
+    /// with the bar's gaps between them. The one anchor nothing else may cross.
+    fn first_group_end() -> f32 {
+        TITLEBAR_EDGE_MARGIN
+            + BRAND_ICON_SIZE
+            + 2.0 * TITLEBAR_BUTTON_GAP
+            + 2.0 * TITLEBAR_BUTTON_SIZE
+    }
+
+    /// The rect the bar gives its mail actions this frame, from the columns the
+    /// app has just laid out — `None` when the pane is too narrow to hold
+    /// them beside the window controls. Runs a frame, so the app's column rects
+    /// are the ones the bar itself read.
+    fn mail_action_rect(ctx: &egui::Context, app: &mut KimoApp, width: f32) -> Option<egui::Rect> {
+        frame_shapes_at(ctx, app, width);
+        let bar = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(width, TITLEBAR_HEIGHT));
+        let rects = titlebar_rects(bar, 3);
+        let pane_left = if app.pane_popup {
+            0.0
+        } else {
+            app.list_column.right()
+        };
+        titlebar_anchors(
+            bar,
+            first_group_end(),
+            app.list_column.left(),
+            pane_left,
+            rects.sync.left(),
+        )
+        .actions
     }
 
     /// The labels are a group of their own, and the navigation column's last
@@ -15508,27 +15835,55 @@ mod tests {
             println!("wrote {}", path.display());
         };
         shot(&mut app, "ui-labels-card.png", &mut textures);
-        // The label row in the column, found where the frame drew it.
+        // The label row in the column, found where the frame drew it. A window
+        // narrow enough for the navigation to have collapsed has no column to
+        // find it in: the label states then simply are not part of the dump,
+        // which is what looking at a narrow *bar* wants anyway.
         let shapes = collect_frame(&ctx, &mut app, &mut textures, Vec::new());
         let row = text_boxes_of(&shapes, nav_column(&app), "Work")
             .into_iter()
-            .next()
-            .expect("the column draws the label");
-        dump_click(&ctx, &mut app, &mut textures, row.center());
-        shot(&mut app, "ui-labels-filter.png", &mut textures);
-        dump_click(&ctx, &mut app, &mut textures, header_action_center(1));
-        shot(&mut app, "ui-labels-popup.png", &mut textures);
+            .next();
+        if let Some(row) = row {
+            dump_click(&ctx, &mut app, &mut textures, row.center());
+            shot(&mut app, "ui-labels-filter.png", &mut textures);
+            dump_click(&ctx, &mut app, &mut textures, header_action_center(1));
+            shot(&mut app, "ui-labels-popup.png", &mut textures);
+        }
         // And Preferences → General, where the sync settings live. The label
         // popup is dismissed first — a menu left open over the columns would be
         // half the picture — and the modal itself is an `Area`, which lays
         // itself out on the frame it is opened on and draws on the next: one
         // frame first, or the picture would be of a window with no modal in it.
         egui::Popup::close_all(&ctx);
+        // The bar with nothing open in the pane first: the pane's run is not
+        // there at all rather than there and dimmed, and the chrome it would
+        // have used is the drag surface. The frames are what its fade needs.
+        app.selected_message = None;
+        for _ in 0..16 {
+            collect_frame(&ctx, &mut app, &mut textures, Vec::new());
+        }
+        shot(&mut app, "ui-bar-no-mail.png", &mut textures);
+        app.selected_message = Some("acct-1".to_string());
+
         app.show_preferences = true;
         app.prefs_tab = PrefsTab::General;
         collect_frame(&ctx, &mut app, &mut textures, Vec::new());
         shot(&mut app, "ui-general.png", &mut textures);
         app.show_preferences = false;
+    }
+
+    /// The dump canvas: the height every picture is drawn at, and the width the
+    /// window is asked for.
+    const DUMP_HEIGHT: usize = 900;
+
+    /// The window the dump tool draws at: 1400 by 900 unless `KIMO_UI_WIDTH`
+    /// says otherwise, which is how the narrow layouts — the capped pane, the
+    /// popup one — are looked at.
+    fn dump_width() -> f32 {
+        std::env::var("KIMO_UI_WIDTH")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(1400.0)
     }
 
     /// One headless frame of the app, rasterized straight from egui's own
@@ -15543,13 +15898,15 @@ mod tests {
         path: &std::path::Path,
         textures: &mut HashMap<egui::TextureId, (usize, usize, Vec<egui::Color32>)>,
     ) {
-        const WIDTH: usize = 1400;
-        const HEIGHT: usize = 900;
+        /// The dump canvas height.
+        const DUMP_HEIGHT: usize = 900;
+        const HEIGHT: usize = DUMP_HEIGHT;
+        let width = dump_width() as usize;
 
         let shapes = collect_frame(ctx, app, textures, Vec::new());
         let ppp = ctx.pixels_per_point();
         let primitives = ctx.tessellate(shapes, ppp);
-        let mut canvas = vec![egui::Color32::TRANSPARENT; WIDTH * HEIGHT];
+        let mut canvas = vec![egui::Color32::TRANSPARENT; width * HEIGHT];
         for primitive in &primitives {
             let egui::epaint::Primitive::Mesh(mesh) = &primitive.primitive else {
                 continue;
@@ -15575,7 +15932,7 @@ mod tests {
                         .cloned()
                         .fold(f32::NEG_INFINITY, f32::max)
                         .ceil()
-                        .min(WIDTH as f32) as usize,
+                        .min(width as f32) as usize,
                 );
                 let (y0, y1) = (
                     ys.iter()
@@ -15619,9 +15976,9 @@ mod tests {
                             (source.b() as u32 * texel.b() as u32 / 255) as u8,
                             (source.a() as u32 * texel.a() as u32 / 255) as u8,
                         );
-                        let dst = canvas[y * WIDTH + x];
+                        let dst = canvas[y * width + x];
                         let alpha = color.a() as u32;
-                        canvas[y * WIDTH + x] = egui::Color32::from_rgba_premultiplied(
+                        canvas[y * width + x] = egui::Color32::from_rgba_premultiplied(
                             (color.r() as u32 + dst.r() as u32 * (255 - alpha) / 255) as u8,
                             (color.g() as u32 + dst.g() as u32 * (255 - alpha) / 255) as u8,
                             (color.b() as u32 + dst.b() as u32 * (255 - alpha) / 255) as u8,
@@ -15632,7 +15989,7 @@ mod tests {
             }
         }
         let bytes: Vec<u8> = canvas.iter().flat_map(|pixel| pixel.to_array()).collect();
-        let image = image::RgbaImage::from_raw(WIDTH as u32, HEIGHT as u32, bytes)
+        let image = image::RgbaImage::from_raw(width as u32, HEIGHT as u32, bytes)
             .expect("the canvas is the size it was allocated");
         image.save(path).expect("the dump directory is writable");
     }
@@ -15651,7 +16008,7 @@ mod tests {
         let input = egui::RawInput {
             screen_rect: Some(egui::Rect::from_min_size(
                 egui::Pos2::ZERO,
-                egui::vec2(1400.0, 900.0),
+                egui::vec2(dump_width(), DUMP_HEIGHT as f32),
             )),
             events,
             ..Default::default()
