@@ -1299,30 +1299,78 @@ Event (mpsc) ──► drain_events() at frame start ──► merge into Accoun
   card opens with is the draft's own — nothing, for a new mail; the mail it
   answers, for the three. **The on-the-spot card is the shorter form**
   (`compose_card`’s `inline`, which is what `ComposeSpot::Pane` means): an
-  answer written under its own mail shows From, To, the files, the body and the
-  two buttons, and nothing else. It has no heading — the mail above it says
-  what it answers — but it has a **head bar**: the avatar of the account the
-  answer goes from, drawn in the label column’s own slot, and the From list
+  answer written under its own mail shows From, To, the body, the files and the
+  two buttons, and nothing else — in that order, a letter’s: the mail is what
+  the card is for, and a file is something put *with* it (`compose_body`
+  before `compose_files_row`) — while the popup keeps its form’s order, files
+  over body, where the attachments belong to the fields above them. It has no
+  heading — the mail above it says what it answers — but it has a **head bar**:
+  the avatar of the account the answer goes from, drawn in the label column’s
+  own slot, and the From list
   beside it, with the separator under the row that the popup’s heading has
   above its form. The list is *flat* there: `flatten_widgets` takes the combo’s
   outline and fill off in that Ui and leaves the hover, because an outline
-  belongs to a form of boxes and this line is the reply’s own from. The face is
-  the one a mail’s card wears (`sender_color` and `sender_initial` of the
+  belongs to a form of boxes and this line is the reply’s own from. **To is
+  flat beside it**, for the same reason: that row’s Ui is flattened too, and
+  the helper also clears the two slots a text box draws its own box from — the
+  fill (`Visuals::text_edit_bg_color`) and the selection stroke it wears with
+  the keyboard in it — so the field has no box focused or not. The popup keeps
+  its To box, as it keeps its Cc, Bcc and Subject. The face is the one a mail’s
+  card wears (`sender_color` and `sender_initial` of the
   account’s address and name, at `AVATAR_DIAMETER`), so the card says who it is
-  from the way every other card in the app says who it is from. Cc, Bcc and
-  Subject are the popup’s rows and are not drawn here — but they are still *in
-  the draft*, so a Reply all goes on copying whom it was copying even though
-  the card does not show it. The popup keeps its heading and all five rows, and
-  one draft moves between the two containers with only the container changing.
+  from the way every other card in the app says who it is from. **To ends with
+  the fold chevron** (`paint_fold_chevron`, in a cell a field tall): the Cc
+  and Bcc lines are the popup’s rows, but on the spot they are one click away
+  under To (`compose_to_row`) — flat like the lines above them, pointing down
+  while they are away and up once they are under the row — and a card opens
+  with them away (`ComposeDraft::copies_open`), so an answer that needs no
+  copies shows the one address it goes to. A Reply all’s own Cc is still *in
+  the draft*, and read — and edited — as soon as the chevron is clicked.
+  Subject stays the popup’s row, and stays in the draft with it. The popup
+  keeps its heading and all five rows, and one draft moves between the two
+  containers with only the container changing.
   The footer is the one other thing the two do not share: the on-the-spot card
   draws `compose_button`’s pair — an icon and a word in one tall target, Send
   in the accent because sending is what the card is for (`paint_send_icon`, the
   plane) and Discard an outline beside it that turns the scheme’s danger on
   hover (`paint_delete_icon`, the trash, the treatment every delete in the app
-  gets) — while the popup keeps egui’s own two, a line of its form. The boxes
-  are a fixed label column plus what `COMPOSE_WIDTH` leaves, the body is
-  `COMPOSE_BODY_HEIGHT` tall and scrolls inside that rather than growing the
-  card, and the first frame puts the keyboard in To.
+  gets) — while the popup keeps egui’s own two, a line of its form. **The
+  card’s foot has no rule over it** either: the card is a letter, and the mail
+  above it — not a line — is what its end is read against. What it has to say
+  (the server’s refusal, that the mail is on its way, why Send cannot be
+  pressed) stands on a row of its own over the buttons, and the pair opens the
+  row at the card’s left edge — the side the mail above is read from — rather
+  than ending it at the right, where the popup’s form keeps its own: Discard
+  first and Send beside it. That row is a *bounded* one (`ui.horizontal`, the
+  height of what is in it): a `with_layout` over the space left would center
+  the pair in all of it and carry the card’s surface down to the pane’s floor,
+  which is what left a band of nothing between the reason and the buttons —
+  **the card ends where its content does**, `CONTENT_PADDING` under the last
+  row on it. The popup’s reason reads beside its two, over the form’s own
+  separator. The boxes are a fixed label column plus what `COMPOSE_WIDTH`
+  leaves; the body is `COMPOSE_BODY_HEIGHT` tall and scrolls inside that
+  rather than growing the card — and **the box fills that height and, on the
+  spot, the card’s whole column** (`compose_body`’s `min_size` and the width
+  `inline` hands it: a letter’s text block, padding to padding, where the
+  popup keeps the form’s field column), not the dozen lines an empty draft
+  needs — so the row under it is never read across a band of the card’s own
+  surface and the mail being written is as wide as the card will hold. **The
+  area is claimed outright** (`compose_body`’s `scope_builder` over a rect of
+  its own), because a window too short for the card is the pane’s to scroll:
+  a scroll area left to the room under the To row is squeezed to a few lines
+  there, which cuts the box off and leaves the card’s surface not even
+  covering what is left of it. The
+  first frame puts the keyboard where the card’s own next move is: To on the
+  popup’s form — and on a forward opened on the spot, which has no recipient
+  yet — and the body on an answer that already knows who it goes to, with
+  `cursor_at_end(false)` so the caret starts the reply *above* the
+  quoted original rather than after it. That same first frame is what brings an
+  on-the-spot card into view: `compose_inline_card` reads the draft’s `focus`
+  before `compose_card` takes it and scrolls the pane by no more than the card
+  needs (`Ui::scroll_to_rect(.., None)` — the shortest scroll that shows it,
+  and its head when it cannot all fit), because a reply cell at the top of a
+  long mail would otherwise open its card below the fold with nothing on
+  screen to say the click had done anything.
   **The backdrop does not close it.** `ModalResponse::should_close` — a click
   beside the card, or Escape — is deliberately ignored: the draft is the only
   copy of the mail, and neither should be what throws it away. Discard is the
