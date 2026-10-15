@@ -194,6 +194,12 @@ pub struct MailMessage {
     /// Unix timestamp (UTC) when the date header could be parsed.
     pub timestamp: Option<i64>,
     pub seen: bool,
+    /// Whether the reader flagged this mail (schema v9: `\Flagged` where the
+    /// account speaks IMAP). Like a label it is the user's own mark rather than
+    /// the mail's content, but unlike one it is the *server's* too: a fetch
+    /// reads it back, and the reader's click pushes it, so flagging a mail here
+    /// flags it everywhere. A POP3 account keeps the flag in the database alone.
+    pub flagged: bool,
     /// The mail's own `Message-ID`, angle brackets off. Empty for mail cached
     /// before schema v7 — the header was not stored then — and for the rare
     /// mail that carries none.

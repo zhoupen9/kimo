@@ -105,7 +105,11 @@ pub fn parse(raw: &[u8], uid: &str, seen: bool) -> MailMessage {
         attachments,
         inline_images,
         // A mail just parsed off the wire carries no labels: they are the
-        // user's own marks, and they live in the database.
+        // user's own marks, and they live in the database. The flag is the one
+        // mark the wire *does* carry — `\Flagged` — and the caller that knows
+        // the flags (`crate::sync`, off the FETCH) sets it; what is parsed here
+        // is the message itself.
+        flagged: false,
         labels: BTreeSet::new(),
     }
 }

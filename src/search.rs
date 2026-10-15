@@ -167,6 +167,10 @@ pub struct SearchHit {
     pub date: String,
     pub timestamp: Option<i64>,
     pub seen: bool,
+    /// Whether the reader flagged the mail. A hit is drawn with the same
+    /// warning tint a folder's row is, so the query carries it like any other
+    /// thing the row says.
+    pub flagged: bool,
     /// How many attachments the mail has (0 for none).
     pub attachments: usize,
     pub snippet: String,
@@ -360,7 +364,7 @@ pub fn run(conn: &rusqlite::Connection, query: &SearchQuery) -> MailResult<Vec<S
     let expression = fts_expression(&query.text);
     let mut sql = String::from(
         "SELECT m.account_id, m.folder, m.uid, m.subject, m.from_addr, m.date_header,
-                m.ts, m.seen, m.body_text, m.preview,
+                m.ts, m.seen, m.flagged, m.body_text, m.preview,
                 (SELECT COUNT(*) FROM attachments a WHERE a.message_id = m.id)
            FROM messages m",
     );
@@ -430,9 +434,10 @@ pub fn run(conn: &rusqlite::Connection, query: &SearchQuery) -> MailResult<Vec<S
             row.get::<_, String>(5)?,
             row.get::<_, Option<i64>>(6)?,
             row.get::<_, i64>(7)?,
-            row.get::<_, String>(8)?,
+            row.get::<_, i64>(8)?,
             row.get::<_, String>(9)?,
-            row.get::<_, i64>(10)?,
+            row.get::<_, String>(10)?,
+            row.get::<_, i64>(11)?,
         ))
     })?;
     let mut hits = Vec::new();
@@ -446,6 +451,7 @@ pub fn run(conn: &rusqlite::Connection, query: &SearchQuery) -> MailResult<Vec<S
             date,
             timestamp,
             seen,
+            flagged,
             body,
             preview,
             attachments,
@@ -459,6 +465,7 @@ pub fn run(conn: &rusqlite::Connection, query: &SearchQuery) -> MailResult<Vec<S
             date,
             timestamp,
             seen: seen != 0,
+            flagged: flagged != 0,
             attachments: attachments.max(0) as usize,
             snippet: snippet(&terms, &body, &preview),
         });
@@ -596,6 +603,7 @@ mod tests {
             date: "Mon, 1 Jan 2026 00:00:00 +0000".to_string(),
             timestamp: Some(1_767_225_600),
             seen: false,
+            flagged: false,
             message_id: String::new(),
             in_reply_to: Vec::new(),
             references: Vec::new(),
@@ -682,6 +690,30 @@ mod tests {
             ..SearchQuery::default()
         };
         assert!(filtered.is_active(), "a filter alone is a search");
+        fs_remove(&dir);
+    }
+
+    /// A hit carries the reader's flag, which is what the row's warning tint is
+    /// drawn from: the query reads it off the message rather than out of the
+    /// search index, so flagging a mail needs no re-index to be seen.
+    #[test]
+    fn a_hit_carries_the_readers_flag() {
+        let (mut conn, dir) = temp_db("search-flag");
+        let mut flagged = message("1", "Report", "a report");
+        flagged.flagged = true;
+        save(
+            &mut conn,
+            "INBOX",
+            Some(1),
+            &[flagged, message("2", "Report again", "another report")],
+        )
+        .unwrap();
+
+        let hits = search(&conn, query("report"));
+        assert_eq!(sorted_uids(&hits), ["1", "2"]);
+        let by_uid = |uid: &str| hits.iter().find(|hit| hit.uid == uid).expect("a hit");
+        assert!(by_uid("1").flagged, "the flagged mail's hit says so");
+        assert!(!by_uid("2").flagged, "and the other does not");
         fs_remove(&dir);
     }
 
@@ -974,6 +1006,7 @@ mod tests {
             date: String::new(),
             timestamp: None,
             seen: false,
+            flagged: false,
             message_id: String::new(),
             in_reply_to: Vec::new(),
             references: Vec::new(),

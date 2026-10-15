@@ -52,7 +52,7 @@ use crate::models::{
 use crate::storage::{self, Folder, Mailbox};
 
 /// The schema version this build writes and understands.
-pub const SCHEMA_VERSION: i64 = 8;
+pub const SCHEMA_VERSION: i64 = 9;
 
 /// How long a statement waits for another writer before giving up. Jobs hold
 /// the connection only around their SQL, so this is a backstop, not a plan.
@@ -137,6 +137,10 @@ CREATE TABLE IF NOT EXISTS messages (
     -- column named after one is a syntax error wherever it is named.
     refs        TEXT NOT NULL DEFAULT '',
     cjk         TEXT NOT NULL DEFAULT '',
+    -- Whether the reader flagged the mail (schema v9). Last, because the step
+    -- that adds it to an older database appends it: a migrated table and a
+    -- fresh one have the same shape, column order included.
+    flagged     INTEGER NOT NULL DEFAULT 0,
     UNIQUE (account_id, folder, uid),
     FOREIGN KEY (account_id) REFERENCES accounts(id) ON DELETE CASCADE,
     FOREIGN KEY (account_id, folder) REFERENCES folders(account_id, name) ON DELETE CASCADE
@@ -306,6 +310,14 @@ CREATE TABLE IF NOT EXISTS message_labels (
 );
 "#;
 
+/// The step from `user_version` 8 to 9: the flag the reader puts on a mail.
+/// Nothing is derived — a database from before this step has no flags and no way
+/// to have meant one — so every mail in it starts unflagged, and the column
+/// lands at the end of the table, which is where `SCHEMA_SQL` puts it too.
+const MIGRATE_V9_SQL: &str = r#"
+ALTER TABLE messages ADD COLUMN flagged INTEGER NOT NULL DEFAULT 0;
+"#;
+
 /// IMAP's floor as the mail a database from before version 4 already implies:
 /// the lowest UID it holds, which is also the lowest it was ever fetched down
 /// to. This is the version-3 step's guess, not the rule — a live folder's floor
@@ -344,11 +356,20 @@ UPDATE folders SET uid_next = (
 /// reports is not a source of truth for mail already shown as read), and the
 /// `WHERE` clause makes an unchanged message a no-op: no row comes back, so
 /// neither the FTS triggers nor the child rows below are touched.
+///
+/// `flagged` is the reader's own mark and is **not** merged: it is in the
+/// `INSERT` — so a mail stored for the first time is born with what the fetch
+/// reported, its `\Flagged` — and in neither the `SET` nor the `WHERE`, so a
+/// re-fetch of a mail the database already has leaves the flag exactly where
+/// the reader's last click put it (`set_flagged`). A POP3 re-fetch, which
+/// rewrites every message it holds, is the reason: it has no flags to report,
+/// and the reader's would otherwise be wiped by every sync.
 const MESSAGE_UPSERT: &str = r#"
 INSERT INTO messages (
     account_id, folder, uid, subject, from_addr, to_addr, date_header, ts,
-    seen, body_text, body_html, preview, message_id, in_reply_to, refs, cjk
-) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)
+    seen, body_text, body_html, preview, message_id, in_reply_to, refs, cjk,
+    flagged
+) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)
 ON CONFLICT(account_id, folder, uid) DO UPDATE SET
     subject     = excluded.subject,
     from_addr   = excluded.from_addr,
@@ -605,6 +626,12 @@ fn migrate(conn: &mut Connection, legacy: Option<(&Path, &Path)>) -> MailResult<
         let tx = conn.transaction()?;
         tx.execute_batch(MIGRATE_V8_SQL)?;
         tx.pragma_update(None, "user_version", 8)?;
+        tx.commit()?;
+    }
+    if start < 9 {
+        let tx = conn.transaction()?;
+        tx.execute_batch(MIGRATE_V9_SQL)?;
+        tx.pragma_update(None, "user_version", 9)?;
         tx.commit()?;
     }
     Ok(())
@@ -1073,7 +1100,7 @@ fn load_mailboxes_on(
         let mut stmt = conn.prepare(
             "SELECT id, account_id, folder, uid, subject, from_addr, to_addr, date_header,
                     ts, seen, body_text, body_html, preview,
-                    message_id, in_reply_to, refs
+                    message_id, in_reply_to, refs, flagged
                FROM messages ORDER BY ts DESC, id DESC",
         )?;
         let rows = stmt.query_map([], |row| {
@@ -1089,6 +1116,7 @@ fn load_mailboxes_on(
                     date: row.get(7)?,
                     timestamp: row.get(8)?,
                     seen: row.get::<_, i64>(9)? != 0,
+                    flagged: row.get::<_, i64>(16)? != 0,
                     message_id: row.get(13)?,
                     in_reply_to: split_ids(&row.get::<_, String>(14)?),
                     references: split_ids(&row.get::<_, String>(15)?),
@@ -1348,6 +1376,7 @@ fn save_messages_on(
                         join_ids(&message.in_reply_to),
                         join_ids(&message.references),
                         cjk,
+                        message.flagged as i64,
                     ],
                     |row| row.get(0),
                 )
@@ -1427,6 +1456,34 @@ fn delete_message_on(
     // caller. The floor is where the folder was last asked from, which deleting
     // a message does not change — the range below it is asked for again and
     // answers with whatever still exists there.
+    Ok(())
+}
+
+/// Put the reader's flag on one message, or take it off: what the title bar's
+/// flag cell runs, and what `Job::SetFlag` writes once the server has been told
+/// (for an account that has one to tell).
+///
+/// There is no derivation and no merge — a flag is a state, not a count — so
+/// what is written is exactly what the reader last chose. A fetch never
+/// carries it either way: `MESSAGE_UPSERT` does not name the column, so
+/// re-fetching a mail leaves a flag where it was, exactly as it leaves the
+/// labels alone.
+pub fn set_flagged(account_id: &str, folder: &str, uid: &str, flagged: bool) -> MailResult<()> {
+    let db = db()?;
+    set_flagged_on(db.conn(), account_id, folder, uid, flagged)
+}
+
+fn set_flagged_on(
+    conn: &Connection,
+    account_id: &str,
+    folder: &str,
+    uid: &str,
+    flagged: bool,
+) -> MailResult<()> {
+    conn.execute(
+        "UPDATE messages SET flagged = ?4 WHERE account_id = ?1 AND folder = ?2 AND uid = ?3",
+        params![account_id, folder, uid, flagged as i64],
+    )?;
     Ok(())
 }
 
@@ -1722,6 +1779,9 @@ impl LegacyMessage {
             date: self.date,
             timestamp: self.timestamp,
             seen: self.seen,
+            // The old JSON kept no flags either: a mail from it starts
+            // unflagged.
+            flagged: false,
             // The old JSON kept no ids: a mail from it threads by subject.
             message_id: String::new(),
             in_reply_to: Vec::new(),
@@ -1817,6 +1877,9 @@ pub(crate) mod test_support {
             sql.push_str("DROP TABLE message_labels;\n");
             sql.push_str("DROP TABLE labels;\n");
         }
+        if version < 9 {
+            sql.push_str("ALTER TABLE messages DROP COLUMN flagged;\n");
+        }
         conn.execute_batch(&sql).unwrap();
         conn.pragma_update(None, "user_version", version).unwrap();
     }
@@ -1900,6 +1963,7 @@ mod tests {
             date: "Mon, 1 Jan 2026 00:00:00 +0000".to_string(),
             timestamp: Some(1_767_225_600),
             seen: false,
+            flagged: false,
             message_id: String::new(),
             in_reply_to: Vec::new(),
             references: Vec::new(),
@@ -2969,6 +3033,124 @@ mod tests {
         set_labels_on(&mut conn, "work", "INBOX", "1", &["Work".to_string()]).unwrap();
         let mailboxes = load_mailboxes_on(&conn, &["work".to_string()]).unwrap();
         assert_eq!(mailboxes["work"].folders[0].messages[0].labels.len(), 1);
+        integrity_check_on(&conn).unwrap();
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The flag round-trips through the message it belongs to: what the title
+    /// bar's cell writes is what the list's row and the pane's card are drawn
+    /// from, so it is read back off the mail rather than out of a table of its
+    /// own.
+    #[test]
+    fn the_flag_round_trips_through_a_message() {
+        let (mut conn, dir) = test_db("flag-round-trip");
+        save_account_on(&conn, &account("work")).unwrap();
+        save_messages_on(
+            &mut conn,
+            "work",
+            "INBOX",
+            Some(1),
+            &[message("1", "Hello", "body")],
+        )
+        .unwrap();
+        assert!(
+            !load_mailboxes_on(&conn, &["work".to_string()]).unwrap()["work"].folders[0].messages
+                [0]
+            .flagged
+        );
+
+        set_flagged_on(&conn, "work", "INBOX", "1", true).unwrap();
+        let mailboxes = load_mailboxes_on(&conn, &["work".to_string()]).unwrap();
+        assert!(mailboxes["work"].folders[0].messages[0].flagged);
+
+        // And off again: a flag is a state rather than a latch.
+        set_flagged_on(&conn, "work", "INBOX", "1", false).unwrap();
+        let mailboxes = load_mailboxes_on(&conn, &["work".to_string()]).unwrap();
+        assert!(!mailboxes["work"].folders[0].messages[0].flagged);
+
+        // A mail the fetch reports as flagged is stored with the mark: the
+        // `INSERT` carries it, which is the one time the server's `\Flagged` is
+        // what the row is born with.
+        let mut flagged = message("2", "Flagged on the server", "body");
+        flagged.flagged = true;
+        save_messages_on(&mut conn, "work", "INBOX", Some(1), &[flagged]).unwrap();
+        let mailboxes = load_mailboxes_on(&conn, &["work".to_string()]).unwrap();
+        let stored = mailboxes["work"].folders[0]
+            .messages
+            .iter()
+            .find(|mail| mail.uid == "2")
+            .expect("the second mail is there");
+        assert!(stored.flagged, "a new row keeps what the fetch reported");
+        integrity_check_on(&conn).unwrap();
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A flag is not the mail's content either: a re-fetch — which a POP3 sync
+    /// does to every message it holds, bodies and all — leaves it where it was,
+    /// which is what `MESSAGE_UPSERT` not naming the column is for.
+    #[test]
+    fn a_flag_outlives_a_re_fetch() {
+        let (mut conn, dir) = test_db("flag-life");
+        save_account_on(&conn, &account("work")).unwrap();
+        let mail = message("1", "Hello", "body");
+        save_messages_on(
+            &mut conn,
+            "work",
+            "INBOX",
+            Some(1),
+            std::slice::from_ref(&mail),
+        )
+        .unwrap();
+        set_flagged_on(&conn, "work", "INBOX", "1", true).unwrap();
+
+        let mut refetched = message("1", "Hello again", "a longer body");
+        refetched.seen = true;
+        save_messages_on(&mut conn, "work", "INBOX", Some(1), &[refetched]).unwrap();
+        let mailboxes = load_mailboxes_on(&conn, &["work".to_string()]).unwrap();
+        let kept = &mailboxes["work"].folders[0].messages[0];
+        assert_eq!(kept.subject, "Hello again", "the fetch updated the row");
+        assert!(kept.flagged, "and left the reader's own mark alone");
+        integrity_check_on(&conn).unwrap();
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A database from version 8 gains the flag column unflagged: there were no
+    /// flags before this step and no way to have meant one, so nothing is
+    /// derived and every mail it holds starts without one — and the column is
+    /// the one flagging writes to.
+    #[test]
+    fn a_version_8_database_gains_the_flag_column() {
+        let (mut conn, dir) = test_db("migrate-v9");
+        save_account_on(&conn, &account("work")).unwrap();
+        save_messages_on(
+            &mut conn,
+            "work",
+            "INBOX",
+            Some(1),
+            &[message("1", "Hello", "body")],
+        )
+        .unwrap();
+        set_flagged_on(&conn, "work", "INBOX", "1", true).unwrap();
+        rewind_to(&conn, 8);
+        assert!(
+            conn.prepare("SELECT flagged FROM messages").is_err(),
+            "the column is what the step is for"
+        );
+
+        migrate(&mut conn, None).unwrap();
+        assert_eq!(
+            count(&conn, "SELECT * FROM pragma_user_version"),
+            SCHEMA_VERSION
+        );
+        let mailboxes = load_mailboxes_on(&conn, &["work".to_string()]).unwrap();
+        assert!(
+            !mailboxes["work"].folders[0].messages[0].flagged,
+            "a mail from before the step is unflagged"
+        );
+
+        set_flagged_on(&conn, "work", "INBOX", "1", true).unwrap();
+        let mailboxes = load_mailboxes_on(&conn, &["work".to_string()]).unwrap();
+        assert!(mailboxes["work"].folders[0].messages[0].flagged);
         integrity_check_on(&conn).unwrap();
         let _ = fs::remove_dir_all(&dir);
     }

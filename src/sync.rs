@@ -125,6 +125,18 @@ pub enum Job {
         uid: String,
         labels: Vec<String>,
     },
+    /// Put the reader's flag on one message, or take it off — the title bar's
+    /// flag cell. `\Flagged` is the one mail mark the *server* keeps as well
+    /// as Kimo, so this is a round trip where `Job::SetLabels` is not: the local
+    /// row is written first (the reader asked for it, and a server that refuses
+    /// must not lose it) and the IMAP `STORE` follows, for an account that has
+    /// one to tell.
+    SetFlag {
+        account: Account,
+        folder: String,
+        uid: String,
+        flagged: bool,
+    },
     /// Delete messages of one folder — the title bar's Delete, which takes the
     /// mail the reading pane shows or, in select mode, every mail the list has
     /// checked. The server is told first and each database row goes only once
@@ -404,6 +416,22 @@ pub fn spawn(job: Job, ctx: egui::Context, tx: Sender<Event>) {
             }
             ctx.request_repaint();
         }
+        Job::SetFlag {
+            account,
+            folder,
+            uid,
+            flagged,
+        } => {
+            // Not a sync: no spinner for a flag write, and the local half is
+            // stored whether or not the server accepts the push.
+            if let Err(error) = set_flag(&account, &folder, &uid, flagged) {
+                let _ = tx.send(Event::SyncFailed {
+                    account_id: account.id.clone(),
+                    error: error.to_string(),
+                });
+            }
+            ctx.request_repaint();
+        }
         Job::SetLabels {
             account_id,
             folder,
@@ -585,7 +613,8 @@ pub fn spawn(job: Job, ctx: egui::Context, tx: Sender<Event>) {
                 | Job::SendMessage { .. }
                 | Job::LoadOlder { .. }
                 | Job::SetLabels { .. }
-                | Job::DeleteAccount { .. } => unreachable!(),
+                | Job::DeleteAccount { .. }
+                | Job::SetFlag { .. } => unreachable!(),
             };
             let _ = tx.send(Event::SyncStarted {
                 account_id: account_id.clone(),
@@ -623,7 +652,8 @@ pub fn spawn(job: Job, ctx: egui::Context, tx: Sender<Event>) {
                 | Job::SendMessage { .. }
                 | Job::LoadOlder { .. }
                 | Job::SetLabels { .. }
-                | Job::DeleteAccount { .. } => unreachable!(),
+                | Job::DeleteAccount { .. }
+                | Job::SetFlag { .. } => unreachable!(),
             };
             let _ = match result {
                 Ok(()) => tx.send(Event::SyncDone { account_id }),
@@ -833,11 +863,10 @@ fn fetch_folder_into(
             }
         };
         for fetched in fetched {
-            let seen = fetched
-                .flags
-                .iter()
-                .any(|f| f.eq_ignore_ascii_case("\\Seen"));
-            messages.push(mail::parse(&fetched.raw, &fetched.uid.to_string(), seen));
+            let (seen, flagged) = fetched_state(&fetched.flags);
+            let mut message = mail::parse(&fetched.raw, &fetched.uid.to_string(), seen);
+            message.flagged = flagged;
+            messages.push(message);
         }
     }
     // Store before announcing: nothing may appear in the window that the
@@ -917,11 +946,10 @@ fn load_older_imap(account: &Account, folder: &str, tx: &Sender<Event>) -> MailR
             let fetched = client.fetch_bodies(&format!("{low}:{high}"), true)?;
             let mut messages = Vec::new();
             for fetched in fetched {
-                let seen = fetched
-                    .flags
-                    .iter()
-                    .any(|f| f.eq_ignore_ascii_case("\\Seen"));
-                messages.push(mail::parse(&fetched.raw, &fetched.uid.to_string(), seen));
+                let (seen, flagged) = fetched_state(&fetched.flags);
+                let mut message = mail::parse(&fetched.raw, &fetched.uid.to_string(), seen);
+                message.flagged = flagged;
+                messages.push(message);
             }
             // The floor moves whether or not the range held anything: it is
             // where this folder has been asked from, and a mailbox with gaps in
@@ -949,6 +977,16 @@ fn load_older_imap(account: &Account, folder: &str, tx: &Sender<Event>) -> MailR
     })
 }
 
+/// The two per-mail states an IMAP `FETCH` reports in its `FLAGS`: whether the
+/// mail has been read, and whether the reader flagged it. Both are handed to
+/// `mail::parse` / set on the message, and both are the *server's* answer only
+/// for a mail the database is storing for the first time: a row that is already
+/// there keeps what the reader did with it (see `MESSAGE_UPSERT`).
+fn fetched_state(flags: &[String]) -> (bool, bool) {
+    let has = |name: &str| flags.iter().any(|flag| flag.eq_ignore_ascii_case(name));
+    (has("\\Seen"), has("\\Flagged"))
+}
+
 /// Store the flag locally and, for IMAP, push it to the server. The local
 /// write happens first: the mail is read either way, and a server that refuses
 /// the `STORE` must not lose that.
@@ -968,6 +1006,32 @@ fn imap_mark_seen(account: &Account, folder: &str, uid: u32) -> MailResult<()> {
         client.login(&account.username, &account.password)?;
         client.select(folder)?;
         client.uid_store_flags_silent(uid, "+FLAGS.SILENT (\\Seen)")
+    })
+}
+
+/// Store the reader's flag locally and, for IMAP, push it to the server. The
+/// same shape as `mark_seen`, and for the same reason: the local write happens
+/// first, so a server that refuses the `STORE` does not cost the reader the flag
+/// they just set. The command differs in both directions — `+FLAGS` to set the
+/// flag, `-FLAGS` to take it off — because a flag is a state rather than a
+/// latch.
+fn set_flag(account: &Account, folder: &str, uid: &str, flagged: bool) -> MailResult<()> {
+    db::set_flagged(&account.id, folder, uid, flagged)?;
+    if account.protocol == Protocol::Imap {
+        let number = uid
+            .parse::<u32>()
+            .map_err(|_| MailError::Protocol(format!("not an IMAP UID: {uid}")))?;
+        imap_set_flag(account, folder, number, flagged)?;
+    }
+    Ok(())
+}
+
+fn imap_set_flag(account: &Account, folder: &str, uid: u32, flagged: bool) -> MailResult<()> {
+    let change = if flagged { "+FLAGS" } else { "-FLAGS" };
+    with_imap(account, |client| {
+        client.login(&account.username, &account.password)?;
+        client.select(folder)?;
+        client.uid_store_flags_silent(uid, &format!("{change}.SILENT (\\Flagged)"))
     })
 }
 
@@ -1503,7 +1567,29 @@ fn sync_pop3(account: &Account, tx: &Sender<Event>) -> MailResult<()> {
 mod tests {
     use super::*;
 
-    /// A `LIST` answer names the mailbox a copy of a sent mail belongs in: the
+    /// The two states an IMAP `FETCH` reports are read off its `FLAGS`, and
+    /// only those two: the rest of the list (`\Answered`, keywords, the
+    /// folder's own `\Deleted`) is not something Kimo keeps. The comparison is
+    /// the wire's, which is not case-sensitive, and a mail with no flags at all
+    /// is neither read nor flagged.
+    #[test]
+    fn a_fetch_reports_its_two_states() {
+        let flags = |list: &[&str]| list.iter().map(|f| f.to_string()).collect::<Vec<_>>();
+        assert_eq!(fetched_state(&flags(&["\\Seen"])), (true, false));
+        assert_eq!(fetched_state(&flags(&["\\Flagged"])), (false, true));
+        assert_eq!(
+            fetched_state(&flags(&["\\Seen", "\\Flagged"])),
+            (true, true)
+        );
+        assert_eq!(fetched_state(&flags(&["\\flagged"])), (false, true));
+        assert_eq!(
+            fetched_state(&flags(&["\\Answered", "$Important"])),
+            (false, false)
+        );
+        assert_eq!(fetched_state(&[]), (false, false));
+    }
+
+    /// A `LIST` answer names the mailbox a copy of a sent mail belongs in: the    /// A `LIST` answer names the mailbox a copy of a sent mail belongs in: the
     /// first one that classifies as Sent, whatever the server calls it — and it
     /// answers the *wire* form, which is what `APPEND` has to be given.
     #[test]

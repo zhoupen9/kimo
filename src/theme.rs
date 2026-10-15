@@ -147,6 +147,12 @@ pub struct ColorScheme {
     pub danger_hover: Color32,
 
     // --- message list ---
+    /// Fill of a flagged mail's row, and of the same mail's card in the reading
+    /// pane: the warning tint a flag is read by. Warm rather than gray, so it is
+    /// never mistaken for the row's own `selection` or `hover`, and dark
+    /// enough under the light scheme's text — the contrast test holds it to the
+    /// same 4.5:1 as the other fills.
+    pub flag: Color32,
     /// Per-sender avatar fills; see [`AVATAR`].
     pub avatar: [Color32; 8],
     /// The sender initial drawn on an avatar.
@@ -179,6 +185,7 @@ impl ColorScheme {
             accent: Color32::from_rgb(106, 69, 208),    // #6A45D0
             on_accent: Color32::from_rgb(255, 255, 255), // #FFFFFF
             selection: Color32::from_rgb(220, 224, 248), // #DCE0F8
+            flag: Color32::from_rgb(255, 243, 219),     // #FFF3DB
             link: Color32::from_rgb(11, 87, 208),       // #0B57D0
             warn: Color32::from_rgb(154, 87, 0),        // #9A5700
             danger: Color32::from_rgb(198, 40, 40),     // #C62828
@@ -213,6 +220,7 @@ impl ColorScheme {
             accent: Color32::from_rgb(139, 123, 240), // #8B7BF0
             on_accent: Color32::from_rgb(255, 255, 255), // #FFFFFF
             selection: Color32::from_rgb(58, 53, 104), // #3A3568
+            flag: Color32::from_rgb(62, 51, 29),     // #3E331D
             link: Color32::from_rgb(127, 168, 255),  // #7FA8FF
             warn: Color32::from_rgb(224, 163, 58),   // #E0A33A
             danger: Color32::from_rgb(255, 107, 107), // #FF6B6B
@@ -277,7 +285,7 @@ impl ColorScheme {
 
     /// Labeled colors for the Appearance page preview, in the order the fields
     /// are declared.
-    pub fn swatches(self) -> [(&'static str, Color32); 19] {
+    pub fn swatches(self) -> [(&'static str, Color32); 20] {
         [
             ("Panel", self.panel),
             ("Content", self.content),
@@ -289,6 +297,7 @@ impl ColorScheme {
             ("Border", self.border),
             ("Mail edge", self.row_edge),
             ("Mail edge top", self.row_edge_top),
+            ("Flag", self.flag),
             ("Text", self.text),
             ("Text weak", self.text_weak),
             ("Accent", self.accent),
@@ -488,7 +497,13 @@ mod tests {
             }
             // Weak text is dimmer than body text, but both stay readable.
             assert!(contrast(scheme.text, scheme.panel) > contrast(scheme.text_weak, scheme.panel));
-            for (slot, fill) in [("selection", scheme.selection), ("hover", scheme.hover)] {
+            for (slot, fill) in [
+                ("selection", scheme.selection),
+                ("hover", scheme.hover),
+                // A flagged mail's row is the one fill a mail keeps for as long
+                // as the flag stands, so its text has to survive it too.
+                ("flag", scheme.flag),
+            ] {
                 let ratio = contrast(scheme.text, fill);
                 assert!(ratio >= 4.5, "{name}: text on {slot} is {ratio:.1}:1");
             }

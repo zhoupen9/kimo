@@ -38,6 +38,10 @@ pub struct Thread {
     pub unread: usize,
     /// Whether any of them carries an attachment.
     pub has_attachments: bool,
+    /// Whether any of them is flagged: a conversation's row stands for its
+    /// mails, so it carries their warning tint the way it carries their
+    /// paperclip.
+    pub flagged: bool,
 }
 
 impl Thread {
@@ -99,6 +103,7 @@ pub fn group(messages: &[MailMessage]) -> Vec<Thread> {
                 has_attachments: indices
                     .iter()
                     .any(|&index| !messages[index].attachments.is_empty()),
+                flagged: indices.iter().any(|&index| messages[index].flagged),
                 messages: Vec::new(),
             };
             indices.reverse(); // oldest first: the order a conversation reads in
@@ -275,6 +280,7 @@ mod tests {
             date: "Mon, 1 Jan 2026 00:00:00 +0000".to_string(),
             timestamp: Some(1_767_225_600),
             seen: false,
+            flagged: false,
             message_id: id.to_string(),
             in_reply_to: references
                 .iter()

@@ -346,7 +346,9 @@ Event (mpsc) ──► drain_events() at frame start ──► merge into Accoun
   same connection — so what was sent is in Kimo's Sent when the user opens it,
   not at the next sync — or `Failed`, which un-sends nothing and is what the
   notice says.
-- Remote mutations are `UID STORE +FLAGS.SILENT (\Seen)` (IMAP) and, behind
+- Remote mutations are `UID STORE +FLAGS.SILENT (\Seen)` (IMAP), `UID STORE
+  ±FLAGS.SILENT (\Flagged)` for the reader's flag (IMAP too; a POP3 account has no
+  server-side flags and keeps the flag locally), and, behind
   the title bar's Delete button, `\Deleted` + `UID EXPUNGE` (IMAP) or `DELE`
   (POP3). A delete tells the server first and deletes locally after; a message
   the server no longer has is deleted locally only, and a select-mode selection
@@ -387,6 +389,10 @@ Event (mpsc) ──► drain_events() at frame start ──► merge into Accoun
   columns and derives nothing, because a database from before it has no
   outgoing server to move over — every account it holds starts as one that only
   reads mail, and Preferences → Accounts is where it gets a way to send. The
+  version-9 step is the flag: one `ALTER TABLE` adding `flagged` at the end of
+  `messages` (where `SCHEMA_SQL` puts it too, so a migrated table and a fresh one
+  have the same shape), defaulting to 0 — there were no flags before it and no
+  way to have meant one, so nothing is derived. The
   version-6 step is that kind of step too: it adds an attachment's `content_type`
   and `size`, and derives nothing, because the part a mail arrived in is not
   stored — the rows it holds keep an empty type and a zero size, and only mail
@@ -617,7 +623,9 @@ Event (mpsc) ──► drain_events() at frame start ──► merge into Accoun
   subject, the addresses and the date under it. Each card is drawn by the pane and not
   by a frame around its mail: `mail_card` reserves the shape and the pane
   fills it in from the pane's own left edge to its right one, because a card is
-  the pane's surface — a mail wider than the pane scrolls sideways over its
+  the pane's surface — the mail itself is never tinted, whatever mark it
+  carries: a flag is shown in the list and on the bar's cell, not on the mail —
+  and a mail wider than the pane scrolls sideways over its
   card instead of dragging the card off the pane with it. The cards are the
   pane's scroll container — headers, rule,
   body and the attachment cards at the foot of each mail scroll together, and
@@ -1008,12 +1016,15 @@ Event (mpsc) ──► drain_events() at frame start ──► merge into Accoun
   longer shows counts as no mail — while select mode leaves Delete alone live
   (see the select-mode bullet below), the one of the seven that has something to
   do with more than one mail. A disabled cell drops its glyph to
-  `weak_text_color`, stops sensing clicks and never fills. Six of the seven
-  are wired: reply, reply all and forward open the compose
+  `weak_text_color`, stops sensing clicks and never fills. All seven are
+  wired: reply, reply all and forward open the compose
   (`compose_about`, as the popup the pen opens), label opens the label popup
-  (`label_popup`, anchored to the cell), and export and delete hand the mail
-  to a worker. Flag is the one still drawn only — a click on it is not even
-  read.
+  (`label_popup`, anchored to the cell), export and delete hand the mail
+  to a worker, and flag marks the mail the pane shows (`toggle_flag`). **Flag is
+  the one cell with a state of its own**: while the mail carries it, the glyph is
+  drawn in the scheme's `warn` — the colour the mail's row and card are tinted
+  with — and the hover text says what the click would do now, "Unflag…" rather
+  than what a flag is.
   The bar is `TITLEBAR_HEIGHT` (40 pt) tall, its buttons
   `TITLEBAR_BUTTON_SIZE` (32 pt) squares centred in that, and the search box
   fills all but 16 pt of it (`TITLEBAR_SEARCH_HEIGHT`), with a rounder corner
@@ -1313,6 +1324,7 @@ Event (mpsc) ──► drain_events() at frame start ──► merge into Accoun
   are filled in slot by slot, `ColorScheme::light()` and
   `ColorScheme::dark()`: surfaces (panel — the chrome; content — the message
   list and the reading pane's card; window, card, hover, input, code, border;
+  `flag`, the warning tint a flagged mail's row in the list takes;
   and `row_edge` / `row_edge_top`, the two faint lines a mail row is drawn
   with, fainter than a hairline and the top one fainter than the sides),
   text and weak text, accent / selection / link, warn / danger / danger_hover,
@@ -1336,7 +1348,7 @@ Event (mpsc) ──► drain_events() at frame start ──► merge into Accoun
   `theme::hex`) but the palette is not editable yet, which is why nothing
   about it is written back to `settings.json`. `theme.rs`'s tests pin the
   contrast floors (body text ≥ 4.5:1 on its panel *and* on its content, accent
-  ≥ 3:1, text on the selection and hover fills ≥ 4.5:1, the close glyph on its
+  ≥ 3:1, text on the selection, hover and flag fills ≥ 4.5:1, the close glyph on its
   red ≥ 4.5:1, both schemes' surfaces on opposite sides of the brightness
   scale, and the mail rows' edges fainter against the list than a hairline,
   with the top edge fainter than the sides); keep them green when you touch a
@@ -1424,6 +1436,37 @@ Event (mpsc) ──► drain_events() at frame start ──► merge into Accoun
   **The mail says what it is labelled with**: a card draws its own labels as one
   run of chips under the head (`label_chips`), one per label and only while it
   has any, so an unlabelled mail's head is still the first thing on it.
+- **A flag is the reader's own mark too, and the one mark the server keeps
+  as well.** The two halves are what make it different from a label: it is one
+  state per mail rather than a set (`MailMessage::flagged`, schema v9), and it is
+  `\Flagged` on an IMAP server, so flagging a mail here flags it everywhere.
+  The title bar's flag cell runs `KimoApp::toggle_flag`: the app's own copy of the
+  mail is flipped first, so the warning fill appears under the pointer rather
+  than a round trip later, and `Job::SetFlag` writes the database and pushes `UID
+  STORE +FLAGS.SILENT (\Flagged)` — or `-FLAGS` to take it off — for an account
+  that speaks IMAP. The local write happens first, like `mark_seen`'s: a server
+  that refuses the `STORE` does not cost the reader the flag they just set, and
+  the failure is reported on the sync cell like every other account failure. A
+  POP3 account has nowhere to push it and keeps the flag in the database alone.
+  **A fetch is where the flag can also arrive**: `MESSAGE_UPSERT`'s `INSERT` carries
+  `flagged`, so mail the server reports as flagged is stored with the mark —
+  and the column is in neither the `SET` nor the `WHERE`, so a mail the database
+  already has keeps what the reader did with it. That is what makes a POP3
+  re-fetch — which rewrites every message it holds, and has no flags to report —
+  harmless.
+  **A flagged mail is shown in the list, and only there.** Its row takes the
+  scheme's `flag` tint and draws the flag glyph at the end of its title line
+  (`message_card`, beside the paperclip for a mail that carries both), while the
+  reading pane is untouched: the mail itself keeps its plain `content` card, so
+  what a flag changes is where the mail is *listed*, not how the mail reads. The
+  selection and the pointer are stronger than the mark and are painted over the
+  row's fill — the fill is selected, else hovered, else flagged — which is what
+  the glyph is for: it is the one thing on the row that says *flagged* whatever
+  else the row is doing, and the bar's own cell says it in the same colour. A
+  conversation's row stands for its mails and carries the mark if any of them
+  has it (`Thread::flagged`), and a search hit carries it too
+  (`SearchHit::flagged`, off the query rather than out of the search index), so no
+  re-index is needed to see it.
 - **The label filter is an AND, and it is the mailbox's rather than a
   folder's.** A click on a label row adds it to `KimoApp::label_filter`
   (`toggle_label`), a click on a selected one takes it out, and the message
@@ -1569,11 +1612,11 @@ Do not "fix" these casually — they are known:
   the mail, and a failed send keeps the draft in the card but nowhere else — no
   outbox, queue or retry, no DKIM, and no OAuth2: submission authenticates with
   `AUTH PLAIN`/`AUTH LOGIN` over TLS, or not at all when the server asks for no
-  login. The title bar's flag button is still drawn but wired to nothing (the
-  other six are: reply, reply all and forward open the compose, label opens
-  the label popup, export and delete hand the mail to a worker, and the compose
-  pen is wired; the mail's own header carries the same cells and answers on the
-  spot — see those bullets above).
+  login. Every title-bar mail action is wired (reply, reply all and forward open
+  the compose, label opens the label popup, flag marks the mail, export and
+  delete hand it to a worker, and the compose pen is wired; the mail's own header
+  carries the same cells minus flag and export and answers on the spot — see
+  those bullets above).
 - Credentials in plain text in `mail.db` (mode 0600, see above); no
   OAuth2/XOAUTH2. The database is not encrypted, and the app never renames or
   deletes it on its own: a corrupt file is the user's to move aside.
@@ -1615,10 +1658,14 @@ Do not "fix" these casually — they are known:
   `first_num` floor, so the messages a first sync skipped arrive only when
   `Load older mail` asks for them.
 - Flags of mail that is already stored are not read back from the server. IMAP
-  `\Seen` is taken for a message as it is fetched, and from then on the local
-  flag is the only truth (`seen` only ever grows). Sync used to refresh the
-  newest batch for free by refetching it; now that a warm sync fetches nothing
-  it already has, mail read in another client keeps the unread mark it had here.
+  `\Seen` **and** `\Flagged` are taken for a message as it is fetched — the two
+  states `fetched_state` reads off the `FETCH`, and the flag is kept for a row the
+  database is storing for the first time — and from then on the local state is
+  the only truth: `seen` only ever grows, and `flagged` is not named by
+  `MESSAGE_UPSERT`'s update at all, so a re-fetch leaves the reader's own click
+  where it was. Sync used to refresh the newest batch for free by refetching it;
+  now that a warm sync fetches nothing it already has, mail read — or flagged —
+  in another client keeps the mark it had here.
 - No IDLE/push for IMAP; sync is manual or on-startup. A desktop
   notification is therefore only ever raised by a sync that ran, and never for
   mail that arrived while the app was closed until the next one asks for it:

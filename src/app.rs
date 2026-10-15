@@ -143,16 +143,20 @@ impl MailAction {
         }
     }
 
-    /// The hover text while there is mail to act on. The two actions that do
-    /// something say what it is: Export where the file goes, and Delete that
-    /// it cannot be undone, because it expunges the mail on the server as
-    /// well.
+    /// The hover text while there is mail to act on. The actions that do
+    /// something say what it is: Export where the file goes, Delete that it
+    /// cannot be undone — it expunges the mail on the server as well — and Flag
+    /// what the mark does, which the bar swaps for its opposite while the flag
+    /// stands (`titlebar_mail_actions`).
     fn tooltip(self) -> &'static str {
         match self {
             MailAction::Export => {
                 "Export — saves the original mail as a .eml file in your Downloads directory"
             }
             MailAction::Delete => "Delete — removes this mail from the server too",
+            // The bar swaps this one for "Unflag…" while the flag stands: a
+            // flag is a state, and the click is what changes it.
+            MailAction::Flag => "Flag — marks the mail with a warning colour",
             other => other.label(),
         }
     }
@@ -945,6 +949,9 @@ struct LabelledMail {
     date: String,
     timestamp: Option<i64>,
     seen: bool,
+    /// Whether the mail is flagged, which the row shows with the same warning
+    /// tint a folder's row does.
+    flagged: bool,
     attachments: usize,
 }
 
@@ -2199,6 +2206,52 @@ impl KimoApp {
         );
     }
 
+    /// Flag the mail the reading pane shows, or take its flag off: what the
+    /// title bar's flag cell runs, and the one mail action that is about the
+    /// *server* as much as about Kimo — `\Flagged` is a mark IMAP keeps, so
+    /// the job behind this tells the server as well as the database
+    /// (`Job::SetFlag`).
+    ///
+    /// The mail's own state is flipped first, in memory: the list's row and the
+    /// pane's card are drawn from it, so the warning tint appears under the
+    /// pointer rather than a round trip later. Nothing is said when the write
+    /// fails — the flag is already on screen, and the account's failure is
+    /// reported on the sync cell like every other one; the next load of the
+    /// folder is where the two agree again.
+    fn toggle_flag(&mut self) {
+        let Some(key) = self.selected_mail_key() else {
+            return;
+        };
+        let Some(account) = self
+            .accounts
+            .iter()
+            .find(|account| account.id == key.account)
+            .cloned()
+        else {
+            return;
+        };
+        // What the click is about: the flag the mail carries now, flipped.
+        let Some(flagged) = self
+            .folder_messages_of(&key.account, &key.folder)
+            .and_then(|messages| messages.iter().find(|mail| mail.uid == key.uid))
+            .map(|mail| !mail.flagged)
+        else {
+            return;
+        };
+        self.set_flag_on_mail(&key, flagged);
+        sync::spawn(
+            Job::SetFlag {
+                account,
+                folder: key.folder.clone(),
+                uid: key.uid.clone(),
+                flagged,
+            },
+            self.ctx.clone(),
+            self.tx.clone(),
+        );
+        self.ctx.request_repaint();
+    }
+
     /// Delete what the title bar's Delete is about: the mail the reading pane
     /// shows, or — while the list is in select mode — every mail checked in it.
     ///
@@ -3393,10 +3446,16 @@ impl KimoApp {
         // The run lays itself out: `TITLEBAR_BUTTON_GAP` between the cells, which
         // is the gap `titlebar_cells_width` assumes.
         row.spacing_mut().item_spacing.x = TITLEBAR_BUTTON_GAP;
+        // The one action with a state of its own: a flagged mail's cell says so
+        // in the scheme's warning colour — the same tint the mail's row and card
+        // are filled with — rather than only taking a click.
+        let flagged = self.selected_mail().is_some_and(|mail| mail.flagged);
         for action in MailAction::ALL {
             let enabled = self.mail_action_enabled(action);
             let response = titlebar_button_faded(row, enabled, fade);
-            let color = if enabled {
+            let color = if enabled && action == MailAction::Flag && flagged {
+                crate::theme::of(row.ctx()).warn
+            } else if enabled {
                 visuals.text_color()
             } else {
                 visuals.weak_text_color()
@@ -3416,7 +3475,9 @@ impl KimoApp {
                 MailAction::Label => {
                     paint_label_icon(painter, response.rect, color, MAIL_ACTION_GLYPH)
                 }
-                MailAction::Flag => paint_flag_icon(painter, response.rect, color),
+                MailAction::Flag => {
+                    paint_flag_icon(painter, response.rect, color, MAIL_ACTION_GLYPH)
+                }
                 MailAction::Export => paint_export_icon(painter, response.rect, color),
                 MailAction::Delete => {
                     paint_delete_icon(painter, response.rect, color, MAIL_ACTION_GLYPH)
@@ -3425,6 +3486,10 @@ impl KimoApp {
             let response = response.on_hover_text(if enabled {
                 if self.select_mode && action == MailAction::Delete {
                     delete_selection_tooltip(self.selected_mails.len())
+                } else if action == MailAction::Flag && flagged {
+                    // The click takes the flag off now, so the hover text says
+                    // that rather than what a flag is.
+                    "Unflag — takes the warning colour off this mail".to_string()
                 } else {
                     action.tooltip().to_string()
                 }
@@ -3463,7 +3528,8 @@ impl KimoApp {
                             self.compose_about(action, ComposeSpot::Popup, &mail);
                         }
                     }
-                    MailAction::Label | MailAction::Flag => {}
+                    MailAction::Label => {}
+                    MailAction::Flag => self.toggle_flag(),
                 }
             }
         }
@@ -4603,6 +4669,7 @@ impl KimoApp {
                         date: message.date.clone(),
                         timestamp: message.timestamp,
                         seen: message.seen,
+                        flagged: message.flagged,
                         attachments: message.attachments.len(),
                     });
                 }
@@ -4775,6 +4842,42 @@ impl KimoApp {
             self.tx.clone(),
         );
         self.ctx.request_repaint();
+    }
+
+    /// Put the flag on the app's own copy of a mail, or take it off: what the
+    /// list's warning tint and the pane card's fill are read from. The database
+    /// is written by the job behind this, not here (`crate::sync`'s
+    /// `set_flag`), so a write that failed leaves the two agreeing again the
+    /// next time the folder is loaded.
+    ///
+    /// A search's own hits are flipped too: they are a copy of the mail rather
+    /// than the mail itself, and the query that built them is not re-run by a
+    /// flag. A conversation's row takes the flag of any mail of its own
+    /// (`Thread::flagged`), and the thread and the label view are derived from
+    /// the account's revision, which is what `folders_changed` moves.
+    fn set_flag_on_mail(&mut self, key: &MailKey, flagged: bool) {
+        let Some(state) = self.states.get_mut(&key.account) else {
+            return;
+        };
+        let Some(mail) = state
+            .mailbox
+            .folders
+            .iter_mut()
+            .find(|folder| folder.name == key.folder)
+            .and_then(|folder| folder.messages.iter_mut().find(|mail| mail.uid == key.uid))
+        else {
+            return;
+        };
+        if mail.flagged == flagged {
+            return;
+        }
+        mail.flagged = flagged;
+        state.folders_changed();
+        for hit in &mut self.search_hits {
+            if hit.account_id == key.account && hit.folder == key.folder && hit.uid == key.uid {
+                hit.flagged = flagged;
+            }
+        }
     }
 
     /// The label popup: the mail's labels as a checklist, and a box that makes a
@@ -5403,6 +5506,7 @@ impl KimoApp {
             third: &third,
             unread: !mail.seen,
             selected,
+            flagged: mail.flagged,
             has_attachments: mail.attachments > 0,
             place: RowPlace::Plain,
             checkbox,
@@ -5549,6 +5653,7 @@ impl KimoApp {
             third: &preview,
             unread: !msg.seen,
             selected,
+            flagged: msg.flagged,
             has_attachments: !msg.attachments.is_empty(),
             place,
             checkbox,
@@ -5601,6 +5706,7 @@ impl KimoApp {
             third: &preview,
             unread: thread.unread > 0,
             selected,
+            flagged: thread.flagged,
             has_attachments: thread.has_attachments,
             place: RowPlace::Thread {
                 open,
@@ -5639,6 +5745,7 @@ impl KimoApp {
             third: &third,
             unread: !hit.seen,
             selected,
+            flagged: hit.flagged,
             // The row draws the same paperclip a folder row does, so a hit says
             // what the mail carries the one way the whole list says it.
             has_attachments: hit.attachments > 0,
@@ -5723,6 +5830,15 @@ impl KimoApp {
             painter
                 .with_clip_rect(column)
                 .rect_filled(full, 0.0, scheme.hover);
+        } else if card.flagged {
+            // The warning fill a flag is read by. Last of the three: the
+            // selection and the pointer are about what the reader is doing
+            // *now*, and their fills are stronger than the mark on the mail —
+            // which is still said by the bar's own flag cell, in warning color,
+            // and by the mail's card in the pane.
+            painter
+                .with_clip_rect(column)
+                .rect_filled(full, 0.0, scheme.flag);
         }
         // Every mail carries its own edges instead of sharing a rule with its
         // neighbour: the two sides and the bottom take the faint `row_edge`,
@@ -5901,13 +6017,21 @@ impl KimoApp {
             card.unread,
         );
 
-        // Second row: subject. A mail with parts gives the end of this line to
-        // the clip, so the title is elided a glyph earlier rather than drawn
-        // under it.
-        let title_right = if card.has_attachments {
-            text_right - ROW_CLIP_WIDTH - ROW_CLIP_GAP
+        // Second row: subject. The end of this line is where a row's two marks
+        // sit: the flag a marked mail carries, and — outermost, because a mail
+        // can carry both — the clip a mail with parts carries. Each takes its
+        // own width and a gap, and the title is elided against what is left of
+        // the line rather than drawn under them.
+        let clip_left = text_right - ROW_CLIP_WIDTH;
+        let flag_left = if card.has_attachments {
+            clip_left - ROW_CLIP_GAP - ROW_FLAG_WIDTH
         } else {
-            text_right
+            clip_left
+        };
+        let title_right = match (card.flagged, card.has_attachments) {
+            (true, _) => flag_left - ROW_CLIP_GAP,
+            (false, true) => clip_left - ROW_CLIP_GAP,
+            (false, false) => text_right,
         };
         let subject = truncate_galley(
             ui.ctx(),
@@ -5926,6 +6050,21 @@ impl KimoApp {
             title_color,
             card.unread,
         );
+        if card.flagged {
+            // The mark its warning fill is about, in the mark's own colour: the
+            // fill says *something* about this mail, and this says what — and it
+            // is the whole of what a reader who cannot tell one fill from
+            // another has to go on.
+            paint_flag_icon(
+                painter,
+                egui::Rect::from_center_size(
+                    egui::pos2(flag_left + ROW_FLAG_WIDTH / 2.0, rect.top() + ROW_SUBJECT_Y),
+                    egui::vec2(ROW_FLAG_SIZE, ROW_FLAG_SIZE),
+                ),
+                scheme.warn,
+                ROW_FLAG_SIZE,
+            );
+        }
         if card.has_attachments {
             // Always muted, and independent of the unread weight: what the mail
             // carries is not part of its title.
@@ -8363,6 +8502,10 @@ struct CardText<'a> {
     /// The row takes the scheme's selection fill: the mail open in the reading
     /// pane, or — in select mode — one whose box is checked.
     selected: bool,
+    /// The mail is flagged, so the row takes the scheme's warning fill — unless
+    /// it is selected or under the pointer, whose fills are stronger and are
+    /// painted over it.
+    flagged: bool,
     /// The mail has parts, so the row draws a paperclip at the end of its
     /// title line. Both lists can answer it: a folder's mail from what was
     /// stored with it, a search hit from what the query counted.
@@ -8537,6 +8680,12 @@ const THREAD_CHEVRON_ALPHA: f32 = 0.65;
 const ROW_CLIP_SIZE: f32 = 14.0;
 const ROW_CLIP_WIDTH: f32 = 8.5;
 const ROW_CLIP_GAP: f32 = 7.0;
+/// The flag a marked mail draws at the end of its title line, in the slot the
+/// paperclip shares with it. The size is the box the 24×24 outline is mapped
+/// into, and the width is what that outline comes to at it — its pole and
+/// banner span x 5 to 19 — which is the room the title leaves for it.
+const ROW_FLAG_SIZE: f32 = 14.0;
+const ROW_FLAG_WIDTH: f32 = (19.0 - 5.0) / 24.0 * ROW_FLAG_SIZE;
 
 /// Decode a stored inline image into an egui texture. Runs on the UI thread
 /// but only once per message/cid; inline mail images are small.
@@ -9645,9 +9794,14 @@ fn paint_label_icon(p: &egui::Painter, rect: egui::Rect, color: egui::Color32, s
 }
 
 /// Flag: a pole with a swallow-tailed pennant on it.
-fn paint_flag_icon(p: &egui::Painter, rect: egui::Rect, color: egui::Color32) {
-    let g = |x: f32, y: f32| glyph_point(rect.center(), x, y);
-    let stroke = egui::Stroke::new(1.5_f32, color);
+/// Flag: a pole with a banner. It is the one glyph of the title bar's set that
+/// is drawn outside it as well — a flagged mail's row in the list draws it at
+/// the end of its title line — so it takes a `size` like reply's arrow rather
+/// than being fixed at `MAIL_ACTION_GLYPH`, and its stroke is scaled with it the
+/// way the paperclip's is (the clip is only ever drawn at the row's size).
+fn paint_flag_icon(p: &egui::Painter, rect: egui::Rect, color: egui::Color32, size: f32) {
+    let g = |x: f32, y: f32| outline_point(rect.center(), x, y, size);
+    let stroke = egui::Stroke::new(1.5_f32 * size / MAIL_ACTION_GLYPH, color);
     p.add(egui::Shape::line(vec![g(5.0, 21.0), g(5.0, 3.0)], stroke));
     p.add(egui::Shape::line(
         vec![
@@ -10143,6 +10297,7 @@ mod tests {
             date: "2026-01-01".to_string(),
             timestamp: Some(1_700_000_000),
             seen,
+            flagged: false,
             message_id: format!("{uid}@example.com"),
             in_reply_to: Vec::new(),
             references: Vec::new(),
@@ -11273,6 +11428,7 @@ mod tests {
             date: "2026-01-01".to_string(),
             timestamp: Some(1_700_000_000),
             seen: false,
+            flagged: false,
             attachments: 1,
             snippet: "a line with report in it".to_string(),
         }];
@@ -12602,6 +12758,7 @@ mod tests {
             date: "2026-01-01".to_string(),
             timestamp: Some(1_700_000_000),
             seen: false,
+            flagged: false,
             attachments: 0,
             snippet: "a line with report in it".to_string(),
         }];
@@ -12818,6 +12975,7 @@ mod tests {
                 date: "2026-01-01".to_string(),
                 timestamp: Some(1_700_000_000),
                 seen: false,
+                flagged: false,
                 attachments: 0,
                 snippet: "a line with report in it".to_string(),
             },
@@ -12830,6 +12988,7 @@ mod tests {
                 date: "2026-01-01".to_string(),
                 timestamp: Some(1_700_000_000),
                 seen: false,
+                flagged: false,
                 attachments: 0,
                 snippet: "another line with report in it".to_string(),
             },
@@ -12842,6 +13001,7 @@ mod tests {
                 date: "2026-01-01".to_string(),
                 timestamp: Some(1_700_000_000),
                 seen: false,
+                flagged: false,
                 attachments: 0,
                 snippet: "a third line with report in it".to_string(),
             },
@@ -13022,6 +13182,7 @@ mod tests {
                 date: "2026-01-01".to_string(),
                 timestamp: Some(1_700_000_000),
                 seen: false,
+                flagged: false,
                 attachments: 0,
                 snippet: "a line with report in it".to_string(),
             }],
@@ -13326,6 +13487,7 @@ mod tests {
             date: "2026-01-01".to_string(),
             timestamp: Some(1_700_000_000),
             seen: false,
+            flagged: false,
             attachments: 0,
             snippet: "a line with report in it".to_string(),
         }];
@@ -14789,6 +14951,7 @@ mod tests {
                 date: String::new(),
                 timestamp: Some(100),
                 seen: false,
+                flagged: false,
                 message_id: String::new(),
                 in_reply_to: Vec::new(),
                 references: Vec::new(),
@@ -14807,6 +14970,7 @@ mod tests {
                 date: String::new(),
                 timestamp: Some(200),
                 seen: false,
+                flagged: false,
                 message_id: String::new(),
                 in_reply_to: Vec::new(),
                 references: Vec::new(),
@@ -15127,6 +15291,7 @@ mod tests {
             date: "Tue, 2026-01-01".to_string(),
             timestamp: Some(1_700_000_000),
             seen: false,
+            flagged: false,
             message_id: "m0".to_string(),
             in_reply_to: Vec::new(),
             references: Vec::new(),
@@ -15805,9 +15970,11 @@ mod tests {
     }
 
     /// Developer tool (there is no compositor at hand in a test): draw a few
-    /// frames — the labelled list and card, the label filter and popup, and
+    /// frames — the labelled list and card, the label filter and popup, the
+    /// flagged list, the bar with and without a mail open in the pane, and
     /// Preferences → General — and write them out as PNGs, so the layout can be
-    /// looked at. `KIMO_UI_DUMP` picks the directory (default `target`).
+    /// looked at. `KIMO_UI_DUMP` picks the directory (default `target`) and
+    /// `KIMO_UI_WIDTH` the window's width (default 1400).
     ///
     ///     cargo test -- --ignored --nocapture dump_ui
     #[test]
@@ -15855,6 +16022,26 @@ mod tests {
         // itself out on the frame it is opened on and draws on the next: one
         // frame first, or the picture would be of a window with no modal in it.
         egui::Popup::close_all(&ctx);
+        // And the flag: the marked row in the list — warning fill, flag glyph,
+        // and a paperclip beside it to show the two marks sharing the end of a
+        // title line — with a marked mail open in the pane, whose card is the
+        // plain surface it always was.
+        app.set_flag_on_mail(&MailKey::new("acct", "INBOX", "acct-0"), true);
+        app.set_flag_on_mail(&MailKey::new("acct", "INBOX", "acct-1"), true);
+        {
+            let state = app.states.get_mut("acct").expect("the fixture account");
+            state.mailbox.folders[0].messages[1].attachments = vec![Attachment {
+                name: "report.pdf".to_string(),
+                content_type: "application/pdf".to_string(),
+                size: 4096,
+            }];
+            state.folders_changed();
+        }
+        for _ in 0..16 {
+            collect_frame(&ctx, &mut app, &mut textures, Vec::new());
+        }
+        shot(&mut app, "ui-flag.png", &mut textures);
+
         // The bar with nothing open in the pane first: the pane's run is not
         // there at all rather than there and dimmed, and the chrome it would
         // have used is the drag surface. The frames are what its fade needs.
@@ -16215,6 +16402,178 @@ mod tests {
         assert!(
             !text_boxes_of(&shapes, nav_column(&app), "Receipts").is_empty(),
             "the group has the new label"
+        );
+    }
+
+    /// The title bar's flag cell is the one mail action with a state of its
+    /// own: a click marks the mail the pane shows, the mark is the warning fill
+    /// the mail's **row** takes — the reading pane is the mail's own surface and
+    /// is not tinted — the cell's own glyph turns the scheme's warning colour
+    /// while the flag stands, so the cell says which of the two things a click
+    /// on it would do, and the same click takes the flag off again.
+    #[test]
+    fn the_flag_cell_marks_the_mail_it_is_on() {
+        let ctx = egui::Context::default();
+        crate::fonts::install(&ctx, None, None);
+        let mut app = app_with_messages(&ctx, 3);
+        let scheme = theme::of(&ctx);
+        // The warning fill the list draws, told apart from the chrome: a row is
+        // the only thing in the column that tall.
+        let row_fill = |shapes: &[egui::epaint::ClippedShape], pane_left: f32| {
+            fills_in_color(shapes, theme::of(&ctx).flag)
+                .into_iter()
+                .find(|rect| rect.height() >= MESSAGE_ROW_HEIGHT && rect.center().x < pane_left)
+        };
+
+        // Mail "1" is the one to mark, and the pane opens on it: the cell is
+        // about the mail the pane shows.
+        app.selected_message = Some("1".to_string());
+        // The run fades in with the mail it acts on (`MAIL_ACTION_FADE_TIME`),
+        // and what is asked below is the cell at rest — the glyph's own colour
+        // rather than a faded one.
+        for _ in 0..16 {
+            run_app_frame(&ctx, &mut app, Vec::new());
+        }
+        assert!(
+            !app.selected_mail().expect("a mail is open").flagged,
+            "a mail starts unflagged"
+        );
+        let cell = egui::Rect::from_center_size(
+            titlebar_action_center(&ctx, &mut app, MailAction::Flag, 1400.0),
+            egui::Vec2::splat(TITLEBAR_BUTTON_SIZE),
+        );
+        let pane_left = app.list_column.right();
+        click_at(&ctx, &mut app, cell.center());
+        assert!(
+            app.selected_mail().expect("a mail is open").flagged,
+            "the cell marked the mail the pane shows"
+        );
+
+        // The cell draws its glyph in the warning colour rather than in the
+        // bar's text colour — and the pane is still the mail's own surface: the
+        // mark is shown in the list, not painted on the mail.
+        let shapes = frame_shapes_at(&ctx, &mut app, 1400.0);
+        let colors = glyph_colors_in(&shapes, cell);
+        assert!(
+            colors.contains(&scheme.warn),
+            "the flag cell draws its glyph in the warning colour: {colors:?}"
+        );
+        assert!(
+            fills_in_color(&shapes, scheme.flag)
+                .into_iter()
+                .all(|rect| rect.center().x < pane_left),
+            "no fill of the warning colour is on the pane's side of the splitter"
+        );
+
+        // Another mail is open: the flagged one — right there in the list,
+        // unselected — is the row that takes the warning fill.
+        app.selected_message = Some("0".to_string());
+        let shapes = frame_shapes_at(&ctx, &mut app, 1400.0);
+        let row = row_fill(&shapes, pane_left).expect("the flagged mail's row is filled");
+        assert_eq!(
+            row.top(),
+            TITLEBAR_HEIGHT + MESSAGE_ROW_HEIGHT,
+            "and it is the flagged mail's row, not the open one's"
+        );
+
+        // The click is a toggle, and it is about the mail the pane shows: with
+        // the flagged mail open again, the same cell takes the mark off.
+        app.selected_message = Some("1".to_string());
+        for _ in 0..16 {
+            run_app_frame(&ctx, &mut app, Vec::new());
+        }
+        click_at(&ctx, &mut app, cell.center());
+        assert!(
+            !app.selected_mail().expect("a mail is open").flagged,
+            "the cell took the flag off again"
+        );
+        let shapes = frame_shapes_at(&ctx, &mut app, 1400.0);
+        assert!(
+            row_fill(&shapes, pane_left).is_none(),
+            "and the warning fill went with it"
+        );
+    }
+
+    /// A flagged mail's row carries the mark itself rather than only the fill:
+    /// the flag glyph at the end of its title line, in the mark's own warning
+    /// colour — and for a mail that also has parts, beside its paperclip rather
+    /// than on top of it, since the row has room for both.
+    #[test]
+    fn a_flagged_row_draws_the_flag_beside_its_paperclip() {
+        let ctx = egui::Context::default();
+        crate::fonts::install(&ctx, None, None);
+        let mut app = app_with_messages(&ctx, 2);
+        let scheme = theme::of(&ctx);
+        let key = MailKey::new("acct", "INBOX", "1");
+        // The pane opens on mail "0", so the row asked about — the second one —
+        // is drawn without the selection's own fill.
+        app.selected_message = Some("0".to_string());
+        let row = |app: &KimoApp| {
+            egui::Rect::from_min_size(
+                egui::pos2(app.list_column.left(), TITLEBAR_HEIGHT + MESSAGE_ROW_HEIGHT),
+                egui::vec2(app.list_column.width(), MESSAGE_ROW_HEIGHT),
+            )
+        };
+        let marks = |app: &mut KimoApp| {
+            let shapes = frame_shapes_at(&ctx, app, 1400.0);
+            let row = row(app);
+            let colors = glyph_colors_in(&shapes, row);
+            let bounds = list_glyph_strokes(&shapes, app.list_column)
+                .into_iter()
+                .filter(|stroke| row.contains(stroke.center()))
+                .fold(None::<egui::Rect>, |bounds, stroke| {
+                    Some(bounds.map_or(stroke, |b| b.union(stroke)))
+                });
+            (colors, bounds, row)
+        };
+
+        // Nothing marked: no flag glyph on the row at all.
+        let (colors, bounds, _) = marks(&mut app);
+        assert!(
+            !colors.contains(&scheme.warn) && bounds.is_none(),
+            "an unmarked row draws no flag: {colors:?} {bounds:?}"
+        );
+
+        // Marked: the flag is drawn, in the warning colour, at the end of the
+        // row's title line.
+        app.set_flag_on_mail(&key, true);
+        let (colors, bounds, row) = marks(&mut app);
+        assert!(
+            colors.contains(&scheme.warn),
+            "the flagged row draws its flag in the warning colour: {colors:?}"
+        );
+        let flag = bounds.expect("the flagged row draws a glyph");
+        assert!(
+            flag.width() > ROW_FLAG_WIDTH - 2.0
+                && flag.width() <= ROW_FLAG_SIZE
+                && flag.height() > ROW_FLAG_SIZE - 6.0
+                && flag.height() <= ROW_FLAG_SIZE,
+            "the flag fills the box the row reserves for it: {flag:?}"
+        );
+        assert!(
+            flag.right() > row.right() - 30.0 && flag.right() <= row.right(),
+            "the flag sits at the end of the title line: {flag:?} in {row:?}"
+        );
+
+        // A mail with a part as well: the clip is the outermost of the two, so
+        // the flag's own room is a clip's width further in — and the row draws
+        // both marks, each in its own colour.
+        let state = app.states.get_mut("acct").expect("the fixture account");
+        state.mailbox.folders[0].messages[1].attachments = vec![Attachment {
+            name: "report.pdf".to_string(),
+            content_type: "application/pdf".to_string(),
+            size: 1024,
+        }];
+        state.folders_changed();
+        let (colors, bounds, _) = marks(&mut app);
+        assert!(
+            colors.contains(&scheme.warn) && colors.contains(&scheme.text_weak),
+            "the row draws both marks, each in its own colour: {colors:?}"
+        );
+        let both = bounds.expect("the row draws both glyphs");
+        assert!(
+            both.width() > flag.width() + ROW_CLIP_GAP,
+            "the clip sits beside the flag rather than over it: {both:?} against {flag:?}"
         );
     }
 
