@@ -796,6 +796,22 @@ Event (mpsc) ──► drain_events() at frame start ──► merge into Accoun
   lives and never opens the folder instead. It is offered in **both modes** — a
   row is a row — so select mode's box checks and its button still takes that one
   mail, without leaving the mode or touching the selection.
+  **Inside that cell sits the row's flag button** (`paint_flag_icon`, the same
+  pennant the row draws at the end of a flagged mail's title line): one
+  `ROW_ACTION_SIZE` cell one `ROW_ACTION_GAP` further from the row's edge, so
+  delete stays outermost as it is in the title bar and on the mail's own head,
+  and a target on every row the way the other two are. **It is the title bar's
+  action and not a second one** — `KimoApp::toggle_flag_on`, the same
+  `Job::SetFlag` that cell and the pane's head run — so what it marks is the mail
+  the row speaks for, and what it says is the bar's own wording, turning over
+  with the state ("Flag …" / "Unflag …") and, for a conversation, naming the
+  newest mail it marks the way its delete button beside it does
+  (`row_flag_tooltip`). The state it switches is on the mail already — the
+  warning fill and the pennant on the title line — so the glyph is drawn in the
+  scheme's `warn` while the mail is flagged and in `text_weak` while it is not,
+  and turning the pointer on the cell previews the mark by filling it with the
+  same `flag` tint a flagged row itself is filled with. A click on it is not a
+  click on the row.
 - The message list is a list of **conversations** by default: `crate::threads::group`
   turns a folder's mail into threads — a reply joins its parent through
   `References` read from the end (the last id this folder holds is the parent),
@@ -1845,7 +1861,7 @@ Do not "fix" these casually — they are known:
   just as final. There is no Delete-key shortcut and no shift-click range: a
   selection is made one checkbox at a time, or every mail of the list at once
   (see the select-mode bullet under Conventions) — and that click is just as
-  final, as is a row's own hover button (see the message-row bullet).
+  final, as is a row's own hover buttons (see the message-row bullet).
 - Labels are **local to this machine**: nothing about them is asked of or told
   to a server, so another client's labels are invisible here and Kimo's are in
   `mail.db` alone — a label names a message row, so mail that comes back under

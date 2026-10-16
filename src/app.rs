@@ -193,6 +193,18 @@ impl MailAction {
             other => other.label(),
         }
     }
+
+    /// The flag cell's hover text, which is the one action whose wording turns
+    /// over with the mail's state: a flagged mail's cell says what the click
+    /// takes off rather than what a flag is. Both flag cells use it — the title
+    /// bar's and the one a list row offers.
+    fn flag_tooltip(flagged: bool) -> &'static str {
+        if flagged {
+            "Unflag — takes the warning colour off this mail"
+        } else {
+            "Flag — marks the mail with a warning colour"
+        }
+    }
 }
 
 /// What a row's own delete button says: the mail the row speaks for, and — for
@@ -205,6 +217,22 @@ fn row_delete_tooltip(place: RowPlace<'_>) -> &'static str {
             "Delete — removes the newest mail of this conversation from the server too"
         }
         RowPlace::Plain | RowPlace::InThread => MailAction::Delete.tooltip(),
+    }
+}
+
+/// What a row's own flag button says: the title bar's flag cell wording for a
+/// mail — which turns over with the state, as that cell's does — and, for a
+/// conversation, the fact that it is the newest mail that takes the mark: the
+/// same mail its delete button beside it takes.
+fn row_flag_tooltip(place: RowPlace<'_>, flagged: bool) -> &'static str {
+    match (place, flagged) {
+        (RowPlace::Thread { .. }, false) => {
+            "Flag — marks the newest mail of this conversation with a warning colour"
+        }
+        (RowPlace::Thread { .. }, true) => {
+            "Unflag — takes the warning colour off the newest mail of this conversation"
+        }
+        (_, flagged) => MailAction::flag_tooltip(flagged),
     }
 }
 
@@ -1113,11 +1141,12 @@ impl MailKey {
     }
 }
 
-/// The mail a row's own delete button is about: the mail the row speaks for. A
+/// The mail a row's own cells are about: the mail the row speaks for. A
 /// conversation's row shows its newest mail — the one the reading pane opens
-/// from it — and that is the one its button takes; the mails the conversation
-/// holds are the list's to delete one by one, or the selection's to take whole.
-fn row_delete_target<'a>(
+/// from it — and that is the one its flag and its delete take; the mails the
+/// conversation holds are the list's to mark one by one, or the selection's to
+/// take whole.
+fn row_action_target<'a>(
     row: ListRow,
     rows: &ListRows,
     messages: &'a [MailMessage],
@@ -2790,10 +2819,7 @@ impl KimoApp {
     /// fails — the flag is already on screen, and the account's failure is
     /// reported on the sync cell like every other one; the next load of the
     /// folder is where the two agree again.
-    fn toggle_flag(&mut self) {
-        let Some(key) = self.selected_mail_key() else {
-            return;
-        };
+    fn toggle_flag_on(&mut self, key: &MailKey) {
         let Some(account) = self
             .accounts
             .iter()
@@ -2810,7 +2836,7 @@ impl KimoApp {
         else {
             return;
         };
-        self.set_flag_on_mail(&key, flagged);
+        self.set_flag_on_mail(key, flagged);
         sync::spawn(
             Job::SetFlag {
                 account,
@@ -2822,6 +2848,15 @@ impl KimoApp {
             self.tx.clone(),
         );
         self.ctx.request_repaint();
+    }
+
+    /// Flag the mail the reading pane shows, or take its flag off: what the
+    /// title bar's flag cell runs, which is `toggle_flag_on` on the mail the
+    /// pane has open.
+    fn toggle_flag(&mut self) {
+        if let Some(key) = self.selected_mail_key() {
+            self.toggle_flag_on(&key);
+        }
     }
 
     /// Delete what the title bar's Delete is about: the mail the reading pane
@@ -4158,10 +4193,10 @@ impl KimoApp {
             let response = response.on_hover_text(if enabled {
                 if self.select_mode && action == MailAction::Delete {
                     delete_selection_tooltip(self.selected_mails.len())
-                } else if action == MailAction::Flag && flagged {
+                } else if action == MailAction::Flag {
                     // The click takes the flag off now, so the hover text says
                     // that rather than what a flag is.
-                    "Unflag — takes the warning colour off this mail".to_string()
+                    MailAction::flag_tooltip(flagged).to_string()
                 } else {
                     action.tooltip().to_string()
                 }
@@ -5284,8 +5319,10 @@ impl KimoApp {
         // a conversation — is checked once the borrow of the state is over.
         let mut checked: Option<Vec<MailKey>> = None;
         // A row's own delete button was clicked: the mail the row speaks for
-        // goes once the borrow of the state is over.
+        // goes once the borrow of the state is over. Its flag button, beside it,
+        // is the same mail marked where it is listed.
         let mut deleted: Option<MailKey> = None;
+        let mut flagged: Option<MailKey> = None;
         // A click on a row in select mode is the way out of it, and nothing
         // else: it does not open the mail under the pointer.
         let mut leave_select = false;
@@ -5351,9 +5388,13 @@ impl KimoApp {
                                     // the conversation in the pane — or, in
                                     // select mode, leaves it. A click on one
                                     // is not a click on another.
-                                    if drawn.delete.clicked() {
+                                    if drawn.flag.clicked() {
+                                        flagged =
+                                            row_action_target(rows.rows[index], rows, messages)
+                                                .map(|msg| MailKey::new(account, folder, &msg.uid));
+                                    } else if drawn.delete.clicked() {
                                         deleted =
-                                            row_delete_target(rows.rows[index], rows, messages)
+                                            row_action_target(rows.rows[index], rows, messages)
                                                 .map(|msg| MailKey::new(account, folder, &msg.uid));
                                     } else if drawn.checkbox.clicked() {
                                         checked = Some(
@@ -5388,7 +5429,13 @@ impl KimoApp {
                                     };
                                     let drawn =
                                         self.message_row(ui, &messages[index], first, place);
-                                    if drawn.delete.clicked() {
+                                    if drawn.flag.clicked() {
+                                        flagged = Some(MailKey::new(
+                                            account,
+                                            folder,
+                                            &messages[index].uid,
+                                        ));
+                                    } else if drawn.delete.clicked() {
                                         deleted = Some(MailKey::new(
                                             account,
                                             folder,
@@ -5453,13 +5500,16 @@ impl KimoApp {
             self.open_rev += 1;
             self.ctx.request_repaint();
         }
-        // A checked row, a row's own delete, the select-all row, and the way
-        // out of select mode. Like the chevron, what the click made is what the
-        // next frame draws, so the frame is asked for here rather than waited
+        // A checked row, a row's own flag or delete, the select-all row, and the
+        // way out of select mode. Like the chevron, what the click made is what
+        // the next frame draws, so the frame is asked for here rather than waited
         // for; the deleted row leaves when the worker says the server agreed.
         if let Some(keys) = checked {
             self.toggle_check(keys);
             self.ctx.request_repaint();
+        }
+        if let Some(key) = flagged {
+            self.toggle_flag_on(&key);
         }
         if let Some(key) = deleted {
             self.delete_mail(&key.account, &key.folder, &key.uid);
@@ -6393,8 +6443,10 @@ impl KimoApp {
         // built from the hit and not from the column.
         let mut clicked: Option<SearchHit> = None;
         let mut checked: Option<Vec<MailKey>> = None;
-        // A hit's own delete button was clicked: the hit goes.
+        // A hit's own delete button was clicked: the hit goes — and its flag
+        // button beside it marks the mail where the hit lives.
         let mut deleted: Option<MailKey> = None;
+        let mut flagged: Option<MailKey> = None;
         let mut leave_select = false;
         // The select-all row was clicked: every hit is checked — or the
         // selection is cleared — once the borrow of the hits is over.
@@ -6424,7 +6476,10 @@ impl KimoApp {
                             for index in rows {
                                 let hit = &hits[shown[index]];
                                 let drawn = self.search_row(ui, hit, index == 0);
-                                if drawn.delete.clicked() {
+                                if drawn.flag.clicked() {
+                                    flagged =
+                                        Some(MailKey::new(&hit.account_id, &hit.folder, &hit.uid));
+                                } else if drawn.delete.clicked() {
                                     deleted =
                                         Some(MailKey::new(&hit.account_id, &hit.folder, &hit.uid));
                                 } else if drawn.checkbox.clicked() {
@@ -6470,6 +6525,9 @@ impl KimoApp {
             self.toggle_check(keys);
             self.ctx.request_repaint();
         }
+        if let Some(key) = flagged {
+            self.toggle_flag_on(&key);
+        }
         if let Some(key) = deleted {
             self.delete_mail(&key.account, &key.folder, &key.uid);
         }
@@ -6508,6 +6566,7 @@ impl KimoApp {
         let mut clicked: Option<LabelledMail> = None;
         let mut checked: Option<Vec<MailKey>> = None;
         let mut deleted: Option<MailKey> = None;
+        let mut flagged: Option<MailKey> = None;
         let mut leave_select = false;
         let mut select_all_clicked: Option<Vec<MailKey>> = None;
         // The same pinned band the folder's list draws, about this list: one
@@ -6571,7 +6630,13 @@ impl KimoApp {
                             for index in rows {
                                 let mail = &matches[shown[index]];
                                 let drawn = self.labelled_row(ui, mail, index == 0);
-                                if drawn.delete.clicked() {
+                                if drawn.flag.clicked() {
+                                    flagged = Some(MailKey::new(
+                                        &mail.account_id,
+                                        &mail.folder,
+                                        &mail.uid,
+                                    ));
+                                } else if drawn.delete.clicked() {
                                     deleted = Some(MailKey::new(
                                         &mail.account_id,
                                         &mail.folder,
@@ -6616,6 +6681,9 @@ impl KimoApp {
         if let Some(keys) = checked {
             self.toggle_check(keys);
             self.ctx.request_repaint();
+        }
+        if let Some(key) = flagged {
+            self.toggle_flag_on(&key);
         }
         if let Some(key) = deleted {
             self.delete_mail(&key.account, &key.folder, &key.uid);
@@ -6670,6 +6738,7 @@ impl KimoApp {
             // can be the same string.
             checkbox_id: row_widget_id("mail-checkbox", &mail.account_id, &mail.folder, &mail.uid),
             delete_id: row_widget_id("mail-delete", &mail.account_id, &mail.folder, &mail.uid),
+            flag_id: row_widget_id("mail-flag", &mail.account_id, &mail.folder, &mail.uid),
         };
         self.message_card(ui, &card, first)
     }
@@ -6815,6 +6884,7 @@ impl KimoApp {
             checkbox,
             checkbox_id: row_widget_id("mail-checkbox", account, folder, &msg.uid),
             delete_id: row_widget_id("mail-delete", account, folder, &msg.uid),
+            flag_id: row_widget_id("mail-flag", account, folder, &msg.uid),
         };
         self.message_card(ui, &card, first)
     }
@@ -6875,6 +6945,7 @@ impl KimoApp {
             // not share one id.
             checkbox_id: row_widget_id("thread-checkbox", account, folder, &thread.key),
             delete_id: row_widget_id("thread-delete", account, folder, &thread.key),
+            flag_id: row_widget_id("thread-flag", account, folder, &thread.key),
         };
         self.message_card(ui, &card, first)
     }
@@ -6913,6 +6984,7 @@ impl KimoApp {
             // accounts' uids apart on one screen.
             checkbox_id: row_widget_id("mail-checkbox", &hit.account_id, &hit.folder, &hit.uid),
             delete_id: row_widget_id("mail-delete", &hit.account_id, &hit.folder, &hit.uid),
+            flag_id: row_widget_id("mail-flag", &hit.account_id, &hit.folder, &hit.uid),
         };
         self.message_card(ui, &card, first)
     }
@@ -6962,13 +7034,18 @@ impl KimoApp {
             ),
             egui::Vec2::splat(ROW_ACTION_SIZE),
         );
+        // The flag button sits just inside it — one cell further from the row's
+        // edge — so delete stays outermost, as it is in the title bar and on the
+        // mail's own head.
+        let flag_rect = delete_rect.translate(egui::vec2(-(ROW_ACTION_SIZE + ROW_ACTION_GAP), 0.0));
         // A target on every row, like the box: egui hit-tests a pass against the
         // widget rects of the previous one, so a target that only appears once
         // the pointer is already on it is a target a click can miss.
         let delete = ui.interact(delete_rect, card.delete_id, egui::Sense::click());
+        let flag = ui.interact(flag_rect, card.flag_id, egui::Sense::click());
         // The pointer on one of the row's controls is the pointer on the row:
         // they are controls inside the row, not holes in it.
-        let hovered = resp.hovered() || checkbox.hovered() || delete.hovered();
+        let hovered = resp.hovered() || checkbox.hovered() || delete.hovered() || flag.hovered();
 
         // Both highlights are the mail's whole row: a square block that fills
         // the column edge to edge, hairlines included, rather than a rounded
@@ -7252,13 +7329,30 @@ impl KimoApp {
             scheme.text_weak,
         );
 
-        // The row's own delete button, in the slot the timestamp gave up: a
-        // muted glyph while the pointer is anywhere on the row, and the
-        // scheme's danger fill under the glyph once the pointer is on the
-        // button itself — the treatment the title bar's close button gets, and
-        // for the same reason: the button is the confirmation, and what it does
-        // cannot be undone.
+        // The row's own two buttons, in the slot the timestamp gave up. The
+        // flag comes first — it is the inner of the pair — and the state it
+        // switches is on the mail already: the row's warning fill and the mark
+        // at the end of its title line. So its glyph wears the mark's own colour
+        // while the mail is flagged, and turning the pointer on the cell
+        // previews the mark by filling it with the tint the flagged row itself
+        // is filled with.
         if hovered {
+            let flag_color = if flag.hovered() || card.flagged {
+                scheme.warn
+            } else {
+                scheme.text_weak
+            };
+            if flag.hovered() {
+                painter.rect_filled(flag_rect, ROW_ACTION_CORNER_RADIUS, scheme.flag);
+                ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+            }
+            paint_flag_icon(painter, flag_rect, flag_color, ROW_ACTION_GLYPH);
+
+            // The delete button beside it: a muted glyph while the pointer is
+            // anywhere on the row, and the scheme's danger fill under the glyph
+            // once the pointer is on the button itself — the treatment the title
+            // bar's close button gets, and for the same reason: the button is the
+            // confirmation, and what it does cannot be undone.
             if delete.hovered() {
                 painter.rect_filled(delete_rect, ROW_ACTION_CORNER_RADIUS, scheme.danger_hover);
                 ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
@@ -7269,11 +7363,13 @@ impl KimoApp {
         }
 
         let delete = delete.on_hover_text(row_delete_tooltip(card.place));
+        let flag = flag.on_hover_text(row_flag_tooltip(card.place, card.flagged));
         RowResponse {
             row: resp,
             chevron,
             checkbox,
             delete,
+            flag,
         }
     }
 
@@ -9890,6 +9986,9 @@ struct CardText<'a> {
     /// The widget id of the row's own delete button — the one it offers under
     /// the pointer — one per row like the box's.
     delete_id: egui::Id,
+    /// The widget id of the row's own flag button, which sits just inside the
+    /// delete cell: a target on every row like the two others.
+    flag_id: egui::Id,
 }
 
 /// What a row's checkbox says about the mail the row stands for.
@@ -9965,6 +10064,10 @@ struct RowResponse {
     /// The row's own delete button: a target on every row like the box, drawn
     /// when the pointer is on the row (see `message_card`).
     delete: egui::Response,
+    /// The row's own flag button, just inside the delete cell: the title bar's
+    /// flag action — the one mail action its head leaves to the bar — offered
+    /// where the mail is listed.
+    flag: egui::Response,
 }
 
 const MESSAGE_ROW_HEIGHT: f32 = 68.0;
@@ -9993,6 +10096,10 @@ const CHECKBOX_CORNER_RADIUS: u8 = 4;
 const ROW_ACTION_SIZE: f32 = 24.0;
 const ROW_ACTION_GLYPH: f32 = 15.0;
 const ROW_ACTION_CORNER_RADIUS: u8 = 4;
+/// The gap between a row's own cells — the flag and the delete — which is the
+/// title bar's own gap: the pair is one run by the row's edge, the way the bar's
+/// run and the mail head's are.
+const ROW_ACTION_GAP: f32 = 6.0;
 /// The width of the check drawn on a checked box, and of the dash a partly
 /// checked conversation gets.
 const CHECKBOX_STROKE: f32 = 2.0;
@@ -14551,6 +14658,13 @@ mod tests {
         )
     }
 
+    /// Where a row's own flag button sits: the cell just inside the delete one,
+    /// so the pair is what the pointer finds at the row's right end. Select
+    /// mode's select-all row pushes every mail row one band lower.
+    fn row_flag_center(app: &KimoApp, row: usize) -> egui::Pos2 {
+        row_delete_center(app, row) - egui::vec2(ROW_ACTION_SIZE + ROW_ACTION_GAP, 0.0)
+    }
+
     /// Where a row's own delete button sits: the cell at the right end of the
     /// row's first line, in the timestamp's slot. Select mode's select-all row
     /// pushes every mail row one band lower.
@@ -15782,7 +15896,7 @@ mod tests {
             conversation
         );
         assert_eq!(
-            row_delete_target(conversation, rows, messages).map(|msg| msg.uid.as_str()),
+            row_action_target(conversation, rows, messages).map(|msg| msg.uid.as_str()),
             Some("3"),
             "the newest mail of the thread, not the whole of it"
         );
@@ -15793,7 +15907,7 @@ mod tests {
             in_thread: false,
         };
         assert_eq!(
-            row_delete_target(plain, rows, messages).map(|msg| msg.uid.as_str()),
+            row_action_target(plain, rows, messages).map(|msg| msg.uid.as_str()),
             Some(messages[1].uid.as_str())
         );
     }
@@ -15819,6 +15933,148 @@ mod tests {
         assert!(
             thread.contains("newest mail"),
             "a conversation's button says which mail it takes: {thread}"
+        );
+    }
+
+    /// The row's other cell: the flag, just inside the delete button. A click
+    /// runs the title bar's own flag action on the mail the row speaks for —
+    /// `Job::SetFlag` behind it — and is not a click on the row, so a mail is
+    /// marked where it is listed rather than opened.
+    #[test]
+    fn the_row_flag_button_marks_the_mail_it_lists() {
+        let ctx = egui::Context::default();
+        crate::fonts::install(&ctx, None, None);
+        let mut app = app_with_messages(&ctx, 3);
+        let _ = frame_shapes_at(&ctx, &mut app, 1400.0);
+        let scheme = theme::of(&ctx);
+
+        let at = row_flag_center(&app, 1);
+        click_at(&ctx, &mut app, at);
+        assert_eq!(
+            app.selected_message, None,
+            "the click flagged rather than opened the mail"
+        );
+        let messages = app.folder_messages_of("acct", "INBOX").expect("mail");
+        let flags: Vec<bool> = messages.iter().map(|mail| mail.flagged).collect();
+        assert!(flags[1], "the mail the row lists is flagged: {flags:?}");
+        assert!(!flags[0] && !flags[2], "and only that one");
+
+        // The pointer on another row: the flagged row takes the warning fill —
+        // the pointer's own fill stands only while it is on *its* row — which is
+        // the mark the cell put on the mail.
+        let below = checkbox_center(&app, 2, false);
+        frame_shapes_with(
+            &ctx,
+            &mut app,
+            1400.0,
+            vec![egui::Event::PointerMoved(egui::pos2(320.0, below.y))],
+        );
+        let shapes = frame_shapes_at(&ctx, &mut app, 1400.0);
+        assert!(
+            fills_in_color(&shapes, scheme.flag)
+                .iter()
+                .any(|rect| rect.width() > 200.0),
+            "the flagged row takes the warning fill"
+        );
+
+        // The pointer on the row itself, away from the cells: the flag button is
+        // there — the pennant and its pole — muted and unfilled, the way the
+        // delete button beside it is.
+        let row = checkbox_center(&app, 1, false);
+        frame_shapes_with(
+            &ctx,
+            &mut app,
+            1400.0,
+            vec![egui::Event::PointerMoved(egui::pos2(320.0, row.y))],
+        );
+        let shapes = frame_shapes_at(&ctx, &mut app, 1400.0);
+        assert!(
+            fills_of_size(&shapes, egui::Vec2::splat(ROW_ACTION_SIZE))
+                .iter()
+                .all(|fill| fill.rect.center() != at),
+            "the cell is not filled until the pointer is on it"
+        );
+        let cell = egui::Rect::from_center_size(at, egui::Vec2::splat(ROW_ACTION_SIZE));
+        assert_eq!(
+            strokes_in(&shapes, cell).len(),
+            2,
+            "the pennant and its pole stand on the cell"
+        );
+
+        // The pointer on the cell: the warning tint under the glyph, which is
+        // what the click puts on the mail.
+        frame_shapes_with(&ctx, &mut app, 1400.0, vec![egui::Event::PointerMoved(at)]);
+        let shapes = frame_shapes_at(&ctx, &mut app, 1400.0);
+        assert!(
+            fills_of_size(&shapes, egui::Vec2::splat(ROW_ACTION_SIZE))
+                .iter()
+                .any(|fill| fill.rect.center() == at && fill.fill == scheme.flag),
+            "the cell takes the warning tint under the pointer"
+        );
+    }
+
+    /// The same cell takes the mark off a flagged mail, and says so — the title
+    /// bar's own wording, which turns over with the state; a conversation's row
+    /// names the newest mail it marks, the way its delete button beside it does.
+    #[test]
+    fn the_row_flag_button_takes_the_mark_off_and_says_which_mail() {
+        let ctx = egui::Context::default();
+        crate::fonts::install(&ctx, None, None);
+        let mut app = app_with_messages(&ctx, 3);
+        app.set_flag_on_mail(&MailKey::new("acct", "INBOX", "1"), true);
+        let _ = frame_shapes_at(&ctx, &mut app, 1400.0);
+
+        let at = row_flag_center(&app, 1);
+        click_at(&ctx, &mut app, at);
+        assert!(
+            !app.folder_messages_of("acct", "INBOX").expect("mail")[1].flagged,
+            "the second click takes the flag off"
+        );
+
+        assert_eq!(
+            row_flag_tooltip(RowPlace::Plain, false),
+            MailAction::tooltip(MailAction::Flag)
+        );
+        assert_eq!(
+            row_flag_tooltip(RowPlace::InThread, true),
+            MailAction::flag_tooltip(true),
+            "a mail of a thread says what the click takes off"
+        );
+        let thread = row_flag_tooltip(
+            RowPlace::Thread {
+                open: false,
+                count: 2,
+                key: "1",
+            },
+            false,
+        );
+        assert!(
+            thread.contains("newest mail"),
+            "a conversation's cell says which mail it marks: {thread}"
+        );
+    }
+
+    /// A conversation's row speaks for its newest mail, and its flag cell marks
+    /// that one — not the thread: the mails under it are their own rows' to mark.
+    #[test]
+    fn a_conversations_flag_button_marks_the_mail_its_row_speaks_for() {
+        let ctx = egui::Context::default();
+        crate::fonts::install(&ctx, None, None);
+        let mut app = app_with_one_conversation(&ctx);
+        let _ = frame_shapes_at(&ctx, &mut app, 1400.0);
+
+        let at = row_flag_center(&app, 0);
+        click_at(&ctx, &mut app, at);
+        let messages = app.folder_messages_of("acct", "INBOX").expect("mail");
+        let flagged: Vec<&str> = messages
+            .iter()
+            .filter(|mail| mail.flagged)
+            .map(|mail| mail.uid.as_str())
+            .collect();
+        assert_eq!(
+            flagged,
+            ["3"],
+            "the newest mail of the thread, and nothing under it"
         );
     }
 
@@ -19947,6 +20203,31 @@ mod tests {
             collect_frame(&ctx, &mut app, &mut textures, Vec::new());
         }
         shot(&mut app, "ui-flag.png", &mut textures);
+
+        // And the row's own two buttons under the pointer: the flag cell just
+        // inside the delete one — wearing the mark's colour on the mail that is
+        // flagged — and then the flag cell itself under the pointer, filled with
+        // the tint a flagged row is filled with.
+        let row = checkbox_center(&app, 1, false);
+        for _ in 0..2 {
+            collect_frame(
+                &ctx,
+                &mut app,
+                &mut textures,
+                vec![egui::Event::PointerMoved(egui::pos2(320.0, row.y))],
+            );
+        }
+        shot(&mut app, "ui-row-buttons.png", &mut textures);
+        let flag_cell = row_flag_center(&app, 1);
+        for _ in 0..2 {
+            collect_frame(
+                &ctx,
+                &mut app,
+                &mut textures,
+                vec![egui::Event::PointerMoved(flag_cell)],
+            );
+        }
+        shot(&mut app, "ui-row-flag-hover.png", &mut textures);
 
         // And the filter: the checklist over the list it narrows — every box
         // clear but "All" — then two of them ticked, then the list itself with
