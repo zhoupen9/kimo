@@ -62,10 +62,9 @@ Read when touching `src/main.rs`, `src/gpu.rs`, `src/glass.rs`, the title bar, t
   scroll offsets (`KimoApp::list_scroll` and `mail_scroll`, each captured where
   its scroll area is built), so scrolling either of them back to the top docks
   the bar again rather than snapping it, and a column with nothing to scroll —
-  or no list and no mail at all — leaves it docked. The brand is not in the
-  bar: the mark heads the navigation column instead (see **The navigation
-  column** below), and the room the bar gives its own content starts at
-  `TITLEBAR_LEFT_INSET` rather than at the window's edge. Inside
+  or no list and no mail at all — leaves it docked. The room the bar gives its
+  own content starts at `TITLEBAR_LEFT_INSET` rather than at the window's
+  edge. Inside
   the bar, left to right: the nav collapse
   toggle, the compose button (the one mail action that needs no mail open, so
   it sits beside the toggle rather than with the other actions over the reading
@@ -422,17 +421,6 @@ Read when touching `src/main.rs`, `src/gpu.rs`, `src/glass.rs`, the title bar, t
 
 ## The navigation column
 
-- The column's first element is its own header (`brand_header`): the
-  application mark — the same embedded PNG the tray serves, downscaled once at
-  startup because egui has no mipmaps to filter a 256 px source down to the
-  square it is drawn at, `BRAND_ICON_SIZE` — the name
-  `BRAND_NAME` beside it, and after that the version the crate was built
-  as (`BRAND_VERSION`, `env!("CARGO_PKG_VERSION")`) in the small,
-  weak text. It is drawn above the column's scroll area rather than in it, so
-  what the window is does not scroll away with what it holds, and it is the one
-  row of the column with nothing to click. **The mark lives here rather than in
-  the title bar**, which is a row of cells and was never a place for a label;
-  the bar keeps the margin the mark used to stand in (`TITLEBAR_LEFT_INSET`).
 - The navigation column is where accounts are switched, which is why the
   title bar has no account menu: every account is a collapsible section
   (`collapsed_accounts` holds the collapsed ids, in memory only), whose header

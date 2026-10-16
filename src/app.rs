@@ -2,8 +2,8 @@
 //! `sync::Event`s drained at the top of every frame; opening a socket happens
 //! only in worker threads.
 //!
-//! Layout: custom title bar on top (the brand, the nav toggle, the compose
-//! button and the search box, then the mail actions — reply, reply all,
+//! Layout: custom title bar on top (the nav toggle, the compose button and the
+//! search box, then the mail actions — reply, reply all,
 //! forward, label, flag, export, delete — as one flat group a fixed gap to its
 //! right, and at the right end the sync cell, the preferences
 //! cog and the window controls), then three columns — collapsible
@@ -778,9 +778,6 @@ pub struct KimoApp {
     /// second, open glyph. Uploaded once at startup from the embedded PNGs
     /// in `folders::FolderKind::ICONS`.
     folder_icons: HashMap<(FolderKind, bool), egui::TextureHandle>,
-    /// The application mark, drawn at the head of the navigation column.
-    /// `None` only if the embedded PNG fails to decode.
-    brand_icon: Option<egui::TextureHandle>,
     /// The frosted backdrop of a floating title bar (see `crate::glass`): the
     /// GL pass is made once, on the first frame the bar floats.
     glass: Glass,
@@ -2108,7 +2105,6 @@ impl KimoApp {
 
         // Folder-list icons: white PNGs (see `folders`), tinted per row.
         let folder_icons = load_folder_icons(ctx);
-        let brand_icon = load_brand_icon(ctx);
 
         let (tx, rx) = mpsc::channel();
         let mut app = Self {
@@ -2152,7 +2148,6 @@ impl KimoApp {
             collapsed_accounts: HashSet::new(),
             was_narrow: false,
             folder_icons,
-            brand_icon,
             glass: Glass::default(),
             theme: Theme::parse(&settings.theme),
             // A file that names no accent, or one no accent answers to.
@@ -3595,8 +3590,8 @@ impl KimoApp {
     /// space drags the window (double-click toggles maximize).
     ///
     /// The bar is laid out as groups, not as one long row of widgets: the
-    /// first group at the left — the brand, the nav toggle and the pen, which
-    /// never give way — the sync cell, the cog and the window controls at the
+    /// first group at the left — the nav toggle and the pen, which never give
+    /// way — the sync cell, the cog and the window controls at the
     /// right, and the search box and the mail actions anchored to the columns
     /// under them (`titlebar_rects`, `titlebar_anchors`).
     /// Every group is drawn inside a rect of its own, clipped to it, and two
@@ -3634,9 +3629,7 @@ impl KimoApp {
 
         // --- left group: the actions that belong to the window itself ---
         // Nav toggle, compose. Laid out from the bar's left edge, and where it
-        // came to is what every other group is placed after. The brand is not
-        // in the bar any more: the mark, the name and the version head the
-        // navigation column instead (`brand_header`).
+        // came to is what every other group is placed after.
         let left_end = ui
             .scope_builder(
                 egui::UiBuilder::new()
@@ -3649,8 +3642,7 @@ impl KimoApp {
                     // the window controls do.
                     row.spacing_mut().item_spacing.x = TITLEBAR_BUTTON_GAP;
                     // The bar's own left margin, before the first cell: the
-                    // toggle is the leftmost thing in the bar now that the mark
-                    // has moved into the column under it.
+                    // toggle is the leftmost thing in the bar.
                     row.add_space(TITLEBAR_LEFT_INSET);
 
                     // Nav collapse toggle (hamburger, painted as lines). An
@@ -4252,12 +4244,7 @@ impl KimoApp {
         // The title bar floats over the columns, so this one's content starts
         // below it: what the glass shows here is the panel fill, not folders.
         ui.add_space(TITLEBAR_HEIGHT);
-        // The column's header, before the accounts and outside their scroll
-        // area: the mark, the name and the version — what the window is, which
-        // should not scroll away with what it holds. An empty column is a
-        // header over a sentence rather than a column with nothing in it, so
-        // this stands before the early return below.
-        brand_header(ui, scheme, self.brand_icon.as_ref());
+
         if self.accounts.is_empty() {
             ui.label("No accounts yet.");
             ui.label(
@@ -9004,8 +8991,8 @@ const TITLEBAR_HEIGHT: f32 = TITLEBAR_HEIGHT_I8 as f32;
 /// the bar read as one row of the same button, whichever group a cell is in.
 const TITLEBAR_BUTTON_SIZE: f32 = 32.0;
 /// The clear space between two of those cells. Every group in the bar lays
-/// itself out with it, so the same rhythm runs from the brand to the close
-/// button.
+/// itself out with it, so the same rhythm runs from the first cell to the
+/// close button.
 const TITLEBAR_BUTTON_GAP: f32 = 6.0;
 /// The cells' hover fill: a small rounded square, not the full-height block the
 /// bar's buttons used to fill under the pointer. Small, because the cell is —
@@ -9320,15 +9307,6 @@ const ATTACHMENT_LINE_GAP: f32 = 2.0;
 /// inset is the field's left margin, so the text begins after the icon.
 const SEARCH_ICON_INSET: i8 = 22;
 const SEARCH_ICON_SIZE: f32 = 15.0;
-/// The name and the version the navigation column's header draws beside the
-/// mark (`brand_header`): the crate's own version, so the two cannot disagree
-/// with the build.
-const BRAND_NAME: &str = "Kimo";
-const BRAND_VERSION: &str = env!("CARGO_PKG_VERSION");
-/// Side of the square mark in that header — a title bar cell's own square
-/// (`TITLEBAR_BUTTON_SIZE`), because it is the one thing the window is known
-/// by and it is drawn at the one size wherever it appears.
-const BRAND_ICON_SIZE: f32 = 32.0;
 /// How far the title bar's first cell starts in from the window's left edge —
 /// the space added before it, as the left group's own first item. Wider than
 /// the margin at the other end, which the window controls keep.
@@ -9453,7 +9431,7 @@ fn titlebar_search_width(room: f32) -> Option<f32> {
 struct TitlebarAnchors {
     /// The search box's left edge: the message list's own left edge, clamped
     /// clear of the first group — a collapsed navigation column puts the list at
-    /// the window's edge, and the box may not land on the brand.
+    /// the window's edge, and the box may not land on that group.
     search: f32,
     /// How wide the plan makes the box (`titlebar_search_width`), or `None` when
     /// the bar has no room for it at all.
@@ -9472,9 +9450,9 @@ struct TitlebarAnchors {
 /// Place the two groups the bar anchors to the columns below it: the search box
 /// over the message list, the mail actions over the reading pane. Both edges are
 /// the columns' own (`KimoApp::list_column`), so both follow the splitters that
-/// move those columns, and both are clamped clear of the first group — the
-/// brand, the nav toggle and the pen, which never give way because the compose
-/// button needs no mail open.
+/// move those columns, and both are clamped clear of the first group — the nav
+/// toggle and the pen, which never give way because the compose button needs no
+/// mail open.
 ///
 /// The run is placed only where it belongs: at the pane's edge, or over it by no
 /// more than `MAIL_ACTION_OVERHANG` when the window controls leave no room
@@ -11115,70 +11093,6 @@ fn paint_row_text(
     }
 }
 
-/// The navigation column's header: the application mark, the name beside it and
-/// the version in the small text after that — what the window is, at the top of
-/// the column the folders are in. It is drawn above the column's scroll area
-/// rather than in it, so the header stays where it is while the accounts scroll
-/// under it, and it is the column's one row with nothing to click: the mark is
-/// a label, not a button.
-fn brand_header(ui: &mut egui::Ui, scheme: ColorScheme, icon: Option<&egui::TextureHandle>) {
-    /// Tall enough for the mark, with a little air above and below it.
-    const ROW_HEIGHT: f32 = BRAND_ICON_SIZE + 8.0;
-    /// Between the mark and the name, and between the name and the version.
-    const NAME_GAP: f32 = 8.0;
-    const VERSION_GAP: f32 = 6.0;
-
-    let (rect, _) = ui.allocate_exact_size(
-        egui::vec2(ui.available_width(), ROW_HEIGHT),
-        egui::Sense::hover(),
-    );
-    if !ui.is_rect_visible(rect) {
-        return;
-    }
-    let mut left = rect.left();
-    if let Some(icon) = icon {
-        let mark = egui::Rect::from_min_size(
-            egui::pos2(left, rect.center().y - BRAND_ICON_SIZE / 2.0),
-            egui::Vec2::splat(BRAND_ICON_SIZE),
-        );
-        // Drawn as it is rather than tinted: this is the application icon, the
-        // same PNG the tray serves, not one of the column's white glyphs.
-        ui.painter().image(
-            icon.id(),
-            mark,
-            egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
-            egui::Color32::WHITE,
-        );
-        left = mark.right() + NAME_GAP;
-    }
-
-    // The name at the column's own text size, then the version in the small
-    // one. Each is centred on the row the way every row in the column centres
-    // its text; at these two sizes the baselines land within a point of each
-    // other, which is what keeps the version reading as part of the same line.
-    let body = egui::TextStyle::Body.resolve(ui.style());
-    let name = ui
-        .ctx()
-        .fonts_mut(|fonts| fonts.layout_no_wrap(BRAND_NAME.to_string(), body, scheme.text));
-    ui.painter().galley(
-        egui::pos2(left, rect.center().y - name.size().y / 2.0),
-        name.clone(),
-        scheme.text,
-    );
-    let small = egui::TextStyle::Small.resolve(ui.style());
-    let version = ui.ctx().fonts_mut(|fonts| {
-        fonts.layout_no_wrap(format!("v{BRAND_VERSION}"), small, scheme.text_weak)
-    });
-    ui.painter().galley(
-        egui::pos2(
-            left + name.size().x + VERSION_GAP,
-            rect.center().y - version.size().y / 2.0,
-        ),
-        version,
-        scheme.text_weak,
-    );
-}
-
 /// One row of the folder list: kind icon, name, and the unread count on the
 /// right. The whole row is the click target and carries the selection
 /// highlight — a `selectable_label` would leave the icon outside its own
@@ -11486,19 +11400,6 @@ fn label_row(
     } else {
         response.on_hover_text(format!("Show the mail labelled {name}"))
     }
-}
-
-/// The application mark for the navigation column's header: the same embedded
-/// 256 px PNG the tray serves, downscaled once here — 64 px is a texel per
-/// device pixel at `BRAND_ICON_SIZE` on a 2× display, where the 256 px source
-/// would alias badly instead, since egui has no mipmaps.
-fn load_brand_icon(ctx: &egui::Context) -> Option<egui::TextureHandle> {
-    let decoded = image::load_from_memory(crate::tray::APP_PNG)
-        .ok()?
-        .to_rgba8();
-    let small = image::imageops::resize(&decoded, 64, 64, image::imageops::FilterType::Lanczos3);
-    let pixels = egui::ColorImage::from_rgba_unmultiplied([64, 64], small.as_raw());
-    Some(ctx.load_texture("brand-icon", pixels, Default::default()))
 }
 
 /// Decode the embedded folder icons (see `folders::FolderKind::ICONS`) into
@@ -16719,7 +16620,7 @@ mod tests {
     /// The runs are measured with `titlebar_cells_width`, which is what the
     /// window controls are placed with and the bar draws the mail actions with;
     /// the left group's cells are found from the layout its row makes (the edge
-    /// margin, the brand icon, then a cell every pitch), and the run of mail
+    /// margin, then a cell every pitch), and the run of mail
     /// actions from `titlebar_anchors`, which is where the bar places it.
     #[test]
     fn every_button_in_the_title_bar_is_the_same_cell() {
@@ -16802,68 +16703,10 @@ mod tests {
         );
     }
 
-    /// The brand is the navigation column's own header now rather than the
-    /// bar's: the mark at the column's top, the name beside it and the version
-    /// after that in the smaller text — above the first account, and outside
-    /// the column's scroll area, so what the window is does not scroll away
-    /// with what it holds.
+    /// The bar draws no image: it is cells and glyphs, and its leftmost cell is
+    /// the navigation toggle, the bar's own margin in from the window's edge.
     #[test]
-    fn the_brand_heads_the_navigation_column() {
-        let ctx = egui::Context::default();
-        crate::fonts::install(&ctx, None, None);
-        let mut app = app_with_messages(&ctx, 2);
-        let shapes = frame_shapes_at(&ctx, &mut app, 1400.0);
-        let nav = nav_column(&app);
-
-        // The mark: the column's one image of a title bar cell's size, and
-        // under the bar rather than behind it.
-        let marks: Vec<egui::Rect> = image_rects_of(&shapes, nav)
-            .into_iter()
-            .filter(|rect| (rect.width() - BRAND_ICON_SIZE).abs() < 0.5)
-            .collect();
-        assert_eq!(marks.len(), 1, "one mark heads the column: {marks:?}");
-        assert!(
-            marks[0].top() >= TITLEBAR_HEIGHT,
-            "the mark is under the bar: {:?}",
-            marks[0]
-        );
-
-        // The name and the version on one line beside it: the version the
-        // smaller of the two, after the name, and both on the mark's own line.
-        let name = text_boxes_of(&shapes, nav, BRAND_NAME);
-        let version = text_boxes_of(&shapes, nav, &format!("v{BRAND_VERSION}"));
-        assert_eq!(name.len(), 1, "the name is drawn once: {name:?}");
-        assert_eq!(version.len(), 1, "the version is drawn once: {version:?}");
-        let (name, version) = (name[0], version[0]);
-        assert!(
-            version.height() < name.height(),
-            "the version is the small text: {version:?} of {name:?}"
-        );
-        assert!(
-            version.left() >= name.right() - 0.5,
-            "the version stands after the name: {version:?} of {name:?}"
-        );
-        assert!(
-            marks[0].top() <= name.top() && name.bottom() <= marks[0].bottom(),
-            "the name is on the mark's own line: {name:?} of {:?}",
-            marks[0]
-        );
-
-        // And the header stands over the accounts it heads.
-        let account = text_boxes_of(&shapes, nav, "Test");
-        assert_eq!(account.len(), 1, "the account's own row: {account:?}");
-        assert!(
-            name.bottom() < account[0].top(),
-            "the header is above the first account: {name:?} of {:?}",
-            account[0]
-        );
-    }
-
-    /// The bar keeps no brand: what it draws is cells and glyphs, and its
-    /// leftmost cell is the navigation toggle, the bar's own margin in from the
-    /// window's edge.
-    #[test]
-    fn the_title_bar_keeps_no_brand() {
+    fn the_title_bar_draws_no_image() {
         let ctx = egui::Context::default();
         crate::fonts::install(&ctx, None, None);
         let mut app = app_with_messages(&ctx, 2);
@@ -16873,7 +16716,7 @@ mod tests {
         assert!(images.is_empty(), "the bar draws no image: {images:?}");
 
         // The toggle's cell is the first thing in the bar, the margin before it
-        // being the bar's own rather than the room a mark needed.
+        // being the bar's own.
         let centre = egui::pos2(
             TITLEBAR_LEFT_INSET + TITLEBAR_BUTTON_SIZE / 2.0,
             TITLEBAR_HEIGHT / 2.0,
@@ -16982,8 +16825,8 @@ mod tests {
         assert!(anchors.sort.is_none(), "nor for the one after it");
 
         // A collapsed navigation column puts the list at the window's edge: the
-        // box follows it and stops clear of the first group instead of landing
-        // on the brand.
+        // box follows it and stops clear of the first group instead of running
+        // under it.
         let anchors = titlebar_anchors(bar(1400.0), first_end, 0.0, 940.0, cluster_left(1400.0));
         assert_eq!(anchors.search, first_end + TITLEBAR_GROUP_GAP);
 
@@ -17369,7 +17212,7 @@ mod tests {
     /// The search box is the message list's: it starts where the list starts and
     /// follows the splitter that moves the list's left edge — and when the
     /// navigation column is collapsed and the list runs to the window's own edge,
-    /// it stops clear of the first group instead of landing on the brand.
+    /// it stops clear of the first group instead of running under it.
     #[test]
     fn the_search_box_follows_the_list() {
         let ctx = egui::Context::default();
@@ -19960,8 +19803,6 @@ mod tests {
 
     /// Every image a frame drew inside `rect`, in the order it drew them — an
     /// image being a textured mesh, which is the shape epaint makes one from.
-    /// The brand is a texture rather than one of the drawn glyphs, so this is
-    /// how a test finds the mark, and how it says the bar no longer has one.
     fn image_rects_of(shapes: &[egui::epaint::ClippedShape], rect: egui::Rect) -> Vec<egui::Rect> {
         let mut out = Vec::new();
         for clipped in shapes {

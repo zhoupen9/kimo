@@ -19,10 +19,9 @@ use crate::dbus::{
 };
 
 /// The application icon (256 px, rasterized from `assets/app.svg`), embedded
-/// at compile time: the tray serves it as an `IconPixmap`, the title bar
-/// draws it as the brand (`app.rs` downscales it once at startup), and a
-/// new-mail notification (`crate::notify`) writes it out as the icon the
-/// notification shows.
+/// at compile time: the tray serves it as an `IconPixmap`, and a new-mail
+/// notification (`crate::notify`) writes it out as the icon the notification
+/// shows.
 pub(crate) const APP_PNG: &[u8] = include_bytes!("../assets/app.png");
 
 const SNI_INTERFACE: &str = "org.kde.StatusNotifierItem";
