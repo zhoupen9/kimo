@@ -245,6 +245,20 @@ Read when touching `src/main.rs`, `src/gpu.rs`, `src/glass.rs`, the title bar, t
   stretches the click target over it. The test named
   `the_search_box_is_as_wide_as_it_was_planned` is what keeps the plan's number
   and the widget's the same one.
+  **The client draws the resize border too**, because a frame with no decorations
+  has no system border to drag: `window_resize_grips` puts eight `RESIZE_GRIP`
+  (5 pt) strips in the foreground layer — the four edges and the four corners,
+  the corner squares their own grip so an edge cannot take them — and a press on
+  one sends `ViewportCommand::BeginResize`, which `egui-winit` turns into
+  winit's `drag_resize_window` (`xdg_toplevel.resize` on Wayland,
+  `_NET_WM_MOVERESIZE` on X11); the pointer on a strip wears that edge's cursor
+  while it is there. The press itself is the trigger rather than egui's drag
+  threshold, because the compositor's resize starts from the button that is down
+  now. The strips answer over the title bar's own drag stretches — moving the
+  window is still the bar's, from `RESIZE_GRIP` down — and a maximized window,
+  which has no edge to pull, is given none. Each grip is an area of its own
+  rather than one ring around the window, so the columns are shadowed only under
+  the pointer.
 
 ## The three columns
 

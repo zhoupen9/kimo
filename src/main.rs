@@ -275,7 +275,9 @@ impl Kimo {
 }
 
 /// The window Kimo draws its own title bar into: undecorated, 1280×800, and
-/// named so the compositor can match window rules against it.
+/// named so the compositor can match window rules against it. Undecorated is
+/// also why the app draws the window's resize border (`window_resize_grips`):
+/// there is no system frame left to resize it with.
 fn window_attributes() -> winit::window::WindowAttributes {
     #[allow(unused_mut)]
     let mut attributes = Window::default_attributes()

@@ -3582,10 +3582,46 @@ impl KimoApp {
             });
     }
 
+    /// The window's own resize border (`resize_grips`): eight strips in the
+    /// foreground layer, one per edge and corner, that ask the compositor to
+    /// resize the window from the edge under the pointer. The window is
+    /// undecorated (`main.rs`), so there is no system border to do it, and on
+    /// Wayland a client-requested `xdg_toplevel.resize` — what winit's
+    /// `drag_resize_window` sends — is the only way an edge drag can resize at
+    /// all.
+    ///
+    /// The press is the trigger, not egui's drag threshold: `BeginResize` hands
+    /// the compositor the button that is down *now* (that is its contract), so a
+    /// gesture that had to travel a few points first would spend them on
+    /// nothing. Each strip is an area of its own rather than one ring around the
+    /// window, so it shadows the columns only under the pointer; a maximized
+    /// window has no edge to pull and gets none.
+    fn window_resize_grips(&self, ctx: &egui::Context) {
+        if ctx.input(|input| input.viewport().maximized.unwrap_or(false)) {
+            return;
+        }
+        for (index, grip) in resize_grips(ctx.viewport_rect()).into_iter().enumerate() {
+            let response = egui::Area::new(egui::Id::new(("window-resize", index)))
+                .order(egui::Order::Foreground)
+                .fixed_pos(grip.rect.min)
+                .movable(false)
+                .sense(egui::Sense::click_and_drag())
+                .show(ctx, |ui| ui.set_min_size(grip.rect.size()))
+                .response;
+            if !response.contains_pointer() {
+                continue;
+            }
+            ctx.set_cursor_icon(grip.cursor);
+            if ctx.input(|input| input.pointer.primary_pressed()) {
+                ctx.send_viewport_cmd(egui::ViewportCommand::BeginResize(grip.direction));
+            }
+        }
+    }
+
     /// Custom window title bar (the window is created undecorated in
-    /// `main.rs`). Left to right: the application mark, the nav collapse
-    /// toggle, the compose button, the account status, the search box, then the
-    /// group of mail actions — and, at the window's own right end, the sync
+    /// `main.rs`). Left to right: the nav collapse toggle, the compose button,
+    /// the account status, the search box, then the group of mail actions —
+    /// and, at the window's own right end, the sync
     /// cell, the preferences cog and minimize / maximize / close. The leftover
     /// space drags the window (double-click toggles maximize).
     ///
@@ -8939,6 +8975,10 @@ impl KimoApp {
         // before the compose window, so a draft floats over it, and before
         // the modals, which egui keeps in the foreground layer.
         self.titlebar_area(ctx);
+        // The window's own resize border: the frame has no decorations, so
+        // these strips are the only pointer way to resize it
+        // (`window_resize_grips`).
+        self.window_resize_grips(ctx);
 
         // The compose modal: over the columns and the bar, and under any modal
         // opened after it (egui stacks the foreground layer in the order its
@@ -9315,6 +9355,11 @@ const TITLEBAR_LEFT_INSET: f32 = 16.0;
 /// close button's rounded fill is not flush against the frame — flush, it
 /// reaches the window's corner.
 const TITLEBAR_RIGHT_MARGIN: f32 = 10.0;
+/// How thick the window's own resize border is, in points: the strip along each
+/// edge and the corner squares where two strips meet (`resize_grips`). The
+/// window is undecorated (`main.rs`), so these strips are the whole of what a
+/// pointer can resize it with.
+const RESIZE_GRIP: f32 = 5.0;
 
 /// The compose modal: the width of its card (what the boxes are laid out for),
 /// the label column of its header fields, the height of one of those one-line
@@ -9520,6 +9565,84 @@ fn titlebar_anchors(
         sort,
         actions,
     }
+}
+
+/// One of the window's eight resize grips: the strip (or corner square) that
+/// answers a press with a `BeginResize` for `direction`, and the cursor the
+/// pointer wears while it is on one.
+#[derive(Clone, Copy, Debug)]
+struct ResizeGrip {
+    rect: egui::Rect,
+    direction: egui::viewport::ResizeDirection,
+    cursor: egui::CursorIcon,
+}
+
+/// The window's own resize border (`window_resize_grips`), as eight grips: the
+/// four edge strips with the corners taken out of them, and the four corner
+/// squares. The corners are grips of their own so that every point on the border
+/// answers with exactly one direction — an edge strip run corner to corner would
+/// answer for the corner of whichever edge was asked first.
+///
+/// Each grip is `RESIZE_GRIP` thick and `grip` is clamped to half of each side,
+/// so the window's interior — the columns, the bar, the mail — is never a grip,
+/// however small the window is.
+fn resize_grips(viewport: egui::Rect) -> [ResizeGrip; 8] {
+    use egui::viewport::ResizeDirection as Dir;
+
+    let grip = RESIZE_GRIP
+        .min(viewport.width() / 2.0)
+        .min(viewport.height() / 2.0);
+    let (left, top, right, bottom) = (
+        viewport.left(),
+        viewport.top(),
+        viewport.right(),
+        viewport.bottom(),
+    );
+    let rect = |x0: f32, y0: f32, x1: f32, y1: f32| {
+        egui::Rect::from_min_max(egui::pos2(x0, y0), egui::pos2(x1, y1))
+    };
+    [
+        ResizeGrip {
+            rect: rect(left, top, left + grip, top + grip),
+            direction: Dir::NorthWest,
+            cursor: egui::CursorIcon::ResizeNorthWest,
+        },
+        ResizeGrip {
+            rect: rect(left + grip, top, right - grip, top + grip),
+            direction: Dir::North,
+            cursor: egui::CursorIcon::ResizeNorth,
+        },
+        ResizeGrip {
+            rect: rect(right - grip, top, right, top + grip),
+            direction: Dir::NorthEast,
+            cursor: egui::CursorIcon::ResizeNorthEast,
+        },
+        ResizeGrip {
+            rect: rect(right - grip, top + grip, right, bottom - grip),
+            direction: Dir::East,
+            cursor: egui::CursorIcon::ResizeEast,
+        },
+        ResizeGrip {
+            rect: rect(right - grip, bottom - grip, right, bottom),
+            direction: Dir::SouthEast,
+            cursor: egui::CursorIcon::ResizeSouthEast,
+        },
+        ResizeGrip {
+            rect: rect(left + grip, bottom - grip, right - grip, bottom),
+            direction: Dir::South,
+            cursor: egui::CursorIcon::ResizeSouth,
+        },
+        ResizeGrip {
+            rect: rect(left, bottom - grip, left + grip, bottom),
+            direction: Dir::SouthWest,
+            cursor: egui::CursorIcon::ResizeSouthWest,
+        },
+        ResizeGrip {
+            rect: rect(left, top + grip, left + grip, bottom - grip),
+            direction: Dir::West,
+            cursor: egui::CursorIcon::ResizeWest,
+        },
+    ]
 }
 
 /// The width of a run of `count` cells in the title bar: `TITLEBAR_BUTTON_SIZE`
@@ -13329,6 +13452,36 @@ mod tests {
         output.textures_delta.clear();
     }
 
+    /// One headless frame's whole output — the viewport commands and the cursor
+    /// icon included, which is what the window-chrome tests read: a resize grip
+    /// asks the compositor for a resize rather than drawing anything.
+    fn app_frame_output(
+        ctx: &egui::Context,
+        app: &mut KimoApp,
+        events: Vec<egui::Event>,
+    ) -> egui::FullOutput {
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1400.0, 900.0),
+            )),
+            events,
+            ..Default::default()
+        };
+        let mut output = ctx.run_ui(input, |ui| app.ui(ui));
+        output.textures_delta.clear();
+        output
+    }
+
+    /// What one frame asked its viewport for.
+    fn viewport_commands(output: &egui::FullOutput) -> Vec<egui::ViewportCommand> {
+        output
+            .viewport_output
+            .get(&egui::ViewportId::ROOT)
+            .map(|viewport| viewport.commands.clone())
+            .unwrap_or_default()
+    }
+
     /// An export answers with the path the worker wrote, and the desktop is told
     /// where it went: the two lines a notification shows, and nothing above the
     /// message list. The path is the whole of it — the name is the dialog's or the
@@ -16725,6 +16878,152 @@ mod tests {
             fill_under_the_pointer(&ctx, &mut app, 1400.0, centre, TITLEBAR_BUTTON_SIZE).is_some(),
             "the toggle's cell is the bar's first"
         );
+    }
+
+    /// The grips ring the window: one per edge and corner, the corners their
+    /// own so an edge cannot take them, and none of the window's inside — the
+    /// columns, the bar, the mail — ever a grip.
+    #[test]
+    fn the_resize_grips_ring_the_window() {
+        let view = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1400.0, 900.0));
+        let grips = resize_grips(view);
+        let at = |point: egui::Pos2| {
+            grips
+                .iter()
+                .find(|grip| grip.rect.contains(point))
+                .map(|grip| grip.direction)
+        };
+
+        // The corners, where two edges meet, answer for themselves.
+        assert_eq!(
+            at(egui::pos2(1.0, 1.0)),
+            Some(egui::viewport::ResizeDirection::NorthWest)
+        );
+        assert_eq!(
+            at(egui::pos2(view.right() - 1.0, 1.0)),
+            Some(egui::viewport::ResizeDirection::NorthEast)
+        );
+        assert_eq!(
+            at(egui::pos2(1.0, view.bottom() - 1.0)),
+            Some(egui::viewport::ResizeDirection::SouthWest)
+        );
+        assert_eq!(
+            at(egui::pos2(view.right() - 1.0, view.bottom() - 1.0)),
+            Some(egui::viewport::ResizeDirection::SouthEast)
+        );
+        // And the edges for the rest of their length.
+        assert_eq!(
+            at(egui::pos2(view.center().x, 1.0)),
+            Some(egui::viewport::ResizeDirection::North)
+        );
+        assert_eq!(
+            at(egui::pos2(view.center().x, view.bottom() - 1.0)),
+            Some(egui::viewport::ResizeDirection::South)
+        );
+        assert_eq!(
+            at(egui::pos2(1.0, view.center().y)),
+            Some(egui::viewport::ResizeDirection::West)
+        );
+        assert_eq!(
+            at(egui::pos2(view.right() - 1.0, view.center().y)),
+            Some(egui::viewport::ResizeDirection::East)
+        );
+
+        // Nothing of the window's inside is a grip: the border is a border,
+        // however thick.
+        let inside = view.shrink(RESIZE_GRIP + 0.01);
+        assert!(
+            grips.iter().all(|grip| !grip.rect.intersects(inside)),
+            "a grip reaches into the window: {grips:?}"
+        );
+    }
+
+    /// The undecorated window's own resize border, at the frame level: a press
+    /// on an edge asks the compositor to resize from that edge (`BeginResize`),
+    /// the pointer over one wears that edge's cursor, and the inside of the
+    /// window asks for nothing.
+    #[test]
+    fn the_window_edges_ask_the_compositor_to_resize() {
+        let ctx = egui::Context::default();
+        crate::fonts::install(&ctx, None, None);
+        let mut app = app_with_messages(&ctx, 2);
+        let view = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1400.0, 900.0));
+        // One frame first, so the grips are among the rects the frames below
+        // are hit-tested against.
+        let _ = app_frame_output(&ctx, &mut app, Vec::new());
+
+        let half = RESIZE_GRIP / 2.0;
+        let button = |point: egui::Pos2, pressed: bool| egui::Event::PointerButton {
+            pos: point,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::default(),
+        };
+        let cases = [
+            (
+                egui::pos2(view.left() + half, view.center().y),
+                egui::viewport::ResizeDirection::West,
+            ),
+            (
+                egui::pos2(view.right() - half, view.center().y),
+                egui::viewport::ResizeDirection::East,
+            ),
+            (
+                egui::pos2(view.center().x, view.top() + half),
+                egui::viewport::ResizeDirection::North,
+            ),
+            (
+                egui::pos2(view.center().x, view.bottom() - half),
+                egui::viewport::ResizeDirection::South,
+            ),
+            (
+                egui::pos2(view.left() + half, view.top() + half),
+                egui::viewport::ResizeDirection::NorthWest,
+            ),
+            (
+                egui::pos2(view.right() - half, view.bottom() - half),
+                egui::viewport::ResizeDirection::SouthEast,
+            ),
+        ];
+        for (point, direction) in cases {
+            // The frame that puts the pointer on the grip, then the one that
+            // presses it, then the release.
+            let _ = app_frame_output(&ctx, &mut app, vec![egui::Event::PointerMoved(point)]);
+            let pressed = app_frame_output(&ctx, &mut app, vec![button(point, true)]);
+            assert!(
+                viewport_commands(&pressed)
+                    .contains(&egui::ViewportCommand::BeginResize(direction)),
+                "{point:?} is the {direction:?} grip: {:?}",
+                viewport_commands(&pressed)
+            );
+            let _ = app_frame_output(&ctx, &mut app, vec![button(point, false)]);
+        }
+
+        // The cursor says which grip before the press does.
+        let moved = app_frame_output(&ctx, &mut app, vec![egui::Event::PointerMoved(cases[0].0)]);
+        assert_eq!(
+            moved.platform_output.cursor_icon,
+            egui::CursorIcon::ResizeWest
+        );
+
+        // And the window's own inside is nobody's grip — neither the middle of
+        // the window nor the title bar just under the top strip, where the bar's
+        // own drag stretches still move it.
+        for point in [
+            view.center(),
+            egui::pos2(view.center().x, RESIZE_GRIP + 5.0),
+        ] {
+            let _ = app_frame_output(&ctx, &mut app, vec![egui::Event::PointerMoved(point)]);
+            let inside = app_frame_output(&ctx, &mut app, vec![button(point, true)]);
+            assert!(
+                !viewport_commands(&inside)
+                    .iter()
+                    .any(|command| matches!(command, egui::ViewportCommand::BeginResize(_))),
+                "{point:?} is not a grip: {:?}",
+                viewport_commands(&inside)
+            );
+            let _ = app_frame_output(&ctx, &mut app, vec![button(point, false)]);
+        }
     }
 
     /// Where the bar's two anchored groups go, for every window shape that
