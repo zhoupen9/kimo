@@ -4815,18 +4815,38 @@ impl KimoApp {
                             if flat {
                                 flatten_widgets(ui, theme::of(ui.ctx()).hover);
                             }
-                            egui::ComboBox::from_id_salt("compose-from")
+                            // What egui's own icon hook is handed — where the
+                            // filled triangle would go, and whether the list
+                            // is open — is kept here for the chevron painted
+                            // after the button: the pointer's state, which
+                            // that chevron's colour answers, is known only
+                            // then (`paint_from_chevron`).
+                            let icon = std::rc::Rc::new(std::cell::Cell::new((
+                                egui::Rect::NOTHING,
+                                false,
+                            )));
+                            let mut combo = egui::ComboBox::from_id_salt("compose-from")
                                 .selected_text(label)
-                                .width(field_width)
-                                .show_ui(ui, |ui| {
-                                    for (id, name, address) in &accounts {
-                                        ui.selectable_value(
-                                            from,
-                                            Some(id.clone()),
-                                            format!("{name} <{address}>"),
-                                        );
-                                    }
+                                .width(field_width);
+                            if flat {
+                                let icon = std::rc::Rc::clone(&icon);
+                                combo = combo.icon(move |_, rect, _, is_open| {
+                                    icon.set((rect, is_open));
                                 });
+                            }
+                            let list = combo.show_ui(ui, |ui| {
+                                for (id, name, address) in &accounts {
+                                    ui.selectable_value(
+                                        from,
+                                        Some(id.clone()),
+                                        format!("{name} <{address}>"),
+                                    );
+                                }
+                            });
+                            if flat {
+                                let (place, open) = icon.get();
+                                paint_from_chevron(ui, &list.response, place, open);
+                            }
                         });
                     }
                     // Only reachable if the From account vanished between
@@ -10278,10 +10298,12 @@ fn compose_to_row(
     .inner
 }
 
-/// The chevron the reply's own To row carries at its end: down while the Cc
-/// and Bcc lines are folded away — the way to them — and up once they are
-/// under the row. The thread rows' chevron turned a quarter (`paint_chevron`):
-/// the same two strokes meeting at a point, and nothing else.
+/// The chevron a flat row of the answer ends with: the To row's, down while
+/// the Cc and Bcc lines are folded away — the way to them — and up once they
+/// are under the row, and the From list's own (`paint_from_chevron`), which
+/// reads the same way over the list it opens. The thread rows' chevron turned
+/// a quarter (`paint_chevron`): the same two strokes meeting at a point, and
+/// nothing else.
 fn paint_fold_chevron(
     painter: &egui::Painter,
     centre: egui::Pos2,
@@ -10304,6 +10326,28 @@ fn paint_fold_chevron(
         ]
     };
     painter.add(egui::Shape::line(points, egui::Stroke::new(1.0_f32, color)));
+}
+
+/// The chevron the reply's From list ends with on the spot, in the place egui
+/// would put the filled triangle a combo box carries: the To row's own drawing
+/// (`paint_fold_chevron`), down while the list is away and up while it is open
+/// under the row — the same glyph, at the same size, and the same colour under
+/// the pointer (`card_action_color`) as the row below it, because the head bar
+/// is a letter's line and not a form of boxes.
+///
+/// `place` is what the combo's own hook handed back — where its triangle would
+/// have been, the one spot the button's own layout is known from — and `list`
+/// is the button's response, which is what says the pointer is on it. The combo
+/// is given a hook that paints nothing: this is what stands in its place.
+fn paint_from_chevron(ui: &egui::Ui, list: &egui::Response, place: egui::Rect, open: bool) {
+    let scheme = theme::of(ui.ctx());
+    paint_fold_chevron(
+        ui.painter(),
+        place.center(),
+        COMPOSE_FOLD_GLYPH,
+        open,
+        card_action_color(scheme, list.hovered()),
+    );
 }
 
 /// What an attachment card's click targets came to: the card itself, and — where
@@ -17746,35 +17790,72 @@ mod tests {
         cards
     }
 
-    /// The three-point line drawing a frame drew inside `card`: the reply's
-    /// fold chevron, found by its shape rather than by working out where the
-    /// To row ends — what else the card draws is its head's rule (a plain
-    /// segment), Send (two fills) and Discard (a two-point line and two
-    /// four-point ones).
+    /// The reply's To row's own chevron: the last of the answer card's line
+    /// drawings — the head bar's From list ends with one too, and it is drawn
+    /// first. What a chevron is, and what else a card draws, is
+    /// [`chevrons_in`]'s.
     fn fold_chevron(shapes: &[egui::epaint::ClippedShape], card: egui::Rect) -> Vec<egui::Pos2> {
+        chevrons_in(shapes, card).pop().unwrap_or_default()
+    }
+
+    /// The chevrons a frame drew inside `area`, in the order it drew them: the
+    /// answer's own two line drawings — the From list's at the end of its head
+    /// bar, the To row's under it — found by their shape rather than by working
+    /// out where those rows end. What else a card draws is its head's rule (a
+    /// plain segment), Send (two fills) and Discard (a two-point line and two
+    /// four-point ones).
+    fn chevrons_in(
+        shapes: &[egui::epaint::ClippedShape],
+        area: egui::Rect,
+    ) -> Vec<Vec<egui::Pos2>> {
+        three_point_paths(shapes, area, true)
+    }
+
+    /// The filled ones: the solid triangle egui gives a combo box is a
+    /// three-point path with a fill, where a chevron is a line drawing and has
+    /// none at all.
+    fn triangles_in(
+        shapes: &[egui::epaint::ClippedShape],
+        area: egui::Rect,
+    ) -> Vec<Vec<egui::Pos2>> {
+        three_point_paths(shapes, area, false)
+    }
+
+    /// The three-point paths a frame drew inside `area`, as the points each was
+    /// drawn through: with `unfilled`, the line drawings — the answer's
+    /// chevrons — and without it the filled ones, which a three-point path can
+    /// only be a triangle.
+    fn three_point_paths(
+        shapes: &[egui::epaint::ClippedShape],
+        area: egui::Rect,
+        unfilled: bool,
+    ) -> Vec<Vec<egui::Pos2>> {
         let mut out = Vec::new();
         for clipped in shapes {
-            collect_fold_chevron(&clipped.shape, card, &mut out);
+            collect_three_point_paths(&clipped.shape, area, unfilled, &mut out);
         }
         out
     }
 
-    fn collect_fold_chevron(shape: &egui::Shape, card: egui::Rect, out: &mut Vec<egui::Pos2>) {
-        if !out.is_empty() {
-            return;
-        }
+    fn collect_three_point_paths(
+        shape: &egui::Shape,
+        area: egui::Rect,
+        unfilled: bool,
+        out: &mut Vec<Vec<egui::Pos2>>,
+    ) {
         match shape {
             egui::Shape::Path(path)
-                if path.fill == egui::Color32::TRANSPARENT && path.points.len() == 3 =>
+                if path.points.len() == 3
+                    && (path.fill == egui::Color32::TRANSPARENT) == unfilled =>
             {
                 let bounds = egui::Rect::from_points(&path.points);
-                if card.contains_rect(bounds) {
-                    out.extend(path.points.iter().copied());
+                if area.contains_rect(bounds) {
+                    out.push(path.points.clone());
                 }
             }
             egui::Shape::Vec(shapes) => {
                 for shape in shapes {
-                    collect_fold_chevron(shape, card, out);
+                    collect_three_point_paths(shape, area, unfilled, out);
                 }
             }
             _ => {}
@@ -18246,6 +18327,161 @@ mod tests {
         }
     }
 
+    /// The answer's From list ends with the chevron its To row ends with rather
+    /// than the solid triangle a stock combo box carries: the head bar is a
+    /// letter's line, so the two rows of the answer that end in something to
+    /// open are drawn alike — one line drawing, down while what it holds is
+    /// away and up while it is out. The popup's own From keeps egui's triangle:
+    /// there the card is a form of boxes, and each box wears that form's own
+    /// marks.
+    #[test]
+    fn the_answers_from_list_ends_with_the_to_rows_chevron() {
+        let ctx = egui::Context::default();
+        crate::fonts::install(&ctx, None, None);
+        let mut app = app_with_messages(&ctx, 1);
+        app.selected_message = Some("0".to_string());
+        run_app_frame(&ctx, &mut app, Vec::new());
+        // Reply: the answer is written under its mail, on the spot.
+        click_at(&ctx, &mut app, header_action_center(4));
+        assert_eq!(app.compose_spot, ComposeSpot::Pane);
+
+        // The head bar is the card down to the rule under it, and the From
+        // list's own chevron is the only glyph drawn in there: a line drawing,
+        // pointing down while the list is away — no filled triangle standing in
+        // its place on the head of a letter.
+        let shapes = frame_shapes_at(&ctx, &mut app, 1400.0);
+        let answer = *pane_cards(&ctx, &mut app)
+            .last()
+            .expect("the answer is a card of the pane");
+        let rule = *horizontal_rules(&shapes, answer)
+            .first()
+            .expect("the head bar's rule");
+        let head = egui::Rect::from_min_max(answer.min, egui::pos2(answer.max.x, rule.top()));
+        let from = chevrons_in(&shapes, head);
+        assert_eq!(from.len(), 1, "one chevron on the head bar: {from:?}");
+        assert!(
+            from[0][1].y > from[0][0].y && from[0][1].y > from[0][2].y,
+            "it points down while the list is away: {from:?}"
+        );
+        let triangle = triangles_in(&shapes, head);
+        assert!(
+            triangle.is_empty(),
+            "and no solid triangle stands in its place: {triangle:?}"
+        );
+
+        // The two rows end with the same drawing: the second chevron of the
+        // card is the To row's, under the head's rule, cut to the same size.
+        let chevrons = chevrons_in(&shapes, answer);
+        assert_eq!(chevrons.len(), 2, "one on each row: {chevrons:?}");
+        assert!(
+            chevrons[1][0].y > rule.top(),
+            "the second is the To row's, under the rule: {chevrons:?}"
+        );
+        let (first, second) = (
+            egui::Rect::from_points(&chevrons[0]).size(),
+            egui::Rect::from_points(&chevrons[1]).size(),
+        );
+        assert!(
+            (first.x - second.x).abs() < 0.5 && (first.y - second.y).abs() < 0.5,
+            "one drawing, on both rows: {chevrons:?}"
+        );
+
+        // It is drawn the way the row under it is drawn too: the scheme's
+        // weak text while the pointer is away, its own text color under the
+        // hand — the flat list's hover fill is what says the button answers
+        // the pointer at all.
+        let from_chevron = egui::Rect::from_points(&from[0]).center();
+        let scheme = theme::of(&ctx);
+        let rest = glyph_colors_in(&shapes, head);
+        assert!(
+            rest.contains(&scheme.text_weak) && !rest.contains(&scheme.text),
+            "the From chevron is weak while the pointer is away: {rest:?}"
+        );
+        let lit = glyph_colors_in(
+            &frame_shapes_with(
+                &ctx,
+                &mut app,
+                1400.0,
+                vec![egui::Event::PointerMoved(from_chevron)],
+            ),
+            head,
+        );
+        assert!(
+            lit.contains(&scheme.text) && !lit.contains(&scheme.text_weak),
+            "the pointer brings it to the text color, as it brings the To row's: {lit:?}"
+        );
+
+        // A click on it opens the list under the row — the combo is still the
+        // combo, with the drawing changed — and the chevron turns up while the
+        // list is out, the way the To row's turns over the lines it folds out.
+        let label = "Test <ada>";
+        let count = |ctx: &egui::Context, app: &mut KimoApp| {
+            frame_texts(ctx, app)
+                .into_iter()
+                .filter(|text| text == label)
+                .count()
+        };
+        assert_eq!(count(&ctx, &mut app), 1, "the list is away at first");
+        click_at(&ctx, &mut app, from_chevron);
+        assert_eq!(
+            count(&ctx, &mut app),
+            2,
+            "the click opened the list under the row"
+        );
+        let shapes = frame_shapes_at(&ctx, &mut app, 1400.0);
+        let out = chevrons_in(&shapes, head);
+        assert_eq!(out.len(), 1, "still one chevron on the head bar: {out:?}");
+        assert!(
+            out[0][1].y < out[0][0].y && out[0][1].y < out[0][2].y,
+            "it points up while the list is under the row: {out:?}"
+        );
+
+        // Another click puts it away again, and the drawing is back where it
+        // started: the same two states the To row's own chevron has.
+        click_at(&ctx, &mut app, from_chevron);
+        assert_eq!(count(&ctx, &mut app), 1, "the click closed the list");
+        let shapes = frame_shapes_at(&ctx, &mut app, 1400.0);
+        let shut = chevrons_in(&shapes, head);
+        assert_eq!(shut.len(), 1, "one chevron on the head bar: {shut:?}");
+        assert!(
+            shut[0][1].y > shut[0][0].y && shut[0][1].y > shut[0][2].y,
+            "it points down again: {shut:?}"
+        );
+
+        // The popup is the same card in its other container, and there the From
+        // list keeps egui's own filled triangle: it is a box among boxes.
+        let mail = app.selected_mail().cloned().expect("the mail to answer");
+        app.compose_about(MailAction::Reply, ComposeSpot::Popup, &mail);
+        for _ in 0..3 {
+            run_app_frame(&ctx, &mut app, Vec::new());
+        }
+        let shapes = frame_shapes_at(&ctx, &mut app, 1400.0);
+        let from_label = text_boxes_of(&shapes, popup_area(), "From")
+            .into_iter()
+            .next()
+            .expect("the popup's own From row");
+        // The row the label is on, out to the card's own width — the label is
+        // right-aligned in the card's label column.
+        let row = egui::Rect::from_min_max(
+            egui::pos2(
+                from_label.right() - COMPOSE_LABEL_WIDTH,
+                from_label.top() - 2.0,
+            ),
+            egui::pos2(
+                from_label.right() - COMPOSE_LABEL_WIDTH + COMPOSE_WIDTH,
+                from_label.bottom() + 2.0,
+            ),
+        );
+        assert!(
+            chevrons_in(&shapes, row).is_empty(),
+            "the popup's From list is no chevron"
+        );
+        assert_eq!(
+            triangles_in(&shapes, row).len(),
+            1,
+            "it keeps egui's own filled triangle"
+        );
+    }
     /// The on-the-spot card's foot is a letter's, not a form's: no rule over
     /// it — the mail above is what the card's end is read against — and what
     /// the card has to say (here, why Send cannot be pressed) on a row of its

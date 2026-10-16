@@ -1310,7 +1310,13 @@ Event (mpsc) ──► drain_events() at frame start ──► merge into Accoun
   beside it, with the separator under the row that the popup’s heading has
   above its form. The list is *flat* there: `flatten_widgets` takes the combo’s
   outline and fill off in that Ui and leaves the hover, because an outline
-  belongs to a form of boxes and this line is the reply’s own from. **To is
+  belongs to a form of boxes and this line is the reply’s own from. **The flat
+  list ends with the To row’s chevron** rather than the filled triangle a combo
+  box carries (`paint_from_chevron`: the To row’s own drawing, painted in the
+  place egui would put its triangle, down while the list is away and up while it
+  is open — the head of a letter ends the way the row under it does, weak until
+  the pointer finds it). The popup’s own From keeps its triangle, a box among
+  boxes. **To is
   flat beside it**, for the same reason: that row’s Ui is flattened too, and
   the helper also clears the two slots a text box draws its own box from — the
   fill (`Visuals::text_edit_bg_color`) and the selection stroke it wears with
