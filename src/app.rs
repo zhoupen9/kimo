@@ -25,7 +25,7 @@
 //! not.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
@@ -151,9 +151,7 @@ impl MailAction {
     /// stands (`titlebar_mail_actions`).
     fn tooltip(self) -> &'static str {
         match self {
-            MailAction::Export => {
-                "Export — saves the original mail as a .eml file in your Downloads directory"
-            }
+            MailAction::Export => "Export — asks where to save the original mail as a .eml file",
             MailAction::Delete => "Delete — removes this mail from the server too",
             // The bar swaps this one for "Unflag…" while the flag stands: a
             // flag is a state, and the click is what changes it.
@@ -559,6 +557,22 @@ fn sent_notice(recipients: &[String], copy: &SentCopy) -> String {
     }
 }
 
+/// The notification one finished export raises: what happened, and where the
+/// file went — the one thing about an export that is not known until the worker
+/// has written it, since the dialog names the file and a session with no dialog
+/// gets a name the writer numbered. `(summary, body)`, the two lines a desktop
+/// notification shows, the way a batch of new mail's are (`new_mail_notices`).
+///
+/// An export is announced by the desktop and not by the line above the message
+/// list (`sent_notice`, `AttachmentDownloaded`): its click was in the title
+/// bar, and the file it wrote is not in the list.
+fn exported_notification(path: &Path) -> (String, String) {
+    (
+        "Mail exported".to_string(),
+        format!("Saved to {}", path.display()),
+    )
+}
+
 /// How many new mails one batch announces one by one. Past this a single
 /// notification counts them instead: a folder that catches up with thirty
 /// arrivals must not stack thirty popups on the desktop.
@@ -719,12 +733,16 @@ pub struct KimoApp {
     /// Why the mail database is not being written to disk, when that is the
     /// case; drawn as a one-line banner above the message list.
     storage_warning: Option<String>,
-    /// What the last export wrote — or that a mail was sent — and when it said
-    /// so: one line above the message list for `NOTICE_TIME`. A file that lands
-    /// in a directory the user was not watching is a file they cannot find, and
-    /// the numbered name it ended up under is the worker's to know; a sent mail
-    /// has left the machine entirely, which is the other thing worth saying out
-    /// loud. Hence the events.
+    /// Where a downloaded attachment went — or that a mail was sent — and when
+    /// it said so: one line above the message list for `NOTICE_TIME`. A file
+    /// that lands in a directory the user was not watching is a file they cannot
+    /// find, and the numbered name it ended up under is the worker's to know; a
+    /// sent mail has left the machine entirely, which is the other thing worth
+    /// saying out loud. Hence the events.
+    ///
+    /// An *export* does not come here: its click was in the title bar and the
+    /// file is not in the list, so the desktop is told instead
+    /// (`exported_notification`).
     notice: Option<(String, Instant)>,
     /// Remote images for HTML mail, keyed by URL; fetched on worker threads
     /// and cached in memory as egui textures (disk cache in storage).
@@ -2315,12 +2333,26 @@ impl KimoApp {
                     self.spawn_search();
                 }
             }
-            // An export and a downloaded attachment are the same answer to
-            // the same question — a file is on disk, and where it went is the
-            // one thing the app has to say. It is also the one thing it could
-            // not have known when the work was asked for, since a name that was
-            // taken is numbered.
-            Event::MessageExported { path } | Event::AttachmentDownloaded { path } => {
+            // An exported mail is announced by the desktop, not by a line above
+            // the message list: the click was in the title bar and the file is
+            // not in the list, so the notification is where the answer belongs —
+            // and where the file went is the one thing about an export that is
+            // not known until the worker has written it.
+            //
+            // The notification preference (Preferences → General) is not
+            // consulted: it is a switch on mail that arrives by itself, and this
+            // answers a click the user has just made. A click answered with
+            // silence would be worse than one answered where they are not
+            // looking.
+            Event::MessageExported { path } => {
+                let (summary, body) = exported_notification(&path);
+                crate::notify::show(&summary, &body, self.ctx.pixels_per_point());
+            }
+            // A downloaded attachment keeps the line: that click was a card under
+            // the mail, and the line is drawn beside what was clicked. Where the
+            // file went is the one thing the app could not know when the work was
+            // asked for, since a name that was taken is numbered.
+            Event::AttachmentDownloaded { path } => {
                 self.notice = Some((format!("Saved to {}", path.display()), Instant::now()));
             }
             Event::FilesChosen { files } => {
@@ -2655,19 +2687,27 @@ impl KimoApp {
         self.forget_blitz_pages(account_id);
     }
 
-    /// Export the mail the reading pane shows: a worker fetches its original
-    /// source from the server and writes it into the downloads directory as a
-    /// `.eml` (`Job::ExportMessage`, `storage::downloads_dir`). The file is
-    /// the message whole — every header, every body part, every attachment —
-    /// which is why the server is asked rather than the database read: what
-    /// Kimo keeps is the parsed mail, with each attachment's name, type and
-    /// size and never its bytes.
+    /// Export the mail the reading pane shows: a worker asks the desktop where
+    /// to put it (`crate::portal::save_file`, the same XDG portal the attach
+    /// card opens its file chooser with), fetches the mail's original source
+    /// from the server and writes it there as a `.eml` (`Job::ExportMessage`).
+    /// The file is the message whole — every header, every body part, every
+    /// attachment — which is why the server is asked rather than the database
+    /// read: what Kimo keeps is the parsed mail, with each attachment's name,
+    /// type and size and never its bytes.
+    ///
+    /// Closing the dialog writes nothing and says nothing: cancelling a save is
+    /// not a failure. A session with no dialog to open is not an export that
+    /// cannot happen either — the file goes to `storage::downloads_dir()`,
+    /// which is also the folder the dialog is suggested to open on, and the
+    /// notification says which file it was.
     ///
     /// The round trip is the catch: mail the server no longer has cannot be
     /// exported at all, and that comes back on the account (`Event::SyncFailed`,
-    /// prefixed "export:") like any other job's failure. What went right is
-    /// reported as one timed line above the message list
-    /// (`Event::MessageExported`).
+    /// prefixed "export:") like any other job's failure. What went right is a
+    /// desktop notification naming the file (`Event::MessageExported`, through
+    /// `exported_notification`) rather than a line above the message list: the
+    /// click was in the title bar, and the file is not in the list.
     fn export_selected_message(&mut self) {
         // The reading pane's own lookup, like Delete's: a uid the pane no
         // longer shows is no mail to export, and the mail's subject is what
@@ -2688,6 +2728,8 @@ impl KimoApp {
                 account,
                 folder,
                 uid: msg.uid,
+                // Where the file goes when the desktop has no dialog to offer,
+                // and the folder the dialog is suggested to open on.
                 dir: storage::downloads_dir(),
                 subject: msg.subject,
             },
@@ -8906,9 +8948,10 @@ const LABEL_CHIP_CORNER_RADIUS: u8 = 9;
 /// What the chip run keeps clear of the head row above it.
 const LABEL_CHIPS_TOP_GAP: f32 = 6.0;
 
-/// How long the line above the message list stays there: long enough to read a
-/// path — or that a mail went out — and act on it, short enough not to become
-/// furniture. Whatever it says does not change when the line goes.
+/// How long the line above the message list stays there: long enough to read
+/// where a downloaded file went — or that a mail went out — and act on it, short
+/// enough not to become furniture. Whatever it says does not change when the line
+/// goes.
 const NOTICE_TIME: Duration = Duration::from_secs(8);
 
 /// The automatic sync (Preferences → General): how many minutes apart its sweeps
@@ -13072,24 +13115,38 @@ mod tests {
         output.textures_delta.clear();
     }
 
-    /// An export answers with the path the worker wrote, and the app says so:
-    /// one line above the message list. It is the only place the name the file
-    /// ended up under is known — a name that was taken is numbered — and the
-    /// line is timed, since the file itself does not go anywhere when it goes.
+    /// An export answers with the path the worker wrote, and the desktop is told
+    /// where it went: the two lines a notification shows, and nothing above the
+    /// message list. The path is the whole of it — the name is the dialog's or the
+    /// writer's, and neither is known until the file is on disk. The line itself
+    /// is not raised here (the arm calls `crate::notify::show`, which posts to
+    /// the thread that talks to a real daemon), so what is pinned is what it says.
     #[test]
     fn a_finished_export_says_where_the_file_went() {
+        let (summary, body) = exported_notification(Path::new("/home/ada/Desktop/Invoice 42.eml"));
+        assert_eq!(summary, "Mail exported");
+        assert_eq!(body, "Saved to /home/ada/Desktop/Invoice 42.eml");
+    }
+
+    /// The other way round, for the file the app writes without being asked
+    /// where: a downloaded attachment's line above the message list — the line
+    /// the export used to get — and the timing that takes it away again. The
+    /// line is one of two things the app says out loud on its own (`sent_notice`
+    /// is the other), and a line that stayed would be furniture.
+    #[test]
+    fn the_line_above_the_list_says_where_a_download_went_and_is_timed() {
         let ctx = egui::Context::default();
         crate::fonts::install(&ctx, None, None);
         let mut app = app_with_messages(&ctx, 1);
-        app.apply_event(Event::MessageExported {
-            path: std::path::PathBuf::from("/home/ada/Downloads/Invoice 42.eml"),
+        app.apply_event(Event::AttachmentDownloaded {
+            path: std::path::PathBuf::from("/home/ada/Downloads/report.pdf"),
         });
 
         let texts = frame_texts(&ctx, &mut app);
         assert!(
             texts
                 .iter()
-                .any(|text| text == "Saved to /home/ada/Downloads/Invoice 42.eml"),
+                .any(|text| text == "Saved to /home/ada/Downloads/report.pdf"),
             "{texts:?}"
         );
 

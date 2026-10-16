@@ -35,22 +35,31 @@ Kimo is a desktop **email client** GUI written in pure Rust:
   Shift-JIS/… mail decodes to proper UTF-8 instead of Latin-1 mojibake.
 - **The file dialog is the desktop's, not Kimo's.** There is no file-picker
   crate: the dialog is asked for over D-Bus from the compositor's own portal
-  (`src/portal.rs`, `org.freedesktop.portal.FileChooser.Open`), which keeps the
+  (`src/portal.rs`, `org.freedesktop.portal.FileChooser`), which keeps the
   dependency list as it is — no GTK, no portal crate with an async runtime behind
   it — and is the only thing that works under Wayland, where winit 0.30 delivers
-  no drag-and-drop events at all. It is a `Job` because the call does not return
-  until the user has answered, and the answer arrives as a `Response` signal on
-  the request object the reply named (read in whichever order the two come: a
-  portal that refuses at once sends the signal first). Two things about the wire
-  that cost a debugging session and are worth keeping: **the connection greets
-  the bus (`Hello`) before anything else**, because a bus answers anything sent
-  before the greeting with an error and then *closes the connection* — which
+  no drag-and-drop events at all. Two calls are made: `OpenFile` for the files an
+  attachment is chosen with, and `SaveFile` for where an export goes — the save
+  told `current_name` and `current_folder`, the name and the folder an export
+  would have used itself, so that pressing Save without touching anything gets the
+  file a session with no dialog gets. A chooser is a `Job` because the call does
+  not return until the user has answered, and the answer arrives as a `Response`
+  signal on the request object the reply named (read in whichever order the two
+  come: a portal that refuses at once sends the signal first). Two things about
+  the wire that cost a debugging session and are worth keeping: **the connection
+  greets the bus (`Hello`) before anything else**, because a bus answers anything
+  sent before the greeting with an error and then *closes the connection* — which
   arrives as "bus closed the connection" and looks nothing like a missing
-  greeting; and **the chooser's method is `OpenFile`** on the current interface
-  (`version` 4), with `Open` kept as the fallback for a portal that predates the
-  rename, taken on `UnknownMethod` alone. The developer test
-  (`cargo test -- --ignored the_desktop_answers_a_chooser_call`) walks the whole
-  path against the real portal on a session that has one: it opens the dialog and
+  greeting; and **the methods have been `OpenFile` and `SaveFile` for as long
+  as the interface has had options** — every release back to 0.10 (2018) declares
+  those two and not the bare `Open`/`Save` one might expect, so a refusal means
+  "this desktop has no dialog" and is not retried under another name. The token
+  that becomes the last element of the request object's path counts rather than
+  naming the process alone, because two dialogs can be up at once — an
+  attachment's and an export's — and two requests under one token would be two
+  requests for one object path. The developer test
+  (`cargo test -- --ignored the_desktop_answers_a_chooser_call`) walks both calls
+  against the real portal on a session that has one: it opens each dialog and
   closes the request the moment the reply names it.
 - **Sending is SMTP submission.** The compose card's Send hands its draft to
   a worker (`Job::SendMessage`), which speaks `EHLO`/`STARTTLS`/`AUTH`/`MAIL
@@ -105,11 +114,17 @@ Kimo is a desktop **email client** GUI written in pure Rust:
   the account already holds under another mailbox (the same `Message-ID`).
   Up to `NOTIFY_MAX` (3) arrivals in one batch are one notification each;
   more become a single one counting them, so catching up with forty mails is
-  one popup and not forty. Preferences → General has the switch
-  (`notifications` in `settings.json`, absent meaning on), and a session with
-  no notification daemon is simply quiet. `cargo test notify_probe --
-  --ignored` under `dbus-run-session` with `dbus-monitor` watching is how the
-  wire form is checked by hand.
+  one popup and not forty. A finished **export** raises one of its own
+  (`exported_notification`: "Mail exported" / "Saved to <path>"), which is
+  where that answer lives rather than above the message list — the click was in
+  the title bar and the file it wrote is not in the list. Preferences → General
+  has the switch for *new mail* (`notifications` in `settings.json`, absent
+  meaning on), and an export is deliberately not gated by it: the switch is
+  about mail that arrives by itself, while an export answers a click the user
+  has just made, and a click answered with silence is worse than one answered
+  where they are not looking. A session with no notification daemon is simply
+  quiet. `cargo test notify_probe -- --ignored` under `dbus-run-session` with
+  `dbus-monitor` watching is how the wire form is checked by hand.
 - **Packaging:** `packaging/linux/kimo.desktop` is the launcher entry for the
   `kimo` app_id, to be installed as
   `~/.local/share/applications/kimo.desktop`. The icon on its own
@@ -1186,31 +1201,51 @@ Event (mpsc) ──► drain_events() at frame start ──► merge into Accoun
   that walked back to it would only make the next sync fetch it again.
 - Exporting a mail (the title bar's Export → `KimoApp::export_selected_message`
   → `Job::ExportMessage`) is the one thing in the app that writes a mail out of
-  it. A worker fetches the message's original RFC 5322 source from the server —
-  IMAP `UID FETCH <uid> (UID FLAGS BODY.PEEK[])` through
-  `ImapClient::uid_body` (PEEK on purpose: fetching a mail to export it must not
-  mark it read), POP3 `UIDL` + `RETR` through `Pop3Client::retr_by_uidl` — and
-  writes it byte for byte to `$HOME/Downloads/<subject>.eml`
-  (`storage::downloads_dir`, made on the first export). There is no file dialog:
-  one destination — the same directory a downloaded attachment goes to, see the
-  attachment-card bullet — and the app says the path it wrote.
+  it, and the one action that asks where. **The worker asks the desktop first**
+  (`crate::portal::save_file`, the XDG portal's `SaveFile` — the same
+  hand-written D-Bus conversation the attach card's chooser uses, on a worker
+  because it does not answer until the user has), then fetches the message's
+  original RFC 5322 source from the server — IMAP
+  `UID FETCH <uid> (UID FLAGS BODY.PEEK[])` through `ImapClient::uid_body` (PEEK
+  on purpose: fetching a mail to export it must not mark it read), POP3 `UIDL` +
+  `RETR` through `Pop3Client::retr_by_uidl` — and writes it byte for byte where
+  the dialog said. The order is the point three times over: a cancelled dialog
+  costs no round trip and says nothing (closing a save is not a failure), and the
+  account's spinner — which says the *server* is being asked — does not turn while
+  the user is choosing a name. The job's `dir` is both the folder the dialog is
+  suggested to open on and the destination when there is no dialog to ask
+  (`storage::downloads_dir`, made on the first export): a session with no portal
+  is not an export that cannot happen, and the fallback hides nothing, because the
+  notice names the file it wrote.
+  **The dialog's answer is the file's name**, extension and all: the dialog was
+  drawn with the name in it, and appending a suffix to what the user left would be
+  Kimo deciding something the dialog already asked. That file is written by
+  `write_at` — through a hidden `.kimo<pid>_<n>.part` beside it and a rename
+  into place, so that replacing a file (which the dialog has already asked
+  about) leaves either the file that was there or the whole new one, and never
+  half of either. The no-dialog writer is `write_file`, the download's too:
+  `<stem>.eml`, numbered `<stem>-2.eml` and on when a name is taken, and
+  *created* (`create_new`) rather than merely asked about, so two exports of the
+  same mail cannot overwrite each other. The name is made from the subject, with
+  what a file name cannot carry replaced and the whole capped at
+  `EXPORT_STEM_BYTES`
+  (`export_stem`; `slug` would ASCII-fy every non-Latin subject away) — offered to
+  the dialog as well as used by the fallback.
   **The original is the point.** What is stored here is the parsed mail, with
   each attachment's name, type and size but never its bytes, so a `.eml`
   rebuilt from the database would not be the message the sender wrote, while
   this one is the message whole, attachments and all. The price is that mail the server no longer has cannot be exported at
   all, and says so rather than writing something close (`Event::SyncFailed`,
   prefixed "export:" — the local copy is not a substitute for the original).
-  The file is named after the subject, with what a file name cannot carry
-  replaced and the whole capped at `EXPORT_STEM_BYTES` (`export_stem`; `slug`
-  would ASCII-fy every non-Latin subject away), numbered `<stem>-2.eml` and on
-  when a name is taken, and *created* (`create_new`) rather than merely asked
-  about, so two exports of the same mail cannot overwrite each other. The job
-  brackets its round trip with `SyncStarted`/`SyncDone` like a delete, and
-  answers `Event::MessageExported { path }` — with the path, because a name that
-  was taken is numbered and only the worker knows what it got. The app shows it
-  as one line above the message list for `NOTICE_TIME` (`list_banner`, the
-  place the storage warning stands) — the same line a finished send uses, which
-  is why it is named for what it is rather than for the export.
+  The job brackets its round trip with `SyncStarted`/`SyncDone` like a delete,
+  and answers `Event::MessageExported { path }` — with the path, because the name
+  may be the dialog's or the fallback's and only the worker knows which it got.
+  The app raises a **desktop notification** for it (`exported_notification`,
+  "Mail exported" / "Saved to <path>") rather than the timed line above the
+  message list that a *downloaded attachment* and a finished send use
+  (`list_banner`, the place the storage warning stands): the export's click was
+  in the title bar, and the file it wrote is not in the list. Nothing is raised
+  when the dialog was closed — nothing happened, so there is nothing to say.
 - Attachments are cards under the body (`attachment_card`), one per part the
   mail named a file for, in the order the parts appear in it: the page glyph,
   the file name, and — under the name — the MIME type and the size, whichever
@@ -1243,11 +1278,12 @@ Event (mpsc) ──► drain_events() at frame start ──► merge into Accoun
   name, the type and the size (schema v6), never the bytes, so the worker fetches
   the mail's original source, takes the part out of
   it (`mail::attachment_bytes`) and writes the file into
-  `storage::downloads_dir` — the same directory, the same one-line
-  `Saved to <path>` notice and the same `create_new` numbering as an export,
-  through the one writer both use (`write_file`; the download's own rules are
-  `download_name`, which keeps the sender's file name, its last path component
-  and a plausible extension, and `safe_stem` behind both).
+  `storage::downloads_dir` — the directory an export with no dialog to ask
+  writes into, the same one-line `Saved to <path>` notice and the same
+  `create_new` numbering, through the writer they share (`write_file`; the
+  download's own rules are `download_name`, which keeps the sender's file name,
+  its last path component and a plausible extension, and `safe_stem` behind
+  both).
   The click carries the mail, the part's *place* in the mail and the name the
   card showed; the worker re-parses the original and refuses unless both match
   — handing over the bytes of some other part is worse than refusing — and the
@@ -1785,9 +1821,9 @@ Do not "fix" these casually — they are known:
   cache: Kimo keeps the name, the MIME type and the decoded size and never the
   bytes, so a card's link fetches the mail's original source again and there is
   nothing to hand over for mail the server no longer has. Nothing is opened
-  afterwards either — the file lands in `~/Downloads` and the desktop's own
-  programs are what open it. Export remains the way to get the whole message,
-  attachments included, as one `.eml`.
+  afterwards either — the file lands in `~/Downloads` (a download does not ask
+  where, unlike Export) and the desktop's own programs are what open it. Export
+  remains the way to get the whole message, attachments included, as one `.eml`.
 - Threading is per folder and, for mail cached before schema v7 — or mail whose
   sender wrote no ids at all — by subject: a reply joins the subject it answers,
   but a conversation whose mails were filed into different folders (or into and

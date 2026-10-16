@@ -9,12 +9,14 @@
 //! the one way to choose a file that works on Wayland — where winit 0.30 has no
 //! drag-and-drop at all, so a drop never reaches a Wayland window.
 //!
-//! Deliberately the smallest part of the interface that does the job: `Open`,
-//! with the answer read off the request object's `Response` signal. No filters,
-//! no parent-window handle (the dialog is then the desktop's own, unowned, which
-//! every portal accepts), no `Save` and no directory picker.
+//! Deliberately the smallest part of the interface that does the job: choosing
+//! files to open and choosing where to save one, with the answer read off the
+//! request object's `Response` signal. No filters, no parent-window handle (the
+//! dialog is then the desktop's own, unowned, which every portal accepts), no
+//! directory picker.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU32, Ordering};
 
 use crate::dbus::{self, Value};
 use crate::error::{MailError, MailResult};
@@ -23,9 +25,6 @@ use crate::error::{MailError, MailResult};
 const PORTAL_BUS: &str = "org.freedesktop.portal.Desktop";
 const PORTAL_PATH: &str = "/org/freedesktop/portal/desktop";
 const FILE_CHOOSER: &str = "org.freedesktop.portal.FileChooser";
-/// What the bus answers when the method is not one the interface has: the one
-/// error that means "try the other name" rather than "no".
-const UNKNOWN_METHOD: &str = "org.freedesktop.DBus.Error.UnknownMethod";
 /// The signal the answer arrives on: the portal sends `Response` on the request
 /// object the reply to the call named.
 const RESPONSE: &str = "Response";
@@ -33,9 +32,52 @@ const RESPONSE: &str = "Response";
 /// Ask the desktop to choose files, and answer with the ones chosen. What comes
 /// back is empty when the dialog was cancelled — which is not an error, and not
 /// something to say anything about — and an error when there is no portal to
-/// ask: the card that called this says so, and has a box that takes a path for
-/// exactly that session.
+/// ask: the card that called this draws the reason under its own area.
 pub fn open_files() -> MailResult<Vec<PathBuf>> {
+    let mut bus = chooser()?;
+    ask(&mut bus, OPEN_FILE, &open_args(&next_token()))
+}
+
+/// Ask the desktop where to save a file, suggesting `name` as what to call it
+/// and `folder` as the directory to open the dialog on. Both are suggestions —
+/// the interface says the dialog is free to ignore them — and the answer, when
+/// there is one, is the file. `Ok(None)` is the user closing the dialog:
+/// nothing to write, and nothing to say about it. An error is a session with no
+/// dialog to ask at all, which the export that called this has an answer for.
+pub fn save_file(name: &str, folder: &Path) -> MailResult<Option<PathBuf>> {
+    let mut bus = chooser()?;
+    let mut files = ask(&mut bus, SAVE_FILE, &save_args(&next_token(), name, folder))?;
+    // A save answers with exactly one URI — the interface says so — and the
+    // first is that file. More than one would be a portal contradicting itself,
+    // and the first is still the file it was asked about.
+    Ok(files.pop())
+}
+
+/// The two calls this makes. `OpenFile` and `SaveFile` are the names the
+/// interface has used since it had options at all — every release of
+/// xdg-desktop-portal back to 0.10 (2018) declares these two and not the bare
+/// `Open`/`Save` an earlier reading of the documentation might expect — so a
+/// desktop that refuses one is a desktop with no dialog to offer rather than
+/// one waiting to be asked under another name.
+const OPEN_FILE: &str = "OpenFile";
+const SAVE_FILE: &str = "SaveFile";
+
+/// The token the answer will be tagged with. It becomes the last element of the
+/// request object's path, so it holds only what an object path element may, and
+/// it counts rather than naming the process alone: two dialogs can be up at
+/// once — a file chooser for an attachment and one for an export, or two
+/// exports — and two requests under one token would be two requests for one
+/// object path.
+fn next_token() -> String {
+    static NEXT: AtomicU32 = AtomicU32::new(1);
+    let count = NEXT.fetch_add(1, Ordering::Relaxed);
+    format!("kimo{}_{count}", std::process::id())
+}
+
+/// A connection to the session bus ready to ask the portal a question: the
+/// socket, this connection's greeting, and the match rule that brings the
+/// answer to *this* connection.
+fn chooser() -> MailResult<dbus::Bus> {
     let mut bus = dbus::Bus::connect()
         .map_err(|error| MailError::Protocol(format!("no session bus: {error}")))?;
     // A bus wants `Hello` before anything else and closes a connection that
@@ -74,41 +116,7 @@ pub fn open_files() -> MailResult<Vec<PathBuf>> {
         "AddMatch",
         &[Value::Str(rule)],
     );
-    // The options the call takes. The token names the request object the answer
-    // will come on — the reply says which one it is — and `multiple` is the
-    // whole of what this asks for beyond the dialog itself.
-    let token = format!("kimo{}", std::process::id());
-    match ask(&mut bus, OPEN_FILE, &token) {
-        // The method was renamed when the interface grew a second kind of
-        // choice (`OpenFile`, `SaveFile`), and a portal that speaks the older
-        // interface says so this way rather than by a version this code would
-        // have to ask for: the older name is the same call.
-        Answered::UnknownMethod => match ask(&mut bus, OPEN, &token) {
-            Answered::Files(files) => Ok(files),
-            Answered::UnknownMethod => Err(MailError::Protocol(
-                "this desktop's file dialog answers to neither of the names Kimo knows".to_string(),
-            )),
-            Answered::Failed(error) => Err(error),
-        },
-        Answered::Files(files) => Ok(files),
-        Answered::Failed(error) => Err(error),
-    }
-}
-
-/// The two names the portal's file chooser has had. The interface is at
-/// `OpenFile` now (`version` 4 on the desktops that have it) and was `Open`
-/// before; both take and answer the same way.
-const OPEN_FILE: &str = "OpenFile";
-const OPEN: &str = "Open";
-
-/// What one call to the portal came to. `UnknownMethod` is kept apart from
-/// every other failure because it is the one a caller can do something about:
-/// it is how a portal that predates the method's rename answers, and the reply
-/// to that is the method's older name.
-enum Answered {
-    Files(Vec<PathBuf>),
-    UnknownMethod,
-    Failed(MailError),
+    Ok(bus)
 }
 
 /// Make one chooser call and wait for what becomes of it.
@@ -117,38 +125,21 @@ enum Answered {
 /// at once sends the response before the reply to the call — so both are read
 /// here, whichever comes first: the reply says which request the answer will be
 /// tagged with, and the `Response` signal *is* the answer.
-fn ask(bus: &mut dbus::Bus, method: &str, token: &str) -> Answered {
-    let serial = match bus.call_no_reply(
-        PORTAL_BUS,
-        PORTAL_PATH,
-        FILE_CHOOSER,
-        method,
-        &open_args(token),
-    ) {
-        Ok(serial) => serial,
-        Err(error) => {
-            return Answered::Failed(MailError::Protocol(format!(
-                "the file dialog could not be asked for: {error}"
-            )))
-        }
-    };
+fn ask(bus: &mut dbus::Bus, method: &str, args: &[Value]) -> MailResult<Vec<PathBuf>> {
+    let serial = bus
+        .call_no_reply(PORTAL_BUS, PORTAL_PATH, FILE_CHOOSER, method, args)
+        .map_err(|error| {
+            MailError::Protocol(format!("the file dialog could not be asked for: {error}"))
+        })?;
     loop {
-        let message = match bus.read_message() {
-            Ok(message) => message,
-            Err(error) => {
-                return Answered::Failed(MailError::Protocol(format!(
-                    "the file dialog went quiet: {error}"
-                )))
-            }
-        };
+        let message = bus
+            .read_message()
+            .map_err(|error| MailError::Protocol(format!("the file dialog went quiet: {error}")))?;
         if message.reply_serial == Some(serial) {
             if message.kind == dbus::MSG_ERROR {
                 let name = message.error_name.clone().unwrap_or_default();
-                if name == UNKNOWN_METHOD {
-                    return Answered::UnknownMethod;
-                }
-                return Answered::Failed(MailError::Protocol(format!(
-                    "this desktop has no file dialog to open ({name}): {}",
+                return Err(MailError::Protocol(format!(
+                    "the desktop refused the file dialog ({name}): {}",
                     first_string(&message.body).unwrap_or_default()
                 )));
             }
@@ -160,31 +151,62 @@ fn ask(bus: &mut dbus::Bus, method: &str, token: &str) -> Answered {
             // signal, this connection's own greetings.
             continue;
         }
-        return match read_response(&message.body) {
-            Ok(files) => Answered::Files(files),
-            Err(error) => Answered::Failed(error),
-        };
+        return read_response(&message.body);
     }
 }
 
-/// The arguments `FileChooser.Open` takes, as the portal declares them —
-/// `(ssa{sv})`: no parent window, a title, and the options. The parent is empty
-/// because the handle a Wayland client would give is an export of its surface,
-/// and an empty string is what a portal takes to mean "no parent" rather than
-/// refusing the call. The options are the token the answer will be tagged with
-/// and whether several files may be chosen at once.
+/// The arguments `FileChooser.OpenFile` takes: choosing files, several of them
+/// at once, for the card that puts them on a mail.
 fn open_args(token: &str) -> Vec<Value> {
+    args("Attach files", token, vec![("multiple", Value::Bool(true))])
+}
+
+/// The arguments `FileChooser.SaveFile` takes: the same call with the two
+/// things a save dialog can be told before it is drawn — what to call the file,
+/// and which directory to open on. What comes back is the name the *user* left
+/// in it, which is why the export writes there rather than numbering a name of
+/// its own.
+fn save_args(token: &str, name: &str, folder: &Path) -> Vec<Value> {
+    args(
+        "Export mail",
+        token,
+        vec![
+            ("current_name", Value::Str(name.to_string())),
+            ("current_folder", Value::bytes(&folder_bytes(folder))),
+        ],
+    )
+}
+
+/// The call both of the above are, as the portal declares it — `(ssa{sv})`: no
+/// parent window, a title, and the options. The parent is empty because the
+/// handle a Wayland client would give is an export of its surface, and an empty
+/// string is what a portal takes to mean "no parent" rather than refusing the
+/// call. The options start with the token the answer will be tagged with, which
+/// every chooser call has, and go on with whatever this one wants to say.
+fn args(title: &str, token: &str, options: Vec<(&str, Value)>) -> Vec<Value> {
+    let mut entries = vec![entry("handle_token", Value::Str(token.to_string()))];
+    for (key, value) in options {
+        entries.push(entry(key, value));
+    }
     vec![
         Value::Str(String::new()),
-        Value::Str("Attach files".to_string()),
+        Value::Str(title.to_string()),
         Value::Array {
             signature: "{sv}".to_string(),
-            values: vec![
-                entry("handle_token", Value::Str(token.to_string())),
-                entry("multiple", Value::Bool(true)),
-            ],
+            values: entries,
         },
     ]
+}
+
+/// A directory as the `ay` the portal's `current_folder` is: the file system's
+/// own bytes — a path is bytes, and not necessarily text — with the nul byte at
+/// the end of them that the interface asks for, since nothing on the other side
+/// counts them.
+fn folder_bytes(folder: &Path) -> Vec<u8> {
+    use std::os::unix::ffi::OsStrExt;
+    let mut bytes = folder.as_os_str().as_bytes().to_vec();
+    bytes.push(0);
+    bytes
 }
 
 /// One `a{sv}` entry: the key, and its value as a variant.
@@ -299,10 +321,11 @@ mod tests {
     }
 
     /// Developer tool: the whole path a click takes, against the real portal on
-    /// this session — connect, greet the bus, ask for the dialog, and close the
-    /// request as soon as the reply names it. The dialog appears for as long as
-    /// that takes (nothing at all, where the portal answers at once) and the
-    /// response that comes back is the cancellation it asked for.
+    /// this session — connect, greet the bus, ask for each of the two dialogs the
+    /// app has, and close each request as soon as the reply names it. Each dialog
+    /// appears for as long as that takes (nothing at all, where the portal
+    /// answers at once) and the response that comes back is the cancellation it
+    /// asked for.
     ///
     /// Ignored because it needs a desktop: there is no portal in a test run, and
     /// the one place this can be checked is a session that has one.
@@ -311,81 +334,68 @@ mod tests {
     #[test]
     #[ignore = "developer tool: needs a session with a portal"]
     fn the_desktop_answers_a_chooser_call() {
-        let mut bus = dbus::Bus::connect().expect("a session bus");
-        let hello = bus
-            .call(
-                "org.freedesktop.DBus",
-                "/org/freedesktop/DBus",
-                "org.freedesktop.DBus",
-                "Hello",
-                &[],
-            )
-            .expect("Hello");
-        assert_eq!(hello.kind, dbus::MSG_METHOD_RETURN, "the bus greets us");
-        let rule = format!("type='signal',member='{RESPONSE}'");
-        bus.call(
-            "org.freedesktop.DBus",
-            "/org/freedesktop/DBus",
-            "org.freedesktop.DBus",
-            "AddMatch",
-            &[Value::Str(rule)],
-        )
-        .expect("AddMatch");
-
-        let token = "kimotest".to_string();
-        let serial = bus
-            .call_no_reply(
-                PORTAL_BUS,
-                PORTAL_PATH,
-                FILE_CHOOSER,
-                OPEN_FILE,
-                &open_args(&token),
-            )
-            .expect("the chooser call goes out");
-        let mut handle = None;
-        let mut response = None;
-        while response.is_none() {
-            let message = bus.read_message().expect("the portal answers");
-            if message.reply_serial == Some(serial) {
-                if message.kind == dbus::MSG_ERROR {
-                    panic!(
-                        "the portal refused the call: {} {}",
-                        message.error_name.as_deref().unwrap_or("error"),
-                        first_string(&message.body).unwrap_or_default()
+        let mut bus = chooser().expect("a session bus with a portal on it");
+        // Both calls the app makes, as the app makes them. The save is the one
+        // worth watching: it is the call with options of its own (a suggested
+        // name and a folder as a byte array), and the one a byte in the wrong
+        // place or a key the portal does not know would be refused for.
+        let calls = [
+            (OPEN_FILE, open_args("kimotest_open")),
+            (
+                SAVE_FILE,
+                save_args("kimotest_save", "Kimo portal test.eml", Path::new("/tmp")),
+            ),
+        ];
+        for (method, args) in calls {
+            let serial = bus
+                .call_no_reply(PORTAL_BUS, PORTAL_PATH, FILE_CHOOSER, method, &args)
+                .expect("the chooser call goes out");
+            let mut handle = None;
+            let mut response = None;
+            while response.is_none() {
+                let message = bus.read_message().expect("the portal answers");
+                if message.reply_serial == Some(serial) {
+                    if message.kind == dbus::MSG_ERROR {
+                        panic!(
+                            "{method} was refused: {} {}",
+                            message.error_name.as_deref().unwrap_or("error"),
+                            first_string(&message.body).unwrap_or_default()
+                        );
+                    }
+                    handle = dbus::Unmarshal::new(&message.body).string();
+                    // Closed the moment it exists: this is a check of the wire,
+                    // not a request for a file. The destination is the portal's
+                    // own bus name and the *path* is the request object — a path
+                    // in the destination field is a malformed message, which the
+                    // daemon answers by dropping the connection rather than by
+                    // an error.
+                    let request = handle.clone().expect("the reply names the request");
+                    let close = bus.call_no_reply(
+                        PORTAL_BUS,
+                        &request,
+                        "org.freedesktop.portal.Request",
+                        "Close",
+                        &[],
                     );
+                    assert!(close.is_ok(), "the request can be closed: {close:?}");
+                    continue;
                 }
-                handle = dbus::Unmarshal::new(&message.body).string();
-                // Closed the moment it exists: this is a check of the wire, not
-                // a request for a file. The destination is the portal's own bus
-                // name and the *path* is the request object — a path in the
-                // destination field is a malformed message, which the daemon
-                // answers by dropping the connection rather than by an error.
-                let request = handle.clone().expect("the reply names the request");
-                let close = bus.call_no_reply(
-                    PORTAL_BUS,
-                    &request,
-                    "org.freedesktop.portal.Request",
-                    "Close",
-                    &[],
-                );
-                assert!(close.is_ok(), "the request can be closed: {close:?}");
-                continue;
+                if message.member.as_deref() == Some(RESPONSE) {
+                    response = Some(dbus::Unmarshal::new(&message.body).uint32());
+                }
             }
-            if message.member.as_deref() == Some(RESPONSE) {
-                response = Some(dbus::Unmarshal::new(&message.body).uint32());
-            }
+            assert!(handle.is_some(), "{method} named its request object");
+            // What the response is matters less than that there is one: 1 is the
+            // cancellation the Close asks for, and 0 is a choice — which this can
+            // be if the dialog was answered before the Close landed. Either means
+            // the portal read the call, made a request, and answered it.
+            let response = response.expect("the portal answered").expect("with a code");
+            eprintln!("{method} answered with {response}");
+            assert!(
+                response <= 1,
+                "{method} answered something Kimo cannot read as files: {response}"
+            );
         }
-        assert!(handle.is_some(), "the call named its request object");
-        // What the response is matters less than that there is one: 1 is the
-        // cancellation the Close asks for, and 0 is a choice — which this can be
-        // if the dialog was answered before the Close landed. Either means the
-        // portal read the call, made a request, and answered it.
-        let response = response.expect("the portal answered").expect("with a code");
-        eprintln!("the dialog answered with {response}");
-        assert!(
-            response <= 1,
-            "the portal answered something Kimo cannot read as files: {response}"
-        );
     }
 
     /// The call itself is the shape the portal declares — `(ssa{sv})` — with the
@@ -415,6 +425,71 @@ mod tests {
             })
             .collect();
         assert_eq!(keys, ["handle_token", "multiple"]);
+    }
+
+    /// The save call is the same shape with the options a save is about: what
+    /// the file is suggested to be called, and the directory the dialog opens
+    /// on. The name is the one the export would have given the file itself, so a
+    /// user who presses Save without touching it gets what they always got. The
+    /// folder is an `ay` — a byte array rather than a string, because a path is
+    /// bytes and not necessarily text — ended by the nul byte the interface asks
+    /// for, since nothing on the other side counts them.
+    #[test]
+    fn the_save_call_is_the_shape_the_portal_declares() {
+        let args = save_args("kimo4242_7", "Invoice 42.eml", Path::new("/home/you/下载"));
+        let (signature, _) = dbus::build_body(&args);
+        assert_eq!(signature, "ssa{sv}");
+        assert_eq!(args[0], Value::Str(String::new()), "no parent window");
+        assert_eq!(args[1], Value::Str("Export mail".to_string()));
+        assert_eq!(
+            option(&args, "handle_token"),
+            Value::Str("kimo4242_7".into())
+        );
+        assert_eq!(
+            option(&args, "current_name"),
+            Value::Str("Invoice 42.eml".into())
+        );
+        let mut folder = b"/home/you/".to_vec();
+        folder.extend_from_slice("下载".as_bytes());
+        folder.push(0);
+        assert_eq!(option(&args, "current_folder"), Value::bytes(&folder));
+    }
+
+    /// One option out of a call's `a{sv}` dictionary, as the value the portal
+    /// would read it as: what these tests are about is what is *in* the call, and
+    /// not only which keys it names.
+    fn option(args: &[Value], key: &str) -> Value {
+        let Value::Array { values, .. } = &args[2] else {
+            panic!("the options are a dictionary: {:?}", args[2]);
+        };
+        for entry in values {
+            if let Value::Struct(fields) = entry {
+                if fields.first() == Some(&Value::Str(key.to_string())) {
+                    return match fields.get(1) {
+                        Some(Value::Variant(value)) => (**value).clone(),
+                        other => panic!("{key} is not a variant: {other:?}"),
+                    };
+                }
+            }
+        }
+        panic!("no {key} option among {values:?}");
+    }
+
+    /// The token becomes the last element of the request object's path, so it may
+    /// only hold what an object path element may — and two dialogs at once must
+    /// not name one request between them.
+    #[test]
+    fn the_token_is_an_object_path_element_and_no_two_calls_share_one() {
+        let first = next_token();
+        let second = next_token();
+        assert_ne!(first, second);
+        for token in [&first, &second] {
+            assert!(
+                token.chars().all(|c| c.is_ascii_alphanumeric() || c == '_'),
+                "{token} is not an object path element"
+            );
+            assert!(token.starts_with(&format!("kimo{}", std::process::id())));
+        }
     }
 
     /// The answer is the files it names: the response code decides whether

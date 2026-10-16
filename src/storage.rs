@@ -67,11 +67,14 @@ pub fn mail_db_path() -> PathBuf {
     data_dir().join("mail.db")
 }
 
-/// Where an exported mail is written: `$HOME/Downloads`, the directory a
-/// desktop keeps downloads in (made on the first export if it is not there
-/// yet). There is no file dialog — a native one is a dependency, and on
-/// Wayland a portal to talk to — so an export has one destination, and the app
-/// says the path it wrote to, which is what lets the file be found.
+/// Where an exported mail is written when the desktop has no file dialog to
+/// ask: `$HOME/Downloads`, the directory a desktop keeps downloads in (made on
+/// the first export if it is not there yet). It is also the folder that dialog
+/// is suggested to open on — the export asks the desktop where to put the file
+/// (`crate::portal::save_file`) — so a user who presses Save without touching
+/// the name gets the file they would have got with no dialog at all. A
+/// downloaded attachment has this one destination: the card is a single click,
+/// and Export is the action that asks where the file goes.
 pub fn downloads_dir() -> PathBuf {
     home().join("Downloads")
 }

@@ -8,6 +8,7 @@
 use std::fs;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::mpsc::Sender;
 use std::time::Duration;
 
@@ -147,20 +148,25 @@ pub enum Job {
         folder: String,
         uids: Vec<String>,
     },
-    /// Fetch one message's original RFC 5322 source and write it into `dir` as
-    /// `<subject>.eml` — the title bar's Export. The server's copy is the
-    /// message whole (every header, every body part, every attachment), which
-    /// is why this is a round trip rather than a rebuild from the database:
-    /// what is stored here is the parsed mail, with each attachment's name,
-    /// type and size and never its bytes.
+    /// Export one message — the title bar's Export: ask the desktop's own file
+    /// dialog where to put it (`crate::portal::save_file`), fetch its original
+    /// RFC 5322 source from the server, and write it there. The server's copy is
+    /// the message whole (every header, every body part, every attachment),
+    /// which is why this is a round trip rather than a rebuild from the
+    /// database: what is stored here is the parsed mail, with each attachment's
+    /// name, type and size and never its bytes.
     ExportMessage {
         account: Account,
         folder: String,
         uid: String,
-        /// The directory the file goes in (`storage::downloads_dir`).
+        /// The directory the file goes in when there is no dialog to ask for
+        /// one, and the folder the dialog is suggested to open on — the same
+        /// place either way (`storage::downloads_dir`).
         dir: PathBuf,
         /// What the file is named after: the subject, which the worker turns
-        /// into a file name (`export_stem`).
+        /// into a file name (`export_stem`) — the name the dialog is offered as
+        /// what to call the file, and the name it gets when there was no dialog
+        /// to offer it to.
         subject: String,
     },
     /// Download one attachment of one message into `dir`: the mail's original
@@ -284,8 +290,10 @@ pub enum Event {
         uid: String,
     },
     /// One message was written out as a `.eml`, at this path. The path is the
-    /// one thing about an export the UI cannot know by itself: the name it
-    /// asked for may already have been taken, and the file is then numbered.
+    /// one thing about an export the UI cannot know by itself: it is the name the
+    /// file dialog answered with — extension and all, since a save dialog decides
+    /// the name — or, when there was no dialog to ask, one the writer numbered
+    /// because the name it was offered was taken.
     MessageExported {
         path: PathBuf,
     },
@@ -556,6 +564,20 @@ pub fn spawn(job: Job, ctx: egui::Context, tx: Sender<Event>) {
             dir,
             subject,
         } => {
+            // The file's name comes first, because both halves of this use it:
+            // it is what the dialog is asked to call the file, and what the file
+            // is called when there is no dialog to ask.
+            let stem = export_stem(&subject);
+            // The desktop's own dialog, before anything is fetched and before
+            // anything is said: a cancel then costs no round trip, and the
+            // account's spinner — which says the *server* is being asked — does
+            // not turn while the user is choosing a name.
+            let Some(place) = export_place(crate::portal::save_file(&format!("{stem}.eml"), &dir))
+            else {
+                // Closed: no file, and nothing to say about it.
+                ctx.request_repaint();
+                return;
+            };
             // A round trip like a delete's, and bracketed the same way: the
             // account's spinner is what says a mail is being fetched while the
             // server is asked.
@@ -563,7 +585,7 @@ pub fn spawn(job: Job, ctx: egui::Context, tx: Sender<Event>) {
             let _ = tx.send(Event::SyncStarted {
                 account_id: account_id.clone(),
             });
-            match export_message(&account, &folder, &uid, &dir, &subject) {
+            match export_message(&account, &folder, &uid, &dir, &stem, &place) {
                 Ok(path) => {
                     // The file is on disk before the app is told where: the
                     // event is what the notice above the message list is drawn
@@ -1180,22 +1202,98 @@ fn pop3_delete_many(
     (deleted, first_error)
 }
 
-/// Export one message: its original source, as the server has it, written into
-/// `dir` as `<subject>.eml`. The fetch is the whole job — what Kimo stores is
-/// the parsed mail, with each attachment's name, type and size and never its
-/// bytes, so an `.eml` rebuilt
-/// from the database would not be the message the sender wrote. The other side
-/// of that: mail the server no longer has cannot be exported at all, and says
-/// so rather than writing something close.
+/// Where an exported mail goes, from what the desktop's file dialog came to.
+#[derive(Debug)]
+enum Place {
+    /// The path the user named in the dialog: the file goes there, exactly. The
+    /// dialog is where the name is decided — extension and all — and a save
+    /// dialog has already asked about a name that is taken.
+    Chosen(PathBuf),
+    /// There was no dialog to ask (`crate::portal` — a session with no portal,
+    /// a bus that is not there). The export is then what it was before there was
+    /// one: the downloads directory, under the name the mail is named after,
+    /// numbered if that name is taken.
+    Downloads,
+}
+
+/// Where an export writes, from the dialog's answer — and `None` when the user
+/// closed it, which is not a failure: nothing is written and nothing is said.
+///
+/// A dialog that cannot be opened at all is the same answer as no dialog, and
+/// nothing is said about that either: a mailbox that refused to save a mail
+/// because a desktop has no portal would be a worse app than one that puts the
+/// file where it always did and says where. Nothing is hidden by the fallback —
+/// the notice names the file that was written, and a failure of the *export*
+/// still comes back on the account.
+fn export_place(asked: MailResult<Option<PathBuf>>) -> Option<Place> {
+    match asked {
+        Ok(Some(path)) => Some(Place::Chosen(path)),
+        Ok(None) => None,
+        Err(_) => Some(Place::Downloads),
+    }
+}
+
+/// Export one message: its original source, as the server has it, written where
+/// `place` says. The fetch is the whole job — what Kimo stores is the parsed
+/// mail, with each attachment's name, type and size and never its bytes, so an
+/// `.eml` rebuilt from the database would not be the message the sender wrote.
+/// The other side of that: mail the server no longer has cannot be exported at
+/// all, and says so rather than writing something close.
 fn export_message(
     account: &Account,
     folder: &str,
     uid: &str,
     dir: &Path,
-    subject: &str,
+    stem: &str,
+    place: &Place,
 ) -> MailResult<PathBuf> {
     let raw = original_source(account, folder, uid)?;
-    write_file(dir, &export_stem(subject), ".eml", &raw)
+    write_export(dir, stem, place, &raw)
+}
+
+/// Write an exported mail the way `place` says: at the path the dialog
+/// answered, or into `dir` under the name the mail is named after. Two writers,
+/// because the two cases promise different things (`write_at` and
+/// `write_file`, each with the reason for its own rule).
+fn write_export(dir: &Path, stem: &str, place: &Place, bytes: &[u8]) -> MailResult<PathBuf> {
+    match place {
+        Place::Chosen(path) => write_at(path, bytes).map(|()| path.clone()),
+        Place::Downloads => write_file(dir, stem, ".eml", bytes),
+    }
+}
+
+/// Write `bytes` at exactly `path`: the file dialog's answer, so the name is
+/// the user's and not Kimo's to number. The file is written through a temporary
+/// name in the same directory and that is renamed into place, which is what
+/// makes replacing a file safe: the name holds either the file that was there or
+/// the whole new one, never half of either — and a write that fails leaves
+/// nothing of Kimo's behind in the user's directory. A failure says which file
+/// it was about, because the path came from a dialog.
+fn write_at(path: &Path, bytes: &[u8]) -> MailResult<()> {
+    // Hidden, and in the file's own directory rather than in a temporary
+    // directory of its own: the rename is then a rename, and not a copy that
+    // fails across a mount. The name is short rather than the file's own with a
+    // suffix — a name the dialog accepted may be as long as a file name may be —
+    // and it counts, so that two exports at once into one directory cannot meet
+    // in one temporary.
+    static NEXT: AtomicU32 = AtomicU32::new(1);
+    let temp = path.with_file_name(format!(
+        ".kimo{}_{}.part",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    ));
+    // The path came from a dialog, so a failure says which file it was about:
+    // "No such file or directory" on its own would not.
+    let failed = |error: std::io::Error| MailError::Storage(format!("{}: {error}", path.display()));
+    if let Err(error) = fs::write(&temp, bytes) {
+        let _ = fs::remove_file(&temp);
+        return Err(failed(error));
+    }
+    if let Err(error) = fs::rename(&temp, path) {
+        let _ = fs::remove_file(&temp);
+        return Err(failed(error));
+    }
+    Ok(())
 }
 
 /// Download one attachment: the mail's original source, the part the card
@@ -1453,13 +1551,14 @@ fn safe_stem(text: &str, fallback: &str) -> String {
 }
 
 /// Write `bytes` into `dir` as `<stem><extension>`, numbered before the
-/// extension if that name is taken, and answer with the path it went to — the
-/// one writer an exported `.eml` and a downloaded attachment share. The file is
-/// *created* rather than merely asked about, so two exports of one mail, or two
-/// clicks on one attachment card, cannot land on one name: the loser of that
-/// race moves to the next number instead of overwriting the winner. A write that
-/// fails halfway takes its partial file with it — a half-written file with a
-/// `.eml` or `.pdf` suffix looks like a document and is not one.
+/// extension if that name is taken, and answer with the path it went to — what
+/// an export with no dialog to ask shares with a downloaded attachment, the two
+/// files Kimo names itself. The file is *created* rather than merely asked
+/// about, so two exports of one mail, or two clicks on one attachment card,
+/// cannot land on one name: the loser of that race moves to the next number
+/// instead of overwriting the winner. A write that fails halfway takes its
+/// partial file with it — a half-written file with a `.eml` or `.pdf` suffix
+/// looks like a document and is not one.
 fn write_file(dir: &Path, stem: &str, extension: &str, bytes: &[u8]) -> MailResult<PathBuf> {
     fs::create_dir_all(dir)?;
     for n in 1..=EXPORT_NAME_TRIES {
@@ -1966,6 +2065,101 @@ mod tests {
         let chart_again = write_file(&dir, "chart", ".png", b"png").unwrap();
         assert_eq!(chart, dir.join("chart.png"));
         assert_eq!(chart_again, dir.join("chart-2.png"));
+
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The names in a directory, sorted: what a write left behind, and what it
+    /// did not.
+    fn names(dir: &Path) -> Vec<String> {
+        let mut names: Vec<String> = fs::read_dir(dir)
+            .expect("the directory is there")
+            .map(|entry| {
+                entry
+                    .expect("an entry")
+                    .file_name()
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect();
+        names.sort();
+        names
+    }
+
+    /// What the export makes of the dialog: the path it answered, the downloads
+    /// directory when there was no dialog to ask at all — an error from the
+    /// portal is not a failed export — and nothing to write when the user closed
+    /// it, which is not a failure either.
+    #[test]
+    fn a_closed_dialog_writes_nothing_and_a_missing_one_writes_to_downloads() {
+        let chosen = PathBuf::from("/home/you/Invoice 42.eml");
+        match export_place(Ok(Some(chosen.clone()))) {
+            Some(Place::Chosen(path)) => assert_eq!(path, chosen),
+            other => panic!("a chosen file is where the export goes: {other:?}"),
+        }
+        assert!(export_place(Ok(None)).is_none(), "a cancel writes nothing");
+        assert!(
+            matches!(
+                export_place(Err(MailError::Protocol("no session bus".to_string()))),
+                Some(Place::Downloads)
+            ),
+            "no dialog at all is the downloads directory, not a failed export"
+        );
+    }
+
+    /// Which writer an export gets. A file the dialog named is written where it
+    /// says: a name that is taken is *replaced*, because the dialog asked about
+    /// replacing it and the user answered, and no numbered sibling appears beside
+    /// it — while an export with no dialog to ask is numbered like a download,
+    /// so the file already there keeps its name and its bytes.
+    #[test]
+    fn an_export_writes_where_the_dialog_said_and_numbers_only_without_one() {
+        let dir = std::env::temp_dir().join(format!("kimo-chosen-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        // The dialog's answer, over a file that is already there.
+        let chosen = dir.join("Invoice 42.eml");
+        fs::write(&chosen, b"an older export").unwrap();
+        let written = write_export(
+            &dir,
+            "Invoice 42",
+            &Place::Chosen(chosen.clone()),
+            b"the mail, whole",
+        )
+        .unwrap();
+        assert_eq!(written, chosen);
+        assert_eq!(fs::read(&chosen).unwrap(), b"the mail, whole");
+        assert_eq!(
+            names(&dir),
+            ["Invoice 42.eml"],
+            "nothing numbered, and nothing left behind"
+        );
+
+        // No dialog to ask: the downloads directory, numbered, with the file
+        // that is already there left as it is.
+        let second = write_export(&dir, "Invoice 42", &Place::Downloads, b"one").unwrap();
+        let third = write_export(&dir, "Invoice 42", &Place::Downloads, b"two").unwrap();
+        assert_eq!(second, dir.join("Invoice 42-2.eml"));
+        assert_eq!(third, dir.join("Invoice 42-3.eml"));
+        assert_eq!(fs::read(&chosen).unwrap(), b"the mail, whole");
+        assert_eq!(fs::read(&second).unwrap(), b"one");
+        assert_eq!(fs::read(&third).unwrap(), b"two");
+
+        // A chosen path that cannot take the file — here a directory of that
+        // name — fails instead of half-succeeding, and takes its temporary with
+        // it: what was there is still there, and nothing of Kimo's is.
+        let taken = dir.join("a directory.eml");
+        fs::create_dir_all(&taken).unwrap();
+        let error =
+            write_export(&dir, "a directory", &Place::Chosen(taken.clone()), b"x").unwrap_err();
+        assert!(taken.is_dir(), "what was there is still there");
+        assert!(!error.to_string().is_empty(), "the reason travels: {error}");
+        assert!(
+            !names(&dir).iter().any(|name| name.ends_with(".part")),
+            "no temporary is left behind: {:?}",
+            names(&dir)
+        );
 
         fs::remove_dir_all(&dir).unwrap();
     }

@@ -20,9 +20,11 @@ rustls with the `ring` crypto provider and Mozilla's root certificates.
 - Folder listing (IMAP), folder selection and per-folder caches
 - Optional automatic sync: every account on a clock you set in Preferences →
   General (off by default, 1–1440 minutes)
-- Desktop notifications when a sync finds new mail (Linux, through the
-  session bus's `org.freedesktop.Notifications`), showing the app's own icon
-  at the screen's scale factor; the switch is in Preferences → General
+- Desktop notifications when a sync finds new mail — and one naming the file
+  when an export has written it — Linux, through the
+  session bus's `org.freedesktop.Notifications`, showing the app's own icon
+  at the screen's scale factor; the switch for new mail is in Preferences →
+  General
 - Message list with unread markers and text preview, grouped into
   conversations: one row per thread — its newest mail, how many it holds and a
   paperclip — with the chevron at its left opening the thread's mails in the
@@ -39,7 +41,8 @@ rustls with the `ring` crypto provider and Mozilla's root certificates.
   message out as one `.eml`
 - `\Seen` flag synchronization (IMAP server-side, POP3 local-only)
 - Compose and send over SMTP, with the copy filed in Sent (IMAP `APPEND`)
-- Export the open mail as the server's original `.eml`
+- Export the open mail as the server's original `.eml` — the desktop's own file
+  dialog asks where to put it
 - Search over the cached mail (SQLite FTS5 with a CJK bigram index), and two
   HTML renderers: native egui widgets, or a Blitz-rasterized page
 - Offline-first: accounts and messages live in one SQLite database,
