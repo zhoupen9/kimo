@@ -89,6 +89,10 @@ pub struct Settings {
     /// "system" | "light" | "dark"; anything else behaves as "system".
     #[serde(default)]
     pub theme: String,
+    /// The chosen accent, as its key in `theme::Accent::ALL`; absent — or a
+    /// key no accent answers to — means Kimo's own.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub accent: Option<String>,
     /// Which HTML body renderer to use: "egui" (the built-in widget
     /// renderer, the default) or "blitz" (full CSS layout, rasterized).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -196,6 +200,7 @@ mod tests {
     fn settings_round_trip_and_default() {
         let s = Settings {
             theme: "dark".into(),
+            accent: Some("teal".into()),
             html_renderer: Some("blitz".into()),
             ui_font: Some("DejaVu Sans".into()),
             threaded: Some(false),
@@ -207,6 +212,7 @@ mod tests {
         let json = serde_json::to_string(&s).unwrap();
         let back: Settings = serde_json::from_str(&json).unwrap();
         assert_eq!(back.theme, "dark");
+        assert_eq!(back.accent.as_deref(), Some("teal"));
         assert_eq!(back.html_renderer.as_deref(), Some("blitz"));
         assert_eq!(back.ui_font.as_deref(), Some("DejaVu Sans"));
         assert_eq!(back.threaded, Some(false));
@@ -217,6 +223,7 @@ mod tests {
         // settings.json with missing keys must still load.
         let missing: Settings = serde_json::from_str("{}").unwrap();
         assert_eq!(missing.theme, "");
+        assert_eq!(missing.accent, None, "absent means Kimo's own accent");
         assert_eq!(missing.html_renderer, None);
         assert_eq!(missing.ui_font, None);
         assert_eq!(missing.mono_font, None);

@@ -7,9 +7,11 @@
 //! bar, folder rows, message cards, avatars — reads the fields directly through
 //! [`of`], which hands out the scheme [`install`]ed for the current frame.
 //!
-//! Both schemes are consts with every slot filled in. Nothing is configurable
-//! yet, so `settings.json` only stores the theme name; the purples are the
-//! brand color of `assets/app.svg`.
+//! Both schemes are consts with every slot filled in, and the one slot a
+//! reader can change is the accent ([`Accent`]): `settings.json` stores the
+//! theme name and the accent's key, and [`ColorScheme::with_accent`] puts the
+//! chosen one into the scheme the theme resolves to. The purples Kimo ships
+//! with are the brand color of `assets/app.svg`.
 
 use egui::Color32;
 
@@ -59,6 +61,141 @@ impl Theme {
             Theme::Dark => DARK,
             Theme::System if system_dark => DARK,
             Theme::System => LIGHT,
+        }
+    }
+}
+
+/// The accent a reader chooses in Preferences → Appearance: the one color the
+/// app paints itself in — a focused field's outline, a checked box, the primary
+/// button, the busy spinner — and the tint selected rows are filled with.
+///
+/// One entry per key `settings.json` stores, the first being Kimo's own: a
+/// settings file that names no accent gets the purples of `assets/app.svg`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Accent {
+    /// The value written in `settings.json`.
+    pub key: &'static str,
+    /// The name Preferences → Appearance shows.
+    pub name: &'static str,
+    /// What the accent resolves to in the light scheme.
+    pub light: AccentColors,
+    /// The same in the dark scheme: an accent that reads on near-white paper
+    /// is not the one that reads on a dark surface, so each choice is picked
+    /// twice.
+    pub dark: AccentColors,
+}
+
+/// One theme's worth of an accent: the color itself, and the fill selected rows
+/// wear.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct AccentColors {
+    /// Focus rings, the check in a checked box, the primary button, the
+    /// spinner.
+    pub accent: Color32,
+    /// Fill of a selected row, an active preferences tab, a ticked filter: the
+    /// accent taken most of the way towards the surface it sits on, far enough
+    /// that the text over it still reads — the contrast test holds every
+    /// accent to it.
+    pub selection: Color32,
+}
+
+impl Accent {
+    /// The choices, in the order the Appearance page shows them: Kimo's own,
+    /// then the wheel.
+    pub const ALL: [Accent; 6] = [
+        Accent {
+            key: "kimo",
+            name: "Kimo",
+            light: AccentColors {
+                accent: Color32::from_rgb(106, 69, 208),     // #6A45D0
+                selection: Color32::from_rgb(220, 224, 248), // #DCE0F8
+            },
+            dark: AccentColors {
+                accent: Color32::from_rgb(139, 123, 240),  // #8B7BF0
+                selection: Color32::from_rgb(58, 53, 104), // #3A3568
+            },
+        },
+        Accent {
+            key: "blue",
+            name: "Blue",
+            light: AccentColors {
+                accent: Color32::from_rgb(29, 78, 216),      // #1D4ED8
+                selection: Color32::from_rgb(217, 224, 246), // #D9E0F6
+            },
+            dark: AccentColors {
+                accent: Color32::from_rgb(59, 130, 246),  // #3B82F6
+                selection: Color32::from_rgb(41, 60, 94), // #293C5E
+            },
+        },
+        Accent {
+            key: "teal",
+            name: "Teal",
+            light: AccentColors {
+                accent: Color32::from_rgb(15, 118, 110),     // #0F766E
+                selection: Color32::from_rgb(215, 230, 230), // #D7E6E6
+            },
+            dark: AccentColors {
+                accent: Color32::from_rgb(13, 148, 136),  // #0D9488
+                selection: Color32::from_rgb(26, 69, 70), // #1A4546
+            },
+        },
+        Accent {
+            key: "green",
+            name: "Green",
+            light: AccentColors {
+                accent: Color32::from_rgb(21, 128, 61),      // #15803D
+                selection: Color32::from_rgb(216, 232, 222), // #D8E8DE
+            },
+            dark: AccentColors {
+                accent: Color32::from_rgb(22, 163, 74),   // #16A34A
+                selection: Color32::from_rgb(26, 68, 46), // #1A442E
+            },
+        },
+        Accent {
+            key: "orange",
+            name: "Orange",
+            light: AccentColors {
+                accent: Color32::from_rgb(194, 65, 12),      // #C2410C
+                selection: Color32::from_rgb(242, 222, 215), // #F2DED7
+            },
+            dark: AccentColors {
+                accent: Color32::from_rgb(234, 88, 12),   // #EA580C
+                selection: Color32::from_rgb(93, 51, 32), // #5D3320
+            },
+        },
+        Accent {
+            key: "rose",
+            name: "Rose",
+            light: AccentColors {
+                accent: Color32::from_rgb(190, 18, 60),      // #BE123C
+                selection: Color32::from_rgb(241, 215, 222), // #F1D7DE
+            },
+            dark: AccentColors {
+                accent: Color32::from_rgb(244, 63, 94),   // #F43F5E
+                selection: Color32::from_rgb(96, 43, 57), // #602B39
+            },
+        },
+    ];
+
+    /// Kimo's own accent: the brand purple, and the one every other key falls
+    /// back to.
+    pub const KIMO: Accent = Self::ALL[0];
+
+    /// The accent a `settings.json` key names; an unknown key — an older file,
+    /// a hand-edited one — is Kimo's own.
+    pub fn parse(key: &str) -> Self {
+        Self::ALL
+            .into_iter()
+            .find(|accent| accent.key == key)
+            .unwrap_or(Self::KIMO)
+    }
+
+    /// What this accent resolves to in the theme in force.
+    pub fn colors(self, dark: bool) -> AccentColors {
+        if dark {
+            self.dark
+        } else {
+            self.light
         }
     }
 }
@@ -128,12 +265,16 @@ pub struct ColorScheme {
     pub on_danger: Color32,
 
     // --- accents ---
-    /// Interactive highlight: focus rings and the busy spinner.
+    /// Interactive highlight: a focused field's outline, the checked box, the
+    /// busy spinner. The reader's to choose (`Accent`, `with_accent`); the
+    /// scheme's own is the brand purple.
     pub accent: Color32,
     /// The mark drawn *on* [`ColorScheme::accent`]: the check in a checked
     /// box. Like the avatar palette it is white in both schemes.
     pub on_accent: Color32,
-    /// Fill of selected rows, selected text and the active preferences tab.
+    /// Fill of selected rows, selected text and the active preferences tab:
+    /// the chosen accent's own tint (`AccentColors::selection`), so a selected
+    /// row says which accent is in force without ever being loud.
     pub selection: Color32,
     /// Hyperlinks in HTML mail.
     pub link: Color32,
@@ -227,6 +368,24 @@ impl ColorScheme {
             danger_hover: Color32::from_rgb(232, 17, 35), // #E81123
             avatar: AVATAR,
             avatar_text: Color32::from_rgb(255, 255, 255), // #FFFFFF
+        }
+    }
+
+    /// The scheme with the reader's accent in it: the accent itself, and the
+    /// tint selected rows are filled with. Every other slot — the surfaces, the
+    /// text, the status colors — is the theme's own, so choosing an accent
+    /// changes what the app is *marked* with and nothing else.
+    ///
+    /// The colors come as a pair per theme (`AccentColors`), which is why this
+    /// asks for the whole [`Accent`] rather than a color: the light and dark
+    /// schemes need different ones, and `Accent::KIMO` is the pair the schemes
+    /// already hold — applying it changes nothing.
+    pub fn with_accent(self, accent: Accent) -> Self {
+        let colors = accent.colors(self.dark);
+        Self {
+            accent: colors.accent,
+            selection: colors.selection,
+            ..self
         }
     }
 
@@ -472,51 +631,114 @@ mod tests {
         }
     }
 
+    /// The floors every color the app draws text or a mark with has to clear:
+    /// the palette ships six accents and a reader may put any of them into
+    /// either theme, so each one answers the same rules as the scheme it is
+    /// applied to (`Accent::ALL`).
     #[test]
     fn foreground_colors_are_readable_on_their_panel() {
-        for (name, scheme) in [("light", LIGHT), ("dark", DARK)] {
-            for (surface, background) in [("panel", scheme.panel), ("content", scheme.content)] {
-                for (slot, color) in [
-                    ("text", scheme.text),
-                    ("text weak", scheme.text_weak),
-                    ("link", scheme.link),
-                    ("warn", scheme.warn),
-                    ("danger", scheme.danger),
-                ] {
-                    let ratio = contrast(color, background);
-                    assert!(ratio >= 4.5, "{name}: {slot} on {surface} is {ratio:.1}:1");
+        for accent in Accent::ALL {
+            for (theme, scheme) in [("light", LIGHT), ("dark", DARK)] {
+                let scheme = scheme.with_accent(accent);
+                let name = format!("{theme}/{}", accent.key);
+                for (surface, background) in [("panel", scheme.panel), ("content", scheme.content)]
+                {
+                    for (slot, color) in [
+                        ("text", scheme.text),
+                        ("text weak", scheme.text_weak),
+                        ("link", scheme.link),
+                        ("warn", scheme.warn),
+                        ("danger", scheme.danger),
+                    ] {
+                        let ratio = contrast(color, background);
+                        assert!(ratio >= 4.5, "{name}: {slot} on {surface} is {ratio:.1}:1");
+                    }
                 }
-            }
-            // The accent is a fill and focus color, not text.
-            for (surface, background) in [("panel", scheme.panel), ("content", scheme.content)] {
-                let accent = contrast(scheme.accent, background);
+                // The accent is a fill and focus color, not text.
+                for (surface, background) in [("panel", scheme.panel), ("content", scheme.content)]
+                {
+                    let accent = contrast(scheme.accent, background);
+                    assert!(
+                        accent >= 3.0,
+                        "{name}: accent on {surface} is {accent:.1}:1"
+                    );
+                }
+                // Weak text is dimmer than body text, but both stay readable.
                 assert!(
-                    accent >= 3.0,
-                    "{name}: accent on {surface} is {accent:.1}:1"
+                    contrast(scheme.text, scheme.panel) > contrast(scheme.text_weak, scheme.panel)
                 );
+                for (slot, fill) in [
+                    ("selection", scheme.selection),
+                    ("hover", scheme.hover),
+                    // A flagged mail's row is the one fill a mail keeps for as long
+                    // as the flag stands, so its text has to survive it too.
+                    ("flag", scheme.flag),
+                ] {
+                    let ratio = contrast(scheme.text, fill);
+                    assert!(ratio >= 4.5, "{name}: text on {slot} is {ratio:.1}:1");
+                }
+                // The close button's glyph has to survive its red.
+                let glyph = contrast(scheme.on_danger, scheme.danger_hover);
+                assert!(
+                    glyph >= 4.5,
+                    "{name}: on_danger on danger_hover is {glyph:.1}:1"
+                );
+                // A selected row's date is `text_weak`: dimmer than the body text
+                // by design — the shipped tint sits at 4.4:1 — but a reader still
+                // reads it, so every accent's tint holds it to 4:1.
+                let weak = contrast(scheme.text_weak, scheme.selection);
+                assert!(weak >= 4.0, "{name}: text_weak on selection is {weak:.1}:1");
+                // The check in a checked box is a UI mark rather than text, so it
+                // answers to the graphic floor.
+                let mark = contrast(scheme.on_accent, scheme.accent);
+                assert!(mark >= 3.0, "{name}: on_accent on accent is {mark:.1}:1");
             }
-            // Weak text is dimmer than body text, but both stay readable.
-            assert!(contrast(scheme.text, scheme.panel) > contrast(scheme.text_weak, scheme.panel));
-            for (slot, fill) in [
-                ("selection", scheme.selection),
-                ("hover", scheme.hover),
-                // A flagged mail's row is the one fill a mail keeps for as long
-                // as the flag stands, so its text has to survive it too.
-                ("flag", scheme.flag),
-            ] {
-                let ratio = contrast(scheme.text, fill);
-                assert!(ratio >= 4.5, "{name}: text on {slot} is {ratio:.1}:1");
+        }
+    }
+
+    #[test]
+    fn accent_parses_known_keys_and_falls_back_to_kimo() {
+        for accent in Accent::ALL {
+            assert_eq!(Accent::parse(accent.key), accent);
+        }
+        assert_eq!(Accent::parse("nonsense"), Accent::KIMO);
+        assert_eq!(Accent::parse(""), Accent::KIMO);
+        assert_eq!(Accent::KIMO, Accent::ALL[0], "Kimo's own comes first");
+        let keys: Vec<&str> = Accent::ALL.iter().map(|accent| accent.key).collect();
+        for (index, key) in keys.iter().enumerate() {
+            assert!(!keys[..index].contains(key), "{key} is listed twice");
+        }
+    }
+
+    /// Kimo's own accent *is* the palettes as they ship, which is what makes it
+    /// the one a settings file that names no accent gets: choosing it has to
+    /// change nothing at all.
+    #[test]
+    fn kimos_own_accent_is_the_scheme_as_it_ships() {
+        assert_eq!(LIGHT.with_accent(Accent::KIMO), LIGHT);
+        assert_eq!(DARK.with_accent(Accent::KIMO), DARK);
+    }
+
+    /// An accent is a mark and a tint, not a palette: applying one moves the
+    /// accent itself and the fill selected rows wear, and leaves every other
+    /// slot of the scheme exactly where it was.
+    #[test]
+    fn an_accent_moves_the_mark_and_the_tint_and_nothing_else() {
+        for (theme, scheme) in [("light", LIGHT), ("dark", DARK)] {
+            for accent in Accent::ALL {
+                let chosen = scheme.with_accent(accent);
+                let colors = accent.colors(scheme.dark);
+                assert_eq!(chosen.accent, colors.accent, "{theme}/{}", accent.key);
+                assert_eq!(chosen.selection, colors.selection, "{theme}/{}", accent.key);
+                // Everything else is the scheme's own, slot for slot: the two
+                // that moved are put back, and what is left has to be `scheme`.
+                let untouched = ColorScheme {
+                    accent: scheme.accent,
+                    selection: scheme.selection,
+                    ..chosen
+                };
+                assert_eq!(untouched, scheme, "{theme}/{}", accent.key);
             }
-            // The close button's glyph has to survive its red.
-            let glyph = contrast(scheme.on_danger, scheme.danger_hover);
-            assert!(
-                glyph >= 4.5,
-                "{name}: on_danger on danger_hover is {glyph:.1}:1"
-            );
-            // The check in a checked box is a UI mark rather than text, so it
-            // answers to the graphic floor.
-            let mark = contrast(scheme.on_accent, scheme.accent);
-            assert!(mark >= 3.0, "{name}: on_accent on accent is {mark:.1}:1");
         }
     }
 

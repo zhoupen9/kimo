@@ -1317,10 +1317,11 @@ Event (mpsc) ──► drain_events() at frame start ──► merge into Accoun
   is open — the head of a letter ends the way the row under it does, weak until
   the pointer finds it). The popup’s own From keeps its triangle, a box among
   boxes. **To is
-  flat beside it**, for the same reason: that row’s Ui is flattened too, and
-  the helper also clears the two slots a text box draws its own box from — the
-  fill (`Visuals::text_edit_bg_color`) and the selection stroke it wears with
-  the keyboard in it — so the field has no box focused or not. The popup keeps
+  flat beside it**, for the same reason: the row’s field is added with
+  `Field::flat`, a field whose frame draws nothing — so it has no box focused
+  or not — which is also what a flat *field* wants where `take_box_off` would
+  do: the visual it clears is the colour of the text selected inside the
+  field, and a flat field has no business recolouring that. The popup keeps
   its To box, as it keeps its Cc, Bcc and Subject. The face is the one a mail’s
   card wears (`sender_color` and `sender_initial` of the
   account’s address and name, at `AVATAR_DIAMETER`), so the card says who it is
@@ -1438,10 +1439,10 @@ Event (mpsc) ──► drain_events() at frame start ──► merge into Accoun
   (account list with
   use/edit/remove, and the add/edit account form in place of the list: it is
   pre-filled from the account it was opened on, and `Save & sync` updates that
-  account and syncs it) and **Appearance** (theme, Simple/Blitz HTML
+  account and syncs it) and **Appearance** (theme, accent, Simple/Blitz HTML
   renderer, the interface/fixed-width fonts — all persisted in
-  `settings.json` — plus a read-only preview of the palette the theme
-  resolves to). Configuration belongs on a page there, not as another
+  `settings.json` — plus a preview of the palette the theme and the accent
+  resolve to). Configuration belongs on a page there, not as another
   title-bar toggle; the title bar keeps only actions (syncing, window
   controls), and switching accounts is a navigation-column affair.
 - Colors live in one place, `src/theme.rs`. `Theme` (system/light/dark — the
@@ -1470,14 +1471,35 @@ Event (mpsc) ──► drain_events() at frame start ──► merge into Accoun
   panel, so `RichText::weak()` is close to, but not the same as, the scheme's
   `text_weak`; the folder and message rows use the latter. Preferences →
   Appearance previews the resolved scheme (`ColorScheme::swatches`,
-  `theme::hex`) but the palette is not editable yet, which is why nothing
-  about it is written back to `settings.json`. `theme.rs`'s tests pin the
-  contrast floors (body text ≥ 4.5:1 on its panel *and* on its content, accent
-  ≥ 3:1, text on the selection, hover and flag fills ≥ 4.5:1, the close glyph on its
+  `theme::hex`), and the one slot of it a reader can change is the accent:
+  `theme::Accent::ALL` is the six choices, the page draws them as chips
+  (`accent_chip`, the one in force ringed), `settings.json` stores the
+  key, and `ColorScheme::with_accent` puts the pair into the scheme the
+  theme resolves to — `Accent::KIMO` is the pair the schemes already hold,
+  so the default changes nothing. An accent carries the colour *and* the
+  tint selected rows are filled with, once per theme, because a violet that
+  reads on near-white paper is not the violet that reads on a dark surface.
+  Everything else about the palette is still not editable, which is why
+  nothing else about it is written back to `settings.json`. `theme.rs`'s tests pin the
+  contrast floors **over every accent of `Accent::ALL`, in both themes** (body
+  text ≥ 4.5:1 on its panel *and* on its content, accent
+  ≥ 3:1, text on the selection, hover and flag fills ≥ 4.5:1, weak text on a
+  selected row ≥ 4:1, the close glyph on its
   red ≥ 4.5:1, both schemes' surfaces on opposite sides of the brightness
   scale, and the mail rows' edges fainter against the list than a hairline,
   with the top edge fainter than the sides); keep them green when you touch a
   color.
+  **A focused field's box is the accent** (`Field`, app.rs). egui draws a text
+  edit's frame from `Visuals::selection.stroke` while the keyboard is in it —
+  the same slot as the colour of *selected text* — so a field that took that
+  line for its outline would recolour every selection in the app. Instead the
+  field is added with a frame that draws nothing (`field_frame`, whose margin is
+  the text's own) and Kimo paints the box itself: the theme's input fill under
+  the text, and over it the border — or the accent, with the keyboard in the
+  field. The writing area is the same box drawn by `compose_body`, around the
+  room the card gives it rather than around the field's own height. The title
+  bar's search box is the one field not drawn this way: it is a non-interactive
+  look-alike behind the search popup, with the glass fill and radius of its own.
 - Fonts are discovered, never fetched through fontconfig (hard rule 1):
   `fonts::scan()` walks the usual directories and reads each face's `name`
   table with ttf-parser. That took ~210 ms for the ~1000 installed faces on

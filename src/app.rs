@@ -37,7 +37,7 @@ use crate::outgoing::{self, Outgoing, OutgoingAttachment};
 use crate::search::{Scope, SearchHit, SearchQuery, SEARCH_LIMIT};
 use crate::storage::{self, Settings};
 use crate::sync::{self, Event, Job, SentCopy};
-use crate::theme::{self, ColorScheme, Theme};
+use crate::theme::{self, Accent, ColorScheme, Theme};
 use crate::threads::{self, Thread};
 
 /// How long the search popup waits after the last keystroke before asking the
@@ -709,6 +709,9 @@ pub struct KimoApp {
     /// GL pass is made once, on the first frame the bar floats.
     glass: Glass,
     theme: Theme,
+    /// The accent the reader chose in Preferences → Appearance; Kimo's own
+    /// until they choose another (`theme::Accent`).
+    accent: Accent,
     /// Cached OS dark-mode preference, so "system" resolution does not hit
     /// the filesystem every frame. Refreshed on startup and whenever the
     /// theme cycles back to System.
@@ -2066,6 +2069,8 @@ impl KimoApp {
             brand_icon,
             glass: Glass::default(),
             theme: Theme::parse(&settings.theme),
+            // A file that names no accent, or one no accent answers to.
+            accent: Accent::parse(settings.accent.as_deref().unwrap_or_default()),
             system_dark: system_prefers_dark(),
             storage_warning: crate::db::warning(),
             notice: None,
@@ -3203,6 +3208,7 @@ impl KimoApp {
     fn persist_settings(&self) {
         let _ = storage::save_settings(&Settings {
             theme: self.theme.as_str().to_string(),
+            accent: Some(self.accent.key.to_string()),
             html_renderer: Some(self.html_renderer.as_str().to_string()),
             ui_font: self.ui_font.clone(),
             mono_font: self.mono_font.clone(),
@@ -3231,10 +3237,19 @@ impl KimoApp {
     }
 
     /// Apply the selected theme to the context, resolving "system" against
-    /// the cached OS preference. The resolved scheme is what the hand-painted
-    /// parts of the UI read back through `theme::of`.
+    /// the cached OS preference and putting the chosen accent into the scheme
+    /// it resolves to. The result is what the hand-painted parts of the UI
+    /// read back through `theme::of`.
     fn apply_theme(&self, ctx: &egui::Context) {
-        theme::install(ctx, self.theme.scheme(self.system_dark));
+        theme::install(ctx, self.scheme());
+    }
+
+    /// The scheme in force: the theme the reader picked, resolved against the
+    /// OS preference where it says "system", with their accent in it. The
+    /// context (`apply_theme`) and the Appearance page's preview both read it
+    /// from here, so what the preview shows is what the app draws with.
+    fn scheme(&self) -> ColorScheme {
+        self.theme.scheme(self.system_dark).with_accent(self.accent)
     }
 
     /// The cached folder the message list is showing, if one is selected and
@@ -4478,11 +4493,11 @@ impl KimoApp {
             });
             ui.separator();
 
-            let text = ui.add(
+            let text = ui.add(Field::new(
                 egui::TextEdit::singleline(&mut self.search.text)
                     .hint_text("Search all mail…")
                     .desired_width(f32::INFINITY),
-            );
+            ));
             if std::mem::take(&mut self.search_focus) {
                 // Just opened: type straight away, no click needed.
                 text.request_focus();
@@ -4759,31 +4774,33 @@ impl KimoApp {
             // The card is laid out at the caller's width, so the boxes get a
             // constant: what the label column and the gap beside it leave.
             let field_width = width - COMPOSE_LABEL_WIDTH - ui.spacing().item_spacing.x;
-            let field = |ui: &mut egui::Ui, label: &str, value: &mut String, hint: &str| {
-                ui.horizontal(|ui| {
-                    ui.add_sized(
-                        [COMPOSE_LABEL_WIDTH, COMPOSE_FIELD_HEIGHT],
-                        egui::Label::new(label).halign(egui::Align::RIGHT),
-                    );
-                    ui.add_enabled(
-                        !sending,
-                        egui::TextEdit::singleline(value)
+            // One row of the card's form: the label in the card's own column,
+            // and the field — in Kimo's box, which is where a focused field
+            // takes the accent (`Field`).
+            let field_row =
+                |ui: &mut egui::Ui, label: &str, value: &mut String, hint: &str, flat: bool| {
+                    ui.horizontal(|ui| {
+                        ui.add_sized(
+                            [COMPOSE_LABEL_WIDTH, COMPOSE_FIELD_HEIGHT],
+                            egui::Label::new(label).halign(egui::Align::RIGHT),
+                        );
+                        let edit = egui::TextEdit::singleline(value)
                             .hint_text(hint)
-                            .desired_width(field_width),
-                    )
-                })
-                .inner
-            };
-            // The same row where the card is a letter rather than a form:
-            // flat, the way the From list above it is drawn, without an
-            // outline or a fill. Cc and Bcc are drawn with it when the To
-            // row's chevron has folded the two out.
+                            .desired_width(field_width);
+                        let field = Field::new(edit).enabled(!sending);
+                        ui.add(if flat { field.flat() } else { field })
+                    })
+                    .inner
+                };
+            // The same row where the card is a letter rather than a form: flat,
+            // the way the From list above it is drawn, without an outline or a
+            // fill. Cc and Bcc are drawn with it when the To row's chevron has
+            // folded the two out.
             let flat_field = |ui: &mut egui::Ui, label: &str, value: &mut String| {
-                ui.scope(|ui| {
-                    flatten_widgets(ui, theme::of(ui.ctx()).hover);
-                    field(ui, label, value, "name@example.com")
-                })
-                .inner
+                field_row(ui, label, value, "name@example.com", true)
+            };
+            let field = |ui: &mut egui::Ui, label: &str, value: &mut String, hint: &str| {
+                field_row(ui, label, value, hint, false)
             };
 
             // The From line, drawn wherever the card wants it: one row of the
@@ -5758,11 +5775,11 @@ impl KimoApp {
                     });
                 ui.separator();
                 ui.horizontal(|ui| {
-                    let field = ui.add(
+                    let field = ui.add(Field::new(
                         egui::TextEdit::singleline(&mut self.label_draft)
                             .hint_text("New label…")
                             .desired_width(LABEL_POPUP_FIELD_WIDTH),
-                    );
+                    ));
                     let enter = entered(&field, ui);
                     if (ui.button("Create").clicked() || enter)
                         && !self.label_draft.trim().is_empty()
@@ -7987,7 +8004,9 @@ impl KimoApp {
             .spacing([10.0, 6.0])
             .show(ui, |ui| {
                 ui.label("Account name");
-                ui.add(egui::TextEdit::singleline(&mut f.name).hint_text("Personal mail"));
+                ui.add(Field::new(
+                    egui::TextEdit::singleline(&mut f.name).hint_text("Personal mail"),
+                ));
                 ui.end_row();
 
                 ui.label("Protocol");
@@ -8012,7 +8031,9 @@ impl KimoApp {
                 ui.end_row();
 
                 ui.label("Server");
-                ui.add(egui::TextEdit::singleline(&mut f.host).hint_text("imap.example.com"));
+                ui.add(Field::new(
+                    egui::TextEdit::singleline(&mut f.host).hint_text("imap.example.com"),
+                ));
                 ui.end_row();
 
                 ui.label("Security");
@@ -8040,11 +8061,15 @@ impl KimoApp {
                 ui.end_row();
 
                 ui.label("Port");
-                ui.add(egui::TextEdit::singleline(&mut f.port_str).hint_text("993"));
+                ui.add(Field::new(
+                    egui::TextEdit::singleline(&mut f.port_str).hint_text("993"),
+                ));
                 ui.end_row();
 
                 ui.label("Username");
-                ui.add(egui::TextEdit::singleline(&mut f.username).hint_text("you@example.com"));
+                ui.add(Field::new(
+                    egui::TextEdit::singleline(&mut f.username).hint_text("you@example.com"),
+                ));
                 ui.end_row();
             });
 
@@ -8066,9 +8091,9 @@ impl KimoApp {
                 .spacing([10.0, 6.0])
                 .show(ui, |ui| {
                     ui.label("Outgoing server");
-                    ui.add(
+                    ui.add(Field::new(
                         egui::TextEdit::singleline(&mut f.smtp_host).hint_text("smtp.example.com"),
-                    );
+                    ));
                     ui.end_row();
 
                     ui.label("Security");
@@ -8099,7 +8124,9 @@ impl KimoApp {
                     ui.end_row();
 
                     ui.label("Port");
-                    ui.add(egui::TextEdit::singleline(&mut f.smtp_port_str).hint_text("587"));
+                    ui.add(Field::new(
+                        egui::TextEdit::singleline(&mut f.smtp_port_str).hint_text("587"),
+                    ));
                     ui.end_row();
 
                     ui.label("Login");
@@ -8110,17 +8137,17 @@ impl KimoApp {
                         );
                         if !f.smtp_own_login {
                             ui.horizontal(|ui| {
-                                ui.add(
+                                ui.add(Field::new(
                                     egui::TextEdit::singleline(&mut f.smtp_username)
                                         .hint_text("Username")
                                         .desired_width(150.0),
-                                );
-                                ui.add(
+                                ));
+                                ui.add(Field::new(
                                     egui::TextEdit::singleline(&mut f.smtp_password)
                                         .hint_text("Password")
                                         .password(true)
                                         .desired_width(150.0),
-                                );
+                                ));
                             });
                         }
                     });
@@ -8258,8 +8285,8 @@ impl KimoApp {
         );
     }
 
-    /// Preferences → Appearance: theme and HTML renderer, both persisted to
-    /// settings.json on change.
+    /// Preferences → Appearance: theme, accent and HTML renderer, all
+    /// persisted to settings.json on change.
     fn appearance_page(&mut self, ui: &mut egui::Ui) {
         ui.label(egui::RichText::new("Theme").strong());
         ui.horizontal(|ui| {
@@ -8277,6 +8304,30 @@ impl KimoApp {
             egui::RichText::new("“System” follows the GTK/KDE dark-mode setting.")
                 .small()
                 .weak(),
+        );
+
+        ui.add_space(12.0);
+        ui.separator();
+        ui.add_space(8.0);
+
+        ui.label(egui::RichText::new("Accent").strong());
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = ACCENT_CHIP_GAP;
+            for accent in Accent::ALL {
+                if accent_chip(ui, self.scheme().dark, accent, self.accent == accent).clicked() {
+                    self.accent = accent;
+                    self.persist_settings();
+                }
+            }
+        });
+        ui.label(
+            egui::RichText::new(format!(
+                "{} — the colour Kimo marks things with: a focused field's outline, \
+                 a checked box, the rows you select.",
+                self.accent.name
+            ))
+            .small()
+            .weak(),
         );
 
         ui.add_space(12.0);
@@ -8351,17 +8402,19 @@ impl KimoApp {
         ui.separator();
         ui.add_space(8.0);
 
-        color_scheme_preview(ui, self.theme.scheme(self.system_dark));
+        color_scheme_preview(ui, self.scheme());
     }
 }
 
-/// Preferences → Appearance: the palette the selected theme resolves to, so
-/// the defaults are visible without a mail open. Read-only: the scheme is not
-/// configurable yet, it only documents what the app draws with.
+/// Preferences → Appearance: the palette in force, so every slot the app draws
+/// with can be read at a glance — the theme's own values with the chosen
+/// accent among them. Read-only: it documents what the app draws with, and the
+/// two slots that *are* configurable are picked above it (the theme's radios
+/// and the accent's chips).
 fn color_scheme_preview(ui: &mut egui::Ui, scheme: ColorScheme) {
     ui.label(egui::RichText::new("Color scheme").strong());
     ui.label(
-        egui::RichText::new(format!("{} — the defaults Kimo ships with.", scheme.name))
+        egui::RichText::new(format!("{} — the palette in force.", scheme.name))
             .small()
             .weak(),
     );
@@ -8388,6 +8441,42 @@ fn color_scheme_preview(ui: &mut egui::Ui, scheme: ColorScheme) {
             ui.painter().circle_filled(rect.center(), 6.0, color);
         }
     });
+}
+
+/// The accent chips of Preferences → Appearance: one square per choice, with
+/// room between them for the chosen one's ring, which is drawn just outside the
+/// chip.
+const ACCENT_CHIP_SIZE: f32 = 20.0;
+const ACCENT_CHIP_CORNER_RADIUS: u8 = 5;
+const ACCENT_CHIP_GAP: f32 = 10.0;
+const ACCENT_CHIP_RING: f32 = 2.0;
+const ACCENT_CHIP_RING_GAP: f32 = 3.0;
+
+/// One accent chip in Preferences → Appearance: the colour itself, ringed in
+/// the app's own ink while it is the one in force — a ring, because the chip
+/// *is* a colour and a mark drawn on it would be a second colour to read — and
+/// named on hover, which is what tells two neighbouring blues apart.
+///
+/// `dark` picks the theme's variant of the accent, so the chips show the
+/// colours the app is drawing with rather than the other scheme's.
+fn accent_chip(ui: &mut egui::Ui, dark: bool, accent: Accent, chosen: bool) -> egui::Response {
+    let size = egui::Vec2::splat(ACCENT_CHIP_SIZE);
+    let (rect, response) = ui.allocate_exact_size(size, egui::Sense::click());
+    let color = accent.colors(dark).accent;
+    ui.painter()
+        .rect_filled(rect, ACCENT_CHIP_CORNER_RADIUS, color);
+    if chosen {
+        ui.painter().rect_stroke(
+            rect.expand(ACCENT_CHIP_RING_GAP),
+            ACCENT_CHIP_CORNER_RADIUS,
+            egui::Stroke::new(ACCENT_CHIP_RING, theme::of(ui.ctx()).text),
+            egui::StrokeKind::Inside,
+        );
+    }
+    if response.hovered() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
+    response.on_hover_text(accent.name)
 }
 
 /// One color chip in the Appearance preview, outlined so that the near-white
@@ -9452,11 +9541,11 @@ fn entered(response: &egui::Response, ui: &egui::Ui) -> bool {
 /// box was left by pressing Enter.
 fn filter_row(ui: &mut egui::Ui, label: &str, value: &mut String, hint: &str) -> bool {
     ui.label(label);
-    let response = ui.add(
+    let response = ui.add(Field::new(
         egui::TextEdit::singleline(value)
             .hint_text(hint)
             .desired_width(300.0),
-    );
+    ));
     let apply = entered(&response, ui);
     ui.end_row();
     apply
@@ -10092,33 +10181,29 @@ fn compose_body(
         let corner_radius = ui.visuals().widgets.inactive.corner_radius;
         ui.painter()
             .rect_filled(area, corner_radius, ui.visuals().text_edit_bg_color());
-        let field = ui
-            .scope(|ui| {
-                take_box_off(ui);
-                egui::ScrollArea::vertical()
-                    .id_salt("compose-body")
-                    .max_height(COMPOSE_BODY_HEIGHT)
-                    .auto_shrink([false, false])
-                    .show(ui, |ui| {
-                        ui.add_enabled(
-                            !sending,
-                            egui::TextEdit::multiline(body)
-                                .hint_text("Write your message…")
-                                .desired_width(width)
-                                .min_size(egui::vec2(width, COMPOSE_BODY_HEIGHT))
-                                .cursor_at_end(caret_at_end),
-                        )
-                    })
-                    .inner
+        let field = egui::ScrollArea::vertical()
+            .id_salt("compose-body")
+            .max_height(COMPOSE_BODY_HEIGHT)
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                ui.add_enabled(
+                    !sending,
+                    egui::TextEdit::multiline(body)
+                        .frame(field_frame())
+                        .hint_text("Write your message…")
+                        .desired_width(width)
+                        .min_size(egui::vec2(width, COMPOSE_BODY_HEIGHT))
+                        .cursor_at_end(caret_at_end),
+                )
             })
             .inner;
-        // And its line, over the writing: the field's own state, the way a
-        // stock frame's stroke is — the scheme's border while the writing
-        // waits for the keyboard, and the selection's ink with the cursor in
-        // it (`Visuals::selection`, the slot a focused field's frame reads).
+        // And its line, over the writing: the rule every field of the app
+        // follows (`Field`) — the accent while the keyboard is in it, the
+        // theme's own border while it waits — drawn on the room's rect rather
+        // than on the text's, which is what keeps the box still.
         let visuals = ui.style().interact(&field);
         let stroke = if field.has_focus() {
-            ui.visuals().selection.stroke
+            egui::Stroke::new(FIELD_STROKE, theme::of(ui.ctx()).accent)
         } else {
             visuals.bg_stroke
         };
@@ -10274,11 +10359,12 @@ fn take_box_off(ui: &mut egui::Ui) {
     }
 }
 
-/// `take_box_off`, and the hover the flat rows keep: a control drawn as a line
-/// of text rather than as a box still says it can be used by filling under the
+/// `take_box_off`, and the hover a flat control keeps: one drawn as a line of
+/// text rather than as a box still says it can be used by filling under the
 /// pointer — the one thing left of a widget's own look. The answer's From list
-/// and its own address lines are drawn with it (`compose_card`), and the
-/// writing area's box is drawn by hand with the other (`compose_body`).
+/// is drawn with it (`compose_card`); the fields that are flat wear
+/// `Field::flat` instead, which takes their box off without touching the
+/// colour of the text selected inside them.
 fn flatten_widgets(ui: &mut egui::Ui, hover: egui::Color32) {
     take_box_off(ui);
     let widgets = &mut ui.visuals_mut().widgets;
@@ -10287,11 +10373,112 @@ fn flatten_widgets(ui: &mut egui::Ui, hover: egui::Color32) {
     widgets.open.weak_bg_fill = hover;
 }
 
+/// The margin a field's text keeps: `TextEdit`'s own default, spelled out here
+/// because the box is Kimo's (`Field`) and it is the frame that carries the
+/// margin — a frame egui would otherwise build out of this very number.
+const FIELD_MARGIN: egui::Margin = egui::Margin::symmetric(4, 2);
+
+/// The width of a field's box: the one point every hairline in the app is
+/// drawn at, and the width egui gives a focused field's own frame.
+const FIELD_STROKE: f32 = 1.0;
+
+/// The frame a field wears when Kimo draws the box itself: the text's margin
+/// and nothing else — no fill, no line. A frame of its own is also what keeps
+/// egui from painting one, and from reaching for `Visuals::selection.stroke` to
+/// paint it: that slot is the colour of *selected text* too, so a field that
+/// took it for its outline would recolour every selection in the app. (The
+/// accent is a fill and focus colour, not text — `theme`'s contrast test says
+/// so.)
+fn field_frame() -> egui::Frame {
+    egui::Frame::NONE.inner_margin(FIELD_MARGIN)
+}
+
+/// One of the app's text fields: an `egui::TextEdit` in Kimo's own box.
+///
+/// The box is drawn here rather than by egui for the reason `field_frame`
+/// gives: the outline a *focused* field wears is the one thing the app wants in
+/// its own colour — the reader's accent — and egui's slot for that line is the
+/// selected-text colour. So the field is added with a frame that draws nothing,
+/// and the box is painted around the field's own rect instead: the theme's
+/// input fill under the text, and over it the border — or the accent, with the
+/// keyboard in the field. It is a line like every other box in the app:
+/// `FIELD_STROKE` wide, drawn inside the box, in the corner radius of the
+/// field's own state.
+///
+/// **`flat` is the field with no box at all**: the answer's own address lines
+/// under their mail, and the writing area, whose box is the room the card gives
+/// it rather than the field's own height (`compose_body`).
+struct Field<'t> {
+    edit: egui::TextEdit<'t>,
+    enabled: bool,
+    flat: bool,
+}
+
+impl<'t> Field<'t> {
+    fn new(edit: egui::TextEdit<'t>) -> Self {
+        Self {
+            edit,
+            enabled: true,
+            flat: false,
+        }
+    }
+
+    /// The field a worker owns for the moment: greyed out, and no longer taking
+    /// the keyboard (`Ui::add_enabled`).
+    fn enabled(mut self, enabled: bool) -> Self {
+        self.enabled = enabled;
+        self
+    }
+
+    /// The field without a box: a line of a letter rather than a form's.
+    fn flat(mut self) -> Self {
+        self.flat = true;
+        self
+    }
+}
+
+impl egui::Widget for Field<'_> {
+    fn ui(self, ui: &mut egui::Ui) -> egui::Response {
+        let Self {
+            edit,
+            enabled,
+            flat,
+        } = self;
+        let edit = edit.frame(field_frame());
+        if flat {
+            return ui.add_enabled(enabled, edit);
+        }
+        // A slot under the text for the box: the box's rect is the field's own,
+        // known only once the field has been laid out, and its fill has to be
+        // under the text rather than over it.
+        let slot = ui.painter().add(egui::Shape::Noop);
+        let field = ui.add_enabled(enabled, edit);
+        let scheme = theme::of(ui.ctx());
+        let visuals = ui.style().interact(&field);
+        let stroke = if field.has_focus() {
+            egui::Stroke::new(FIELD_STROKE, scheme.accent)
+        } else {
+            visuals.bg_stroke
+        };
+        ui.painter().set(
+            slot,
+            egui::Shape::Rect(egui::epaint::RectShape::new(
+                field.rect,
+                visuals.corner_radius,
+                scheme.input,
+                stroke,
+                egui::StrokeKind::Inside,
+            )),
+        );
+        field
+    }
+}
+
 /// The reply's own To row on the spot: the field, flat like the From line
-/// above it (`flatten_widgets`), and the chevron at the row's end that folds
-/// the Cc and Bcc lines out under it — down while they are away, up once they
-/// are under the row. The chevron's cell is taken off the field's own width,
-/// so the row ends where every other row's field does.
+/// above it (`Field::flat`), and the chevron at the row's end that folds the
+/// Cc and Bcc lines out under it — down while they are away, up once they are
+/// under the row. The chevron's cell is taken off the field's own width, so
+/// the row ends where every other row's field does.
 ///
 /// Returns the field's response — what puts the keyboard in it on the card's
 /// first frame — and the chevron's, which is the caller's to act on.
@@ -10303,42 +10490,36 @@ fn compose_to_row(
     open: bool,
 ) -> (egui::Response, egui::Response) {
     let scheme = theme::of(ui.ctx());
-    ui.scope(|ui| {
-        flatten_widgets(ui, scheme.hover);
-        ui.horizontal(|ui| {
-            ui.add_sized(
-                [COMPOSE_LABEL_WIDTH, COMPOSE_FIELD_HEIGHT],
-                egui::Label::new("To").halign(egui::Align::RIGHT),
-            );
-            let room = COMPOSE_FOLD_CELL + ui.spacing().item_spacing.x;
-            let field = ui.add_enabled(
-                !sending,
-                egui::TextEdit::singleline(to)
-                    .hint_text("name@example.com")
-                    .desired_width(width - room),
-            );
-            let (rect, fold) =
-                ui.allocate_exact_size(egui::Vec2::splat(COMPOSE_FOLD_CELL), egui::Sense::click());
-            let fold = titlebar_hover(ui, fold);
-            paint_fold_chevron(
-                ui.painter(),
-                rect.center(),
-                COMPOSE_FOLD_GLYPH,
-                open,
-                card_action_color(scheme, fold.hovered()),
-            );
-            if fold.hovered() {
-                ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
-            }
-            let tip = if open {
-                "Fold Cc and Bcc away"
-            } else {
-                "Add Cc and Bcc"
-            };
-            let fold = fold.on_hover_text(tip);
-            (field, fold)
-        })
-        .inner
+    ui.horizontal(|ui| {
+        ui.add_sized(
+            [COMPOSE_LABEL_WIDTH, COMPOSE_FIELD_HEIGHT],
+            egui::Label::new("To").halign(egui::Align::RIGHT),
+        );
+        let room = COMPOSE_FOLD_CELL + ui.spacing().item_spacing.x;
+        let edit = egui::TextEdit::singleline(to)
+            .hint_text("name@example.com")
+            .desired_width(width - room);
+        let field = ui.add(Field::new(edit).enabled(!sending).flat());
+        let (rect, fold) =
+            ui.allocate_exact_size(egui::Vec2::splat(COMPOSE_FOLD_CELL), egui::Sense::click());
+        let fold = titlebar_hover(ui, fold);
+        paint_fold_chevron(
+            ui.painter(),
+            rect.center(),
+            COMPOSE_FOLD_GLYPH,
+            open,
+            card_action_color(scheme, fold.hovered()),
+        );
+        if fold.hovered() {
+            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+        }
+        let tip = if open {
+            "Fold Cc and Bcc away"
+        } else {
+            "Add Cc and Bcc"
+        };
+        let fold = fold.on_hover_text(tip);
+        (field, fold)
     })
     .inner
 }
@@ -17313,6 +17494,69 @@ mod tests {
         );
     }
 
+    /// Preferences → Appearance offers the accent as a row of chips — one per
+    /// choice, each drawn in the colour it stands for — and the one in force is
+    /// ringed in the app's own ink rather than ticked, because a chip *is* a
+    /// colour and a mark on it would be a second colour to read.
+    #[test]
+    fn the_appearance_page_shows_the_accents_with_the_one_in_force_ringed() {
+        let ctx = egui::Context::default();
+        crate::fonts::install(&ctx, None, None);
+        let mut app = app_with_messages(&ctx, 1);
+        app.show_preferences = true;
+        app.prefs_tab = PrefsTab::Appearance;
+        // The key a settings file names is what the app starts with; a click on
+        // a chip is the same assignment, and what it writes there is the
+        // app's own business rather than this test's.
+        app.accent = Accent::parse("teal");
+        for _ in 0..FADE_FRAMES {
+            run_app_frame(&ctx, &mut app, Vec::new());
+        }
+        let scheme = theme::of(&ctx);
+        let chosen = app.accent.colors(scheme.dark).accent;
+        assert_eq!(
+            scheme.accent, chosen,
+            "the chosen accent is the one the app draws with"
+        );
+
+        let shapes = frame_shapes_at(&ctx, &mut app, 1400.0);
+        let chips: Vec<egui::epaint::RectShape> =
+            fills_of_size(&shapes, egui::Vec2::splat(ACCENT_CHIP_SIZE))
+                .into_iter()
+                .filter(|chip| {
+                    Accent::ALL
+                        .iter()
+                        .any(|accent| accent.colors(scheme.dark).accent == chip.fill)
+                })
+                .collect();
+        assert_eq!(chips.len(), Accent::ALL.len(), "one chip per choice");
+        for accent in Accent::ALL {
+            let color = accent.colors(scheme.dark).accent;
+            assert!(
+                chips.iter().any(|chip| chip.fill == color),
+                "{} is offered: {:?}",
+                accent.name,
+                chips.iter().map(|chip| chip.fill).collect::<Vec<_>>()
+            );
+        }
+        // The ring: one stroke, just outside the chip it belongs to — which has
+        // to be the chosen one's.
+        let ring = ACCENT_CHIP_SIZE + ACCENT_CHIP_RING_GAP * 2.0;
+        let rings: Vec<(egui::Rect, egui::Color32)> = stroked_boxes_in(&shapes, popup_area())
+            .into_iter()
+            .filter(|(rect, _)| {
+                (rect.width() - ring).abs() < 0.5 && (rect.height() - ring).abs() < 0.5
+            })
+            .collect();
+        assert_eq!(rings.len(), 1, "one chip is ringed: {rings:?}");
+        assert_eq!(rings[0].1, scheme.text, "in the app's own ink");
+        let ringed = chips
+            .iter()
+            .find(|chip| chip.rect.contains(rings[0].0.center()))
+            .expect("the ring is round one of the chips");
+        assert_eq!(ringed.fill, chosen, "and it is the one in force");
+    }
+
     /// The account form's Sending group: off is an account that only reads
     /// mail, on needs a server and a port, and what it builds is what the
     /// account gets — credentials it does not name included.
@@ -17866,15 +18110,20 @@ mod tests {
         three_point_paths(shapes, area, false)
     }
 
-    /// The boxes a frame drew a line around, inside `area`: the rounded rects
-    /// with a stroke on them, which is what a box drawn by hand is — the
-    /// writing area's border (`compose_body`) and the outline buttons' own.
-    /// A fill is a rect without one, and a glyph is a path or a segment
-    /// (`stroke_bounds`).
+    /// Frames enough for a fade to be over: a modal comes in over a few of them,
+    /// and a shape drawn while it is still coming in is a shape at half its
+    /// colour — which is what a test that reads colours has to wait out.
+    const FADE_FRAMES: usize = 16;
+
+    /// The boxes a frame drew a line around, inside `area`, with the colour each
+    /// line was drawn in: the rounded rects with a stroke on them, which is what
+    /// a box drawn by hand is — a field's (`Field`), the writing area's
+    /// (`compose_body`), the outline buttons' own. A fill is a rect without one,
+    /// and a glyph is a path or a segment (`stroke_bounds`).
     fn stroked_boxes_in(
         shapes: &[egui::epaint::ClippedShape],
         area: egui::Rect,
-    ) -> Vec<egui::Rect> {
+    ) -> Vec<(egui::Rect, egui::Color32)> {
         let mut out = Vec::new();
         for clipped in shapes {
             collect_stroked_boxes(&clipped.shape, area, &mut out);
@@ -17882,11 +18131,15 @@ mod tests {
         out
     }
 
-    fn collect_stroked_boxes(shape: &egui::Shape, area: egui::Rect, out: &mut Vec<egui::Rect>) {
+    fn collect_stroked_boxes(
+        shape: &egui::Shape,
+        area: egui::Rect,
+        out: &mut Vec<(egui::Rect, egui::Color32)>,
+    ) {
         match shape {
             egui::Shape::Rect(rect) if rect.stroke.width > 0.0 => {
                 if area.contains_rect(rect.rect) {
-                    out.push(rect.rect);
+                    out.push((rect.rect, rect.stroke.color));
                 }
             }
             egui::Shape::Vec(shapes) => {
@@ -18262,6 +18515,67 @@ mod tests {
         );
     }
 
+    /// A field's box is Kimo's, and its line says who has the keyboard: the
+    /// accent while it does, the theme's own border while it waits. The accent
+    /// is the reader's to choose, so the same card is drawn in whatever colour
+    /// they picked — here Teal, which neither scheme ships.
+    #[test]
+    fn a_focused_field_wears_the_accent_and_a_waiting_one_the_border() {
+        let ctx = egui::Context::default();
+        crate::fonts::install(&ctx, None, None);
+        let mut app = app_with_messages(&ctx, 1);
+        app.accent = Accent::parse("teal");
+        // A new mail in the popup: its form is boxes, and its first frame puts
+        // the keyboard in To, which is the field the ring is for. The frames
+        // are what the modal's own fade needs: a shape drawn while it is
+        // still coming in is a shape at half its colour.
+        app.compose = Some(ComposeDraft::new(Some("acct".to_string())));
+        app.compose_spot = ComposeSpot::Popup;
+        for _ in 0..FADE_FRAMES {
+            run_app_frame(&ctx, &mut app, Vec::new());
+        }
+        let scheme = theme::of(&ctx);
+        assert_eq!(
+            scheme.accent,
+            app.accent.colors(scheme.dark).accent,
+            "the chosen accent is the one the app draws with"
+        );
+
+        let shapes = frame_shapes_at(&ctx, &mut app, 1400.0);
+        let lines = stroked_boxes_in(&shapes, popup_area());
+        let line_of = |field: &egui::Rect| {
+            lines
+                .iter()
+                .find(|(rect, _)| rect == field)
+                .map(|(_, color)| *color)
+        };
+        // Each field's box is the input fill on the row of its own label.
+        let fields = fills_in_color(&shapes, scheme.input);
+        let field_box = |label: &str| {
+            let label = text_boxes_of(&shapes, popup_area(), label)
+                .into_iter()
+                .next()
+                .unwrap_or_else(|| panic!("the form draws no {label} row"));
+            *fields
+                .iter()
+                .filter(|rect| rect.center().y > label.top() && rect.center().y < label.bottom())
+                .min_by(|a, b| a.left().total_cmp(&b.left()))
+                .unwrap_or_else(|| panic!("nothing is drawn beside {label}"))
+        };
+        assert_eq!(
+            line_of(&field_box("To")),
+            Some(scheme.accent),
+            "the field with the keyboard wears the accent"
+        );
+        for waiting in ["Cc", "Bcc", "Subject"] {
+            assert_eq!(
+                line_of(&field_box(waiting)),
+                Some(scheme.border),
+                "{waiting} waits in the theme's own border"
+            );
+        }
+    }
+
     /// The writing area's box is the card's, not the text's: it stands on the
     /// room the card gives the body — `COMPOSE_BODY_HEIGHT` of it — with its
     /// line drawn on all four sides of that box, however long the mail is. The
@@ -18304,7 +18618,7 @@ mod tests {
         );
         let boxes = stroked_boxes_in(&shapes, answer);
         assert!(
-            boxes.contains(&body),
+            boxes.iter().any(|(rect, _)| *rect == body),
             "and its line is drawn on that box: {boxes:?} of {body:?}"
         );
     }
@@ -19314,6 +19628,14 @@ mod tests {
         app.prefs_tab = PrefsTab::General;
         collect_frame(&ctx, &mut app, &mut textures, Vec::new());
         shot(&mut app, "ui-general.png", &mut textures);
+        // And Preferences → Appearance, where the theme's radios, the accent's
+        // chips and the palette they resolve to are: the whole page at once,
+        // which is the one place a colour can be chosen.
+        app.prefs_tab = PrefsTab::Appearance;
+        for _ in 0..2 {
+            collect_frame(&ctx, &mut app, &mut textures, Vec::new());
+        }
+        shot(&mut app, "ui-appearance.png", &mut textures);
         app.show_preferences = false;
     }
 
