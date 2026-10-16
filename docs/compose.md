@@ -94,7 +94,7 @@ Read when touching `compose_card`, `src/outgoing.rs`, or `Job::SendMessage`.
   outline and fill off in that Ui and leaves the hover, because an outline
   belongs to a form of boxes and this line is the card’s own from. **The flat
   list ends with the To row’s chevron** rather than the filled triangle a combo
-  box carries (`paint_from_chevron`: the To row’s own drawing, painted in the
+  box carries (`paint_combo_chevron`: the To row’s own drawing, painted in the
   place egui would put its triangle, down while the list is away and up while it
   is open — the head of a letter ends the way the row under it does, weak until
   the pointer finds it). **To is

@@ -4654,21 +4654,61 @@ impl KimoApp {
 
         let modal = egui::Modal::new(egui::Id::new("search")).show(ctx, |ui| {
             ui.set_width(430.0);
-            ui.horizontal(|ui| {
-                ui.heading("Search");
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui.button("Close").clicked() {
-                        open = false;
-                    }
-                });
-            });
-            ui.separator();
-
-            let text = ui.add(Field::new(
-                egui::TextEdit::singleline(&mut self.search.text)
-                    .hint_text("Search all mail…")
-                    .desired_width(f32::INFINITY),
-            ));
+            // The bar the query is typed in, and the popup's first row: no
+            // heading over it and no close button beside it — the bar is what
+            // the popup is, Escape and a click outside close it, and the typing
+            // goes into it the moment it opens. Kimo draws the box (`Field`),
+            // the magnifier inside its left edge (`paint_search_icon`, the
+            // title bar's own drawing) and, once there is something to clear,
+            // the round cross inside its right (`paint_close_icon`).
+            let text = ui.add(
+                Field::new(
+                    egui::TextEdit::singleline(&mut self.search.text)
+                        .hint_text("Search all mail…")
+                        .desired_width(f32::INFINITY)
+                        .min_size(egui::vec2(0.0, SEARCH_BAR_HEIGHT))
+                        .vertical_align(egui::Align::Center),
+                )
+                .margin(SEARCH_BAR_MARGIN),
+            );
+            let scheme = theme::of(ui.ctx());
+            let bar = text.rect;
+            let weak = ui.visuals().weak_text_color();
+            paint_search_icon(
+                ui.painter(),
+                egui::Rect::from_center_size(
+                    egui::pos2(bar.left() + SEARCH_ICON_INSET as f32 / 2.0, bar.center().y),
+                    egui::Vec2::splat(SEARCH_ICON_SIZE),
+                ),
+                weak,
+            );
+            if !self.search.text.is_empty() {
+                // The cross empties the bar's own text and not the filters: it
+                // sits in the bar, and each filter has a box of its own to
+                // empty. The list behind follows at once (`run_now`) rather
+                // than waiting out the settle clock.
+                let cross = egui::Rect::from_center_size(
+                    egui::pos2(bar.right() - SEARCH_ICON_INSET as f32 / 2.0, bar.center().y),
+                    egui::Vec2::splat(SEARCH_CLEAR_SIZE),
+                );
+                let clear = ui.interact(cross, text.id.with("clear"), egui::Sense::click());
+                if clear.hovered() {
+                    ui.painter()
+                        .rect_filled(cross, SEARCH_CLEAR_RADIUS, scheme.hover);
+                    ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                }
+                paint_close_icon(
+                    ui.painter(),
+                    cross,
+                    if clear.hovered() { scheme.text } else { weak },
+                );
+                if clear.clicked() {
+                    self.search.text.clear();
+                    self.search_focus = true;
+                    run_now = true;
+                }
+                clear.on_hover_text("Clear the search");
+            }
             if std::mem::take(&mut self.search_focus) {
                 // Just opened: type straight away, no click needed.
                 text.request_focus();
@@ -4690,9 +4730,21 @@ impl KimoApp {
                         .unwrap_or_else(|| "Account".to_string()),
                     Scope::Folder { .. } => "This folder".to_string(),
                 };
-                egui::ComboBox::from_id_salt("search-scope")
+                // The combo is the card's own kind of control, not a form's box:
+                // no fill and no line at rest, the hover kept, and the app's
+                // chevron where egui would put its filled triangle — the same
+                // treatment the compose card's From list gets, and the reason
+                // the pointer's own state is kept for the chevron painted after
+                // the button (`flatten_widgets`, `paint_combo_chevron`).
+                flatten_widgets(ui, theme::of(ui.ctx()).hover);
+                let icon = std::rc::Rc::new(std::cell::Cell::new((egui::Rect::NOTHING, false)));
+                let hook = std::rc::Rc::clone(&icon);
+                let list = egui::ComboBox::from_id_salt("search-scope")
                     .selected_text(label)
                     .width(170.0)
+                    .icon(move |_, rect, _, is_open| {
+                        hook.set((rect, is_open));
+                    })
                     .show_ui(ui, |ui| {
                         ui.selectable_value(&mut self.search.scope, Scope::AllMail, "All mail");
                         for (id, name) in &accounts {
@@ -4713,6 +4765,8 @@ impl KimoApp {
                             );
                         }
                     });
+                let (place, open) = icon.get();
+                paint_combo_chevron(ui, &list.response, place, open);
             });
 
             ui.add_space(4.0);
@@ -4756,34 +4810,26 @@ impl KimoApp {
                     ui.end_row();
                 });
 
-            ui.add_space(6.0);
-            ui.separator();
-            ui.horizontal(|ui| {
-                if self.search_running {
-                    ui.spinner();
-                    ui.label(egui::RichText::new("Searching…").small().weak());
-                } else if self.search.is_active() {
-                    ui.label(
-                        egui::RichText::new(results_label(self.search_hits.len()))
-                            .small()
-                            .weak(),
-                    );
-                }
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui.button("Search").clicked() {
-                        run_now = true;
-                        open = false;
-                    }
-                    if self.search.is_active() && ui.button("Clear").clicked() {
-                        // Empty the boxes but stay open: clearing one query to
-                        // type the next is the common case, and the list behind
-                        // returns to the folders either way.
-                        self.search = SearchQuery::default();
-                        self.search_focus = true;
-                        run_now = true;
+            // What the query found, when there is a query — and nothing at all
+            // otherwise, rather than a rule with an empty row under it. No
+            // Search button stands here either: the query runs as it is typed
+            // (`SEARCH_SETTLE`), and Enter only skips that wait.
+            if self.search_running || self.search.is_active() {
+                ui.add_space(6.0);
+                ui.separator();
+                ui.horizontal(|ui| {
+                    if self.search_running {
+                        ui.spinner();
+                        ui.label(egui::RichText::new("Searching…").small().weak());
+                    } else {
+                        ui.label(
+                            egui::RichText::new(results_label(self.search_hits.len()))
+                                .small()
+                                .weak(),
+                        );
                     }
                 });
-            });
+            }
         });
         // Backdrop click or Escape closes the popup. What was typed stays
         // applied: the search is live, so closing is not a cancel.
@@ -5059,7 +5105,7 @@ impl KimoApp {
                             // is open — is kept here for the chevron painted
                             // after the button: the pointer's state, which
                             // that chevron's colour answers, is known only
-                            // then (`paint_from_chevron`).
+                            // then (`paint_combo_chevron`).
                             let icon = std::rc::Rc::new(std::cell::Cell::new((
                                 egui::Rect::NOTHING,
                                 false,
@@ -5081,7 +5127,7 @@ impl KimoApp {
                                 }
                             });
                             let (place, open) = icon.get();
-                            paint_from_chevron(ui, &list.response, place, open);
+                            paint_combo_chevron(ui, &list.response, place, open);
                         });
                     }
                     // Only reachable if the From account vanished between
@@ -7129,8 +7175,8 @@ impl KimoApp {
                 );
                 // The chevron is a target of its own: the row's click opens the
                 // conversation in the reading pane, and the chevron is what
-                // opens the mails under it in the list. It is a line drawing
-                // rather than the filled triangle a folder section has, and it
+                // opens the mails under it in the list. It is a line drawing —
+                // every disclosure in the app is (`docs/ui-style.md`) — and it
                 // takes the pointer through a widget with a hover fill to say
                 // so.
                 let target =
@@ -9211,6 +9257,9 @@ const CONVERSATION_CARD_GAP: f32 = 12.0;
 /// it turns into a horizontal scrollbar instead (`mail_list).
 const NAV_MIN_WIDTH: f32 = 150.0;
 const NAV_DEFAULT_WIDTH: f32 = 200.0;
+/// The account row's disclosure chevron (`paint_chevron`), the size of a thread
+/// row's: with it the app draws no solid triangle anywhere (`docs/ui-style.md`).
+const ACCOUNT_CHEVRON: f32 = 10.0;
 const CONTENT_MIN_WIDTH: f32 = 280.0;
 const CONTENT_DEFAULT_WIDTH: f32 = 460.0;
 const LIST_MIN_WIDTH: f32 = 240.0;
@@ -9323,6 +9372,21 @@ const ATTACHMENT_LINE_GAP: f32 = 2.0;
 /// inset is the field's left margin, so the text begins after the icon.
 const SEARCH_ICON_INSET: i8 = 22;
 const SEARCH_ICON_SIZE: f32 = 15.0;
+/// The search popup's own bar: taller than a form's field, so the magnifier and
+/// the clear cross have room inside it, with an inset at each end taken out of
+/// the text's own margins.
+const SEARCH_BAR_HEIGHT: f32 = 28.0;
+const SEARCH_BAR_MARGIN: egui::Margin = egui::Margin {
+    left: SEARCH_ICON_INSET,
+    right: SEARCH_ICON_INSET,
+    top: 4,
+    bottom: 4,
+};
+/// The round cross that empties the bar, the size of a file card's own cross
+/// (`ATTACHMENT_CLOSE_SIZE`) and round for the same reason: the button is a
+/// circle, and its radius is half of it.
+const SEARCH_CLEAR_SIZE: f32 = 18.0;
+const SEARCH_CLEAR_RADIUS: u8 = 9;
 /// How far the title bar's first cell starts in from the window's left edge —
 /// the space added before it, as the left group's own first item. Wider than
 /// the margin at the other end, which the window controls keep.
@@ -9860,15 +9924,20 @@ fn entered(response: &egui::Response, ui: &egui::Ui) -> bool {
     response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter))
 }
 
-/// One label + box row of the search popup's filter grid. Returns true when the
-/// box was left by pressing Enter.
+/// One label + box row of the search popup's filter grid. The box is quiet —
+/// the fill and no line until the pointer or the keyboard is on it — the way
+/// the compose card's address rows are (`docs/ui-style.md`). Returns true when
+/// the box was left by pressing Enter.
 fn filter_row(ui: &mut egui::Ui, label: &str, value: &mut String, hint: &str) -> bool {
     ui.label(label);
-    let response = ui.add(Field::new(
-        egui::TextEdit::singleline(value)
-            .hint_text(hint)
-            .desired_width(300.0),
-    ));
+    let response = ui.add(
+        Field::new(
+            egui::TextEdit::singleline(value)
+                .hint_text(hint)
+                .desired_width(300.0),
+        )
+        .quiet(),
+    );
     let apply = entered(&response, ui);
     ui.end_row();
     apply
@@ -10531,7 +10600,7 @@ fn compose_body(
                 ui.add_enabled(
                     !sending,
                     egui::TextEdit::multiline(body)
-                        .frame(field_frame())
+                        .frame(field_frame(FIELD_MARGIN))
                         .hint_text("Write your message…")
                         .desired_width(width)
                         .min_size(egui::vec2(width, COMPOSE_BODY_HEIGHT))
@@ -10741,8 +10810,8 @@ const FIELD_STROKE: f32 = 1.0;
 /// took it for its outline would recolour every selection in the app. (The
 /// accent is a fill and focus colour, not text — `theme`'s contrast test says
 /// so.)
-fn field_frame() -> egui::Frame {
-    egui::Frame::NONE.inner_margin(FIELD_MARGIN)
+fn field_frame(margin: egui::Margin) -> egui::Frame {
+    egui::Frame::NONE.inner_margin(margin)
 }
 
 /// One of the app's text fields: an `egui::TextEdit` in Kimo's own box.
@@ -10767,6 +10836,13 @@ struct Field<'t> {
     edit: egui::TextEdit<'t>,
     enabled: bool,
     boxed: FieldBox,
+    /// Where the text sits inside the box: `FIELD_MARGIN` unless the caller
+    /// needs room for a glyph drawn in there with it — the search bar's
+    /// magnifier and clear cross (`SEARCH_BAR_MARGIN`). It is the *frame's*
+    /// margin rather than `TextEdit::margin`, because a field given a frame of
+    /// its own ignores that one: egui builds its frame out of `margin` only
+    /// when the caller hands it none, and `Field` hands it `field_frame`.
+    margin: egui::Margin,
 }
 
 /// How a field draws its box (`Field`). The line is Kimo's in every case that
@@ -10790,7 +10866,15 @@ impl<'t> Field<'t> {
             edit,
             enabled: true,
             boxed: FieldBox::Boxed,
+            margin: FIELD_MARGIN,
         }
+    }
+
+    /// The field whose text keeps `margin` room inside the box, for a glyph
+    /// drawn in there with it (`SEARCH_BAR_MARGIN`).
+    fn margin(mut self, margin: egui::Margin) -> Self {
+        self.margin = margin;
+        self
     }
 
     /// The field a worker owns for the moment: greyed out, and no longer taking
@@ -10820,8 +10904,9 @@ impl egui::Widget for Field<'_> {
             edit,
             enabled,
             boxed,
+            margin,
         } = self;
-        let edit = edit.frame(field_frame());
+        let edit = edit.frame(field_frame(margin));
         if boxed == FieldBox::Flat {
             return ui.add_enabled(enabled, edit);
         }
@@ -10918,7 +11003,7 @@ fn compose_to_row(
 
 /// The chevron a flat row of the answer ends with: the To row's, down while
 /// the Cc and Bcc lines are folded away — the way to them — and up once they
-/// are under the row, and the From list's own (`paint_from_chevron`), which
+/// are under the row, and a flat combo's own (`paint_combo_chevron`), which
 /// reads the same way over the list it opens. The thread rows' chevron turned
 /// a quarter (`paint_chevron`): the same two strokes meeting at a point, and
 /// nothing else.
@@ -10946,19 +11031,19 @@ fn paint_fold_chevron(
     painter.add(egui::Shape::line(points, egui::Stroke::new(1.0_f32, color)));
 }
 
-/// The chevron the card's From list ends with, in either container, in the place
-/// egui would put the filled triangle a combo box carries: the To row's own
-/// drawing
+/// The chevron a combo the app draws flat ends with, in the place egui would put
+/// the filled triangle a combo box carries: the To row's own drawing
 /// (`paint_fold_chevron`), down while the list is away and up while it is open
-/// under the row — the same glyph, at the same size, and the same colour under
-/// the pointer (`card_action_color`) as the row below it, because the head bar
-/// is a letter's line and not a form of boxes.
+/// — the same glyph, at the same size, and the same colour under the pointer
+/// (`card_action_color`) as the row it stands on, because these are a card's
+/// lines rather than a form of boxes: the compose card's From list, in either
+/// container, and the search popup's scope.
 ///
 /// `place` is what the combo's own hook handed back — where its triangle would
 /// have been, the one spot the button's own layout is known from — and `list`
 /// is the button's response, which is what says the pointer is on it. The combo
 /// is given a hook that paints nothing: this is what stands in its place.
-fn paint_from_chevron(ui: &egui::Ui, list: &egui::Response, place: egui::Rect, open: bool) {
+fn paint_combo_chevron(ui: &egui::Ui, list: &egui::Response, place: egui::Rect, open: bool) {
     let scheme = theme::of(ui.ctx());
     paint_fold_chevron(
         ui.painter(),
@@ -11244,9 +11329,10 @@ fn paint_row_text(
 /// highlight and put the count inside the name. The colors come straight from
 /// the scheme instead of from egui's widget states, which is what lets an
 /// unread folder read brighter than a read one.
-/// Account header in the navigation column: a disclosure triangle, the
-/// account name and its unread total. Clicking the row collapses or expands
-/// the account's folders.
+/// Account header in the navigation column: a disclosure chevron
+/// (`paint_chevron`, down while the account's folders are out and right while
+/// they are away), the account name and its unread total. Clicking the row
+/// collapses or expands the account's folders.
 /// The labels a mail carries, drawn as one run of chips on the mail's own card:
 /// what the user marked it with, said on the mail rather than only in the popup
 /// that put it there. Each chip is as wide as its name wants, and the run wraps
@@ -11304,26 +11390,17 @@ fn account_row(
         ui.painter().rect_filled(rect, 3.0_f32, scheme.hover);
     }
 
-    // Disclosure triangle: pointing right while collapsed, down while open.
+    // The disclosure (`paint_chevron`): right while collapsed, down while open —
+    // the app's one disclosure shape (`docs/ui-style.md`), which is what the
+    // navigation column's last solid triangle became.
     let center = egui::pos2(rect.left() + 10.0, rect.center().y);
-    let triangle = if collapsed {
-        vec![
-            egui::pos2(center.x - 3.0, center.y - 5.0),
-            egui::pos2(center.x + 4.0, center.y),
-            egui::pos2(center.x - 3.0, center.y + 5.0),
-        ]
-    } else {
-        vec![
-            egui::pos2(center.x - 5.0, center.y - 3.0),
-            egui::pos2(center.x + 5.0, center.y - 3.0),
-            egui::pos2(center.x, center.y + 4.0),
-        ]
-    };
-    ui.painter().add(egui::Shape::convex_polygon(
-        triangle,
+    paint_chevron(
+        ui.painter(),
+        center,
+        ACCOUNT_CHEVRON,
+        !collapsed,
         scheme.text_weak,
-        egui::Stroke::NONE,
-    ));
+    );
 
     let left = center.x + 10.0;
     let mut right = rect.right() - 6.0;
@@ -16460,6 +16537,34 @@ mod tests {
         }
     }
 
+    /// The centres of the stroked circles a frame drew in `area` — the
+    /// magnifier both search bars draw (`paint_search_icon`) is one.
+    fn stroked_circles_in(
+        shapes: &[egui::epaint::ClippedShape],
+        area: egui::Rect,
+    ) -> Vec<egui::Pos2> {
+        fn walk(shape: &egui::Shape, area: egui::Rect, out: &mut Vec<egui::Pos2>) {
+            match shape {
+                egui::Shape::Circle(circle) if circle.stroke.width > 0.0 => {
+                    if area.contains(circle.center) {
+                        out.push(circle.center);
+                    }
+                }
+                egui::Shape::Vec(shapes) => {
+                    for shape in shapes {
+                        walk(shape, area, out);
+                    }
+                }
+                _ => {}
+            }
+        }
+        let mut out = Vec::new();
+        for clipped in shapes {
+            walk(&clipped.shape, area, &mut out);
+        }
+        out
+    }
+
     /// Where every straight stroke the frame drew is centred. A cross drawn by
     /// `paint_close_icon` is two strokes whose midpoints are the same point, so
     /// a button of that shape — and only that shape — is found by asking for it
@@ -17569,6 +17674,169 @@ mod tests {
                 drawn.rect
             );
         }
+    }
+
+    /// The navigation column's account header opens with the app's chevron
+    /// (`paint_chevron`) rather than a solid triangle: the last one of those in
+    /// the UI is gone (`docs/ui-style.md`).
+    #[test]
+    fn the_account_row_folds_its_folders_with_a_chevron() {
+        let ctx = egui::Context::default();
+        crate::fonts::install(&ctx, None, None);
+        let mut app = app_with_messages(&ctx, 1);
+        run_app_frame(&ctx, &mut app, Vec::new());
+        let shapes = frame_shapes_at(&ctx, &mut app, 1400.0);
+
+        let nav = nav_column(&app);
+        let chevrons = chevrons_in(&shapes, nav);
+        assert_eq!(
+            chevrons.len(),
+            1,
+            "the account's one disclosure is a chevron: {chevrons:?}"
+        );
+        assert!(
+            triangles_in(&shapes, nav).is_empty(),
+            "and the navigation column draws no solid triangle at all"
+        );
+
+        // A click on the row folds the folders away, and the chevron turns with
+        // them: right while they are away, down while they are out.
+        let down = chevrons[0][1].y > chevrons[0][0].y;
+        assert!(down, "it points down while the folders are out");
+        let row = egui::Rect::from_center_size(
+            egui::pos2(chevrons[0][1].x, chevrons[0][1].y),
+            egui::vec2(20.0, 20.0),
+        );
+        click_at(&ctx, &mut app, row.center());
+        let shapes = frame_shapes_at(&ctx, &mut app, 1400.0);
+        let folded = chevrons_in(&shapes, nav_column(&app));
+        assert_eq!(folded.len(), 1, "the one disclosure is still there");
+        assert!(
+            folded[0][1].x > folded[0][0].x,
+            "and it points right once the folders are away, where a down chevron's \
+             middle point shares its ends' x: {folded:?}"
+        );
+    }
+
+    /// The search popup is the bar and the form under it: no heading, no close
+    /// button and no Search button — the query runs as it is typed — with the
+    /// magnifier drawn inside the bar's left edge and the round cross inside its
+    /// right once there is something to clear.
+    #[test]
+    fn the_search_popup_is_a_bar_with_a_magnifier_and_a_clear_cross() {
+        let ctx = egui::Context::default();
+        crate::fonts::install(&ctx, None, None);
+        let mut app = app_with_messages(&ctx, 1);
+        app.open_search();
+        for _ in 0..FADE_FRAMES {
+            run_app_frame(&ctx, &mut app, Vec::new());
+        }
+
+        // Nothing of the old chrome is drawn: the popup says what it is by
+        // being a search bar, and Escape or a click outside closes it.
+        let texts = frame_texts(&ctx, &mut app);
+        for gone in ["Search", "Close", "Clear"] {
+            assert!(
+                !texts.iter().any(|text| text == gone),
+                "{gone} is not drawn any more: {texts:?}"
+            );
+        }
+        for still in ["Search in", "Subject", "Only"] {
+            assert!(
+                texts.iter().any(|text| text == still),
+                "{still} is still on the form: {texts:?}"
+            );
+        }
+
+        // The bar is a box of its own height, and the magnifier's circle sits
+        // inside its left edge (the painter centres it a point up and left of
+        // the rect it is given).
+        let bar_of = |shapes: &[egui::epaint::ClippedShape]| -> egui::Rect {
+            stroked_boxes_in(shapes, popup_area())
+                .into_iter()
+                .map(|(rect, _)| rect)
+                .find(|rect| (rect.height() - SEARCH_BAR_HEIGHT).abs() < 0.5)
+                .expect("the search bar is a field with a box")
+        };
+        let cross_of = |bar: egui::Rect| {
+            egui::pos2(bar.right() - SEARCH_ICON_INSET as f32 / 2.0, bar.center().y)
+        };
+        let shapes = frame_shapes_at(&ctx, &mut app, 1400.0);
+        let bar = bar_of(&shapes);
+        let magnifier = egui::pos2(
+            bar.left() + SEARCH_ICON_INSET as f32 / 2.0 - 1.0,
+            bar.center().y - 1.0,
+        );
+        assert!(
+            stroked_circles_in(&shapes, popup_area())
+                .iter()
+                .any(|centre| centre.distance(magnifier) < 1.0),
+            "the magnifier is drawn inside the bar's left edge"
+        );
+
+        // The hint keeps clear of the magnifier: where the text starts inside
+        // the box is the field's own margin (`Field::margin`), which is what
+        // `TextEdit::margin` cannot say once `Field` gives the widget a frame
+        // of its own.
+        let hint = text_boxes_of(&shapes, popup_area(), "Search all mail…")
+            .into_iter()
+            .next()
+            .expect("the bar's hint");
+        assert!(
+            hint.left() >= bar.left() + SEARCH_ICON_INSET as f32,
+            "the text starts after the magnifier: {hint:?} in {bar:?}"
+        );
+
+        // The scope is a flat combo: no box at rest, and the app's chevron
+        // where egui would put its filled triangle.
+        let scope = text_boxes_of(&shapes, popup_area(), "All mail")
+            .into_iter()
+            .next()
+            .expect("the scope's own text");
+        let scope_row = egui::Rect::from_min_max(
+            egui::pos2(scope.left() - 60.0, scope.top() - 4.0),
+            egui::pos2(scope.left() + 220.0, scope.bottom() + 4.0),
+        );
+        assert!(
+            triangles_in(&shapes, scope_row).is_empty(),
+            "the scope keeps no filled triangle"
+        );
+        assert!(
+            !chevrons_in(&shapes, scope_row).is_empty(),
+            "it ends with the app's chevron instead"
+        );
+
+        // An empty bar has nothing to clear, so no cross.
+        assert!(
+            !stroke_centres(&shapes, popup_area())
+                .iter()
+                .any(|centre| centre.distance(cross_of(bar)) < 1.0),
+            "an empty bar has no cross"
+        );
+
+        // Typed in, the cross is there — two strokes meeting at its centre — and
+        // a click empties the bar without closing the popup. The bar is found
+        // again rather than reused, and only once the form has settled: a query
+        // gives the popup the row its count stands on, which moves the whole
+        // form up with it by the time the next frame is drawn.
+        app.search.text = "ada".to_string();
+        for _ in 0..3 {
+            run_app_frame(&ctx, &mut app, Vec::new());
+        }
+        let shapes = frame_shapes_at(&ctx, &mut app, 1400.0);
+        let bar = bar_of(&shapes);
+        let clear = cross_of(bar);
+        assert_eq!(
+            stroke_centres(&shapes, popup_area())
+                .iter()
+                .filter(|centre| centre.distance(clear) < 1.0)
+                .count(),
+            2,
+            "the cross is two strokes in the bar's right end"
+        );
+        click_at(&ctx, &mut app, clear);
+        assert!(app.search.text.is_empty(), "the cross emptied the bar");
+        assert!(app.show_search, "and the popup stayed open");
     }
 
     /// Dragging the splitter with the pointer, the way a user does: the pane
@@ -20920,6 +21188,28 @@ mod tests {
         }
         shot(&mut app, "ui-sort-menu.png", &mut textures);
         egui::Popup::close_all(&ctx);
+
+        // And the search popup: the bar with the magnifier inside its left edge
+        // and the round cross inside its right once there is a query to clear,
+        // over the scope combo and the filter grid — with no heading, no close
+        // button and no Search button, because the query runs as it is typed.
+        app.open_search();
+        for _ in 0..FADE_FRAMES {
+            collect_frame(&ctx, &mut app, &mut textures, Vec::new());
+        }
+        shot(&mut app, "ui-search-empty.png", &mut textures);
+        app.search.text = "ada".to_string();
+        for _ in 0..2 {
+            collect_frame(&ctx, &mut app, &mut textures, Vec::new());
+        }
+        shot(&mut app, "ui-search.png", &mut textures);
+        app.search = SearchQuery::default();
+        app.search_hits.clear();
+        app.search_running = false;
+        app.show_search = false;
+        for _ in 0..FADE_FRAMES {
+            collect_frame(&ctx, &mut app, &mut textures, Vec::new());
+        }
 
         // The bar with nothing open in the pane first: the pane's run is not
         // there at all rather than there and dimmed, and the chrome it would

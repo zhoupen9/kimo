@@ -240,10 +240,22 @@ Read when touching a list row, threading, select mode, search in the bar, the re
   leave focus behind when the popup closes, and one string backs both, so
   whatever is typed in the popup is what the box shows. `search_modal`, an
   `egui::Modal`, holds the free text, the scope combo and the filter grid
-  the column used to carry, with the live result count along its bottom; Enter
-  in any of its boxes (or the Search button) applies the query and closes it,
-  and Clear empties it without closing, so closing the popup is never a
-  cancel. Nothing else about a search is drawn: the message list starts
+  the column used to carry, with the live result count along its bottom. **The
+  popup is that bar and its form and nothing else**: no heading over it and no
+  close button beside it — Escape and a click outside close it — and no Search
+  button anywhere, because the query runs as it is typed (`SEARCH_SETTLE`);
+  Enter in any of its boxes only skips that wait and closes. The bar carries the
+  title bar's own magnifier inside its left edge (`paint_search_icon`) and,
+  while there is text to clear, a round cross inside its right
+  (`paint_close_icon` over a `scheme.hover` circle): the cross empties the
+  bar's text and nothing else — each filter has a box of its own to empty — and
+  the list behind follows at once rather than on the settle clock. The result
+  row is part of the popup only while there is a query; with none, the form ends
+  under the filters. The filter boxes are `Field::quiet`, the way the compose
+  card's address rows are, and the scope is a flat combo with the app's chevron
+  where egui would put a triangle (`flatten_widgets`, `paint_combo_chevron`) —
+  [`ui-style.md`](ui-style.md) both times. Nothing else about a
+  search is drawn: the message list starts
   straight at the rows — the folder's mail or the hits — because a header over
   them was noise the project owner asked to drop, and the magnifier is the only
   sign left. (Select mode's select-all row is not that header: it is there only

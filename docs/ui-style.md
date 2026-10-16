@@ -25,7 +25,7 @@ uses one of them rather than inventing a third:
   `scheme.text_weak` at rest).
 - `paint_fold_chevron(painter, centre, size, open, color)` — the same drawing as
   a fold: down while what it opens is away, up while it is out
-  (`COMPOSE_FOLD_GLYPH`). `paint_from_chevron` is that chevron where an
+  (`COMPOSE_FOLD_GLYPH`). `paint_combo_chevron` is that chevron where an
   `egui::ComboBox` would put its triangle.
 
 The color is the caller's, from the scheme or from the place the glyph sits
@@ -34,17 +34,15 @@ and a chevron that is clickable is a hover target: `PointingHand`, and hover
 text saying what the click does.
 
 **Where the code stands.** The message list's conversations, the popup pane's
-back button, and the compose card's To row and From list — in either container —
-all draw chevrons. Two things do not:
+back button, the compose card's To row and From list in either container, the
+search popup's scope, and the navigation column's account headers all draw
+chevrons. One thing does not:
 
-- `account_row` — the navigation column's account headers — still fills a
-  `convex_polygon` triangle. It is the one disclosure in the app that is not a
-  chevron; it becomes `paint_chevron` when that row is next touched.
-- egui's own `ComboBox` triangle (the search-scope menu, Preferences' font
-  picker) is egui's internal drawing and stays: a form's box keeps its box's
-  glyph. The compose card's From list is the one combo that is a letter's line
-  rather than a form's box, so `paint_from_chevron` paints over the place its
-  triangle would take.
+- egui's own `ComboBox` triangle (Preferences' font picker) is egui's internal
+  drawing and stays: a form's box keeps its box's glyph. The combos that are a
+  card's own lines rather than a form's boxes — the compose card's From list and
+  the search popup's scope — are drawn flat, and `paint_combo_chevron` paints
+  over the place their triangles would take.
 
 ## A mail address field has no outline until the pointer or the keyboard is on it
 
@@ -62,17 +60,26 @@ The box is Kimo's own, painted in `Field` over a frame that draws nothing
 egui draw it would recolour every selection in the app. The accent is a fill and
 focus color, not text — [theme.md](theme.md)'s contrast rule says so.
 
-**Where the code stands.** The popup's form follows the rule: its address lines
+**The text's margin is the frame's.** A field given a frame of its own — which is
+every field here — ignores `TextEdit::margin`: egui builds a frame out of that
+number only when the caller hands it none, and `Field` hands it `field_frame`.
+Where a glyph is drawn inside the box, the room for it is `Field::margin` — the
+search bar's magnifier and clear cross (`SEARCH_BAR_MARGIN`) — and that is what
+keeps the query and its hint clear of the icon.
+
+**Where the code stands.** The compose form follows the rule: its address lines
 are `Field::quiet`, and Subject is one of them so the form reads as one thing
-rather than three quiet rows between two boxed ones. The From list is neither: it is a combo
-rather than a `Field`, and the card draws it as a letter's line in either
-container — `flatten_widgets` takes egui's outline and fill off it and leaves
-the hover fill that says it opens, with the chevron of rule 1 where egui's
-triangle would be. `Field::flat` — the on-the-spot card's lines — is still the
+rather than three quiet rows between two boxed ones — and so do the search
+popup's filter boxes, From and To among them, which are address lines by name.
+The compose card's From list and the search popup's scope are neither: they are
+combos rather than `Field`s, and they are drawn as a card's own lines —
+`flatten_widgets` takes egui's outline and fill off them and leaves the hover
+fill that says they open, with the chevron of rule 1 where egui's triangle would
+be. `Field::flat` — the on-the-spot card's lines — is still the
 other state: it draws nothing at all, focused or not, so the answer under its
 mail has no box to bring out. The body is not one of these fields — it is the letter's
 writing area, whose box is the room the card gives it (`compose_body`) — and the
-title bar's search box is the bar's own box, not an address line.
+two search bars are the bars' own boxes, not address lines.
 
 ## Cc and Bcc are folded away until they are asked for
 

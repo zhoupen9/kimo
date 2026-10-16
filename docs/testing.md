@@ -12,8 +12,8 @@ Read before claiming a UI or renderer change works, or when timing one.
   own frames and needs no compositor at all:
   `cargo test -- --ignored --nocapture dump_ui` drives the clicks
   itself and rasterizes the frames — the columns, the card, the compose form in
-  both its containers, the label popup, Preferences → General — straight from
-  egui's own triangles into
+  both its containers, the search popup, the label popup, Preferences → General
+  — straight from egui's own triangles into
   `target/ui-*.png`
   (`KIMO_UI_DUMP` picks another directory), which is how a layout is looked at
   on a machine whose display is somebody else's. Its frames have to go through
