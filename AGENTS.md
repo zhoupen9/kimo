@@ -24,7 +24,10 @@ Kimo is a desktop **email client** GUI written in pure Rust:
   remembered in `settings.json` (`html_renderer`).
   *Simple* (the default) parses with html5ever (via `scraper`) and draws
   egui widgets in `src/html.rs` with a small CSS subset (`src/css.rs`):
-  theme-following, selectable, clickable, no layout fidelity.  *Blitz* feeds
+  theme-following, selectable, clickable, no layout fidelity.  The mail's own
+  colours are read as CSS (`csscolorparser`) and adapted to the theme in force
+  (`palette`, OKLCH) before they are drawn — see the mail-colour bullet under
+  Conventions.  *Blitz* feeds
   the same HTML to the pure-Rust Blitz browser engine (stylo/taffy/
   vello_cpu) in `src/blitz_render.rs` and blits the rasterized page — close
   to what the sender designed, but a static image with clickable link boxes.
@@ -208,9 +211,10 @@ src/portal.rs           the desktop's own file dialog, asked for over D-Bus (XDG
 src/mail.rs             raw RFC 5322 bytes → MailMessage (mail-parser; HTML kept, attachments
                         as name/type/size, one part back out for a download)
 src/outgoing.rs         the mail being sent: addresses, headers, encoding → RFC 5322 bytes
-src/html.rs             HTML mail → egui widgets (subset: blocks, lists, tables, links, inline styles)
+src/html.rs             HTML mail → egui widgets (subset: blocks, lists, tables, links, inline
+                        styles; the mail's colors adapted to the theme)
 src/blitz_render.rs     HTML mail → rasterized page via Blitz (headless render, net provider, fonts)
-src/css.rs              tiny CSS subset (decls, tag/class/id selectors) for HTML mail
+src/css.rs              tiny CSS subset (decls, tag/class/id selectors, CSS colors) for HTML mail
 src/folders.rs          folder kind (name → special mailbox, incl. CJK) + embedded row icons
 src/glass.rs            the floating title bar's frosted backdrop (wgpu passes + a paint callback)
 src/render_bench.rs     test-only: times both HTML renderers for the same bodies (bench_render)
@@ -1930,6 +1934,24 @@ Do not "fix" these casually — they are known:
   attachment bytes stored on the message (`InlineImage.data`, the
   `inline_images` table). Improving fidelity here means improving this renderer — Blitz mode
   is the escape hatch for mail this subset cannot lay out, not a replacement.
+  **A mail's colours are adapted to the theme** (`html::adapt_color`), which is
+  what makes this renderer theme-following rather than theme-blind: mail is
+  written for white paper, and the dark theme draws it on a surface that is
+  nothing like it — the sender's `#000000` on the card is 1.4:1, which is not
+  text. A colour a declaration sets is read as CSS and moved through OKLCH, so
+  what changes is lightness and not identity: the **light** theme draws every
+  colour as written; in the **dark** theme a background above 0.85 lightness
+  becomes the surface mail sits on (`0.12, 0.12, 0.14`), text below 0.25
+  becomes (`0.90, 0.90, 0.92`), text above 0.85 is left alone, and the middle
+  keeps its hue and chroma with its lightness flipped. It happens in
+  `apply_decls`, once per declaration, so what a wrapper sets is inherited down
+  the tree already adapted, and the alpha a colour carries is kept.
+  **The flip is unconditional**, so a mid-tone above half lightness comes back
+  *darker* than it went in: `color: red` (`#FF0000`, l 0.63) is drawn
+  `#9F0000`, which on the dark card is less readable than the red was — lifting
+  instead of flipping is a one-line change if the owner wants it. Blitz mode
+  adapts nothing: it draws the sender's page as the sender wrote it, transparent
+  background and all.
 - Blitz renders tables in the *separate* borders model: `blitz_render`'s
   `COMPAT_CSS` overrides `border-collapse` because blitz's collapsing paints
   the first cell's border width/colour across the whole table — a 3px dark

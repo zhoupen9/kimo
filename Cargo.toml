@@ -52,6 +52,16 @@ mail-parser = { version = "0.11", features = ["full_encoding"] }
 # HTML mail rendering: html5ever DOM (pure Rust, from Servo) + egui widgets.
 scraper = "0.27"
 ego-tree = "0.11"
+# Mail HTML carries its own colours, picked for the white paper mail is
+# written on, and the Simple renderer adapts them to the theme in force
+# (`html::adapt_color`). That means reading what the mail actually wrote —
+# `csscolorparser` is CSS Colour 4, so `rgb()`/`hsl()`/the named colours come out
+# rather than being dropped — and moving a colour in a perceptual space:
+# `palette` gives sRGB ↔ OKLCH, so lightening a black body keeps its hue and
+# chroma instead of going grey. Both are pure Rust (hard rule 1); nothing else
+# here needs either.
+csscolorparser = "0.9"
+palette = { version = "0.7", default-features = false, features = ["std"] }
 
 # Remote mail content (images/stylesheets), fetched on worker threads.
 # ureq is synchronous + rustls-based (pure Rust; `tls` feature pulls rustls

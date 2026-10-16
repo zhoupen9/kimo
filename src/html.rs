@@ -16,6 +16,7 @@ use egui::{RichText, Ui};
 use scraper::{Html, Node};
 
 use crate::css;
+use crate::theme;
 
 /// Remote and inline resources available to the renderer plus the URLs it
 /// wants fetched. The app supplies what it has (loaded textures, fetched
@@ -76,6 +77,10 @@ pub fn render_document(ui: &mut Ui, doc: &Document, html_ctx: &mut HtmlContext<'
     let mut r = Renderer {
         pending: Vec::new(),
         ids: 0,
+        // The mail's own colours are drawn for the paper it was written on, so
+        // the renderer has to know which surface it is drawing on
+        // (`adapt_color`). Read once per layout: it cannot change mid-walk.
+        dark: theme::of(ui.ctx()).dark,
         rules: html_ctx
             .stylesheets
             .values()
@@ -92,6 +97,9 @@ pub fn render_document(ui: &mut Ui, doc: &Document, html_ctx: &mut HtmlContext<'
 struct Renderer<'r, 'a> {
     pending: Vec<Seg>,
     ids: u64,
+    /// Whether the theme in force is the dark one, which is what the mail's own
+    /// colours are adapted to (`adapt_color`).
+    dark: bool,
     /// Parsed CSS rules: fetched stylesheets first, then `<style>` blocks
     /// in document order.
     rules: Vec<css::Rule>,
@@ -251,7 +259,7 @@ impl Renderer<'_, '_> {
                 if decls.hidden {
                     return;
                 }
-                let styled = apply_decls(style, &decls);
+                let styled = apply_decls(style, &decls, self.dark);
                 let style: &Seg = &styled;
 
                 match name {
@@ -541,13 +549,63 @@ struct StyleLike {
     link: Option<String>,
 }
 
-fn apply_decls(style: &Seg, decls: &css::Decls) -> Seg {
+/// A colour the mail defined, as the theme in force wants it drawn.
+///
+/// Mail HTML is written for the paper mail is read on — white — and the dark
+/// theme draws it on a surface that is nothing like it: the mail's own
+/// `#000000` on the card is 1.4:1, which is not text at all. So a colour the
+/// mail declares goes through OKLCH — perceptual lightness, chroma, hue —
+/// before it is drawn, which is what lets a colour be moved without becoming a
+/// different colour:
+///
+/// * the **light** theme draws every colour the sender wrote, as written: the
+///   paper is the paper the mail was written for;
+/// * in the dark theme a **background** lighter than 85% lightness becomes the
+///   dark surface mail sits on (`0.12, 0.12, 0.14`), so a white-paper mail
+///   stops glaring — while one the sender made dark on purpose (a banner, a
+///   footer, a dark table head) is already right and is left alone;
+/// * **text** darker than 25% lightness becomes near-white
+///   (`0.90, 0.90, 0.92`), text lighter than 85% is left alone, and the middle
+///   of the range keeps its hue and chroma with its lightness flipped
+///   (`1 - l`) — a navy heading comes back a light blue rather than a grey,
+///   which is the whole reason for the trip through OKLCH.
+///
+/// The alpha the mail wrote is kept: the rules above are about lightness, and
+/// `rgba(0, 0, 0, 0)` is not a black anybody can read.
+fn adapt_color(color: egui::Color32, is_background: bool, dark: bool) -> egui::Color32 {
+    use palette::{IntoColor, Oklch, Srgb};
+
+    // The light theme pays nothing for this — not even the conversions.
+    if !dark {
+        return color;
+    }
+    let [r, g, b, a] = color.to_srgba_unmultiplied();
+    let srgb: Srgb<f32> = Srgb::new(r, g, b).into_format();
+    let oklch: Oklch = srgb.into_color();
+    let adapted: Srgb<f32> = if is_background {
+        if oklch.l > 0.85 {
+            Srgb::new(0.12, 0.12, 0.14)
+        } else {
+            srgb
+        }
+    } else if oklch.l < 0.25 {
+        Srgb::new(0.90, 0.90, 0.92)
+    } else if oklch.l > 0.85 {
+        srgb
+    } else {
+        Oklch::new(1.0 - oklch.l, oklch.chroma, oklch.hue).into_color()
+    };
+    let adapted: Srgb<u8> = adapted.into_format();
+    egui::Color32::from_rgba_unmultiplied(adapted.red, adapted.green, adapted.blue, a)
+}
+
+fn apply_decls(style: &Seg, decls: &css::Decls, dark: bool) -> Seg {
     let mut s = style.clone();
     if let Some(c) = decls.color {
-        s.color = Some(c);
+        s.color = Some(adapt_color(c, false, dark));
     }
     if let Some(b) = decls.background {
-        s.background = Some(b);
+        s.background = Some(adapt_color(b, true, dark));
     }
     if let Some(b) = decls.bold {
         s.bold = b;
@@ -711,6 +769,8 @@ mod tests {
         Renderer {
             pending: Vec::new(),
             ids: 0,
+            // The light theme: the text-run tests are not about colour.
+            dark: false,
             rules: Vec::new(),
             ctx: hctx,
         }
@@ -962,5 +1022,165 @@ mod tests {
                 );
             });
         });
+    }
+
+    /// The colours of the text a frame drew, in the order it drew them: the mail
+    /// is laid out into a real frame, so what this reads is what would be on
+    /// screen rather than what a helper believes would be.
+    fn drawn_text_colors(ctx: &egui::Context, html: &str) -> Vec<egui::Color32> {
+        let images = HashMap::new();
+        let inline = HashMap::new();
+        let sheets = HashMap::new();
+        let mut hctx = empty_ctx(&images, &inline, &sheets);
+        let mut output = ctx.run_ui(egui::RawInput::default(), |ui| {
+            egui::CentralPanel::default().show(ui, |ui| {
+                render(ui, html, &mut hctx);
+            });
+        });
+        output.textures_delta.clear();
+        output
+            .shapes
+            .iter()
+            .filter_map(|clipped| match &clipped.shape {
+                egui::Shape::Text(text) => Some(text.galley.job.sections[0].format.color),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The mail's colours, as each theme draws them. The light theme is the paper
+    /// the mail was written for, so every colour is the sender's own; the dark
+    /// theme has three rules and this is all of them.
+    #[test]
+    fn the_dark_theme_adapts_the_colours_the_mail_declares() {
+        let black = egui::Color32::from_rgb(0, 0, 0);
+        let white = egui::Color32::from_rgb(255, 255, 255);
+        // #172B4D: the navy a Word-written mail gives its headings.
+        let navy = egui::Color32::from_rgb(23, 43, 77);
+        let dark_box = egui::Color32::from_rgb(32, 32, 32);
+        let light_text = egui::Color32::from_rgb(230, 232, 236);
+
+        // Light: as written — as text and as a background both.
+        for colour in [black, white, navy, dark_box, light_text] {
+            assert_eq!(adapt_color(colour, false, false), colour);
+            assert_eq!(adapt_color(colour, true, false), colour);
+        }
+
+        // Dark, text: black goes near-white, the navy heading comes back a light
+        // blue of the same hue, and what is already light stays as it is.
+        assert_eq!(
+            adapt_color(black, false, true),
+            egui::Color32::from_rgb(230, 230, 235)
+        );
+        assert_eq!(
+            adapt_color(navy, false, true),
+            egui::Color32::from_rgb(137, 162, 204)
+        );
+        assert_eq!(adapt_color(light_text, false, true), light_text);
+
+        // Dark, background: white paper becomes the dark surface mail is drawn
+        // on, while a box the sender made dark is already right.
+        assert_eq!(
+            adapt_color(white, true, true),
+            egui::Color32::from_rgb(31, 31, 36)
+        );
+        assert_eq!(adapt_color(dark_box, true, true), dark_box);
+    }
+
+    /// The middle of the range keeps what makes it that colour: only lightness is
+    /// flipped, so a navy heading is still blue afterwards — a grey would have
+    /// been the cheap way to make it readable — and the alpha, which no rule here
+    /// is about, comes through untouched.
+    #[test]
+    fn a_midtone_keeps_its_hue_its_chroma_and_its_alpha() {
+        use palette::{IntoColor, Oklch, Srgb};
+
+        let oklch = |colour: egui::Color32| -> Oklch {
+            let [r, g, b, _] = colour.to_srgba_unmultiplied();
+            let srgb: Srgb<f32> = Srgb::new(r, g, b).into_format();
+            srgb.into_color()
+        };
+
+        let navy = egui::Color32::from_rgb(23, 43, 77);
+        let before = oklch(navy);
+        let after = oklch(adapt_color(navy, false, true));
+        assert!(
+            (after.l - (1.0 - before.l)).abs() < 0.01,
+            "lightness is flipped: {} -> {}",
+            before.l,
+            after.l
+        );
+        assert!(
+            (after.chroma - before.chroma).abs() < 0.02,
+            "chroma is kept: {} -> {}",
+            before.chroma,
+            after.chroma
+        );
+        assert!(
+            (after.hue.into_inner() - before.hue.into_inner()).abs() < 1.0,
+            "hue is kept: {} -> {}",
+            before.hue.into_inner(),
+            after.hue.into_inner()
+        );
+
+        // A transparent colour stays transparent: nothing here makes an
+        // invisible thing visible, and nothing makes a visible one vanish.
+        assert_eq!(adapt_color(egui::Color32::TRANSPARENT, false, true).a(), 0);
+        assert_eq!(
+            adapt_color(
+                egui::Color32::from_rgba_unmultiplied(0, 0, 0, 128),
+                false,
+                true
+            )
+            .a(),
+            128
+        );
+    }
+
+    /// Which rule a declaration gets is decided by which slot it is: the same
+    /// white is text (already light, left alone) and a background (paper, turned
+    /// into the dark surface).
+    #[test]
+    fn a_declaration_is_adapted_as_text_or_as_a_background() {
+        let white_text = css::parse_decls("color: #ffffff");
+        assert_eq!(
+            apply_decls(&Seg::default(), &white_text, true).color,
+            Some(egui::Color32::from_rgb(255, 255, 255))
+        );
+
+        let white_paper = css::parse_decls("background-color: #ffffff");
+        assert_eq!(
+            apply_decls(&Seg::default(), &white_paper, true).background,
+            Some(egui::Color32::from_rgb(31, 31, 36))
+        );
+
+        let black_text = css::parse_decls("color: #000000");
+        assert_eq!(
+            apply_decls(&Seg::default(), &black_text, true).color,
+            Some(egui::Color32::from_rgb(230, 230, 235))
+        );
+    }
+
+    /// The request, end to end: one mail, two themes. The colour the mail declares
+    /// for its text is the sender's in the light theme and the adapted one in the
+    /// dark — the theme reaches the walker through the context, not through a
+    /// parameter every caller would have to remember to pass.
+    #[test]
+    fn the_same_mail_is_drawn_in_the_colour_each_theme_wants() {
+        let mail = "<p style=\"color: #000000\">paper</p>";
+
+        let light = egui::Context::default();
+        crate::theme::install(&light, crate::theme::LIGHT);
+        assert_eq!(
+            drawn_text_colors(&light, mail),
+            vec![egui::Color32::from_rgb(0, 0, 0)]
+        );
+
+        let dark = egui::Context::default();
+        crate::theme::install(&dark, crate::theme::DARK);
+        assert_eq!(
+            drawn_text_colors(&dark, mail),
+            vec![egui::Color32::from_rgb(230, 230, 235)]
+        );
     }
 }

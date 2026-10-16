@@ -81,10 +81,16 @@ pub fn parse_decls(text: &str) -> Decls {
         let value = value.trim();
         match key.as_str() {
             "color" => d.color = parse_color(value),
-            "background-color" | "background" => {
-                // `background` may be several layered values; take the first
-                // token and keep it only if it is a color.
-                d.background = value.split_whitespace().next().and_then(parse_color);
+            "background-color" => d.background = parse_color(value),
+            "background" => {
+                // The shorthand may be several layered values — `white
+                // url(a.png) no-repeat` — of which this subset keeps the
+                // colour. The whole value is tried first, because a colour may
+                // have spaces of its own (`rgb(255, 255, 255)` is one value
+                // and not three tokens), and the first token is the fallback
+                // for the rest.
+                d.background = parse_color(value)
+                    .or_else(|| value.split_whitespace().next().and_then(parse_color));
             }
             "font-weight" => {
                 d.bold = match value.to_ascii_lowercase().as_str() {
@@ -198,54 +204,18 @@ pub fn parse_size(value: &str) -> Option<f32> {
     }
 }
 
+/// A CSS colour as egui wants it, read by `csscolorparser`: the named colours,
+/// `#rgb`/`#rgba`/`#rrggbb`/`#rrggbbaa`, `rgb()`/`rgba()`/`hsl()`/`hsla()` and the
+/// rest of CSS Colour 4. Mail is written by Word and Outlook as much as by
+/// hand, and those spell a colour `rgb(23, 43, 77)` as readily as `#172B4D` —
+/// the hand-rolled table this replaced read the second and dropped the first.
+/// The alpha a colour carries comes with it (`Color32` is where it lives).
+/// `None` for anything that is not a colour, and for the parts of a shorthand
+/// that are not one.
 pub fn parse_color(value: &str) -> Option<Color32> {
-    let value = value.trim().to_ascii_lowercase();
-    let named = match value.as_str() {
-        "black" => Some((0, 0, 0)),
-        "white" => Some((255, 255, 255)),
-        "red" => Some((220, 50, 47)),
-        "green" => Some((0, 160, 0)),
-        "blue" => Some((0, 80, 220)),
-        "yellow" => Some((255, 220, 0)),
-        "orange" => Some((255, 140, 0)),
-        "purple" => Some((128, 0, 128)),
-        "gray" | "grey" => Some((128, 128, 128)),
-        "silver" => Some((192, 192, 192)),
-        "maroon" => Some((128, 0, 0)),
-        "navy" => Some((0, 0, 128)),
-        "teal" => Some((0, 128, 128)),
-        "aqua" | "cyan" => Some((0, 200, 200)),
-        "fuchsia" | "magenta" => Some((255, 0, 255)),
-        "lime" => Some((0, 255, 0)),
-        "olive" => Some((128, 128, 0)),
-        _ => None,
-    };
-    if let Some((r, g, b)) = named {
-        return Some(Color32::from_rgb(r, g, b));
-    }
-    let hex = value.strip_prefix('#')?;
-    match hex.len() {
-        3 | 4 => {
-            let nibble = |i: usize| u8::from_str_radix(&hex[i..i + 1], 16).ok();
-            let r = nibble(0)? * 17;
-            let g = nibble(1)? * 17;
-            let b = nibble(2)? * 17;
-            Some(Color32::from_rgb(r, g, b))
-        }
-        6 | 8 => {
-            let byte = |i: usize| u8::from_str_radix(&hex[i..i + 2], 16).ok();
-            let r = byte(0)?;
-            let g = byte(2)?;
-            let b = byte(4)?;
-            if hex.len() == 8 {
-                let a = byte(6)?;
-                Some(Color32::from_rgba_unmultiplied(r, g, b, a))
-            } else {
-                Some(Color32::from_rgb(r, g, b))
-            }
-        }
-        _ => None,
-    }
+    let parsed = csscolorparser::parse(value.trim()).ok()?;
+    let [r, g, b, a] = parsed.to_rgba8();
+    Some(Color32::from_rgba_unmultiplied(r, g, b, a))
 }
 
 #[cfg(test)]
@@ -286,13 +256,59 @@ mod tests {
 
     #[test]
     fn colors_parse_named_hex_and_short() {
-        assert_eq!(parse_color("RED"), Some(Color32::from_rgb(220, 50, 47)));
+        // The named colours are CSS's own values, not shades of Kimo's: what
+        // the mail asks for is what the mail gets.
+        assert_eq!(parse_color("RED"), Some(Color32::from_rgb(255, 0, 0)));
         assert_eq!(parse_color("#abc"), Some(Color32::from_rgb(170, 187, 204)));
         assert_eq!(
             parse_color("#aabbcc"),
             Some(Color32::from_rgb(170, 187, 204))
         );
+        assert_eq!(
+            parse_color("#abcd"),
+            Some(Color32::from_rgba_unmultiplied(170, 187, 204, 221))
+        );
         assert_eq!(parse_color("notacolor"), None);
+    }
+
+    /// What the parser reads beyond hex and the names: the functions mail
+    /// actually uses, the alpha they carry, and the shorthand's own shape —
+    /// a colour with spaces in it is one value, not three tokens.
+    #[test]
+    fn colors_parse_functions_alpha_and_shorthand() {
+        assert_eq!(
+            parse_color("rgb(23, 43, 77)"),
+            Some(Color32::from_rgb(23, 43, 77))
+        );
+        assert_eq!(
+            parse_color("hsl(0, 100%, 50%)"),
+            Some(Color32::from_rgb(255, 0, 0))
+        );
+        assert_eq!(
+            parse_color("transparent"),
+            Some(Color32::from_rgba_unmultiplied(0, 0, 0, 0))
+        );
+        assert_eq!(
+            parse_color("rebeccapurple"),
+            Some(Color32::from_rgb(102, 51, 153))
+        );
+        // A length, a URL and nonsense are not colours.
+        assert_eq!(parse_color("12px"), None);
+        assert_eq!(parse_color("url(a.png)"), None);
+
+        let white = Some(Color32::from_rgb(255, 255, 255));
+        assert_eq!(
+            parse_decls("background-color: rgb(255, 255, 255)").background,
+            white
+        );
+        assert_eq!(
+            parse_decls("background: rgb(255, 255, 255)").background,
+            white
+        );
+        assert_eq!(
+            parse_decls("background: white url(a.png) no-repeat").background,
+            white
+        );
     }
 
     #[test]
@@ -343,7 +359,8 @@ mod tests {
     fn overlay_later_wins() {
         let mut base = parse_decls("color: red; font-weight: bold");
         base.overlay(&parse_decls("color: blue"));
-        assert_eq!(base.color, Some(Color32::from_rgb(0, 80, 220)));
+        // CSS's blue, which is what a mail asking for `blue` means.
+        assert_eq!(base.color, Some(Color32::from_rgb(0, 0, 255)));
         assert_eq!(base.bold, Some(true));
     }
 }

@@ -44,7 +44,8 @@ rustls with the `ring` crypto provider and Mozilla's root certificates.
 - Export the open mail as the server's original `.eml` — the desktop's own file
   dialog asks where to put it
 - Search over the cached mail (SQLite FTS5 with a CJK bigram index), and two
-  HTML renderers: native egui widgets, or a Blitz-rasterized page
+  HTML renderers: native egui widgets (the mail's own colors adapted to the
+  light or dark theme), or a Blitz-rasterized page
 - Offline-first: accounts and messages live in one SQLite database,
   `~/.local/share/kimo/mail.db`; UI preferences in
   `~/.config/kimo/settings.json`
