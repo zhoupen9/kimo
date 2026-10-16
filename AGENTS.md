@@ -127,6 +127,7 @@ src/protocol/smtp.rs    minimal SMTP submission client (EHLO capabilities, START
 | [docs/protocols.md](docs/protocols.md) | `src/protocol/`, a TLS setting, a charset, the mapping of a server's refusal |
 | [docs/ui-shell.md](docs/ui-shell.md) | `src/main.rs`, `src/gpu.rs`, `src/glass.rs`, the title bar, the column plan, the navigation column |
 | [docs/ui-mail.md](docs/ui-mail.md) | a list row, threading, select mode, the search box and its popup, the reading pane, attachments, labels, flags, filters, sort |
+| [docs/ui-style.md](docs/ui-style.md) | drawing a widget: an icon or a disclosure, a mail address field, the Cc/Bcc fold |
 | [docs/compose.md](docs/compose.md) | `compose_card`, `src/outgoing.rs`, `Job::SendMessage` |
 | [docs/theme.md](docs/theme.md) | `src/theme.rs`, `src/fonts.rs`, any color a widget draws |
 | [docs/html-mail.md](docs/html-mail.md) | `src/html.rs`, `src/css.rs`, `src/blitz_render.rs`, a Blitz build feature |

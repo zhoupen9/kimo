@@ -12,6 +12,7 @@ are where new reasoning goes when a change is done.
 | [protocols.md](protocols.md) | the IMAP/POP3/SMTP clients, TLS and the finite-field DH fallback, mailbox names, error mapping |
 | [ui-shell.md](ui-shell.md) | the window and its title bar, the three columns and how they give way, the frosted backdrop, the navigation column, the egui 0.36 integration |
 | [ui-mail.md](ui-mail.md) | the message list, rows and threading, select mode, the search box and popup, the reading pane, attachments, labels, flags, filters, sort |
+| [ui-style.md](ui-style.md) | the house rules a drawn widget obeys: chevrons over solid triangles, the mail address fields' outline, the Cc/Bcc fold |
 | [compose.md](compose.md) | the compose card in both its containers, and the mail `outgoing` writes |
 | [theme.md](theme.md) | the light/dark schemes and how a mail's own colors are adapted, font discovery |
 | [html-mail.md](html-mail.md) | the in-egui subset renderer, the Blitz raster, and Blitz's build and scale rules |
