@@ -71,5 +71,6 @@ accordingly.
 
 ## Development
 
-See [AGENTS.md](AGENTS.md) for architecture notes, conventions and the
-project's hard rules before contributing.
+See [AGENTS.md](AGENTS.md) for the project's hard rules, the commands and the
+module map, and [docs/](docs/README.md) for the architecture notes and
+conventions, before contributing.
