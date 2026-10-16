@@ -10057,6 +10057,17 @@ fn compose_files_row(
 /// the room the box takes, so the row under it — the files on the spot, the
 /// footer in the window — is not read across a band of nothing.
 ///
+/// **The box is the card's, drawn around the room rather than around the
+/// text.** A text edit draws its own frame about what it holds; an answer
+/// holds a mail with a quote under it, far more text than the
+/// `COMPOSE_BODY_HEIGHT` viewport does, so a frame of the field's own would
+/// run past the room at both ends and go where the scroll goes — its top out
+/// of sight after a scroll down, its bottom before one, which reads as a box
+/// with two sides. The frame is drawn here instead, in the viewport's own
+/// rect: the fill under the writing and the line over it, the way every other
+/// box in the app is drawn, with the field given no frame of its own
+/// (`take_box_off`).
+///
 /// The area is claimed outright rather than left to what the pane has under the
 /// row above: a window too short for the card is the *pane's* to scroll, and a
 /// scroll area that took the room it was given would squeeze the writing area
@@ -10077,21 +10088,43 @@ fn compose_body(
 ) -> egui::Response {
     let area = egui::Rect::from_min_size(ui.cursor().min, egui::vec2(width, COMPOSE_BODY_HEIGHT));
     ui.scope_builder(egui::UiBuilder::new().max_rect(area), |ui| {
-        egui::ScrollArea::vertical()
-            .id_salt("compose-body")
-            .max_height(COMPOSE_BODY_HEIGHT)
-            .auto_shrink([false, false])
-            .show(ui, |ui| {
-                ui.add_enabled(
-                    !sending,
-                    egui::TextEdit::multiline(body)
-                        .hint_text("Write your message…")
-                        .desired_width(width)
-                        .min_size(egui::vec2(width, COMPOSE_BODY_HEIGHT))
-                        .cursor_at_end(caret_at_end),
-                )
+        // The box's fill, under the writing: what a stock field sits on.
+        let corner_radius = ui.visuals().widgets.inactive.corner_radius;
+        ui.painter()
+            .rect_filled(area, corner_radius, ui.visuals().text_edit_bg_color());
+        let field = ui
+            .scope(|ui| {
+                take_box_off(ui);
+                egui::ScrollArea::vertical()
+                    .id_salt("compose-body")
+                    .max_height(COMPOSE_BODY_HEIGHT)
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        ui.add_enabled(
+                            !sending,
+                            egui::TextEdit::multiline(body)
+                                .hint_text("Write your message…")
+                                .desired_width(width)
+                                .min_size(egui::vec2(width, COMPOSE_BODY_HEIGHT))
+                                .cursor_at_end(caret_at_end),
+                        )
+                    })
+                    .inner
             })
-            .inner
+            .inner;
+        // And its line, over the writing: the field's own state, the way a
+        // stock frame's stroke is — the scheme's border while the writing
+        // waits for the keyboard, and the selection's ink with the cursor in
+        // it (`Visuals::selection`, the slot a focused field's frame reads).
+        let visuals = ui.style().interact(&field);
+        let stroke = if field.has_focus() {
+            ui.visuals().selection.stroke
+        } else {
+            visuals.bg_stroke
+        };
+        ui.painter()
+            .rect_stroke(area, corner_radius, stroke, egui::StrokeKind::Inside);
+        field
     })
     .inner
 }
@@ -10213,17 +10246,19 @@ fn compose_button(
     response
 }
 
-/// Take the box off the widgets of this `Ui`: no outline, no fill — only the
-/// hover keeps `hover`, which is the one thing that still says a flat control
-/// can be used. It is scoped to the `Ui` it is called on, so the rest of the
-/// form keeps its boxes.
+/// Take the box off the widgets of this `Ui`: no outline, no fill, so what is
+/// drawn in it stands on the surface under it and the box — if the caller
+/// wants one — is the caller's to paint.
 ///
 /// A text box wears its box from two slots of its own rather than the widgets'
 /// — the fill it sits on (`Visuals::text_edit_bg_color`) and, with the
 /// keyboard in it, the stroke of the selection — so both are taken off here
-/// too: a flat field is flat focused and unfocused alike. A combo reads
-/// neither, so the From list loses nothing by it.
-fn flatten_widgets(ui: &mut egui::Ui, hover: egui::Color32) {
+/// too: a field whose box is drawn by hand is flat focused and unfocused
+/// alike. A combo reads neither, so the From list loses nothing by it.
+///
+/// It is scoped to the `Ui` it is called on, so the rest of the form keeps its
+/// boxes.
+fn take_box_off(ui: &mut egui::Ui) {
     let visuals = ui.visuals_mut();
     visuals.text_edit_bg_color = Some(egui::Color32::TRANSPARENT);
     visuals.selection.stroke = egui::Stroke::NONE;
@@ -10237,6 +10272,16 @@ fn flatten_widgets(ui: &mut egui::Ui, hover: egui::Color32) {
         state.bg_stroke = egui::Stroke::NONE;
         state.weak_bg_fill = egui::Color32::TRANSPARENT;
     }
+}
+
+/// `take_box_off`, and the hover the flat rows keep: a control drawn as a line
+/// of text rather than as a box still says it can be used by filling under the
+/// pointer — the one thing left of a widget's own look. The answer's From list
+/// and its own address lines are drawn with it (`compose_card`), and the
+/// writing area's box is drawn by hand with the other (`compose_body`).
+fn flatten_widgets(ui: &mut egui::Ui, hover: egui::Color32) {
+    take_box_off(ui);
+    let widgets = &mut ui.visuals_mut().widgets;
     widgets.hovered.weak_bg_fill = hover;
     widgets.active.weak_bg_fill = hover;
     widgets.open.weak_bg_fill = hover;
@@ -17821,6 +17866,38 @@ mod tests {
         three_point_paths(shapes, area, false)
     }
 
+    /// The boxes a frame drew a line around, inside `area`: the rounded rects
+    /// with a stroke on them, which is what a box drawn by hand is — the
+    /// writing area's border (`compose_body`) and the outline buttons' own.
+    /// A fill is a rect without one, and a glyph is a path or a segment
+    /// (`stroke_bounds`).
+    fn stroked_boxes_in(
+        shapes: &[egui::epaint::ClippedShape],
+        area: egui::Rect,
+    ) -> Vec<egui::Rect> {
+        let mut out = Vec::new();
+        for clipped in shapes {
+            collect_stroked_boxes(&clipped.shape, area, &mut out);
+        }
+        out
+    }
+
+    fn collect_stroked_boxes(shape: &egui::Shape, area: egui::Rect, out: &mut Vec<egui::Rect>) {
+        match shape {
+            egui::Shape::Rect(rect) if rect.stroke.width > 0.0 => {
+                if area.contains_rect(rect.rect) {
+                    out.push(rect.rect);
+                }
+            }
+            egui::Shape::Vec(shapes) => {
+                for shape in shapes {
+                    collect_stroked_boxes(shape, area, out);
+                }
+            }
+            _ => {}
+        }
+    }
+
     /// The three-point paths a frame drew inside `area`, as the points each was
     /// drawn through: with `unfilled`, the line drawings — the answer's
     /// chevrons — and without it the filled ones, which a three-point path can
@@ -18115,7 +18192,8 @@ mod tests {
     /// than the field column the labelled rows use, so the mail being written
     /// is as wide as the card will hold. The box still stops at that height
     /// when the mail outgrows it — that is the scroll area's own `max_height`
-    /// — and only the box's frame, not the card, takes the extra height.
+    /// — and what it holds scrolls under the box rather than the box growing
+    /// with it (`compose_body`).
     #[test]
     fn the_answers_body_fills_the_writing_area() {
         let ctx = egui::Context::default();
@@ -18181,6 +18259,53 @@ mod tests {
         assert!(
             (answer.bottom() - bottom - CONTENT_PADDING.y).abs() < 0.5,
             "the card closes under the buttons: card {answer:?} of {buttons:?}"
+        );
+    }
+
+    /// The writing area's box is the card's, not the text's: it stands on the
+    /// room the card gives the body — `COMPOSE_BODY_HEIGHT` of it — with its
+    /// line drawn on all four sides of that box, however long the mail is. The
+    /// fixtures' answers quote one line, but an answer quotes a *mail*, and a
+    /// text edit's own frame follows what it holds: a frame taller than the
+    /// viewport runs its ends outside the room, where the scroll takes them —
+    /// the top out of sight after a scroll down, the bottom before one.
+    #[test]
+    fn the_answers_body_box_is_the_writing_area_and_not_the_mail() {
+        let ctx = egui::Context::default();
+        crate::fonts::install(&ctx, None, None);
+        let mut app = app_with_messages(&ctx, 1);
+        app.selected_message = Some("0".to_string());
+        run_app_frame(&ctx, &mut app, Vec::new());
+        click_at(&ctx, &mut app, header_action_center(4));
+        // A mail longer than the room the card gives it: what a quoted mail
+        // is, and what no fixture's own answer is.
+        app.compose.as_mut().expect("the reply opened a draft").body =
+            (0..60).map(|line| format!("> line {line}\n")).collect();
+        for _ in 0..2 {
+            run_app_frame(&ctx, &mut app, Vec::new());
+        }
+
+        let shapes = frame_shapes_at(&ctx, &mut app, 1400.0);
+        let answer = *pane_cards(&ctx, &mut app)
+            .last()
+            .expect("the answer is a card of the pane");
+        // The writing area is the one field the card draws as a box: the
+        // scheme's own input fill. It is looked for as the box the card's
+        // middle sits in, so a box that grew with the mail is found too —
+        // which is what the field's own frame used to be — and is measured
+        // below.
+        let body = *fills_in_color(&shapes, theme::of(&ctx).input)
+            .iter()
+            .find(|rect| rect.contains(answer.center()))
+            .expect("the body is on the card");
+        assert!(
+            (body.height() - COMPOSE_BODY_HEIGHT).abs() < 1.0,
+            "the box is the writing area, not the mail: {body:?}"
+        );
+        let boxes = stroked_boxes_in(&shapes, answer);
+        assert!(
+            boxes.contains(&body),
+            "and its line is drawn on that box: {boxes:?} of {body:?}"
         );
     }
 

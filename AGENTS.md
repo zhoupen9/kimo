@@ -1361,6 +1361,15 @@ Event (mpsc) ──► drain_events() at frame start ──► merge into Accoun
   popup keeps the form’s field column), not the dozen lines an empty draft
   needs — so the row under it is never read across a band of the card’s own
   surface and the mail being written is as wide as the card will hold. **The
+  box is the card’s, not the text’s** (`compose_body`): a text edit draws its
+  own frame about what it holds, and an answer holds a quoted mail — more
+  text than the `COMPOSE_BODY_HEIGHT` viewport holds — so a frame of the
+  field’s own would run past the room at both ends and go where the scroll
+  goes: its top out of sight after a scroll down, its bottom out of sight
+  before one, which reads as a box with two sides. The fill and the line are
+  painted here instead, in the viewport’s own rect, the line answering the
+  keyboard the way every field’s frame does (`Visuals::selection`), and the
+  field is given no frame of its own (`take_box_off`). **The
   area is claimed outright** (`compose_body`’s `scope_builder` over a rect of
   its own), because a window too short for the card is the pane’s to scroll:
   a scroll area left to the room under the To row is squeezed to a few lines
