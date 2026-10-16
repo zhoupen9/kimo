@@ -1949,9 +1949,9 @@ Do not "fix" these casually — they are known:
   **The flip is unconditional**, so a mid-tone above half lightness comes back
   *darker* than it went in: `color: red` (`#FF0000`, l 0.63) is drawn
   `#9F0000`, which on the dark card is less readable than the red was — lifting
-  instead of flipping is a one-line change if the owner wants it. Blitz mode
-  adapts nothing: it draws the sender's page as the sender wrote it, transparent
-  background and all.
+  instead of flipping is a one-line change if the owner wants it. **Blitz
+  transforms nothing at all** — it draws the sender's page, on a paper of its own
+  (see the next bullet but one).
 - Blitz renders tables in the *separate* borders model: `blitz_render`'s
   `COMPAT_CSS` overrides `border-collapse` because blitz's collapsing paints
   the first cell's border width/colour across the whole table — a 3px dark
@@ -1960,6 +1960,26 @@ Do not "fix" these casually — they are known:
   cell borders do not merge (a 1px border on both sides of a shared edge draws
   2px), and `cellspacing` stays 0 unless the mail sets `border-spacing` in
   CSS. Fixing this properly means fixing blitz, not this workaround.
+- **A Blitz page is drawn on a paper** (`draw_blitz_page`, the pane's own
+  doing — nothing in the render path is touched): the mail's colours are never
+  transformed, but a mail that declares no background of its own would otherwise
+  be composited straight onto the pane's card, and in the dark theme that is the
+  sender's `#000000` on `#24272E`, 1.4:1. So the pane fills the page box with a
+  paper before it blits the raster: **white** by default, and switchable per mail
+  from the contrast cell at the inner end of the mail head's action run (the
+  sixth cell, `header_action_center(5)`; `Paper`, `KimoApp::blitz_paper`,
+  `toggle_blitz_paper`). White is the default and is *not* stored, so the map
+  holds exactly the mails the reader changed, and only for the session — nothing
+  goes to `settings.json`. A mail that **does** declare a background keeps it:
+  `blitz-paint`'s `paint_scene` resolves the root element's background, else
+  `body`'s, and fills the whole page with it, so the raster is opaque across the
+  page and the paper behind it never shows. That is also why the cell is not
+  hidden for such a mail — nothing in Kimo reads the mail's CSS to decide.
+  `BLITZ_PAPER_DARK` is the dark scheme's own `content` surface, and the paper
+  is deliberately not part of `blitz_key`: flipping one repaints a frame and
+  starts no render. The cell is drawn only where a Blitz page is (`html_renderer`
+  is Blitz and the mail has an HTML body), so Simple mode and plain-text mail
+  have none.
 - Blitz mode is a raster: text is not selectable, links are clickable boxes
   (from `get_client_bounding_rect`), form controls are inert, and mail with a
   fixed-width layout is laid out at its own width and scaled down into the

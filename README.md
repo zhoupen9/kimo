@@ -45,7 +45,9 @@ rustls with the `ring` crypto provider and Mozilla's root certificates.
   dialog asks where to put it
 - Search over the cached mail (SQLite FTS5 with a CJK bigram index), and two
   HTML renderers: native egui widgets (the mail's own colors adapted to the
-  light or dark theme), or a Blitz-rasterized page
+  light or dark theme), or a Blitz-rasterized page — the sender's page on white
+  paper, or on the mail's own background, with a light/dark paper switch on the
+  mail's header
 - Offline-first: accounts and messages live in one SQLite database,
   `~/.local/share/kimo/mail.db`; UI preferences in
   `~/.config/kimo/settings.json`

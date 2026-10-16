@@ -95,6 +95,40 @@ impl HtmlRenderer {
     }
 }
 
+/// Which paper a mail's Blitz page is drawn on, when the reader has said so.
+///
+/// White is the paper mail is written for and the default; `Dark` is the
+/// surface a reader who does not want white asks for. The choice is per mail and
+/// lasts the session — nothing about it is written to `settings.json` — and it
+/// only ever shows where the mail itself painted nothing: a mail that declares an
+/// html or body background has it painted across the whole page by the renderer
+/// (see `draw_blitz_page`).
+#[derive(Clone, Copy, PartialEq, Eq, Default, Debug)]
+enum Paper {
+    #[default]
+    White,
+    Dark,
+}
+
+impl Paper {
+    /// The colour the pane fills the page with before the mail's own raster.
+    fn color(self) -> egui::Color32 {
+        match self {
+            Paper::White => egui::Color32::WHITE,
+            Paper::Dark => BLITZ_PAPER_DARK,
+        }
+    }
+
+    /// What the click on the mail's paper cell would do, which is what the cell
+    /// says — the way the flag cell says "Unflag…" while the flag stands.
+    fn tooltip(self) -> &'static str {
+        match self {
+            Paper::White => "Use a dark paper for this mail",
+            Paper::Dark => "Use white paper for this mail",
+        }
+    }
+}
+
 /// Pages of the preferences modal.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum PrefsTab {
@@ -787,6 +821,11 @@ pub struct KimoApp {
     /// drags and compositor resize animations move the geometry every frame;
     /// see `GEOMETRY_SETTLE`.
     pending_blitz_key: Option<(String, Instant)>,
+    /// The paper a mail's Blitz page is drawn on, for the mails the reader has
+    /// switched away from white. The map holds only those: a mail switched back
+    /// takes its entry with it, so what is here is exactly the list of papers
+    /// that differ from the default, and nothing about it is persisted.
+    blitz_paper: HashMap<MailKey, Paper>,
     /// The built-in renderer's copy of the mail on screen: the parsed body and
     /// the width it is laid out for. See [`BodyCache`].
     body: BodyCache,
@@ -2112,6 +2151,7 @@ impl KimoApp {
             blitz_order: Vec::new(),
             blitz_cancel: crate::blitz_render::Cancellation::default(),
             pending_blitz_key: None,
+            blitz_paper: HashMap::new(),
             body: BodyCache::default(),
             scrolled_message: None,
             list_column: egui::Rect::ZERO,
@@ -2943,9 +2983,11 @@ impl KimoApp {
     }
 
     /// Drop every cached Blitz page belonging to an account (keys start
-    /// with its id and a `/`, so `work` cannot match `work-2`).
+    /// with its id and a `/`, so `work` cannot match `work-2`) — and the papers
+    /// its mails were switched to, which are no mail's any more.
     fn forget_blitz_pages(&mut self, account_id: &str) {
         self.forget_blitz_prefix(&format!("{account_id}/"));
+        self.blitz_paper.retain(|key, _| key.account != account_id);
     }
 
     /// Drop the cached pages of one message. The key a page is stored under is
@@ -3177,6 +3219,27 @@ impl KimoApp {
         }
     }
 
+    /// Which paper this mail's Blitz page is drawn on: white unless the reader
+    /// has switched this one to the dark surface.
+    fn paper_of(&self, key: &MailKey) -> Paper {
+        self.blitz_paper.get(key).copied().unwrap_or_default()
+    }
+
+    /// Switch one mail's paper between white and the dark surface. Nothing else
+    /// depends on it — not the render, whose key has no paper in it, and not the
+    /// mail, whose own background the renderer paints over this either way — so
+    /// the click only has to ask for the next frame.
+    fn toggle_blitz_paper(&mut self, key: &MailKey) {
+        match self.paper_of(key) {
+            Paper::White => {
+                self.blitz_paper.insert(key.clone(), Paper::Dark);
+            }
+            Paper::Dark => {
+                self.blitz_paper.remove(key);
+            }
+        }
+    }
+
     /// Reading pane in Blitz mode: request a render if this message and
     /// geometry have none yet, then blit the finished page.
     fn blitz_view(&mut self, ui: &mut egui::Ui, msg: &MailMessage, html: &str) {
@@ -3217,8 +3280,14 @@ impl KimoApp {
         }
 
         let mut retry = false;
+        // The paper is the pane's, not the page's: the render key has no paper
+        // in it, so switching one repaints this frame and starts no work.
+        let paper = self
+            .pane_mail_key(&msg.uid)
+            .map(|key| self.paper_of(&key))
+            .unwrap_or_default();
         match self.blitz_pages.get(&key) {
-            Some(BlitzPage::Ready(page)) => draw_blitz_page(ui, page),
+            Some(BlitzPage::Ready(page)) => draw_blitz_page(ui, page, paper.color()),
             Some(BlitzPage::Failed(error)) => {
                 ui.vertical_centered(|ui| {
                     ui.add_space(24.0);
@@ -7624,6 +7693,29 @@ impl KimoApp {
                         }
                     }
                 }
+                // The paper cell, when this card is drawing a Blitz page: the
+                // one control on the head that is about the *view* rather than
+                // about the mail, which is why it is drawn last — it sits at the
+                // run's inner end, nearest the sender, and the five mail actions
+                // keep their order with delete outermost, as the title bar has
+                // it. A mail whose own HTML paints a background is not affected
+                // by it (the renderer paints that over the paper), and the cell
+                // is not hidden for one: nothing here reads the mail's CSS.
+                if self.html_renderer == HtmlRenderer::Blitz && msg.body_html.is_some() {
+                    let key = self.pane_mail_key(&msg.uid);
+                    let paper = key
+                        .as_ref()
+                        .map(|key| self.paper_of(key))
+                        .unwrap_or_default();
+                    let response = card_action_button(ui, true);
+                    let color = card_action_color(scheme, response.hovered());
+                    paint_paper_icon(ui.painter(), response.rect, color, CARD_ACTION_GLYPH);
+                    if response.on_hover_text(paper.tooltip()).clicked() {
+                        if let Some(key) = key {
+                            self.toggle_blitz_paper(&key);
+                        }
+                    }
+                }
                 // What the actions leave of the row is the sender.
                 ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
                     ui.spacing_mut().item_spacing.x = AVATAR_TEXT_GAP;
@@ -9468,6 +9560,11 @@ fn titlebar_fill(ui: &egui::Ui, rect: egui::Rect, fill: egui::Color32) {
 const BLITZ_PAGE_MARGIN: f32 = 8.0;
 const BLITZ_WIDTH_STEP: u32 = 32;
 const BLITZ_PAGES_CACHED: usize = 2;
+/// The paper a Blitz page is drawn on when the mail declares no background of its
+/// own and the reader has switched this mail away from white: the dark scheme's
+/// content surface, so a dark paper is the surface the app draws mail on
+/// elsewhere rather than a colour of its own.
+const BLITZ_PAPER_DARK: egui::Color32 = crate::theme::DARK.content;
 
 /// How long the pane geometry must hold still before the reading pane lays the
 /// mail out for it again. Dragging the splitter, or a compositor animating a
@@ -9691,7 +9788,13 @@ fn quantize(value: f32, step: u32) -> u32 {
 }
 
 /// Blit a finished Blitz page and re-attach its links as clickable boxes.
-fn draw_blitz_page(ui: &mut egui::Ui, page: &RasterizedPage) {
+///
+/// The page is drawn on `paper`: a mail that declares an html or body
+/// background has it painted across the whole page by the renderer's own canvas
+/// fill (`blitz-paint`'s `paint_scene`), which covers what is drawn here, so
+/// this shows only where the mail painted nothing at all — which, for a mail
+/// written for white paper, is most of it.
+fn draw_blitz_page(ui: &mut egui::Ui, page: &RasterizedPage, paper: egui::Color32) {
     if page.truncated {
         ui.label(
             egui::RichText::new("This message is too tall to render in full — the end is missing.")
@@ -9710,6 +9813,13 @@ fn draw_blitz_page(ui: &mut egui::Ui, page: &RasterizedPage) {
     let origin = egui::pos2(
         space.left() + BLITZ_PAGE_MARGIN,
         space.top() + BLITZ_PAGE_MARGIN,
+    );
+    // Under the tiles, because a painter draws in the order it is given: the
+    // paper is the page box, scaled with the page like the tiles are.
+    ui.painter().rect_filled(
+        egui::Rect::from_min_size(origin, page.size * fit),
+        0.0,
+        paper,
     );
     let uv = egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
     for tile in &page.tiles {
@@ -11623,6 +11733,27 @@ fn paint_compose_icon(p: &egui::Painter, rect: egui::Rect, color: egui::Color32)
 
     // The pen: its nib inside the page, its tip out past the corner.
     p.add(egui::Shape::line(vec![g(9.2, 17.2), g(21.6, 4.8)], stroke));
+}
+
+/// Paper: the contrast mark — a ring with one half of it filled, which is what
+/// the cell switches between. Drawn at `size` like the card's other glyphs.
+fn paint_paper_icon(p: &egui::Painter, rect: egui::Rect, color: egui::Color32, size: f32) {
+    let centre = outline_point(rect.center(), 12.0, 12.0, size);
+    let radius = size * 8.0 / 24.0;
+    p.circle_stroke(centre, radius, egui::Stroke::new(1.5_f32, color));
+
+    // The right half, filled: the arc from the ring's top round to its bottom,
+    // closed through the centre, so what is painted is a half disc rather than a
+    // polygon the ring would have to be cut out of.
+    const STEPS: usize = 12;
+    let mut half = Vec::with_capacity(STEPS + 2);
+    half.push(centre);
+    for step in 0..=STEPS {
+        let angle =
+            -std::f32::consts::FRAC_PI_2 + std::f32::consts::PI * step as f32 / STEPS as f32;
+        half.push(centre + egui::vec2(angle.cos(), angle.sin()) * radius);
+    }
+    p.add(egui::Shape::convex_polygon(half, color, egui::Stroke::NONE));
 }
 
 /// Reply: an arrow curving back to the left, its shaft turning down at the
@@ -17217,6 +17348,257 @@ mod tests {
         assert!(!blitz_page_reusable(864.0, 900.0));
     }
 
+    /// Give one of `app_with_messages`' mails an HTML body, so the pane has a
+    /// page for Blitz to draw.
+    fn html_body(app: &mut KimoApp, index: usize) {
+        app.states
+            .get_mut("acct")
+            .unwrap()
+            .mailbox
+            .folders
+            .first_mut()
+            .unwrap()
+            .messages[index]
+            .body_html = Some("<p>The mail.</p>".to_string());
+    }
+
+    /// A finished Blitz page for a test: one tile, and the page box the test
+    /// knows. Answers the tile's texture too, so a frame can be asked where the
+    /// page was drawn relative to the paper under it. `fill` is what the mail
+    /// "painted" — an opaque grey to stand in for a page, `TRANSPARENT` for a
+    /// mail that painted nothing, which is the case the paper exists for.
+    fn ready_blitz_page(
+        ctx: &egui::Context,
+        size: egui::Vec2,
+        fill: egui::Color32,
+    ) -> (BlitzPage, egui::TextureId) {
+        let [r, g, b, a] = fill.to_array();
+        let pixels = [r, g, b, a].repeat(4);
+        let image = egui::ColorImage::from_rgba_premultiplied([2, 2], &pixels);
+        let texture = ctx.load_texture("test-blitz-tile", image, egui::TextureOptions::LINEAR);
+        let tile = texture.id();
+        let page = BlitzPage::Ready(RasterizedPage {
+            tiles: vec![RasterTile {
+                texture,
+                offset: egui::Vec2::ZERO,
+                size,
+            }],
+            size,
+            links: Vec::new(),
+            truncated: false,
+        });
+        (page, tile)
+    }
+
+    /// Show one mail in Blitz mode with a page already rendered for it, and answer
+    /// the frame that drew it. The pane is emptied first so the first frame
+    /// records the key this geometry wants (`pending_blitz_key`); the page is
+    /// then put under exactly that key, and the second frame draws it instead of
+    /// starting a render of its own — which is what lets a test look at a Blitz
+    /// pane without running the engine.
+    fn blitz_frame_with_page(
+        ctx: &egui::Context,
+        app: &mut KimoApp,
+        uid: &str,
+        size: egui::Vec2,
+    ) -> (Vec<egui::epaint::ClippedShape>, egui::TextureId) {
+        app.html_renderer = HtmlRenderer::Blitz;
+        app.selected_message = Some(uid.to_string());
+        app.blitz_pages.clear();
+        app.blitz_order.clear();
+        app.pending_blitz_key = None;
+        frame_shapes_at(ctx, app, 1400.0);
+        let (key, _) = app
+            .pending_blitz_key
+            .clone()
+            .expect("the pane asks for a render of this mail");
+        let (page, tile) = ready_blitz_page(ctx, size, egui::Color32::from_gray(128));
+        app.blitz_pages.insert(key, page);
+        (frame_shapes_at(ctx, app, 1400.0), tile)
+    }
+
+    /// True when a frame filled a rectangle of exactly the page's size in this
+    /// colour: the paper the Blitz pane drew under the mail.
+    fn paper_fill(
+        shapes: &[egui::epaint::ClippedShape],
+        size: egui::Vec2,
+        color: egui::Color32,
+    ) -> bool {
+        fills_in_color(shapes, color)
+            .into_iter()
+            .any(|rect| (rect.size() - size).length() < 0.5)
+    }
+
+    /// Every shape a frame drew, depth first, in the order it drew them: what the
+    /// paper test needs in order to ask whether the paper went under the page.
+    fn shapes_in_order(shapes: &[egui::epaint::ClippedShape]) -> Vec<egui::Shape> {
+        fn walk(shape: &egui::Shape, out: &mut Vec<egui::Shape>) {
+            match shape {
+                egui::Shape::Vec(inner) => {
+                    for shape in inner {
+                        walk(shape, out);
+                    }
+                }
+                other => out.push(other.clone()),
+            }
+        }
+        let mut out = Vec::new();
+        for clipped in shapes {
+            walk(&clipped.shape, &mut out);
+        }
+        out
+    }
+
+    /// A Blitz page is drawn on a paper, and the paper is *under* the mail: white
+    /// by default, so a mail written for white paper is readable in either theme
+    /// — while a mail that paints a background of its own has it painted across
+    /// the whole page by the renderer, over this.
+    #[test]
+    fn a_blitz_page_is_drawn_on_white_paper_under_the_mail() {
+        let ctx = egui::Context::default();
+        crate::fonts::install(&ctx, None, None);
+        let mut app = app_with_messages(&ctx, 1);
+        html_body(&mut app, 0);
+
+        let page = egui::vec2(400.0, 200.0);
+        let (shapes, tile) = blitz_frame_with_page(&ctx, &mut app, "0", page);
+        assert!(
+            paper_fill(&shapes, page, egui::Color32::WHITE),
+            "the page is drawn on white paper"
+        );
+
+        let ordered = shapes_in_order(&shapes);
+        let paper = ordered.iter().position(|shape| {
+            matches!(shape, egui::Shape::Rect(rect)
+                if rect.fill == egui::Color32::WHITE && (rect.rect.size() - page).length() < 0.5)
+        });
+        let mail = ordered
+            .iter()
+            .position(|shape| matches!(shape, egui::Shape::Mesh(mesh) if mesh.texture_id == tile));
+        assert!(
+            matches!((paper, mail), (Some(paper), Some(mail)) if paper < mail),
+            "the paper goes under the page: paper {paper:?}, page {mail:?}"
+        );
+    }
+
+    /// The paper cell: the sixth of the head's run, and the one control there
+    /// that is about the view rather than about the mail. A click flips that one
+    /// mail's paper — the mail beside it keeps its own — and costs no render: the
+    /// page in the cache is the same page, drawn on the other paper.
+    #[test]
+    fn the_paper_cell_flips_one_mails_paper_and_nothing_else() {
+        let ctx = egui::Context::default();
+        crate::fonts::install(&ctx, None, None);
+        let mut app = app_with_messages(&ctx, 2);
+        html_body(&mut app, 0);
+        html_body(&mut app, 1);
+
+        let page = egui::vec2(400.0, 200.0);
+        let (shapes, _) = blitz_frame_with_page(&ctx, &mut app, "0", page);
+        assert!(paper_fill(&shapes, page, egui::Color32::WHITE));
+
+        let pages = app.blitz_pages.len();
+        click_at(&ctx, &mut app, header_action_center(5));
+        let shapes = frame_shapes_at(&ctx, &mut app, 1400.0);
+        assert!(
+            paper_fill(&shapes, page, BLITZ_PAPER_DARK),
+            "the click drew this mail on the dark surface"
+        );
+        assert!(
+            !paper_fill(&shapes, page, egui::Color32::WHITE),
+            "and the white paper is gone"
+        );
+        assert_eq!(
+            app.blitz_pages.len(),
+            pages,
+            "the flip repainted the frame and started no render"
+        );
+
+        // The mail next to it is its own: the paper is per mail.
+        let (shapes, _) = blitz_frame_with_page(&ctx, &mut app, "1", page);
+        assert!(paper_fill(&shapes, page, egui::Color32::WHITE));
+
+        // And the first keeps what it was given, for the session.
+        let (shapes, _) = blitz_frame_with_page(&ctx, &mut app, "0", page);
+        assert!(paper_fill(&shapes, page, BLITZ_PAPER_DARK));
+
+        // Clicking again puts it back on the default, which is not a record.
+        click_at(&ctx, &mut app, header_action_center(5));
+        let shapes = frame_shapes_at(&ctx, &mut app, 1400.0);
+        assert!(paper_fill(&shapes, page, egui::Color32::WHITE));
+        assert!(
+            app.blitz_paper.is_empty(),
+            "white is the default, not an entry"
+        );
+    }
+
+    /// The cell is the Blitz page's own: Simple mode draws the mail as widgets on
+    /// the card and has no paper to switch, and a plain-text mail has no page at
+    /// all — so neither draws the cell.
+    #[test]
+    fn the_paper_cell_is_only_drawn_for_a_blitz_page() {
+        let ctx = egui::Context::default();
+        crate::fonts::install(&ctx, None, None);
+        let mut app = app_with_messages(&ctx, 2);
+        html_body(&mut app, 0);
+        app.selected_message = Some("0".to_string());
+        run_app_frame(&ctx, &mut app, Vec::new());
+
+        let cell = header_action_center(5);
+        assert_eq!(app.html_renderer, HtmlRenderer::Simple);
+        assert!(
+            fill_under_the_pointer(&ctx, &mut app, 1400.0, cell, CARD_ACTION_SIZE).is_none(),
+            "Simple mode draws no paper cell"
+        );
+
+        app.html_renderer = HtmlRenderer::Blitz;
+        app.selected_message = Some("1".to_string());
+        run_app_frame(&ctx, &mut app, Vec::new());
+        assert!(
+            fill_under_the_pointer(&ctx, &mut app, 1400.0, cell, CARD_ACTION_SIZE).is_none(),
+            "a plain-text mail has no page to draw on"
+        );
+
+        app.selected_message = Some("0".to_string());
+        run_app_frame(&ctx, &mut app, Vec::new());
+        assert!(
+            fill_under_the_pointer(&ctx, &mut app, 1400.0, cell, CARD_ACTION_SIZE).is_some(),
+            "the mail drawn by Blitz carries the cell"
+        );
+    }
+
+    /// The paper map holds only the mails the reader has changed, and loses an
+    /// account's entries with that account's pages.
+    #[test]
+    fn the_paper_map_holds_only_what_the_reader_changed() {
+        let ctx = egui::Context::default();
+        crate::fonts::install(&ctx, None, None);
+        let mut app = app_with_messages(&ctx, 1);
+        let key = MailKey::new("acct", "INBOX", "0");
+
+        assert_eq!(app.paper_of(&key), Paper::White, "white is the default");
+        app.toggle_blitz_paper(&key);
+        assert_eq!(app.paper_of(&key), Paper::Dark);
+        assert_eq!(app.blitz_paper.len(), 1);
+        app.toggle_blitz_paper(&key);
+        assert_eq!(app.paper_of(&key), Paper::White);
+        assert!(
+            app.blitz_paper.is_empty(),
+            "a mail switched back takes its entry with it"
+        );
+
+        app.toggle_blitz_paper(&key);
+        app.forget_blitz_pages("acct");
+        assert!(
+            app.blitz_paper.is_empty(),
+            "an account's papers go with its pages"
+        );
+
+        assert_eq!(Paper::White.color(), egui::Color32::WHITE);
+        assert_eq!(Paper::Dark.color(), BLITZ_PAPER_DARK);
+        assert_ne!(Paper::White.tooltip(), Paper::Dark.tooltip());
+    }
+
     #[test]
     fn quantize_rounds_up_to_geometry_steps() {
         assert_eq!(quantize(0.0, 32), 32);
@@ -19694,6 +20076,38 @@ mod tests {
         }
         shot(&mut app, "ui-appearance.png", &mut textures);
         app.show_preferences = false;
+
+        // And the Blitz page's paper: the sender's page on white, and on the dark
+        // surface after the contrast cell on the mail's head. The page is a test
+        // one — a real render is a worker's job, not a dump's — and its tile is
+        // transparent, the way a mail that paints no background of its own
+        // rasterizes, so what these two shots show is the paper itself.
+        app.html_renderer = HtmlRenderer::Blitz;
+        {
+            let state = app.states.get_mut("acct").expect("the fixture account");
+            state.mailbox.folders[0].messages[1].body_html = Some("<p>The mail.</p>".to_string());
+        }
+        app.blitz_pages.clear();
+        app.blitz_order.clear();
+        app.pending_blitz_key = None;
+        for _ in 0..2 {
+            collect_frame(&ctx, &mut app, &mut textures, Vec::new());
+        }
+        if let Some((key, _)) = app.pending_blitz_key.clone() {
+            let (page, _) =
+                ready_blitz_page(&ctx, egui::vec2(900.0, 260.0), egui::Color32::TRANSPARENT);
+            app.blitz_pages.insert(key, page);
+        }
+        for _ in 0..2 {
+            collect_frame(&ctx, &mut app, &mut textures, Vec::new());
+        }
+        shot(&mut app, "ui-blitz-paper.png", &mut textures);
+        dump_click(&ctx, &mut app, &mut textures, header_action_center(5));
+        for _ in 0..2 {
+            collect_frame(&ctx, &mut app, &mut textures, Vec::new());
+        }
+        shot(&mut app, "ui-blitz-paper-dark.png", &mut textures);
+        app.html_renderer = HtmlRenderer::Simple;
     }
 
     /// The dump canvas: the height every picture is drawn at, and the width the
