@@ -62,15 +62,14 @@ Read when touching `src/main.rs`, `src/gpu.rs`, `src/glass.rs`, the title bar, t
   scroll offsets (`KimoApp::list_scroll` and `mail_scroll`, each captured where
   its scroll area is built), so scrolling either of them back to the top docks
   the bar again rather than snapping it, and a column with nothing to scroll —
-  or no list and no mail at all — leaves it docked. Inside
-  the bar, left to right: the application icon (the brand, and the leftmost
-  thing in the bar, kept `TITLEBAR_EDGE_MARGIN` clear of the window's edge
-  rather than flush against it: the same
-  embedded PNG the tray serves, downscaled once at startup because egui has
-  no mipmaps to filter a 256 px source down to 18 pt), the nav collapse
+  or no list and no mail at all — leaves it docked. The brand is not in the
+  bar: the mark heads the navigation column instead (see **The navigation
+  column** below), and the room the bar gives its own content starts at
+  `TITLEBAR_LEFT_INSET` rather than at the window's edge. Inside
+  the bar, left to right: the nav collapse
   toggle, the compose button (the one mail action that needs no mail open, so
   it sits beside the toggle rather than with the other actions over the reading
-  pane; **those three are the bar's first group**, and the one thing in the bar
+  pane; **those two are the bar's first group**, and the one thing in the bar
   that never gives way — compose is always available, so it is always there; its
   glyph is a page with a pen writing on it
   — `paint_compose_icon`, one of the bar's own 24×24 outlines like the mail
@@ -99,7 +98,7 @@ Read when touching `src/main.rs`, `src/gpu.rs`, `src/glass.rs`, the title bar, t
   room left over (`titlebar_anchors`): the box starts at the message list's own
   left edge and the run at the reading pane's, so each sits over the column it
   belongs to and follows that column's splitter — and each is clamped clear of
-  the first group, which is what keeps the box off the brand when the navigation
+  the first group, which is what keeps the box off the toggle when the navigation
   is collapsed and the list runs to the window's own edge. The box is the one
   thing the bar gives up as a window narrows: its own width, then its floor
   (`TITLEBAR_SEARCH_FLOOR`), then nothing, with the search popup still a Ctrl+F
@@ -213,7 +212,7 @@ Read when touching `src/main.rs`, `src/gpu.rs`, `src/glass.rs`, the title bar, t
   minimize / maximize / close. `titlebar_rects` carves the bar into the room for
   its own content (`content`: everything left of the sync cell) and the fixed
   right end — the sync cell, a gap, the cog, a gap, the three window controls,
-  ending `TITLEBAR_EDGE_MARGIN` short of the window's edge, the count coming
+  ending `TITLEBAR_RIGHT_MARGIN` short of the window's edge, the count coming
   from `titlebar`'s own button list so the two cannot drift — while the two
   middle groups are placed from the columns below them (`titlebar_anchors`) —
   the box and the filter cell as one group, the pane's run as another — which is
@@ -423,6 +422,17 @@ Read when touching `src/main.rs`, `src/gpu.rs`, `src/glass.rs`, the title bar, t
 
 ## The navigation column
 
+- The column's first element is its own header (`brand_header`): the
+  application mark — the same embedded PNG the tray serves, downscaled once at
+  startup because egui has no mipmaps to filter a 256 px source down to the
+  square it is drawn at, `BRAND_ICON_SIZE` — the name
+  `BRAND_NAME` beside it, and after that the version the crate was built
+  as (`BRAND_VERSION`, `env!("CARGO_PKG_VERSION")`) in the small,
+  weak text. It is drawn above the column's scroll area rather than in it, so
+  what the window is does not scroll away with what it holds, and it is the one
+  row of the column with nothing to click. **The mark lives here rather than in
+  the title bar**, which is a row of cells and was never a place for a label;
+  the bar keeps the margin the mark used to stand in (`TITLEBAR_LEFT_INSET`).
 - The navigation column is where accounts are switched, which is why the
   title bar has no account menu: every account is a collapsible section
   (`collapsed_accounts` holds the collapsed ids, in memory only), whose header

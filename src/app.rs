@@ -778,8 +778,8 @@ pub struct KimoApp {
     /// second, open glyph. Uploaded once at startup from the embedded PNGs
     /// in `folders::FolderKind::ICONS`.
     folder_icons: HashMap<(FolderKind, bool), egui::TextureHandle>,
-    /// The application icon, drawn at the left of the title bar. `None` only
-    /// if the embedded PNG fails to decode.
+    /// The application mark, drawn at the head of the navigation column.
+    /// `None` only if the embedded PNG fails to decode.
     brand_icon: Option<egui::TextureHandle>,
     /// The frosted backdrop of a floating title bar (see `crate::glass`): the
     /// GL pass is made once, on the first frame the bar floats.
@@ -3633,8 +3633,10 @@ impl KimoApp {
         let content = rects.content;
 
         // --- left group: the actions that belong to the window itself ---
-        // Brand, nav toggle, compose, sync. Laid out from the bar's left edge,
-        // and where it came to is what every other group is placed after.
+        // Nav toggle, compose. Laid out from the bar's left edge, and where it
+        // came to is what every other group is placed after. The brand is not
+        // in the bar any more: the mark, the name and the version head the
+        // navigation column instead (`brand_header`).
         let left_end = ui
             .scope_builder(
                 egui::UiBuilder::new()
@@ -3646,16 +3648,10 @@ impl KimoApp {
                     // `TITLEBAR_BUTTON_GAP` apart exactly as the mail actions and
                     // the window controls do.
                     row.spacing_mut().item_spacing.x = TITLEBAR_BUTTON_GAP;
-                    // Brand first: the application icon is the leftmost
-                    // thing in the bar (the tray embeds the same PNG), the
-                    // edge margin clear of the window's frame.
-                    row.add_space(TITLEBAR_EDGE_MARGIN);
-                    if let Some(icon) = self.brand_icon.clone() {
-                        row.add(
-                            egui::Image::from_texture(&icon)
-                                .fit_to_exact_size(egui::vec2(BRAND_ICON_SIZE, BRAND_ICON_SIZE)),
-                        );
-                    }
+                    // The bar's own left margin, before the first cell: the
+                    // toggle is the leftmost thing in the bar now that the mark
+                    // has moved into the column under it.
+                    row.add_space(TITLEBAR_LEFT_INSET);
 
                     // Nav collapse toggle (hamburger, painted as lines). An
                     // icon cell rather than an `egui::Button`, so it carries no
@@ -4067,7 +4063,7 @@ impl KimoApp {
                     // The list reads from the window's right edge inwards, which
                     // is where the cells are placed from: `buttons[0]` is the
                     // close button, and the run ends
-                    // `TITLEBAR_EDGE_MARGIN` short of the window's corner.
+                    // `TITLEBAR_RIGHT_MARGIN` short of the window's corner.
                     let rect = egui::Rect::from_min_size(
                         egui::pos2(
                             rects.controls.right()
@@ -4256,6 +4252,12 @@ impl KimoApp {
         // The title bar floats over the columns, so this one's content starts
         // below it: what the glass shows here is the panel fill, not folders.
         ui.add_space(TITLEBAR_HEIGHT);
+        // The column's header, before the accounts and outside their scroll
+        // area: the mark, the name and the version — what the window is, which
+        // should not scroll away with what it holds. An empty column is a
+        // header over a sentence rather than a column with nothing in it, so
+        // this stands before the early return below.
+        brand_header(ui, scheme, self.brand_icon.as_ref());
         if self.accounts.is_empty() {
             ui.label("No accounts yet.");
             ui.label(
@@ -9318,15 +9320,23 @@ const ATTACHMENT_LINE_GAP: f32 = 2.0;
 /// inset is the field's left margin, so the text begins after the icon.
 const SEARCH_ICON_INSET: i8 = 22;
 const SEARCH_ICON_SIZE: f32 = 15.0;
-/// Side of the square brand icon at the left of the title bar.
-const BRAND_ICON_SIZE: f32 = 18.0;
-/// How far the bar's content stays clear of the window's own left and right
-/// edges: the brand icon starts this far in — as the row's own first item, the
-/// space added before it — and the window controls end this far short of the
-/// right edge, so the rounded fills at either end are not flush against the
-/// frame. Flush, the mark reads as cropped rather than placed and the close
-/// button's fill reaches the window's corner.
-const TITLEBAR_EDGE_MARGIN: f32 = 10.0;
+/// The name and the version the navigation column's header draws beside the
+/// mark (`brand_header`): the crate's own version, so the two cannot disagree
+/// with the build.
+const BRAND_NAME: &str = "Kimo";
+const BRAND_VERSION: &str = env!("CARGO_PKG_VERSION");
+/// Side of the square mark in that header — a title bar cell's own square
+/// (`TITLEBAR_BUTTON_SIZE`), because it is the one thing the window is known
+/// by and it is drawn at the one size wherever it appears.
+const BRAND_ICON_SIZE: f32 = 32.0;
+/// How far the title bar's first cell starts in from the window's left edge —
+/// the space added before it, as the left group's own first item. Wider than
+/// the margin at the other end, which the window controls keep.
+const TITLEBAR_LEFT_INSET: f32 = 16.0;
+/// How far the window controls end short of the window's own right edge, so the
+/// close button's rounded fill is not flush against the frame — flush, it
+/// reaches the window's corner.
+const TITLEBAR_RIGHT_MARGIN: f32 = 10.0;
 
 /// The compose modal: the width of its card (what the boxes are laid out for),
 /// the label column of its header fields, the height of one of those one-line
@@ -9401,7 +9411,7 @@ fn titlebar_rects(bar: egui::Rect, controls: usize) -> TitlebarRects {
             egui::vec2(width, TITLEBAR_BUTTON_SIZE),
         )
     };
-    let controls_left = bar.right() - TITLEBAR_EDGE_MARGIN - titlebar_cells_width(controls);
+    let controls_left = bar.right() - TITLEBAR_RIGHT_MARGIN - titlebar_cells_width(controls);
     let cog_left = controls_left - TITLEBAR_BUTTON_GAP - TITLEBAR_BUTTON_SIZE;
     let sync_left = cog_left - TITLEBAR_BUTTON_GAP - TITLEBAR_BUTTON_SIZE;
     TitlebarRects {
@@ -9413,7 +9423,7 @@ fn titlebar_rects(bar: egui::Rect, controls: usize) -> TitlebarRects {
         cog: cell(cog_left, TITLEBAR_BUTTON_SIZE),
         controls: cell(
             controls_left,
-            bar.right() - TITLEBAR_EDGE_MARGIN - controls_left,
+            bar.right() - TITLEBAR_RIGHT_MARGIN - controls_left,
         ),
     }
 }
@@ -11105,6 +11115,70 @@ fn paint_row_text(
     }
 }
 
+/// The navigation column's header: the application mark, the name beside it and
+/// the version in the small text after that — what the window is, at the top of
+/// the column the folders are in. It is drawn above the column's scroll area
+/// rather than in it, so the header stays where it is while the accounts scroll
+/// under it, and it is the column's one row with nothing to click: the mark is
+/// a label, not a button.
+fn brand_header(ui: &mut egui::Ui, scheme: ColorScheme, icon: Option<&egui::TextureHandle>) {
+    /// Tall enough for the mark, with a little air above and below it.
+    const ROW_HEIGHT: f32 = BRAND_ICON_SIZE + 8.0;
+    /// Between the mark and the name, and between the name and the version.
+    const NAME_GAP: f32 = 8.0;
+    const VERSION_GAP: f32 = 6.0;
+
+    let (rect, _) = ui.allocate_exact_size(
+        egui::vec2(ui.available_width(), ROW_HEIGHT),
+        egui::Sense::hover(),
+    );
+    if !ui.is_rect_visible(rect) {
+        return;
+    }
+    let mut left = rect.left();
+    if let Some(icon) = icon {
+        let mark = egui::Rect::from_min_size(
+            egui::pos2(left, rect.center().y - BRAND_ICON_SIZE / 2.0),
+            egui::Vec2::splat(BRAND_ICON_SIZE),
+        );
+        // Drawn as it is rather than tinted: this is the application icon, the
+        // same PNG the tray serves, not one of the column's white glyphs.
+        ui.painter().image(
+            icon.id(),
+            mark,
+            egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+            egui::Color32::WHITE,
+        );
+        left = mark.right() + NAME_GAP;
+    }
+
+    // The name at the column's own text size, then the version in the small
+    // one. Each is centred on the row the way every row in the column centres
+    // its text; at these two sizes the baselines land within a point of each
+    // other, which is what keeps the version reading as part of the same line.
+    let body = egui::TextStyle::Body.resolve(ui.style());
+    let name = ui
+        .ctx()
+        .fonts_mut(|fonts| fonts.layout_no_wrap(BRAND_NAME.to_string(), body, scheme.text));
+    ui.painter().galley(
+        egui::pos2(left, rect.center().y - name.size().y / 2.0),
+        name.clone(),
+        scheme.text,
+    );
+    let small = egui::TextStyle::Small.resolve(ui.style());
+    let version = ui.ctx().fonts_mut(|fonts| {
+        fonts.layout_no_wrap(format!("v{BRAND_VERSION}"), small, scheme.text_weak)
+    });
+    ui.painter().galley(
+        egui::pos2(
+            left + name.size().x + VERSION_GAP,
+            rect.center().y - version.size().y / 2.0,
+        ),
+        version,
+        scheme.text_weak,
+    );
+}
+
 /// One row of the folder list: kind icon, name, and the unread count on the
 /// right. The whole row is the click target and carries the selection
 /// highlight — a `selectable_label` would leave the icon outside its own
@@ -11414,9 +11488,10 @@ fn label_row(
     }
 }
 
-/// The application icon for the title bar: the same embedded 256 px PNG the
-/// tray serves, downscaled once here — painting it at 18 pt straight from the
-/// 256 px texture would alias badly, since egui has no mipmaps.
+/// The application mark for the navigation column's header: the same embedded
+/// 256 px PNG the tray serves, downscaled once here — 64 px is a texel per
+/// device pixel at `BRAND_ICON_SIZE` on a 2× display, where the 256 px source
+/// would alias badly instead, since egui has no mipmaps.
 fn load_brand_icon(ctx: &egui::Context) -> Option<egui::TextureHandle> {
     let decoded = image::load_from_memory(crate::tray::APP_PNG)
         .ok()?
@@ -16570,7 +16645,7 @@ mod tests {
             // And while there is room for them, they are in that order: what
             // the right end needs is the sync cell, its gap, the cog, its gap,
             // the three controls and the margin from the window's edge.
-            let right_end = TITLEBAR_EDGE_MARGIN
+            let right_end = TITLEBAR_RIGHT_MARGIN
                 + TITLEBAR_BUTTON_SIZE
                 + TITLEBAR_BUTTON_GAP
                 + TITLEBAR_BUTTON_SIZE
@@ -16599,7 +16674,7 @@ mod tests {
             // reach the corner the compositor cut.
             assert_eq!(
                 rects.controls.right(),
-                bar(width).right() - TITLEBAR_EDGE_MARGIN,
+                bar(width).right() - TITLEBAR_RIGHT_MARGIN,
                 "{width} pt"
             );
         }
@@ -16662,10 +16737,11 @@ mod tests {
         let pitch = TITLEBAR_BUTTON_SIZE + TITLEBAR_BUTTON_GAP;
         let middle = TITLEBAR_HEIGHT / 2.0;
 
-        // The left group: the brand icon, then the nav toggle and compose — the
-        // window's own actions, a cell every pitch after the icon. Sync is not
-        // one of them any more: it stands with the cog at the right end.
-        let first_left = TITLEBAR_EDGE_MARGIN + BRAND_ICON_SIZE + TITLEBAR_BUTTON_GAP;
+        // The left group: the nav toggle and compose — the window's own
+        // actions, a cell every pitch, the first of them the bar's left margin
+        // in from the window's edge. Sync is not one of them any more: it
+        // stands with the cog at the right end.
+        let first_left = TITLEBAR_LEFT_INSET;
         let mut cells: Vec<egui::Pos2> = (0..2)
             .map(|index| {
                 egui::pos2(
@@ -16694,7 +16770,7 @@ mod tests {
         }
 
         // The right end: sync, then the cog, then the three window controls,
-        // which end `TITLEBAR_EDGE_MARGIN` short of the window's own edge.
+        // which end `TITLEBAR_RIGHT_MARGIN` short of the window's own edge.
         cells.push(rects.sync.center());
         cells.push(rects.cog.center());
         for index in 0..3 {
@@ -16726,6 +16802,88 @@ mod tests {
         );
     }
 
+    /// The brand is the navigation column's own header now rather than the
+    /// bar's: the mark at the column's top, the name beside it and the version
+    /// after that in the smaller text — above the first account, and outside
+    /// the column's scroll area, so what the window is does not scroll away
+    /// with what it holds.
+    #[test]
+    fn the_brand_heads_the_navigation_column() {
+        let ctx = egui::Context::default();
+        crate::fonts::install(&ctx, None, None);
+        let mut app = app_with_messages(&ctx, 2);
+        let shapes = frame_shapes_at(&ctx, &mut app, 1400.0);
+        let nav = nav_column(&app);
+
+        // The mark: the column's one image of a title bar cell's size, and
+        // under the bar rather than behind it.
+        let marks: Vec<egui::Rect> = image_rects_of(&shapes, nav)
+            .into_iter()
+            .filter(|rect| (rect.width() - BRAND_ICON_SIZE).abs() < 0.5)
+            .collect();
+        assert_eq!(marks.len(), 1, "one mark heads the column: {marks:?}");
+        assert!(
+            marks[0].top() >= TITLEBAR_HEIGHT,
+            "the mark is under the bar: {:?}",
+            marks[0]
+        );
+
+        // The name and the version on one line beside it: the version the
+        // smaller of the two, after the name, and both on the mark's own line.
+        let name = text_boxes_of(&shapes, nav, BRAND_NAME);
+        let version = text_boxes_of(&shapes, nav, &format!("v{BRAND_VERSION}"));
+        assert_eq!(name.len(), 1, "the name is drawn once: {name:?}");
+        assert_eq!(version.len(), 1, "the version is drawn once: {version:?}");
+        let (name, version) = (name[0], version[0]);
+        assert!(
+            version.height() < name.height(),
+            "the version is the small text: {version:?} of {name:?}"
+        );
+        assert!(
+            version.left() >= name.right() - 0.5,
+            "the version stands after the name: {version:?} of {name:?}"
+        );
+        assert!(
+            marks[0].top() <= name.top() && name.bottom() <= marks[0].bottom(),
+            "the name is on the mark's own line: {name:?} of {:?}",
+            marks[0]
+        );
+
+        // And the header stands over the accounts it heads.
+        let account = text_boxes_of(&shapes, nav, "Test");
+        assert_eq!(account.len(), 1, "the account's own row: {account:?}");
+        assert!(
+            name.bottom() < account[0].top(),
+            "the header is above the first account: {name:?} of {:?}",
+            account[0]
+        );
+    }
+
+    /// The bar keeps no brand: what it draws is cells and glyphs, and its
+    /// leftmost cell is the navigation toggle, the bar's own margin in from the
+    /// window's edge.
+    #[test]
+    fn the_title_bar_keeps_no_brand() {
+        let ctx = egui::Context::default();
+        crate::fonts::install(&ctx, None, None);
+        let mut app = app_with_messages(&ctx, 2);
+        let shapes = frame_shapes_at(&ctx, &mut app, 1400.0);
+        let bar = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1400.0, TITLEBAR_HEIGHT));
+        let images = image_rects_of(&shapes, bar);
+        assert!(images.is_empty(), "the bar draws no image: {images:?}");
+
+        // The toggle's cell is the first thing in the bar, the margin before it
+        // being the bar's own rather than the room a mark needed.
+        let centre = egui::pos2(
+            TITLEBAR_LEFT_INSET + TITLEBAR_BUTTON_SIZE / 2.0,
+            TITLEBAR_HEIGHT / 2.0,
+        );
+        assert!(
+            fill_under_the_pointer(&ctx, &mut app, 1400.0, centre, TITLEBAR_BUTTON_SIZE).is_some(),
+            "the toggle's cell is the bar's first"
+        );
+    }
+
     /// Where the bar's two anchored groups go, for every window shape that
     /// matters: the box is the message list's, the run the reading pane's, both
     /// clamped clear of the first group — and the run is given up rather than
@@ -16741,6 +16899,10 @@ mod tests {
         // What the bar's right end takes: the three window controls, the cog and
         // the sync cell, with the gaps between them and the edge margin.
         let cluster_left = |window: f32| titlebar_rects(bar(window), 3).sync.left();
+        // What that right end takes off a window's width, so the case below can
+        // build a bar out of the room the box needs rather than a hand-tuned
+        // number that has to follow every size the bar's left group grows by.
+        let right_end = 1400.0 - cluster_left(1400.0);
 
         // The default window (1400 pt, a 200 pt navigation column and a 460 pt
         // pane): the box is the list's own edge, the run the pane's — and the
@@ -16786,8 +16948,16 @@ mod tests {
         );
 
         // A bar with room for the filter but not for the sort after it: the
-        // filter is the one that stays, and the sort is not drawn at all.
-        let anchors = titlebar_anchors(bar(560.0), first_end, 0.0, 0.0, 360.0);
+        // filter is the one that stays, and the sort is not drawn at all. The
+        // bar ends where the filter's own square does — the box's width, a
+        // cell's gap and the filter, and a group's gap at either end.
+        let cluster = first_end
+            + TITLEBAR_GROUP_GAP
+            + TITLEBAR_SEARCH_WIDTH
+            + TITLEBAR_BUTTON_GAP
+            + TITLEBAR_BUTTON_SIZE
+            + TITLEBAR_GROUP_GAP;
+        let anchors = titlebar_anchors(bar(cluster + right_end), first_end, 0.0, 0.0, cluster);
         assert_eq!(anchors.search_width, Some(TITLEBAR_SEARCH_WIDTH));
         assert!(anchors.filter.is_some(), "the filter still fits");
         assert!(
@@ -16799,8 +16969,10 @@ mod tests {
         // A bar with room for the box but none for a cell beside it: the box is
         // what is kept — it is the list's own, and its width is planned first —
         // and neither cell is drawn rather than squeezed or drawn over its
-        // neighbours.
-        let anchors = titlebar_anchors(bar(506.0), first_end, 0.0, 0.0, 312.0);
+        // neighbours. The bar is the box's own width and the two group gaps
+        // around it and nothing more: a cell would need a square on top of that.
+        let cluster = first_end + TITLEBAR_GROUP_GAP + TITLEBAR_SEARCH_WIDTH + TITLEBAR_GROUP_GAP;
+        let anchors = titlebar_anchors(bar(cluster + right_end), first_end, 0.0, 0.0, cluster);
         assert_eq!(anchors.search_width, Some(TITLEBAR_SEARCH_WIDTH));
         assert!(
             anchors.filter.is_none(),
@@ -16857,8 +17029,8 @@ mod tests {
         assert_eq!(anchors.search, first_end + TITLEBAR_GROUP_GAP);
 
         // And a window too narrow for the run and the controls together: at
-        // 500 pt the controls start at 300, and the run needs 266 of the 112 pt
-        // that are left after the first group.
+        // 500 pt the sync cell starts at 306, and the run needs 266 pt of the
+        // 174 that are left between the first group and that cell.
         assert!(
             titlebar_anchors(bar(500.0), first_end, 0.0, 0.0, cluster_left(500.0))
                 .actions
@@ -17104,10 +17276,7 @@ mod tests {
                 &mut app,
                 NARROW,
                 egui::pos2(
-                    TITLEBAR_EDGE_MARGIN
-                        + BRAND_ICON_SIZE
-                        + TITLEBAR_BUTTON_GAP
-                        + TITLEBAR_BUTTON_SIZE / 2.0,
+                    TITLEBAR_LEFT_INSET + TITLEBAR_BUTTON_SIZE / 2.0,
                     TITLEBAR_HEIGHT / 2.0
                 ),
                 TITLEBAR_BUTTON_SIZE
@@ -19789,6 +19958,35 @@ mod tests {
         }
     }
 
+    /// Every image a frame drew inside `rect`, in the order it drew them — an
+    /// image being a textured mesh, which is the shape epaint makes one from.
+    /// The brand is a texture rather than one of the drawn glyphs, so this is
+    /// how a test finds the mark, and how it says the bar no longer has one.
+    fn image_rects_of(shapes: &[egui::epaint::ClippedShape], rect: egui::Rect) -> Vec<egui::Rect> {
+        let mut out = Vec::new();
+        for clipped in shapes {
+            collect_image_rects(&clipped.shape, rect, &mut out);
+        }
+        out
+    }
+
+    fn collect_image_rects(shape: &egui::Shape, rect: egui::Rect, out: &mut Vec<egui::Rect>) {
+        match shape {
+            egui::Shape::Mesh(mesh) => {
+                let drawn = mesh.calc_bounds();
+                if rect.contains_rect(drawn) {
+                    out.push(drawn);
+                }
+            }
+            egui::Shape::Vec(shapes) => {
+                for shape in shapes {
+                    collect_image_rects(shape, rect, out);
+                }
+            }
+            _ => {}
+        }
+    }
+
     /// The navigation column's own rect this frame: everything left of the
     /// message list.
     fn nav_column(app: &KimoApp) -> egui::Rect {
@@ -19965,13 +20163,11 @@ mod tests {
         )
     }
 
-    /// Where the first group ends: the brand icon, the nav toggle and the pen,
-    /// with the bar's gaps between them. The one anchor nothing else may cross.
+    /// Where the first group ends: the nav toggle and the pen, a cell's gap
+    /// between them and the bar's own margin before the first. The one anchor
+    /// nothing else may cross.
     fn first_group_end() -> f32 {
-        TITLEBAR_EDGE_MARGIN
-            + BRAND_ICON_SIZE
-            + 2.0 * TITLEBAR_BUTTON_GAP
-            + 2.0 * TITLEBAR_BUTTON_SIZE
+        TITLEBAR_LEFT_INSET + TITLEBAR_BUTTON_GAP + 2.0 * TITLEBAR_BUTTON_SIZE
     }
 
     /// The rect the bar gives its mail actions this frame, from the columns the
