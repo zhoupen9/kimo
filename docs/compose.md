@@ -76,65 +76,76 @@ Read when touching `compose_card`, `src/outgoing.rs`, or `Job::SendMessage`.
   (`compose_card`’s `inline`, which is what `ComposeSpot::Pane` means): an
   answer written under its own mail shows From, To, the body, the files and the
   two buttons, and nothing else — in that order, a letter’s: the mail is what
-  the card is for, and a file is something put *with* it (`compose_body`
-  before `compose_files_row`) — while the popup keeps its form’s order, files
-  over body, where the attachments belong to the fields above them. It has no
-  heading — the mail above it says what it answers — but it has a **head bar**:
-  the avatar of the account the answer goes from, drawn in the label column’s
-  own slot, and the From list
-  beside it, with the separator under the row that the popup’s heading has
-  above its form. The list is *flat* there: `flatten_widgets` takes the combo’s
+  the card is for, and a file is something put *with* it (`compose_body` before
+  `compose_files_row`) — and the popup draws the same card under its heading,
+  its Subject row the one thing the answer on the spot has no use for. The
+  attachments are the card’s own row in either container: no label beside them,
+  and the cards and the box across the card’s whole width (`compose_files_row`).
+  The answer on the spot has no heading — the mail above it says what it answers
+  — but both containers have a **head**, in two columns: the
+  avatar of the account the mail goes from on the left, and the lines it goes out
+  on beside it — From first, then To and the copies its chevron folds out
+  (`to_and_copies`), and on the popup’s form Subject after them. The rows wear a
+  mail header’s labels, colons and all (`From:`, `To:`, `Cc:`, `Bcc:`,
+  `Subject:`). No rule under the head in either container: the popup’s heading is
+  what sits over its form, and the answer under its mail is a letter’s own first
+  lines.
+  The list is *flat* in either container: `flatten_widgets` takes the combo’s
   outline and fill off in that Ui and leaves the hover, because an outline
-  belongs to a form of boxes and this line is the reply’s own from. **The flat
+  belongs to a form of boxes and this line is the card’s own from. **The flat
   list ends with the To row’s chevron** rather than the filled triangle a combo
   box carries (`paint_from_chevron`: the To row’s own drawing, painted in the
   place egui would put its triangle, down while the list is away and up while it
   is open — the head of a letter ends the way the row under it does, weak until
-  the pointer finds it). The popup’s own From keeps its triangle, a box among
-  boxes. **To is
+  the pointer finds it). **To is
   flat beside it**, for the same reason: the row’s field is added with
   `Field::flat`, a field whose frame draws nothing — so it has no box focused
   or not — which is also what a flat *field* wants where `take_box_off` would
   do: the visual it clears is the colour of the text selected inside the
-  field, and a flat field has no business recolouring that. The popup keeps
-  its To box, as it keeps its Cc, Bcc and Subject. The face is the one a mail’s
+  field, and a flat field has no business recolouring that. The popup’s own
+  fields are `Field::quiet` instead: To, Cc, Bcc and Subject draw the input
+  fill with no line until the pointer or the keyboard is on one
+  (`docs/ui-style.md`). The face is the one a mail’s
   card wears (`sender_color` and `sender_initial` of the
   account’s address and name, at `AVATAR_DIAMETER`), so the card says who it is
   from the way every other card in the app says who it is from. **To ends with
   the fold chevron** (`paint_fold_chevron`, in a cell a field tall): the Cc
-  and Bcc lines are the popup’s rows, but on the spot they are one click away
-  under To (`compose_to_row`) — flat like the lines above them, pointing down
-  while they are away and up once they are under the row — and a card opens
-  with them away (`ComposeDraft::copies_open`), so an answer that needs no
-  copies shows the one address it goes to. A Reply all’s own Cc is still *in
-  the draft*, and read — and edited — as soon as the chevron is clicked.
-  Subject stays the popup’s row, and stays in the draft with it. The popup
-  keeps its heading and all five rows, and one draft moves between the two
-  containers with only the container changing.
-  The footer is the one other thing the two do not share: the on-the-spot card
-  draws `compose_button`’s pair — an icon and a word in one tall target, Send
-  in the accent because sending is what the card is for (`paint_send_icon`, the
-  plane) and Discard an outline beside it that turns the scheme’s danger on
-  hover (`paint_delete_icon`, the trash, the treatment every delete in the app
-  gets) — while the popup keeps egui’s own two, a line of its form. **The
-  card’s foot has no rule over it** either: the card is a letter, and the mail
-  above it — not a line — is what its end is read against. What it has to say
-  (the server’s refusal, that the mail is on its way, why Send cannot be
-  pressed) stands on a row of its own over the buttons, and the pair opens the
-  row at the card’s left edge — the side the mail above is read from — rather
-  than ending it at the right, where the popup’s form keeps its own: Discard
-  first and Send beside it. That row is a *bounded* one (`ui.horizontal`, the
-  height of what is in it): a `with_layout` over the space left would center
-  the pair in all of it and carry the card’s surface down to the pane’s floor,
-  which is what left a band of nothing between the reason and the buttons —
-  **the card ends where its content does**, `CONTENT_PADDING` under the last
-  row on it. The popup’s reason reads beside its two, over the form’s own
-  separator. The boxes are a fixed label column plus what `COMPOSE_WIDTH`
-  leaves; the body is `COMPOSE_BODY_HEIGHT` tall and scrolls inside that
-  rather than growing the card — and **the box fills that height and, on the
-  spot, the card’s whole column** (`compose_body`’s `min_size` and the width
-  `inline` hands it: a letter’s text block, padding to padding, where the
-  popup keeps the form’s field column), not the dozen lines an empty draft
+  and Bcc lines are one click away under To (`compose_to_row`) in either
+  container — flat like the lines above them on the spot, quiet in the popup’s
+  form, pointing down while they are away and up once they are under the row —
+  and a card opens with them away (`ComposeDraft::copies_open`), so a card that
+  needs no copies shows the one address it goes to. A Reply all’s own Cc is
+  still *in the draft*, and read — and edited — as soon as the chevron is
+  clicked. Subject is the popup’s own row — quiet like the lines above it, and
+  always drawn — and it stays in the draft with them. The popup keeps its
+  heading and its Subject row, and one draft moves between the two containers
+  with only the
+  container changing.
+  The footer is the card’s own in either container: `compose_button`’s pair — an
+  icon and a word in one tall target, Send in the accent because sending is what
+  the card is for (`paint_send_icon`, the plane) and Discard an outline beside it
+  that turns the scheme’s danger on hover (`paint_delete_icon`, the trash, the
+  treatment every delete in the app gets). **The word follows that ink** — white
+  on the danger fill, greyed with the rest of the disabled treatment — because a
+  galley carries the colour it was laid out in and the shape has to override it
+  (`compose_button`). **The card draws no rule at all in either container** —
+  neither under its head nor over its foot, and the popup’s heading above its
+  form carries none either: the card is a letter, and the mail above it — not a
+  line — is what its ends are read against. What the card has to say (the
+  server’s refusal, that the mail is on its way, why Send cannot be pressed)
+  stands on a row of its own over the buttons, and the pair opens the row at the
+  card’s left edge — the side the mail above is read from — rather than ending
+  it at the right: **Discard first and Send beside it**. That row is a *bounded*
+  one (`ui.horizontal`, the height of what is in it): a `with_layout` over the
+  space left would center the pair in all of it and carry the card’s surface
+  down to the pane’s floor, which is what left a band of nothing between the
+  reason and the buttons — **the card ends where its content does**,
+  `CONTENT_PADDING` under the last row on it. The boxes are a fixed label column
+  plus what `COMPOSE_WIDTH` leaves, behind the head’s avatar column; the body is
+  `COMPOSE_BODY_HEIGHT` tall and scrolls inside that rather than growing the
+  card — and **the box fills that height and the card’s whole column**
+  (`compose_body`’s `min_size` and the width the card hands it), not the dozen
+  lines an empty draft
   needs — so the row under it is never read across a band of the card’s own
   surface and the mail being written is as wide as the card will hold. **The
   box is the card’s, not the text’s** (`compose_body`): a text edit draws its

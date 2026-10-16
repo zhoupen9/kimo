@@ -34,16 +34,17 @@ and a chevron that is clickable is a hover target: `PointingHand`, and hover
 text saying what the click does.
 
 **Where the code stands.** The message list's conversations, the popup pane's
-back button, and the reply's To row and From list all draw chevrons. Two things
-do not:
+back button, and the compose card's To row and From list — in either container —
+all draw chevrons. Two things do not:
 
 - `account_row` — the navigation column's account headers — still fills a
   `convex_polygon` triangle. It is the one disclosure in the app that is not a
   chevron; it becomes `paint_chevron` when that row is next touched.
 - egui's own `ComboBox` triangle (the search-scope menu, Preferences' font
-  picker, the popup's From) is egui's internal drawing and stays: a form's box
-  keeps its box's glyph. The app paints over it only where the row is a letter
-  rather than a form (`paint_from_chevron`).
+  picker) is egui's internal drawing and stays: a form's box keeps its box's
+  glyph. The compose card's From list is the one combo that is a letter's line
+  rather than a form's box, so `paint_from_chevron` paints over the place its
+  triangle would take.
 
 ## A mail address field has no outline until the pointer or the keyboard is on it
 
@@ -61,16 +62,17 @@ The box is Kimo's own, painted in `Field` over a frame that draws nothing
 egui draw it would recolour every selection in the app. The accent is a fill and
 focus color, not text — [theme.md](theme.md)'s contrast rule says so.
 
-**Where the code stands.** Neither field shape is the rule yet. `Field` — the
-popup's form — draws the box at rest and takes the accent only when focused, so
-its hover still shows the resting line. `Field::flat` — the on-the-spot card's
-lines — draws nothing at all, focused or not, so it never shows the accent box.
-The rule is the two states together: nothing at rest, the accent while hovered
-or focused. The From line is a combo rather than a `Field`: the on-the-spot
-head bar flattens it (`flatten_widgets`) and ends it with the fold chevron,
-while the popup keeps its box. The body is not one of these fields — it is the
-letter's writing area, whose box is the room the card gives it (`compose_body`)
-— and the title bar's search box is the bar's own box, not an address line.
+**Where the code stands.** The popup's form follows the rule: its address lines
+are `Field::quiet`, and Subject is one of them so the form reads as one thing
+rather than three quiet rows between two boxed ones. The From list is neither: it is a combo
+rather than a `Field`, and the card draws it as a letter's line in either
+container — `flatten_widgets` takes egui's outline and fill off it and leaves
+the hover fill that says it opens, with the chevron of rule 1 where egui's
+triangle would be. `Field::flat` — the on-the-spot card's lines — is still the
+other state: it draws nothing at all, focused or not, so the answer under its
+mail has no box to bring out. The body is not one of these fields — it is the letter's
+writing area, whose box is the room the card gives it (`compose_body`) — and the
+title bar's search box is the bar's own box, not an address line.
 
 ## Cc and Bcc are folded away until they are asked for
 
@@ -86,10 +88,10 @@ all's own Cc is there to read the moment the chevron opens it — and sending
 reads the draft, never the screen.
 
 **Where the code stands.** `compose_to_row` and `ComposeDraft::copies_open` are
-the whole of it, on the on-the-spot card, and
-`the_replys_to_row_folds_cc_and_bcc_out` pins the behaviour. The popup's form
-still draws To, Cc, Bcc and Subject as four rows: it is the one compose
-container where the fold is missing.
+the whole of it, and both containers draw the row: the on-the-spot card flat,
+the popup's form quiet. `the_replys_to_row_folds_cc_and_bcc_out` pins the
+behaviour on the spot, and `a_mails_header_answers_it_where_the_mail_is` the
+popup's — folded on the first frame, out again from the chevron's click.
 
 ## Working by these rules
 
