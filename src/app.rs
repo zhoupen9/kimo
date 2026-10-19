@@ -8118,9 +8118,39 @@ impl KimoApp {
             ui.horizontal(|ui| {
                 ui.heading("Preferences");
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui.button("Close").clicked() {
+                    // A cross rather than a worded button: the modal's own
+                    // chrome, drawn like the search bar's clear cross one size
+                    // up, and it says what it does on hover. Escape and the
+                    // backdrop close the modal too.
+                    let (rect, _) = ui.allocate_exact_size(
+                        egui::Vec2::splat(PREFS_CLOSE_SIZE),
+                        egui::Sense::hover(),
+                    );
+                    let response = ui.interact(
+                        rect,
+                        egui::Id::new("preferences-close"),
+                        egui::Sense::click(),
+                    );
+                    let scheme = theme::of(ui.ctx());
+                    let hovered = response.hovered();
+                    if hovered {
+                        ui.painter()
+                            .rect_filled(rect, PREFS_CLOSE_RADIUS, scheme.hover);
+                        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                    }
+                    paint_close_icon(
+                        ui.painter(),
+                        rect,
+                        if hovered {
+                            scheme.text
+                        } else {
+                            scheme.text_weak
+                        },
+                    );
+                    if response.clicked() {
                         open = false;
                     }
+                    response.on_hover_text("Close preferences");
                 });
             });
             ui.separator();
@@ -9387,6 +9417,12 @@ const SEARCH_BAR_MARGIN: egui::Margin = egui::Margin {
 /// circle, and its radius is half of it.
 const SEARCH_CLEAR_SIZE: f32 = 18.0;
 const SEARCH_CLEAR_RADIUS: u8 = 9;
+/// The cross that closes the preferences modal: a round target at the end of
+/// the heading row, the search bar's clear cross one size up. A dialog's
+/// heading has room a bar's inset does not, and the target has to read as a
+/// button rather than as part of the title.
+const PREFS_CLOSE_SIZE: f32 = 22.0;
+const PREFS_CLOSE_RADIUS: u8 = 11;
 /// How far the title bar's first cell starts in from the window's left edge —
 /// the space added before it, as the left group's own first item. Wider than
 /// the margin at the other end, which the window controls keep.
@@ -18851,6 +18887,29 @@ mod tests {
             .find(|chip| chip.rect.contains(rings[0].0.center()))
             .expect("the ring is round one of the chips");
         assert_eq!(ringed.fill, chosen, "and it is the one in force");
+    }
+
+    /// The preferences heading ends in a cross rather than a worded button —
+    /// the modal's own chrome — and a click on the cross closes the modal.
+    #[test]
+    fn the_preferences_cross_closes_the_modal() {
+        let ctx = egui::Context::default();
+        crate::fonts::install(&ctx, None, None);
+        let mut app = app_with_messages(&ctx, 1);
+        app.show_preferences = true;
+        for _ in 0..FADE_FRAMES {
+            run_app_frame(&ctx, &mut app, Vec::new());
+        }
+        let texts = frame_texts(&ctx, &mut app);
+        assert!(
+            !texts.iter().any(|text| text == "Close"),
+            "the heading's worded button is gone: {texts:?}"
+        );
+        let close = ctx
+            .read_response(egui::Id::new("preferences-close"))
+            .expect("the cross is a widget of the heading row");
+        click_at(&ctx, &mut app, close.rect.center());
+        assert!(!app.show_preferences, "the cross closes the modal");
     }
 
     /// The account form's Sending group: off is an account that only reads

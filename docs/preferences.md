@@ -14,9 +14,12 @@ Read when touching `preferences_modal`, a key in `settings.json`, or the sync cl
   account and syncs it) and **Appearance** (theme, accent, Simple/Blitz HTML
   renderer, the interface/fixed-width fonts — all persisted in
   `settings.json` — plus a preview of the palette the theme and the accent
-  resolve to). Configuration belongs on a page there, not as another
-  title-bar toggle; the title bar keeps only actions (syncing, window
-  controls), and switching accounts is a navigation-column affair.
+  resolve to). The heading row ends in the cross that closes the modal
+  (`PREFS_CLOSE_SIZE`, drawn by `paint_close_icon`, with the scheme's hover
+  fill under the pointer) — a modal's cross, not the title bar's danger red:
+  closing preferences destroys nothing. Configuration belongs on a page there,
+  not as another title-bar toggle; the title bar keeps only actions (syncing,
+  window controls), and switching accounts is a navigation-column affair.
 
 ## Automatic sync
 
