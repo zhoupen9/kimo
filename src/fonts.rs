@@ -2,13 +2,15 @@
 //!
 //! egui cannot enumerate fonts, and the project may not use fontconfig (hard
 //! rule 1), so the installed families are found by walking the usual font
-//! directories and reading each face's `name` table with `ttf-parser` — pure
-//! Rust, and already compiled in through Blitz (fontique/fontdb).
+//! directories and reading the few tables a face's identity needs (`name`,
+//! `OS/2`, `post`) rather than the font file itself: a desktop's CJK
+//! collections alone are gigabytes, and reading them left the allocator
+//! holding tens of megabytes after every scan.
 //!
-//! Reading every installed face takes a noticeable moment on a machine with
-//! hundreds of fonts, so it is a worker job (`sync::Job::ScanFonts`) that
-//! comes back as `Event::FontsScanned`; only the one-file read needed to
-//! install a picked family happens on the UI thread.
+//! The scan still runs as a worker job (`sync::Job::ScanFonts`) that comes
+//! back as `Event::FontsScanned`, because a directory walk is filesystem work;
+//! only the one-file read needed to install a picked family happens on the UI
+//! thread.
 //!
 //! The choice made in Preferences → Appearance is applied to the egui UI (and
 //! therefore to the built-in HTML renderer, `crate::html`). Blitz keeps its
@@ -20,6 +22,7 @@
 //! variants. See `CjkScript`.
 
 use std::collections::BTreeMap;
+use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
 /// Font directories worth scanning, in preference order. Missing ones are
@@ -76,37 +79,352 @@ pub fn font_files() -> Vec<PathBuf> {
     files
 }
 
-/// All installed families by name, sorted by name. Reads every face's name
-/// table — call it from a worker thread (`Job::ScanFonts`), never per frame.
+// ----- reading a face without reading its file -------------------------------
+
+/// What one face declares about itself: what the family picker and Blitz's
+/// font registration ask for, and nothing else.
+///
+/// These fields live in the face's `name`, `OS/2` and `post` tables — a few
+/// KiB altogether — so they are read table by table instead of handing the
+/// whole file to `ttf-parser`, whose `Face` borrows the entire font. A font
+/// directory can hold gigabytes of CJK collections; scanning it must not read
+/// them.
+///
+/// A face whose tables cannot be read still takes its slot in [`faces`], with
+/// no family, so the face indexes stored in `settings.json` keep pointing at
+/// the face they meant.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct FaceInfo {
+    /// Typographic family (name ID 16) when the font has one, otherwise the
+    /// legacy family (ID 1): "DejaVu Sans", not "DejaVu Sans Bold".
+    pub family: Option<String>,
+    /// Typographic subfamily (ID 17) when present, otherwise the legacy one
+    /// (ID 2): "Regular", "Bold", "SemiBold", "Bold Italic".
+    pub subfamily: Option<String>,
+    /// `OS/2` `usWeightClass`; 400 when the table is missing, as `ttf-parser`
+    /// reports it.
+    pub weight: u16,
+    /// `OS/2` fsSelection bit 5.
+    pub bold: bool,
+    /// `OS/2` fsSelection bit 0, or a non-zero `post` italic angle.
+    pub italic: bool,
+    /// `post` `isFixedPitch`.
+    pub monospace: bool,
+}
+
+/// A `name` table is normally a few KiB; this only stops a corrupt length from
+/// making the scan allocate a huge buffer.
+const MAX_NAME_TABLE: u32 = 1 << 20;
+/// OS/2 version 5 is 100 bytes and is the longest; the fields read here end at
+/// offset 64.
+const MAX_OS2_TABLE: u32 = 100;
+/// `post` is parsed from its first 32 bytes.
+const MAX_POST_TABLE: u32 = 32;
+/// No desktop font collection comes near this many faces.
+const MAX_FACES: usize = 1024;
+
+/// A font file open for the few reads a scan makes.
+struct FontFile {
+    file: std::fs::File,
+    len: u64,
+}
+
+impl FontFile {
+    fn open(path: &Path) -> Option<Self> {
+        let file = std::fs::File::open(path).ok()?;
+        let len = file.metadata().ok()?.len();
+        Some(Self { file, len })
+    }
+
+    /// `len` bytes at `offset`, or `None` when that runs past the end of the
+    /// file — a font claiming a table it does not carry.
+    fn read(&mut self, offset: u64, len: u32) -> Option<Vec<u8>> {
+        if offset.checked_add(u64::from(len))? > self.len {
+            return None;
+        }
+        let mut buffer = vec![0; len as usize];
+        self.file.seek(SeekFrom::Start(offset)).ok()?;
+        self.file.read_exact(&mut buffer).ok()?;
+        Some(buffer)
+    }
+}
+
+/// Where each face starts: one zero for a plain TTF/OTF, or the `ttcf`
+/// collection's face offsets. A collection's header is tag, version, count,
+/// then one offset per face.
+fn face_offsets(font: &mut FontFile) -> Option<Vec<u64>> {
+    let header = font.read(0, 12)?;
+    if &header[0..4] != b"ttcf" {
+        return Some(vec![0]);
+    }
+    let count = u32_at(&header, 8)? as usize;
+    if count == 0 || count > MAX_FACES {
+        return None;
+    }
+    let offsets = font.read(12, (count * 4) as u32)?;
+    Some(
+        offsets
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|offset| u64::from(u32::from_be_bytes(*offset)))
+            .collect(),
+    )
+}
+
+/// The ranges of the three tables a scan reads, as `(offset, length)`.
+#[derive(Default)]
+struct Tables {
+    name: Option<(u64, u32)>,
+    os2: Option<(u64, u32)>,
+    post: Option<(u64, u32)>,
+}
+
+/// The tables of the face whose table directory starts at `offset`.
+///
+/// The version is checked against the four sfnt flavours (`TrueType`, `OTTO`,
+/// `true`, `typ1`) so a collection offset pointing into the middle of a table
+/// is not mistaken for a face.
+fn face_tables(font: &mut FontFile, offset: u64) -> Option<Tables> {
+    let header = font.read(offset, 12)?;
+    let version = u32_at(&header, 0)?;
+    if !matches!(
+        version,
+        0x0001_0000 | 0x4F54_544F | 0x7472_7565 | 0x7479_7031
+    ) {
+        return None;
+    }
+    let count = u16_at(&header, 4)? as usize;
+    if count == 0 || count > MAX_FACES {
+        return None;
+    }
+    let directory = font.read(offset + 12, (count * 16) as u32)?;
+    let mut tables = Tables::default();
+    for record in directory.as_chunks::<16>().0 {
+        let slot = if &record[0..4] == b"name" {
+            &mut tables.name
+        } else if &record[0..4] == b"OS/2" {
+            &mut tables.os2
+        } else if &record[0..4] == b"post" {
+            &mut tables.post
+        } else {
+            continue;
+        };
+        if slot.is_none() {
+            *slot = Some((u64::from(u32_at(record, 8)?), u32_at(record, 12)?));
+        }
+    }
+    Some(tables)
+}
+
+/// One face's name, style and fixed-pitch flag, read from its three tables.
+fn face_info(font: &mut FontFile, offset: u64) -> FaceInfo {
+    let Some(tables) = face_tables(font, offset) else {
+        return FaceInfo::default();
+    };
+    let (family, subfamily) = tables
+        .name
+        .and_then(|(offset, len)| font.read(offset, len.min(MAX_NAME_TABLE)))
+        .map(|data| parse_names(&data))
+        .unwrap_or((None, None));
+    let os2 = tables
+        .os2
+        .and_then(|(offset, len)| font.read(offset, len.min(MAX_OS2_TABLE)))
+        .and_then(|data| parse_os2(&data));
+    let post = tables
+        .post
+        .and_then(|(offset, len)| font.read(offset, len.min(MAX_POST_TABLE)))
+        .and_then(|data| parse_post(&data));
+    FaceInfo {
+        family,
+        subfamily,
+        weight: os2.as_ref().map_or(400, |os2| os2.weight),
+        bold: os2
+            .as_ref()
+            .is_some_and(|os2| os2.fs_selection & (1 << 5) != 0),
+        italic: os2.as_ref().is_some_and(|os2| os2.fs_selection & 1 != 0)
+            || post.as_ref().is_some_and(|post| post.italic_angle != 0),
+        monospace: post.as_ref().is_some_and(|post| post.monospaced),
+    }
+}
+
+/// Every face of the font at `path`, in collection order.
+///
+/// A face that cannot be read is still returned, with no family, so an index
+/// into the list keeps naming the same face. An unreadable file yields an
+/// empty list.
+pub fn faces(path: &Path) -> Vec<FaceInfo> {
+    let Some(mut font) = FontFile::open(path) else {
+        return Vec::new();
+    };
+    let Some(offsets) = face_offsets(&mut font) else {
+        return Vec::new();
+    };
+    offsets
+        .into_iter()
+        .map(|offset| face_info(&mut font, offset))
+        .collect()
+}
+
+fn u16_at(data: &[u8], offset: usize) -> Option<u16> {
+    let bytes = data.get(offset..offset + 2)?;
+    Some(u16::from_be_bytes([bytes[0], bytes[1]]))
+}
+
+fn u32_at(data: &[u8], offset: usize) -> Option<u32> {
+    let bytes = data.get(offset..offset + 4)?;
+    Some(u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+}
+
+/// A face's family and subfamily, both preferring the typographic records
+/// (name IDs 16/17) over the legacy ones (1/2).
+///
+/// Only the Unicode platform and the Windows symbol/BMP encodings are decoded,
+/// which is what `ttf-parser` reads: a Macintosh record is skipped rather than
+/// guessed at, and the names the picker stores do not change between this
+/// reader and a full parse.
+fn parse_names(data: &[u8]) -> (Option<String>, Option<String>) {
+    let count = u16_at(data, 2).map_or(0, usize::from);
+    let Some(storage) = u16_at(data, 4).and_then(|offset| data.get(usize::from(offset)..)) else {
+        return (None, None);
+    };
+    let mut family = None;
+    let mut typographic_family = None;
+    let mut subfamily = None;
+    let mut typographic_subfamily = None;
+    for index in 0..count {
+        let start = 6 + index * 12;
+        let Some(record) = data.get(start..start + 12) else {
+            break;
+        };
+        let name_id = u16_at(record, 6).unwrap_or(0);
+        let length = usize::from(u16_at(record, 8).unwrap_or(0));
+        let offset = usize::from(u16_at(record, 10).unwrap_or(0));
+        let Some(end) = offset.checked_add(length) else {
+            continue;
+        };
+        let Some(bytes) = storage.get(offset..end) else {
+            continue;
+        };
+        let platform = u16_at(record, 0).unwrap_or(0);
+        let encoding = u16_at(record, 2).unwrap_or(0);
+        let Some(text) = decode_name(platform, encoding, bytes) else {
+            continue;
+        };
+        if text.is_empty() {
+            continue;
+        }
+        match name_id {
+            ttf_parser::name_id::TYPOGRAPHIC_FAMILY if typographic_family.is_none() => {
+                typographic_family = Some(text);
+            }
+            ttf_parser::name_id::FAMILY if family.is_none() => family = Some(text),
+            ttf_parser::name_id::TYPOGRAPHIC_SUBFAMILY if typographic_subfamily.is_none() => {
+                typographic_subfamily = Some(text);
+            }
+            ttf_parser::name_id::SUBFAMILY if subfamily.is_none() => subfamily = Some(text),
+            _ => {}
+        }
+    }
+    (
+        typographic_family.or(family),
+        typographic_subfamily.or(subfamily),
+    )
+}
+
+/// Decode a name record in an encoding `ttf-parser` also reads: the Unicode
+/// platform, or Windows' symbol and Unicode-BMP encodings (UTF-16BE either
+/// way). Other platforms are Mac Roman records, which it skips.
+fn decode_name(platform: u16, encoding: u16, bytes: &[u8]) -> Option<String> {
+    let unicode = platform == 0 || (platform == 3 && encoding <= 1);
+    if !unicode {
+        return None;
+    }
+    let units: Vec<u16> = bytes
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|pair| u16::from_be_bytes(*pair))
+        .collect();
+    String::from_utf16(&units).ok()
+}
+
+/// The `OS/2` fields the rank needs, when the table is a version this reader
+/// knows — the same versions `ttf-parser` accepts, with its length checks.
+struct Os2 {
+    weight: u16,
+    fs_selection: u16,
+}
+
+fn parse_os2(data: &[u8]) -> Option<Os2> {
+    let expected = match u16_at(data, 0)? {
+        0 => 78,
+        1 => 86,
+        2..=4 => 96,
+        5 => 100,
+        _ => return None,
+    };
+    if data.len() < expected {
+        return None;
+    }
+    Some(Os2 {
+        weight: u16_at(data, 4)?,
+        // usWeightClass, then fsSelection after the panose block and the
+        // Unicode ranges.
+        fs_selection: u16_at(data, 62)?,
+    })
+}
+
+/// The `post` fields a scan needs. The table must be at least 32 bytes and a
+/// version `ttf-parser` accepts, or it is ignored altogether.
+struct Post {
+    italic_angle: i32,
+    monospaced: bool,
+}
+
+fn parse_post(data: &[u8]) -> Option<Post> {
+    if data.len() < 32 {
+        return None;
+    }
+    let version = u32_at(data, 0)?;
+    if !matches!(
+        version,
+        0x0001_0000 | 0x0002_0000 | 0x0002_5000 | 0x0003_0000 | 0x0004_0000
+    ) {
+        return None;
+    }
+    let angle: [u8; 4] = data.get(4..8)?.try_into().ok()?;
+    Some(Post {
+        italic_angle: i32::from_be_bytes(angle),
+        monospaced: u32_at(data, 12)? != 0,
+    })
+}
+
+/// All installed families by name, sorted by name. Reads each face's `name`,
+/// `OS/2` and `post` tables rather than the font file — call it from a worker
+/// thread (`Job::ScanFonts`), never per frame.
 pub fn scan() -> Vec<FontFamily> {
     // The rank keeps a family's bold or italic face from shadowing its regular
     // one, whichever the directory walk reaches first.
     let mut families: BTreeMap<String, (u16, FontFamily)> = BTreeMap::new();
     for path in font_files() {
-        let Ok(data) = std::fs::read(&path) else {
-            continue;
-        };
-        let faces = ttf_parser::fonts_in_collection(&data).unwrap_or(1);
-        for index in 0..faces {
-            let Ok(face) = ttf_parser::Face::parse(&data, index) else {
-                continue;
-            };
-            let Some(name) = face_family_name(&face) else {
+        for (index, face) in faces(&path).into_iter().enumerate() {
+            let Some(name) = face.family.as_deref() else {
                 continue;
             };
             let candidate = (
                 face_rank(&face),
                 FontFamily {
-                    name: name.clone(),
+                    name: name.to_string(),
                     path: path.clone(),
-                    index,
-                    monospace: face.is_monospaced(),
+                    index: index as u32,
+                    monospace: face.monospace,
                 },
             );
-            match families.get(&name) {
+            match families.get(name) {
                 Some((rank, _)) if *rank <= candidate.0 => {}
                 _ => {
-                    families.insert(name, candidate);
+                    families.insert(name.to_string(), candidate);
                 }
             }
         }
@@ -318,10 +636,10 @@ fn face_family_name(face: &ttf_parser::Face<'_>) -> Option<String> {
 /// italic and off weights — plenty of families ship a lighter face before
 /// their Regular one (DejaVu Sans arrives as ExtraLight), and the picker
 /// should not load that one just because the directory walk saw it first.
-fn face_rank(face: &ttf_parser::Face<'_>) -> u16 {
-    let bold = if face.is_bold() { 1000 } else { 0 };
-    let italic = if face.is_italic() { 500 } else { 0 };
-    bold + italic + face.weight().to_number().abs_diff(400)
+fn face_rank(face: &FaceInfo) -> u16 {
+    let bold = if face.bold { 1000 } else { 0 };
+    let italic = if face.italic { 500 } else { 0 };
+    bold + italic + face.weight.abs_diff(400)
 }
 
 fn collect_fonts(dir: &Path, depth: usize, out: &mut Vec<PathBuf>) {
@@ -433,5 +751,230 @@ mod tests {
         assert!(find(&families, "DejaVu").is_none());
         assert!(find(&families, "Noto Sans").is_none());
         assert!(find(&[], "DejaVu Sans").is_none());
+    }
+
+    // ----- the name-only reader ---------------------------------------------
+
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// `bytes` written to a path unique to this test process.
+    fn temp_font(bytes: &[u8]) -> PathBuf {
+        static NEXT: AtomicUsize = AtomicUsize::new(0);
+        let path = std::env::temp_dir().join(format!(
+            "kimo-fonts-{}-{}.ttf",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::write(&path, bytes).expect("write the test font");
+        path
+    }
+
+    /// An sfnt whose table directory starts at `base`, carrying `tables` in
+    /// order the way a real font lays them out.
+    fn sfnt_at(base: usize, tables: &[(&[u8; 4], Vec<u8>)]) -> Vec<u8> {
+        let data_start = base + 12 + 16 * tables.len();
+        let mut body = Vec::new();
+        let mut records = Vec::new();
+        for (tag, table) in tables {
+            records.push((*tag, data_start + body.len(), table.len()));
+            body.extend_from_slice(table);
+            while body.len() % 4 != 0 {
+                body.push(0);
+            }
+        }
+        let mut out = Vec::new();
+        out.extend_from_slice(&0x0001_0000u32.to_be_bytes());
+        out.extend_from_slice(&(tables.len() as u16).to_be_bytes());
+        out.extend_from_slice(&[0; 6]);
+        for (tag, offset, len) in records {
+            out.extend_from_slice(tag);
+            out.extend_from_slice(&[0; 4]);
+            out.extend_from_slice(&(offset as u32).to_be_bytes());
+            out.extend_from_slice(&(len as u32).to_be_bytes());
+        }
+        out.extend_from_slice(&body);
+        out
+    }
+
+    fn sfnt(tables: &[(&[u8; 4], Vec<u8>)]) -> Vec<u8> {
+        sfnt_at(0, tables)
+    }
+
+    /// A `.ttc` holding one face per entry, each at its own file offset.
+    fn ttc(faces: &[&[(&[u8; 4], Vec<u8>)]]) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.extend_from_slice(b"ttcf");
+        out.extend_from_slice(&0x0001_0000u32.to_be_bytes());
+        out.extend_from_slice(&(faces.len() as u32).to_be_bytes());
+        let mut offset = 12 + 4 * faces.len();
+        let mut built = Vec::new();
+        for tables in faces {
+            out.extend_from_slice(&(offset as u32).to_be_bytes());
+            let face = sfnt_at(offset, tables);
+            offset += face.len();
+            built.push(face);
+        }
+        for face in built {
+            out.extend_from_slice(&face);
+        }
+        out
+    }
+
+    /// A format-0 `name` table for `(platform, encoding, name ID, text)`
+    /// records, stored as UTF-16BE like the fonts Windows/Unicode records are.
+    fn name_table(records: &[(u16, u16, u16, &str)]) -> Vec<u8> {
+        let mut strings = Vec::new();
+        let mut entries = Vec::new();
+        for (platform, encoding, name_id, text) in records {
+            let encoded: Vec<u8> = text
+                .encode_utf16()
+                .flat_map(|unit| unit.to_be_bytes())
+                .collect();
+            entries.push((
+                *platform,
+                *encoding,
+                *name_id,
+                encoded.len() as u16,
+                strings.len() as u16,
+            ));
+            strings.extend_from_slice(&encoded);
+        }
+        let mut out = Vec::new();
+        out.extend_from_slice(&0u16.to_be_bytes());
+        out.extend_from_slice(&(entries.len() as u16).to_be_bytes());
+        out.extend_from_slice(&(6 + 12 * entries.len() as u16).to_be_bytes());
+        for (platform, encoding, name_id, len, offset) in entries {
+            out.extend_from_slice(&platform.to_be_bytes());
+            out.extend_from_slice(&encoding.to_be_bytes());
+            out.extend_from_slice(&0u16.to_be_bytes());
+            out.extend_from_slice(&name_id.to_be_bytes());
+            out.extend_from_slice(&len.to_be_bytes());
+            out.extend_from_slice(&offset.to_be_bytes());
+        }
+        out.extend_from_slice(&strings);
+        out
+    }
+
+    /// A version-0 `OS/2` table with these weight and fsSelection values.
+    fn os2_table(weight: u16, fs_selection: u16) -> Vec<u8> {
+        let mut out = vec![0u8; 78];
+        out[4..6].copy_from_slice(&weight.to_be_bytes());
+        out[62..64].copy_from_slice(&fs_selection.to_be_bytes());
+        out
+    }
+
+    /// A version-2 `post` table with this italic angle and fixed-pitch flag.
+    fn post_table(italic_angle: f32, monospaced: bool) -> Vec<u8> {
+        let mut out = vec![0u8; 32];
+        out[0..4].copy_from_slice(&0x0002_0000u32.to_be_bytes());
+        out[4..8].copy_from_slice(&((italic_angle * 65536.0) as i32).to_be_bytes());
+        out[12..16].copy_from_slice(&u32::from(monospaced).to_be_bytes());
+        out
+    }
+
+    #[test]
+    fn a_face_is_read_from_its_name_os2_and_post_tables() {
+        let path = temp_font(&sfnt(&[
+            (
+                b"name",
+                name_table(&[
+                    (3, 1, 1, "DejaVu Sans"),
+                    (3, 1, 2, "Bold"),
+                    (3, 1, 16, "DejaVu Sans"),
+                    (3, 1, 17, "SemiBold"),
+                ]),
+            ),
+            (b"OS/2", os2_table(600, 1 << 5)),
+            (b"post", post_table(0.0, true)),
+        ]));
+        let faces = faces(&path);
+        assert_eq!(faces.len(), 1);
+        assert_eq!(faces[0].family.as_deref(), Some("DejaVu Sans"));
+        // The typographic subfamily (ID 17) beats the legacy one (ID 2).
+        assert_eq!(faces[0].subfamily.as_deref(), Some("SemiBold"));
+        assert_eq!(faces[0].weight, 600);
+        assert!(faces[0].bold);
+        assert!(!faces[0].italic);
+        assert!(faces[0].monospace);
+        std::fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn a_post_italic_angle_marks_the_face_italic() {
+        let path = temp_font(&sfnt(&[
+            (b"name", name_table(&[(3, 1, 1, "Georgia")])),
+            (b"OS/2", os2_table(400, 0)),
+            (b"post", post_table(-12.0, false)),
+        ]));
+        let faces = faces(&path);
+        assert_eq!(faces[0].family.as_deref(), Some("Georgia"));
+        assert!(faces[0].italic);
+        assert!(!faces[0].bold);
+        assert!(!faces[0].monospace);
+        std::fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn mac_only_names_are_skipped_like_ttf_parser_skips_them() {
+        let path = temp_font(&sfnt(&[(b"name", name_table(&[(1, 0, 1, "Helvetica")]))]));
+        let faces = faces(&path);
+        assert_eq!(faces.len(), 1);
+        assert_eq!(faces[0].family, None);
+        std::fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn collection_faces_keep_their_slots_when_one_cannot_be_read() {
+        let named: [(&[u8; 4], Vec<u8>); 1] =
+            [(b"name", name_table(&[(3, 1, 1, "Noto Sans CJK SC")]))];
+        let unnamed: [(&[u8; 4], Vec<u8>); 1] = [(b"post", post_table(0.0, false))];
+        let path = temp_font(&ttc(&[named.as_slice(), unnamed.as_slice()]));
+        let faces = faces(&path);
+        assert_eq!(faces.len(), 2);
+        assert_eq!(faces[0].family.as_deref(), Some("Noto Sans CJK SC"));
+        // The second face still occupies index 1, so a stored face index keeps
+        // naming the face it named when it was stored.
+        assert_eq!(faces[1].family, None);
+        std::fs::remove_file(path).ok();
+    }
+
+    #[test]
+    fn a_truncated_table_reads_as_an_unknown_face() {
+        let mut bytes = sfnt(&[(b"name", name_table(&[(3, 1, 1, "Truncated Sans")]))]);
+        bytes.truncate(12 + 16);
+        let path = temp_font(&bytes);
+        let faces = faces(&path);
+        assert_eq!(faces.len(), 1);
+        assert_eq!(faces[0].family, None);
+        std::fs::remove_file(path).ok();
+    }
+
+    /// The picker's names and the face it stores are what `settings.json`
+    /// keeps, so the name-only reader must say exactly what a full
+    /// `ttf-parser` parse says. Runs on whatever fonts the machine has.
+    #[test]
+    fn the_name_only_reader_agrees_with_ttf_parser() {
+        let mut compared = 0;
+        for path in font_files().into_iter().take(24) {
+            let Ok(data) = std::fs::read(&path) else {
+                continue;
+            };
+            for (index, ours) in faces(&path).iter().enumerate() {
+                let Ok(face) = ttf_parser::Face::parse(&data, index as u32) else {
+                    continue;
+                };
+                let where_ = format!("{} face {index}", path.display());
+                assert_eq!(ours.family, face_family_name(&face), "{where_}");
+                assert_eq!(ours.weight, face.weight().to_number(), "{where_}");
+                assert_eq!(ours.bold, face.is_bold(), "{where_}");
+                assert_eq!(ours.italic, face.is_italic(), "{where_}");
+                assert_eq!(ours.monospace, face.is_monospaced(), "{where_}");
+                compared += 1;
+            }
+        }
+        assert!(
+            compared > 0 || font_files().is_empty(),
+            "no installed face was comparable"
+        );
     }
 }

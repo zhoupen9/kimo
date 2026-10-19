@@ -45,7 +45,13 @@ Read when touching `src/html.rs`, `src/css.rs`, `src/blitz_render.rs`, or a Blit
   `blitz_render` therefore registers fonts from disk itself (a curated set —
   parsing every installed face took ~46s in a debug build) and maps the CSS
   generic families plus the per-script fallbacks onto them. Keep it that way,
-  and keep the curated list in sync with the generic families.
+  and keep the curated list in sync with the generic families. Match a face's
+  **family name**, read from the face (`fonts::faces`), never the file name:
+  a file name is not a family — "DejaVuSansMNerdFont" contains "DejaVuSans",
+  and "NotoSerifCJK-SemiBold" contains "Bold" — and matching on it registered
+  179 MiB of faces on the development machine instead of 122 MiB, none of the
+  difference asked for by any mail. CJK families take only their Regular and
+  Bold faces for the same reason.
 
 - Blitz's painter scale must equal the document's viewport scale. Text is
   laid out at the viewport scale but positioned with the painter's scale, so

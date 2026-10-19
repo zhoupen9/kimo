@@ -63,17 +63,24 @@ Read when touching `src/theme.rs`, `src/fonts.rs`, or adding a color to a widget
 ## Fonts
 
 - Fonts are discovered, never fetched through fontconfig (hard rule 1):
-  `fonts::scan()` walks the usual directories and reads each face's `name`
-  table with ttf-parser. That took ~210 ms for the ~1000 installed faces on
-  the development machine, so it runs as `Job::ScanFonts` on a worker thread
-  and arrives as `Event::FontsScanned`; only the single-file read that
-  installs a picked family happens on the UI thread. Families are keyed by
-  their *typographic* family name, and each one keeps its plainest face
-  (regular weight, non-italic) so "DejaVu Sans" does not resolve to the
-  ExtraLight file. `fonts::install` also binds the named families
-  `kimo_ui`/`kimo_mono` — epaint panics on an unbound named family — which
-  the Appearance page previews through. Blitz keeps its own curated font set
-  (`blitz_render::load_fonts`); the Preferences choice applies to the egui UI
+  `fonts::scan()` walks the usual directories and reads each face's `name`,
+  `OS/2` and `post` tables — a few KiB per face — instead of reading the font
+  file whole. Reading the files took ~2.4 GB of I/O and left the allocator
+  holding ~50 MB afterwards on the development machine (four pan-CJK
+  collections are ~90 MB on their own); the table reads are ~4 MB. The scan
+  runs as `Job::ScanFonts` on a worker thread and arrives as
+  `Event::FontsScanned`; only the single-file read that installs a picked
+  family happens on the UI thread. Name records are decoded exactly as
+  ttf-parser decodes them (Unicode platform, Windows symbol/BMP encodings),
+  and a test compares the reader with a full ttf-parser parse on the installed
+  fonts, because the picker's names and chosen face are what `settings.json`
+  stores. Families are keyed by their *typographic* family name, and each one
+  keeps its plainest face (regular weight, non-italic) so "DejaVu Sans" does
+  not resolve to the ExtraLight file. `fonts::install` also binds the named
+  families `kimo_ui`/`kimo_mono` — epaint panics on an unbound named family —
+  which the Appearance page previews through. Blitz keeps its own curated font
+  set (`blitz_render::load_fonts`), matched by family name rather than file
+  name (see `docs/html-mail.md`); the Preferences choice applies to the egui UI
   and to monospace text in the built-in HTML renderer. The CJK fallback is a
   pan-CJK collection (Noto Sans CJK), whose faces cover the same characters
   but not the same *forms*: the face therefore follows the locale

@@ -605,8 +605,14 @@ fn load_fonts() -> FontContext {
     context
 }
 
-/// Font files worth registering, matched on the file name with punctuation
-/// removed ("DejaVu Sans" and "DejaVuSans" both become "dejavusans").
+/// Families worth registering, by family name with spaces, punctuation and
+/// case removed ("Liberation Sans" → "liberationsans").
+///
+/// The *family* is matched, not the file name. A file name is not a family:
+/// the old match pulled in every "DejaVuSansMNerdFont" variant and every CJK
+/// "SemiBold" face — tens of megabytes of faces no mail asks for. The family
+/// comes from the face's own `name` table (`fonts::faces`), which is a few KiB
+/// of reading per file.
 ///
 /// Registering every installed font would be more faithful, but parsing a
 /// font's tables costs milliseconds even in release builds: on a machine with
@@ -621,18 +627,15 @@ const PREFERRED_FONTS: &[&str] = &[
     "dejavusans",
     "dejavuserif",
     "dejavusansmono",
-    "notosansregular",
-    "notosansbold",
-    "notosansitalic",
-    "notoserifregular",
-    "notoserifbold",
-    "notoserifitalic",
+    "notosans",
+    "notoserif",
     "notosansmono",
     "notosansarabic",
     "notosanshebrew",
     "notosansthai",
     "notosansdevanagari",
     "notosanssymbols",
+    "notosanssymbols2",
     "notocoloremoji",
     "notoemoji",
     "carlito",
@@ -652,8 +655,10 @@ const PREFERRED_FONTS: &[&str] = &[
     "tahoma",
 ];
 
-/// CJK families, restricted to Regular and Bold: their collections are ~20 MB
-/// files with several faces each, and parsing every weight would cost seconds.
+/// CJK families, matched as family prefixes ("Noto Sans CJK SC"…), and only in
+/// Regular or Bold: each collection is a ~20 MB file holding several faces,
+/// and the SemiBold/Black files are a weight no mail asks for, not another
+/// family.
 const PREFERRED_CJK_FONTS: &[&str] = &[
     "notosanscjk",
     "notoserifcjk",
@@ -692,23 +697,36 @@ fn discover_font_files() -> Vec<PathBuf> {
     installed
 }
 
-/// Match a font file against `PREFERRED_FONTS` / `PREFERRED_CJK_FONTS`.
-fn is_preferred_font(path: &Path) -> bool {
-    let Some(stem) = path.file_stem().and_then(|stem| stem.to_str()) else {
-        return false;
-    };
-    let name: String = stem
-        .chars()
-        .filter(char::is_ascii_alphanumeric)
-        .flat_map(char::to_lowercase)
-        .collect();
-    if PREFERRED_FONTS.iter().any(|family| name.contains(family)) {
+/// Match one face's family and subfamily against the two lists.
+fn is_preferred_face(family: &str, subfamily: &str) -> bool {
+    let family = normalize(family);
+    if PREFERRED_FONTS.iter().any(|known| family == *known) {
         return true;
     }
-    PREFERRED_CJK_FONTS
-        .iter()
-        .any(|family| name.contains(family))
-        && (name.contains("regular") || name.contains("bold"))
+    let subfamily = normalize(subfamily);
+    (subfamily == "regular" || subfamily == "bold")
+        && PREFERRED_CJK_FONTS
+            .iter()
+            .any(|known| family.starts_with(known))
+}
+
+/// A family or style name reduced to lowercase alphanumerics, so a name's
+/// spacing, punctuation and case do not decide a match: "Noto Sans CJK SC" →
+/// "notosanscjksc", "SemiBold" → "semibold".
+fn normalize(name: &str) -> String {
+    name.chars()
+        .filter(char::is_ascii_alphanumeric)
+        .flat_map(char::to_lowercase)
+        .collect()
+}
+
+/// Whether any face of the font at `path` is one the lists want.
+fn is_preferred_font(path: &Path) -> bool {
+    crate::fonts::faces(path).iter().any(|face| {
+        face.family.as_deref().is_some_and(|family| {
+            is_preferred_face(family, face.subfamily.as_deref().unwrap_or_default())
+        })
+    })
 }
 
 /// Families tried, in order, for the generic CSS families. Latin faces come
@@ -828,6 +846,28 @@ fn family_ids(collection: &mut Collection, names: &[&str]) -> Vec<FamilyId> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The family decides, not the file name: the Nerd Font variants and the
+    /// CJK SemiBold faces used to match because their *file names* contained a
+    /// preferred family.
+    #[test]
+    fn preferred_fonts_match_families_not_file_names() {
+        assert!(is_preferred_face("DejaVu Sans", "Book"));
+        assert!(is_preferred_face("Liberation Serif", "Bold Italic"));
+        assert!(is_preferred_face("Noto Sans", "Regular"));
+        assert!(is_preferred_face("Noto Color Emoji", "Regular"));
+        assert!(is_preferred_face("Noto Sans CJK SC", "Regular"));
+        assert!(is_preferred_face("Noto Serif CJK SC", "Bold"));
+
+        assert!(!is_preferred_face("DejaVu Sans MNerd Font", "Regular"));
+        assert!(!is_preferred_face("DejaVu Sans Condensed", "Book"));
+        assert!(!is_preferred_face("Noto Sans Arabic UI", "Regular"));
+        // CJK faces are Regular/Bold only: "SemiBold" is not "Bold".
+        assert!(!is_preferred_face("Noto Serif CJK SC", "SemiBold"));
+        assert!(!is_preferred_face("Noto Sans CJK SC", "Bold Italic"));
+        assert!(!is_preferred_face("Noto Sans Mono CJK SC", "Regular"));
+        assert!(!is_preferred_face("Helvetica", "Regular"));
+    }
 
     #[test]
     fn percent_decoding_handles_escapes_and_passthrough() {
