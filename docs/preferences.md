@@ -11,15 +11,24 @@ Read when touching `preferences_modal`, a key in `settings.json`, or the sync cl
   (account list with
   use/edit/remove, and the add/edit account form in place of the list: it is
   pre-filled from the account it was opened on, and `Save & sync` updates that
-  account and syncs it) and **Appearance** (theme, accent, Simple/Blitz HTML
+  account and syncs it), **Appearance** (theme, accent, Simple/Blitz HTML
   renderer, the interface/fixed-width fonts — all persisted in
   `settings.json` — plus a preview of the palette the theme and the accent
-  resolve to). The heading row ends in the cross that closes the modal
+  resolve to) and **About** (the app's icon, the build's version and a short
+  summary of what Kimo is). The heading row ends in the cross that closes the modal
   (`PREFS_CLOSE_SIZE`, drawn by `paint_close_icon`, with the scheme's hover
   fill under the pointer) — a modal's cross, not the title bar's danger red:
   closing preferences destroys nothing. Configuration belongs on a page there,
   not as another title-bar toggle; the title bar keeps only actions (syncing,
   window controls), and switching accounts is a navigation-column affair.
+
+- **About reads the build rather than remembering a string**: the version is
+  `CARGO_PKG_VERSION`, so a release that bumps `Cargo.toml` cannot leave the
+  page claiming another one; the icon is the embedded `assets/app.png` the
+  tray serves and notifications write (`crate::tray::APP_PNG`), decoded and
+  uploaded the first time the page is drawn rather than at startup. The page
+  is deliberately read-only — it is where a reader checks what is running, not
+  another place to change it.
 
 ## Automatic sync
 

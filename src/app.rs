@@ -135,6 +135,7 @@ enum PrefsTab {
     General,
     Accounts,
     Appearance,
+    About,
 }
 
 /// One of the mail actions in the title bar. All of them act on the mail open
@@ -778,6 +779,9 @@ pub struct KimoApp {
     /// second, open glyph. Uploaded once at startup from the embedded PNGs
     /// in `folders::FolderKind::ICONS`.
     folder_icons: HashMap<(FolderKind, bool), egui::TextureHandle>,
+    /// The app's own icon, uploaded the first time Preferences → About draws
+    /// it from the embedded PNG the tray and notifications use.
+    app_icon: Option<egui::TextureHandle>,
     /// The frosted backdrop of a floating title bar (see `crate::glass`): the
     /// GL pass is made once, on the first frame the bar floats.
     glass: Glass,
@@ -2148,6 +2152,7 @@ impl KimoApp {
             collapsed_accounts: HashSet::new(),
             was_narrow: false,
             folder_icons,
+            app_icon: None,
             glass: Glass::default(),
             theme: Theme::parse(&settings.theme),
             // A file that names no accent, or one no accent answers to.
@@ -8161,6 +8166,7 @@ impl KimoApp {
                         (PrefsTab::General, "General"),
                         (PrefsTab::Accounts, "Accounts"),
                         (PrefsTab::Appearance, "Appearance"),
+                        (PrefsTab::About, "About"),
                     ] {
                         if ui.selectable_label(self.prefs_tab == tab, label).clicked() {
                             self.prefs_tab = tab;
@@ -8175,6 +8181,7 @@ impl KimoApp {
                         PrefsTab::General => self.general_page(ui),
                         PrefsTab::Accounts => self.accounts_page(ui),
                         PrefsTab::Appearance => self.appearance_page(ui),
+                        PrefsTab::About => self.about_page(ui),
                     }
                 });
             });
@@ -8711,7 +8718,64 @@ impl KimoApp {
 
         color_scheme_preview(ui, self.scheme());
     }
+
+    /// Preferences → About: the app's icon, the version it was built as, and
+    /// what it is. The icon is the embedded PNG the tray and notifications
+    /// serve, uploaded once the first time this page is drawn; the version is
+    /// the build's own `CARGO_PKG_VERSION`, so the page cannot drift from
+    /// Cargo.toml.
+    fn about_page(&mut self, ui: &mut egui::Ui) {
+        if self.app_icon.is_none() {
+            self.app_icon = load_app_icon(ui.ctx());
+        }
+        ui.horizontal(|ui| {
+            if let Some(icon) = &self.app_icon {
+                let (rect, _) = ui
+                    .allocate_exact_size(egui::Vec2::splat(ABOUT_ICON_SIZE), egui::Sense::hover());
+                ui.painter().image(
+                    icon.id(),
+                    rect,
+                    egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                    egui::Color32::WHITE,
+                );
+                ui.add_space(ABOUT_ICON_GAP);
+            }
+            ui.vertical(|ui| {
+                ui.label(egui::RichText::new("Kimo").heading());
+                ui.label(
+                    egui::RichText::new(format!("Version {}", env!("CARGO_PKG_VERSION")))
+                        .small()
+                        .weak(),
+                );
+            });
+        });
+        ui.add_space(12.0);
+        ui.separator();
+        ui.add_space(8.0);
+        ui.label(egui::RichText::new("A desktop email client written in pure Rust").strong());
+        ui.add_space(4.0);
+        ui.label(
+            "Kimo reads mail over IMAP4rev1 and POP3, sends it over SMTP, and keeps its \
+             accounts, folders and cached mail in one local SQLite database. The interface \
+             is drawn with egui, TLS is rustls with the ring provider, and HTML mail renders \
+             either as native widgets or as a Blitz-rasterized page.",
+        );
+        ui.add_space(12.0);
+        ui.label(
+            egui::RichText::new(
+                "No async runtime, no JavaScript, and no C library beyond the bundled SQLite \
+                 the mail database uses.",
+            )
+            .small()
+            .weak(),
+        );
+    }
 }
+
+/// The icon Preferences → About draws, and the gap between it and the app's
+/// name.
+const ABOUT_ICON_SIZE: f32 = 72.0;
+const ABOUT_ICON_GAP: f32 = 16.0;
 
 /// Preferences → Appearance: the palette in force, so every slot the app draws
 /// with can be read at a glance — the theme's own values with the chosen
@@ -11660,6 +11724,19 @@ fn label_row(
     }
 }
 
+/// Decode the app's embedded icon for Preferences → About. It is the same
+/// 256 px PNG the tray serves and notifications write (`crate::tray::APP_PNG`),
+/// uploaded lazily so a session that never opens the page pays nothing. A
+/// failed decode leaves the page worded only, which is a cosmetic loss.
+fn load_app_icon(ctx: &egui::Context) -> Option<egui::TextureHandle> {
+    let decoded = image::load_from_memory(crate::tray::APP_PNG)
+        .ok()?
+        .to_rgba8();
+    let size = [decoded.width() as usize, decoded.height() as usize];
+    let pixels = egui::ColorImage::from_rgba_unmultiplied(size, decoded.as_raw());
+    Some(ctx.load_texture("app-icon", pixels, egui::TextureOptions::LINEAR))
+}
+
 /// Decode the embedded folder icons (see `folders::FolderKind::ICONS`) into
 /// textures, once at startup. A failed decode is skipped: that row then draws
 /// without its icon, which is a cosmetic loss at worst.
@@ -13092,6 +13169,16 @@ mod tests {
                 }
             }
             _ => {}
+        }
+    }
+
+    /// Whether a shape samples a texture — the About page's way of checking
+    /// that its icon was actually drawn, not merely uploaded.
+    fn draws_texture(shape: &egui::Shape, id: egui::TextureId) -> bool {
+        match shape {
+            egui::Shape::Mesh(mesh) => mesh.texture_id == id,
+            egui::Shape::Vec(shapes) => shapes.iter().any(|shape| draws_texture(shape, id)),
+            _ => false,
         }
     }
 
@@ -18912,6 +18999,45 @@ mod tests {
         assert!(!app.show_preferences, "the cross closes the modal");
     }
 
+    /// Preferences → About names the running build and draws the app's icon:
+    /// the version is Cargo.toml's, read at compile time, so a release cannot
+    /// ship a page that claims another one.
+    #[test]
+    fn the_about_page_shows_the_build_version_and_the_app_icon() {
+        let ctx = egui::Context::default();
+        crate::fonts::install(&ctx, None, None);
+        let mut app = app_with_messages(&ctx, 1);
+        app.show_preferences = true;
+        app.prefs_tab = PrefsTab::About;
+        for _ in 0..FADE_FRAMES {
+            run_app_frame(&ctx, &mut app, Vec::new());
+        }
+
+        let texts = frame_texts(&ctx, &mut app);
+        assert!(texts.iter().any(|text| text == "Kimo"), "{texts:?}");
+        let version = format!("Version {}", env!("CARGO_PKG_VERSION"));
+        assert!(texts.contains(&version), "{texts:?}");
+        assert!(
+            texts
+                .iter()
+                .any(|text| text == "A desktop email client written in pure Rust"),
+            "{texts:?}"
+        );
+
+        let icon = app
+            .app_icon
+            .as_ref()
+            .expect("the embedded icon decoded")
+            .id();
+        let shapes = frame_shapes_at(&ctx, &mut app, 1400.0);
+        assert!(
+            shapes
+                .iter()
+                .any(|clipped| draws_texture(&clipped.shape, icon)),
+            "the page draws the icon it loaded"
+        );
+    }
+
     /// The account form's Sending group: off is an account that only reads
     /// mail, on needs a server and a port, and what it builds is what the
     /// account gets — credentials it does not name included.
@@ -21006,7 +21132,8 @@ mod tests {
     /// frames — the labelled list and card, the label filter and popup, the
     /// flagged list, the list filter's menu and the list it leaves, the sort
     /// menu, the bar with and without a mail open in the pane, and
-    /// Preferences → General — and write them out as PNGs, so the layout can be
+    /// Preferences → General, Appearance and About — and write them out as PNGs,
+    /// so the layout can be
     /// looked at. `KIMO_UI_DUMP` picks the directory (default `target`) and
     /// `KIMO_UI_WIDTH` the window's width (default 1400).
     ///
@@ -21292,6 +21419,13 @@ mod tests {
             collect_frame(&ctx, &mut app, &mut textures, Vec::new());
         }
         shot(&mut app, "ui-appearance.png", &mut textures);
+        // And Preferences → About: the icon, the build's version and the
+        // summary, the one page that configures nothing.
+        app.prefs_tab = PrefsTab::About;
+        for _ in 0..2 {
+            collect_frame(&ctx, &mut app, &mut textures, Vec::new());
+        }
+        shot(&mut app, "ui-about.png", &mut textures);
         app.show_preferences = false;
 
         // And the Blitz page's paper: the sender's page on white, and on the dark
