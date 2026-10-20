@@ -92,7 +92,12 @@ Read when touching `src/main.rs`, `src/gpu.rs`, `src/glass.rs`, the title bar, t
   icon-only **Sync now** cell, the
   preferences cog, drag area,
   double-click maximize, and the
-  minimize/maximize/close buttons sent as `ViewportCommand`s.
+  minimize/maximize/close buttons sent as `ViewportCommand`s — minimize is
+  `Minimized(true)`, or `Visible(false)` with minimize-to-tray on and a tray
+  registered (`minimize_command`). On Wayland that `Visible(false)` drops and
+  reopens the window instead of unmapping it (see
+  [preferences.md](preferences.md)); the loop's `wake` channel is what keeps a
+  hidden Kimo alive.
   **The two middle groups are anchored to the columns under them**, not to the
   room left over (`titlebar_anchors`): the box starts at the message list's own
   left edge and the run at the reading pane's, so each sits over the column it

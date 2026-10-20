@@ -372,6 +372,14 @@ pub enum SentCopy {
     Failed(String),
 }
 
+/// Ask for a repaint and wake the loop directly. The direct wake matters while
+/// the window is hidden: egui can consider an immediate repaint already served
+/// by a window that no longer exists.
+fn worker_wake(ctx: &egui::Context) {
+    ctx.request_repaint();
+    crate::wake::now();
+}
+
 pub fn spawn(job: Job, ctx: egui::Context, tx: Sender<Event>) {
     std::thread::spawn(move || match job {
         Job::FetchImage { url } => {
@@ -385,7 +393,7 @@ pub fn spawn(job: Job, ctx: egui::Context, tx: Sender<Event>) {
                 Err(_) => Event::ImageFailed { url },
             };
             let _ = tx.send(event);
-            ctx.request_repaint();
+            worker_wake(&ctx);
         }
         Job::FetchStylesheet { url } => {
             let event = match fetch_text(&url) {
@@ -393,7 +401,7 @@ pub fn spawn(job: Job, ctx: egui::Context, tx: Sender<Event>) {
                 Err(_) => Event::StylesheetFailed { url },
             };
             let _ = tx.send(event);
-            ctx.request_repaint();
+            worker_wake(&ctx);
         }
         Job::RenderHtml { key, request } => {
             match crate::blitz_render::render(&request) {
@@ -408,11 +416,11 @@ pub fn spawn(job: Job, ctx: egui::Context, tx: Sender<Event>) {
                     let _ = tx.send(Event::HtmlRenderFailed { key, error });
                 }
             }
-            ctx.request_repaint();
+            worker_wake(&ctx);
         }
         Job::ScanFonts => {
             let _ = tx.send(Event::FontsScanned(crate::fonts::scan()));
-            ctx.request_repaint();
+            worker_wake(&ctx);
         }
         Job::Search { seq, query } => {
             let event = match db::db().and_then(|db| crate::search::run(db.conn(), &query)) {
@@ -423,7 +431,7 @@ pub fn spawn(job: Job, ctx: egui::Context, tx: Sender<Event>) {
                 },
             };
             let _ = tx.send(event);
-            ctx.request_repaint();
+            worker_wake(&ctx);
         }
         Job::PickFiles => {
             // Not bracketed with SyncStarted/SyncDone: no account is being
@@ -439,7 +447,7 @@ pub fn spawn(job: Job, ctx: egui::Context, tx: Sender<Event>) {
                     });
                 }
             }
-            ctx.request_repaint();
+            worker_wake(&ctx);
         }
         Job::MarkSeen {
             account,
@@ -454,7 +462,7 @@ pub fn spawn(job: Job, ctx: egui::Context, tx: Sender<Event>) {
                     error: error.to_string(),
                 });
             }
-            ctx.request_repaint();
+            worker_wake(&ctx);
         }
         Job::SetFlag {
             account,
@@ -470,7 +478,7 @@ pub fn spawn(job: Job, ctx: egui::Context, tx: Sender<Event>) {
                     error: error.to_string(),
                 });
             }
-            ctx.request_repaint();
+            worker_wake(&ctx);
         }
         Job::SetLabels {
             account_id,
@@ -488,7 +496,7 @@ pub fn spawn(job: Job, ctx: egui::Context, tx: Sender<Event>) {
                     error: error.to_string(),
                 });
             }
-            ctx.request_repaint();
+            worker_wake(&ctx);
         }
         Job::DeleteAccount { account_id } => {
             if let Err(error) = db::delete_account(&account_id) {
@@ -497,7 +505,7 @@ pub fn spawn(job: Job, ctx: egui::Context, tx: Sender<Event>) {
                     error: error.to_string(),
                 });
             }
-            ctx.request_repaint();
+            worker_wake(&ctx);
         }
         Job::LoadOlder { account, folder } => {
             // A round trip like any other: the account's spinner says the
@@ -517,7 +525,7 @@ pub fn spawn(job: Job, ctx: egui::Context, tx: Sender<Event>) {
                     });
                 }
             }
-            ctx.request_repaint();
+            worker_wake(&ctx);
         }
         Job::DeleteMessage {
             account,
@@ -555,7 +563,7 @@ pub fn spawn(job: Job, ctx: egui::Context, tx: Sender<Event>) {
                     let _ = tx.send(Event::SyncDone { account_id });
                 }
             }
-            ctx.request_repaint();
+            worker_wake(&ctx);
         }
         Job::ExportMessage {
             account,
@@ -575,7 +583,7 @@ pub fn spawn(job: Job, ctx: egui::Context, tx: Sender<Event>) {
             let Some(place) = export_place(crate::portal::save_file(&format!("{stem}.eml"), &dir))
             else {
                 // Closed: no file, and nothing to say about it.
-                ctx.request_repaint();
+                worker_wake(&ctx);
                 return;
             };
             // A round trip like a delete's, and bracketed the same way: the
@@ -603,7 +611,7 @@ pub fn spawn(job: Job, ctx: egui::Context, tx: Sender<Event>) {
                     });
                 }
             }
-            ctx.request_repaint();
+            worker_wake(&ctx);
         }
         Job::DownloadAttachment {
             account,
@@ -633,7 +641,7 @@ pub fn spawn(job: Job, ctx: egui::Context, tx: Sender<Event>) {
                     });
                 }
             }
-            ctx.request_repaint();
+            worker_wake(&ctx);
         }
         Job::SendMessage { account, mail } => {
             // Not bracketed with SyncStarted/SyncDone like the other round
@@ -650,7 +658,7 @@ pub fn spawn(job: Job, ctx: egui::Context, tx: Sender<Event>) {
                     });
                 }
             }
-            ctx.request_repaint();
+            worker_wake(&ctx);
         }
         account_job => {
             let account_id = match &account_job {
@@ -718,7 +726,7 @@ pub fn spawn(job: Job, ctx: egui::Context, tx: Sender<Event>) {
                     error: e.to_string(),
                 }),
             };
-            ctx.request_repaint();
+            worker_wake(&ctx);
         }
     });
 }

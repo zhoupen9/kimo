@@ -106,6 +106,7 @@ src/glass.rs            the floating title bar's frosted backdrop (wgpu passes +
 src/render_bench.rs     test-only: times both HTML renderers for the same bodies (bench_render)
 src/dbus.rs             the session bus: D-Bus wire protocol (marshalling, framing, the connection)
 src/tray.rs             StatusNotifierItem over the session bus (std::thread) + svg→ARGB icon
+src/wake.rs             the event loop's wake channel, for work that finishes while the window is hidden
 src/notify.rs           new-mail notifications over the session bus (std::thread) + their 48·scale icon
 src/sync.rs             Job/Event enums, worker threads, per-protocol sync logic
 src/protocol/mod.rs     protocol modules

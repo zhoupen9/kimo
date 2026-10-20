@@ -25,6 +25,9 @@ rustls with the `ring` crypto provider and Mozilla's root certificates.
   session bus's `org.freedesktop.Notifications`, showing the app's own icon
   at the screen's scale factor; the switch for new mail is in Preferences →
   General
+- Optional minimize-to-tray: with it on, the minimize button hides Kimo and
+  the tray icon brings it back; without a registered tray the button keeps the
+  normal minimize
 - Message list with unread markers and text preview, grouped into
   conversations: one row per thread — its newest mail, how many it holds and a
   paperclip — with the chevron at its left opening the thread's mails in the

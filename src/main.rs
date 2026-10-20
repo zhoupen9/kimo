@@ -29,11 +29,13 @@ mod storage;
 mod sync;
 mod theme;
 mod tray;
+mod wake;
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use winit::application::ApplicationHandler;
+use winit::dpi::LogicalSize;
 use winit::event::WindowEvent;
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::window::{Window, WindowId};
@@ -47,14 +49,24 @@ enum Wake {
     Repaint(Duration),
 }
 
-/// The window, its GPU context, egui's input state and the app. All of it is
-/// made in `resumed`, because a window needs the event loop to be running.
+/// The window, its GPU context, egui's input state and the app. The app and
+/// the GPU renderer outlive the window: Wayland cannot hide a toplevel, so
+/// minimize-to-tray drops the window (and its surface) and a tray Show opens a
+/// new one, keeping the mail state, the compose draft and every uploaded
+/// texture.
 struct Kimo {
     egui_ctx: egui::Context,
     window: Option<Arc<Window>>,
     state: Option<egui_winit::State>,
     gpu: Option<gpu::Gpu>,
     app: Option<app::KimoApp>,
+    /// The window egui's repaint callback may ask for a redraw on. It is
+    /// cleared when the window is dropped, so the callback does not keep a
+    /// hidden window alive.
+    window_slot: Arc<Mutex<Option<Arc<Window>>>>,
+    /// The size the next window opens at: the one the last window had when it
+    /// was hidden, or the startup default.
+    window_size: LogicalSize<f64>,
     /// What the loop knows about the window: `egui_winit` fills it in every
     /// frame, reads commands back into it, and egui gets it as this frame's
     /// viewport input.
@@ -63,8 +75,6 @@ struct Kimo {
     actions: Vec<egui_winit::ActionRequested>,
     /// When egui asked for the next frame, if it is not now.
     redraw_at: Option<Instant>,
-    /// Wakes the loop for a repaint egui wants later than right now.
-    proxy: winit::event_loop::EventLoopProxy<Wake>,
 }
 
 fn main() -> Result<(), winit::error::EventLoopError> {
@@ -77,67 +87,71 @@ fn main() -> Result<(), winit::error::EventLoopError> {
 
     let event_loop = EventLoop::<Wake>::with_user_event().build()?;
     let proxy = event_loop.create_proxy();
+    wake::set(proxy.clone());
+    let egui_ctx = egui::Context::default();
+    let window_slot: Arc<Mutex<Option<Arc<Window>>>> = Arc::new(Mutex::new(None));
+    // Any thread may ask egui for a frame, so the request has to reach the
+    // event loop: a redraw is immediate, a delay becomes a timer. With no
+    // window — a hidden Wayland one — the wake still has to arrive, because a
+    // tray Show is what reopens it.
+    let repaint_slot = Arc::clone(&window_slot);
+    let repaint_proxy = proxy.clone();
+    egui_ctx.set_request_repaint_callback(move |info| {
+        let scheduled =
+            !info.delay.is_zero() && repaint_proxy.send_event(Wake::Repaint(info.delay)).is_ok();
+        if scheduled {
+            return;
+        }
+        let window = repaint_slot.lock().ok().and_then(|slot| slot.clone());
+        if let Some(window) = window {
+            window.request_redraw();
+        } else {
+            let _ = repaint_proxy.send_event(Wake::Repaint(Duration::ZERO));
+        }
+    });
     let mut kimo = Kimo {
-        egui_ctx: egui::Context::default(),
+        egui_ctx,
         window: None,
         state: None,
         gpu: None,
         app: None,
+        window_slot,
+        window_size: LogicalSize::new(1280.0, 800.0),
         viewport: egui::ViewportInfo::default(),
         actions: Vec::new(),
         redraw_at: None,
-        proxy,
     };
     event_loop.run_app(&mut kimo)
 }
 
 impl ApplicationHandler<Wake> for Kimo {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
-        if self.window.is_some() {
-            return;
-        }
-        let window = Arc::new(
-            event_loop
-                .create_window(window_attributes())
-                .expect("kimo: cannot open a window"),
-        );
-        // Any thread may ask egui for a frame, so the request has to reach the
-        // event loop: a redraw is immediate, a delay becomes a timer.
-        let proxy = self.proxy.clone();
-        let waker = window.clone();
-        self.egui_ctx.set_request_repaint_callback(move |info| {
-            // An immediate repaint is a redraw; a delayed one becomes a timer
-            // in `about_to_wait`. A loop that will not take the message (it is
-            // shutting down) is woken directly rather than losing the frame.
-            let scheduled =
-                !info.delay.is_zero() && proxy.send_event(Wake::Repaint(info.delay)).is_ok();
-            if !scheduled {
-                waker.request_redraw();
-            }
-        });
-
-        let state = egui_winit::State::new(
-            self.egui_ctx.clone(),
-            egui::ViewportId::ROOT,
-            &*window,
-            Some(window.scale_factor() as f32),
-            None,
-            None,
-        );
-        let gpu = gpu::Gpu::new(window.clone(), event_loop.owned_display_handle());
-        let app = app::KimoApp::new(&self.egui_ctx);
-
-        self.state = Some(state);
-        self.gpu = Some(gpu);
-        self.app = Some(app);
-        self.window = Some(window);
-        if let Some(window) = &self.window {
-            window.request_redraw();
+        if self.window.is_none() {
+            self.open_window(event_loop);
         }
     }
 
-    fn user_event(&mut self, _event_loop: &ActiveEventLoop, event: Wake) {
+    fn user_event(&mut self, event_loop: &ActiveEventLoop, event: Wake) {
+        if crate::tray::take_quit_request() {
+            event_loop.exit();
+            return;
+        }
         match event {
+            Wake::Repaint(delay) if delay.is_zero() => {
+                let show_requested = crate::tray::take_show_request();
+                if self.window.is_some() {
+                    if let Some(window) = &self.window {
+                        window.request_redraw();
+                    }
+                } else if show_requested {
+                    self.open_window(event_loop);
+                } else {
+                    // A sync result, a notification, the auto-sync clock: the
+                    // app keeps running with no window, but only the work that
+                    // does not need pixels.
+                    self.pump_hidden();
+                }
+            }
             Wake::Repaint(delay) => {
                 let at = Instant::now() + delay;
                 self.redraw_at = Some(self.redraw_at.map_or(at, |current| current.min(at)));
@@ -162,6 +176,9 @@ impl ApplicationHandler<Wake> for Kimo {
         match event {
             WindowEvent::CloseRequested => event_loop.exit(),
             WindowEvent::Resized(size) => {
+                if size.width > 0 && size.height > 0 {
+                    self.window_size = size.to_logical(window.scale_factor());
+                }
                 if let Some(gpu) = self.gpu.as_mut() {
                     gpu.resize(size);
                 }
@@ -186,6 +203,10 @@ impl ApplicationHandler<Wake> for Kimo {
                 self.redraw_at = None;
                 if let Some(window) = &self.window {
                     window.request_redraw();
+                } else {
+                    // No window to draw, but the timer may still be the
+                    // auto-sync clock: pump the app's hidden work.
+                    self.pump_hidden();
                 }
                 ControlFlow::Wait
             }
@@ -196,6 +217,78 @@ impl ApplicationHandler<Wake> for Kimo {
 }
 
 impl Kimo {
+    /// Make the window — at startup, or again after a Wayland hide. The app
+    /// and the GPU device and renderer survive a hide; only the egui input
+    /// state and the window's surface are remade.
+    fn open_window(&mut self, event_loop: &ActiveEventLoop) {
+        if self.window.is_some() {
+            return;
+        }
+        let window = Arc::new(
+            event_loop
+                .create_window(window_attributes(self.window_size))
+                .expect("kimo: cannot open a window"),
+        );
+        let state = egui_winit::State::new(
+            self.egui_ctx.clone(),
+            egui::ViewportId::ROOT,
+            &*window,
+            Some(window.scale_factor() as f32),
+            None,
+            None,
+        );
+        match self.gpu.as_mut() {
+            Some(gpu) => gpu.attach_surface(window.clone()),
+            None => {
+                self.gpu = Some(gpu::Gpu::new(
+                    window.clone(),
+                    event_loop.owned_display_handle(),
+                ));
+            }
+        }
+        if self.app.is_none() {
+            self.app = Some(app::KimoApp::new(&self.egui_ctx));
+        }
+        self.state = Some(state);
+        self.window = Some(window.clone());
+        *self.window_slot.lock().unwrap() = Some(window.clone());
+        window.request_redraw();
+    }
+
+    /// Drop the window without ending the process. This is Wayland's only way
+    /// to hide a toplevel: the compositor has no unmap request, and niri, for
+    /// one, ignores `set_minimized` outright. The tray's Show opens a new
+    /// window through `open_window`.
+    fn hide_window(&mut self) {
+        let Some(window) = self.window.as_ref() else {
+            return;
+        };
+        let size = window.inner_size();
+        if size.width > 0 && size.height > 0 {
+            self.window_size = size.to_logical(window.scale_factor());
+        }
+        // Drop the callback's strong reference first, then the surface, then
+        // the window itself. Keeping the slot set would keep the hidden window
+        // alive through the repaint callback.
+        *self.window_slot.lock().unwrap() = None;
+        if let Some(gpu) = &mut self.gpu {
+            gpu.detach_surface();
+        }
+        self.state = None;
+        self.window = None;
+        self.actions.clear();
+        self.redraw_at = None;
+    }
+
+    /// The app's work that needs no pixels: drain what the workers sent and
+    /// keep the automatic sync clock turning. The UI itself is not run, so a
+    /// hidden Kimo costs no frames.
+    fn pump_hidden(&mut self) {
+        if let Some(app) = &mut self.app {
+            app.pump_hidden();
+        }
+    }
+
     /// One frame: egui runs the app, the GPU draws what it drew (see
     /// `crate::gpu`), and what egui wants done to the window — resize it, drag
     /// it, close it — comes back as viewport commands.
@@ -222,6 +315,22 @@ impl Kimo {
             .insert(egui::ViewportId::ROOT, self.viewport.clone());
 
         let viewports = gpu.render(&window, state, app, event_loop);
+        // Minimize-to-tray asks for `Visible(false)`. X11 can unmap the
+        // window; Wayland cannot, so the window is dropped after this frame.
+        let visible_false = viewports.values().any(|output| {
+            output
+                .commands
+                .iter()
+                .any(|command| matches!(command, egui::ViewportCommand::Visible(false)))
+        });
+        let hide_on_wayland = is_wayland(&window) && visible_false;
+        // A Show that arrived while the window was still visible has been
+        // honoured by this frame. While hiding, leave the request for the wake
+        // handler: a Show that raced the hide should reopen the window, not be
+        // swallowed here.
+        if !hide_on_wayland {
+            crate::tray::take_show_request();
+        }
 
         let mut actions = std::mem::take(&mut self.actions);
         for (_, output) in viewports {
@@ -271,14 +380,19 @@ impl Kimo {
             }
         }
         self.actions = actions;
+        if hide_on_wayland {
+            self.hide_window();
+        }
     }
 }
 
-/// The window Kimo draws its own title bar into: undecorated, 1280×800, and
-/// named so the compositor can match window rules against it. Undecorated is
-/// also why the app draws the window's resize border (`window_resize_grips`):
-/// there is no system frame left to resize it with.
-fn window_attributes() -> winit::window::WindowAttributes {
+/// The window Kimo draws its own title bar into: undecorated, 1280×800 by
+/// default, and named so the compositor can match window rules against it.
+/// Undecorated is also why the app draws the window's resize border
+/// (`window_resize_grips`): there is no system frame left to resize it with.
+/// `size` is the one the last window had when it was hidden, so reopening it
+/// from the tray does not snap back to the startup size.
+fn window_attributes(size: LogicalSize<f64>) -> winit::window::WindowAttributes {
     #[allow(unused_mut)]
     let mut attributes = Window::default_attributes()
         .with_title("Kimo")
@@ -288,7 +402,7 @@ fn window_attributes() -> winit::window::WindowAttributes {
         // Wayland this flag is also what stops winit from marking the whole
         // surface opaque, and on X11 it is what picks a 32-bit visual.
         .with_transparent(true)
-        .with_inner_size(winit::dpi::LogicalSize::new(1280.0, 800.0));
+        .with_inner_size(size);
     #[cfg(target_os = "linux")]
     {
         use winit::platform::wayland::WindowAttributesExtWayland;
@@ -301,4 +415,19 @@ fn window_attributes() -> winit::window::WindowAttributes {
         attributes = WindowAttributesExtX11::with_name(attributes, "kimo", "kimo");
     }
     attributes
+}
+
+/// Whether this window is a Wayland toplevel. On X11 `set_visible(false)` is
+/// enough to hide, so the window is kept; on Wayland it has to be dropped.
+fn is_wayland(window: &Window) -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        use winit::platform::wayland::WindowExtWayland;
+        window.xdg_toplevel().is_some()
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = window;
+        false
+    }
 }

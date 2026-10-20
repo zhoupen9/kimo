@@ -830,6 +830,11 @@ pub struct KimoApp {
     /// On by default: it is what the feature is for, and the switch is there
     /// for the session that does not want to be interrupted.
     notifications: bool,
+    /// Whether the title bar's minimize button hides the window instead of
+    /// minimising it (Preferences → General). Off by default, and the hide
+    /// only happens while a tray is registered, because the tray is the way
+    /// back (`crate::tray::available`).
+    minimize_to_tray: bool,
     /// Installed font families for the Appearance pickers; `None` while the
     /// worker scan (`Job::ScanFonts`) is still running.
     font_families: Option<Vec<FontFamily>>,
@@ -2173,6 +2178,9 @@ impl KimoApp {
             // And here too: a file that says nothing about notifications gets
             // them, because that is what the app is for.
             notifications: settings.notifications.unwrap_or(true),
+            // Minimize stays the window manager's until the reader asks for
+            // the tray behaviour.
+            minimize_to_tray: settings.minimize_to_tray.unwrap_or(false),
             font_families: None,
             ui_font: settings.ui_font.clone(),
             mono_font: settings.mono_font.clone(),
@@ -2217,6 +2225,20 @@ impl KimoApp {
     fn drain_events(&mut self) {
         while let Ok(event) = self.rx.try_recv() {
             self.apply_event(event);
+        }
+    }
+
+    /// The work that has to continue while the window is hidden: worker
+    /// results are drained (a notification is one of them) and the automatic
+    /// sync clock keeps turning. The UI itself is not run, so a hidden Kimo
+    /// costs no frames.
+    pub(crate) fn pump_hidden(&mut self) {
+        let ctx = self.ctx.clone();
+        self.drain_events();
+        // egui's own repaint request may be suppressed while no window is
+        // drawing, so the clock is put on the event loop's wake channel too.
+        if let Some(wait) = self.pump_auto_sync(&ctx) {
+            crate::wake::after(wait);
         }
     }
 
@@ -2638,16 +2660,17 @@ impl KimoApp {
     /// A sweep that is already in flight is left to finish (a second one would
     /// fetch the same mail twice); the clock is set either way, so a busy
     /// account is asked again a full interval later rather than every frame.
-    fn pump_auto_sync(&mut self, ctx: &egui::Context) {
+    ///
+    /// The wait is returned so a hidden app can also put it on the event
+    /// loop's wake channel: there is no frame to ask.
+    fn pump_auto_sync(&mut self, ctx: &egui::Context) -> Option<Duration> {
         let now = Instant::now();
-        let Some(wait) = auto_sync_wait(
+        let wait = auto_sync_wait(
             self.auto_sync,
             self.auto_synced_at,
             self.auto_sync_every,
             now,
-        ) else {
-            return;
-        };
+        )?;
         if wait.is_zero() {
             self.auto_synced_at = now;
             if !self.sync_in_flight() {
@@ -2655,6 +2678,7 @@ impl KimoApp {
             }
         }
         ctx.request_repaint_after(wait);
+        Some(wait)
     }
 
     /// Whether any account is syncing right now, which is what the automatic
@@ -3362,6 +3386,7 @@ impl KimoApp {
             auto_sync: Some(self.auto_sync),
             auto_sync_minutes: Some((self.auto_sync_every.as_secs() / SECS_PER_MINUTE) as u32),
             notifications: Some(self.notifications),
+            minimize_to_tray: Some(self.minimize_to_tray),
         });
     }
 
@@ -4137,9 +4162,10 @@ impl KimoApp {
                     }
                     if resp.clicked() {
                         match ctrl {
-                            Ctrl::Minimize => row
-                                .ctx()
-                                .send_viewport_cmd(egui::ViewportCommand::Minimized(true)),
+                            Ctrl::Minimize => {
+                                let hide = self.minimize_to_tray && crate::tray::available();
+                                row.ctx().send_viewport_cmd(minimize_command(hide));
+                            }
                             Ctrl::Maximize => row
                                 .ctx()
                                 .send_viewport_cmd(egui::ViewportCommand::Maximized(!maximized)),
@@ -8500,8 +8526,9 @@ impl KimoApp {
         });
     }
 
-    /// Preferences → General: the mail list, the automatic sync and the
-    /// notifications, all persisted on change.
+    /// Preferences → General: the mail list, the automatic sync, the
+    /// notifications and the window's minimize behaviour, all persisted on
+    /// change.
     fn general_page(&mut self, ui: &mut egui::Ui) {
         ui.label(egui::RichText::new("Mail list").strong());
         if ui
@@ -8593,6 +8620,27 @@ impl KimoApp {
             egui::RichText::new(
                 "Linux desktops show these through org.freedesktop.Notifications on the \
                  session bus; a session without a notification daemon simply stays quiet.",
+            )
+            .small()
+            .weak(),
+        );
+
+        ui.add_space(12.0);
+        ui.separator();
+        ui.add_space(8.0);
+
+        ui.label(egui::RichText::new("Window").strong());
+        if ui
+            .checkbox(&mut self.minimize_to_tray, "Minimize to the tray")
+            .changed()
+        {
+            self.persist_settings();
+        }
+        ui.label(
+            egui::RichText::new(
+                "The minimize button hides Kimo instead of sending it to the task bar; \
+                 click the tray icon, or its Show item, to bring it back. Without a tray \
+                 icon, minimize keeps its normal behaviour.",
             )
             .small()
             .weak(),
@@ -8902,7 +8950,7 @@ impl KimoApp {
         self.apply_theme(ctx);
         // The automatic sync is a frame's business too: it is what asks for the
         // frame its clock needs, and what starts the sweep when it is up.
-        self.pump_auto_sync(ctx);
+        let _ = self.pump_auto_sync(ctx);
 
         // The columns give way to a narrowing window in one order
         // (`plan_columns`): the navigation collapses first, then the reading
@@ -9588,6 +9636,18 @@ fn titlebar_rects(bar: egui::Rect, controls: usize) -> TitlebarRects {
             controls_left,
             bar.right() - TITLEBAR_RIGHT_MARGIN - controls_left,
         ),
+    }
+}
+
+/// What the title bar's minimize button sends. With minimize-to-tray on and a
+/// tray registered the window is hidden rather than minimised — the tray's
+/// Show raises it again — and without a tray it keeps the normal minimize, so
+/// the window cannot be hidden with no way back.
+fn minimize_command(hide: bool) -> egui::ViewportCommand {
+    if hide {
+        egui::ViewportCommand::Visible(false)
+    } else {
+        egui::ViewportCommand::Minimized(true)
     }
 }
 
@@ -17103,6 +17163,67 @@ mod tests {
             actions.right() + MAIL_ACTION_EDGE_GAP <= rects.sync.min.x + 0.5,
             "the run draws {} pt into the bar's right end",
             actions.right() + MAIL_ACTION_EDGE_GAP - rects.sync.min.x
+        );
+    }
+
+    /// Minimize is the window manager's by default; only with minimize-to-tray
+    /// on — and a tray that can bring it back — is the window hidden.
+    #[test]
+    fn minimize_to_tray_hides_only_when_a_tray_can_bring_the_window_back() {
+        assert_eq!(
+            minimize_command(false),
+            egui::ViewportCommand::Minimized(true)
+        );
+        assert_eq!(
+            minimize_command(true),
+            egui::ViewportCommand::Visible(false)
+        );
+    }
+
+    /// A click on the minimize cell asks the window manager to minimize when
+    /// the preference is off — the cell is a real hit target, not a painted
+    /// glyph. The tray path is `minimize_command`'s above.
+    #[test]
+    fn the_minimize_cell_minimizes_when_minimize_to_tray_is_off() {
+        let ctx = egui::Context::default();
+        crate::fonts::install(&ctx, None, None);
+        let mut app = app_with_messages(&ctx, 1);
+        // One frame first: the right end is carved out of the window's size.
+        frame_shapes_at(&ctx, &mut app, 1400.0);
+        app.minimize_to_tray = false;
+
+        let bar = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1400.0, TITLEBAR_HEIGHT));
+        let rects = titlebar_rects(bar, 3);
+        let pitch = TITLEBAR_BUTTON_SIZE + TITLEBAR_BUTTON_GAP;
+        let center = egui::pos2(
+            rects.controls.right() - TITLEBAR_BUTTON_SIZE / 2.0 - 2.0 * pitch,
+            TITLEBAR_HEIGHT / 2.0,
+        );
+        let button = |pressed| egui::Event::PointerButton {
+            pos: center,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::default(),
+        };
+
+        let mut commands = viewport_commands(&app_frame_output(
+            &ctx,
+            &mut app,
+            vec![egui::Event::PointerMoved(center)],
+        ));
+        commands.extend(viewport_commands(&app_frame_output(
+            &ctx,
+            &mut app,
+            vec![button(true)],
+        )));
+        commands.extend(viewport_commands(&app_frame_output(
+            &ctx,
+            &mut app,
+            vec![button(false)],
+        )));
+        assert!(
+            commands.contains(&egui::ViewportCommand::Minimized(true)),
+            "the minimize cell asks for the normal minimize: {commands:?}"
         );
     }
 

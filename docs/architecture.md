@@ -15,6 +15,13 @@ worker thread (sync.rs)
 Event (mpsc) ──► drain_events() at frame start ──► merge into AccountUiState
 ```
 
+A worker also calls `wake::now()` after sending its event. While the window is
+hidden there is no frame to start: egui can consider an immediate repaint
+already served, and a Wayland minimize-to-tray window has been dropped
+altogether. `src/wake.rs` is the event loop's own channel, and a hidden
+`KimoApp::pump_hidden` drains the channel's events and keeps the auto-sync
+clock turning. Tray Show and Quit use the same wake.
+
 ## Sync is incremental
 
 - Syncing is incremental, and the state that makes it so lives in the database:

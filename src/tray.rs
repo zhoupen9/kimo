@@ -13,6 +13,8 @@
 //! (e.g. GNOME without an extension) simply disables the tray — the app keeps
 //! running.
 
+use std::sync::atomic::{AtomicBool, Ordering};
+
 use crate::dbus::{
     build_body, properties_dict, Bus, Unmarshal, Value, FIELD_DESTINATION, FIELD_ERROR_NAME,
     FIELD_REPLY_SERIAL, FIELD_SIGNATURE, MSG_ERROR, MSG_METHOD_CALL, MSG_METHOD_RETURN,
@@ -23,6 +25,35 @@ use crate::dbus::{
 /// notification (`crate::notify`) writes it out as the icon the notification
 /// shows.
 pub(crate) const APP_PNG: &[u8] = include_bytes!("../assets/app.png");
+
+/// Whether the tray is registered and being served. The window's minimize
+/// button consults this before hiding the window: the tray is the way back,
+/// and a hide with no tray would be a window out of reach.
+static AVAILABLE: AtomicBool = AtomicBool::new(false);
+
+/// Set when Show (or a left click on the icon) asks for the window. The main
+/// loop reads it when there is no window to draw: on Wayland a hidden window
+/// is gone, so the request has to recreate it rather than send it a command.
+static SHOW_REQUESTED: AtomicBool = AtomicBool::new(false);
+
+/// Set when Quit is chosen. The loop may have no window to receive the close
+/// command, so it reads this and exits itself.
+static QUIT_REQUESTED: AtomicBool = AtomicBool::new(false);
+
+/// Whether a tray icon is registered and listening for Show.
+pub(crate) fn available() -> bool {
+    AVAILABLE.load(Ordering::Relaxed)
+}
+
+/// Take the pending Show request, if any.
+pub(crate) fn take_show_request() -> bool {
+    SHOW_REQUESTED.swap(false, Ordering::Relaxed)
+}
+
+/// Take the pending Quit request, if any.
+pub(crate) fn take_quit_request() -> bool {
+    QUIT_REQUESTED.swap(false, Ordering::Relaxed)
+}
 
 const SNI_INTERFACE: &str = "org.kde.StatusNotifierItem";
 const DBUSMENU_INTERFACE: &str = "com.canonical.dbusmenu";
@@ -321,17 +352,28 @@ fn menu_events(member: &str, body: &[u8]) -> Vec<(i32, String)> {
     out
 }
 
-/// Bring the main window back and focus it.
+/// Bring the main window back and focus it. The window may have been hidden
+/// by minimize-to-tray or minimised by the window manager, so both states are
+/// undone before it is raised.
 fn show_window(ctx: &egui::Context) {
+    SHOW_REQUESTED.store(true, Ordering::Relaxed);
+    ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
     ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
     ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
     ctx.request_repaint();
+    // egui can consider an immediate repaint already served; the loop still
+    // has to hear about a show when there is no window to redraw.
+    crate::wake::now();
 }
 
-/// Ask eframe to close the main viewport, which ends the process.
+/// Ask for the main viewport to close. The loop ends the process; when the
+/// window is hidden there is no viewport to receive the command, so the quit
+/// request travels through the wake channel too.
 fn quit(ctx: &egui::Context) {
+    QUIT_REQUESTED.store(true, Ordering::Relaxed);
     ctx.send_viewport_cmd(egui::ViewportCommand::Close);
     ctx.request_repaint();
+    crate::wake::now();
 }
 
 fn sni_property(name: &str, icon: &Icon) -> Option<Value> {
@@ -585,7 +627,12 @@ pub fn spawn(ctx: egui::Context) {
                     }
                     Ok(_) => {}
                 }
-                serve(&mut bus, &ctx, &icon)
+                // Registered and listening: from here until `serve` returns,
+                // minimize-to-tray has a way back.
+                AVAILABLE.store(true, Ordering::Relaxed);
+                let served = serve(&mut bus, &ctx, &icon);
+                AVAILABLE.store(false, Ordering::Relaxed);
+                served
             };
             if let Err(e) = run() {
                 eprintln!("kimo tray: {e}");

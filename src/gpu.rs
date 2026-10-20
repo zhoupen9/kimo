@@ -35,7 +35,15 @@ const WINDOW_CORNER_RADIUS: f32 = 8.0;
 /// The window's GPU context: device, surface, egui's renderer, and the offscreen
 /// scene a frame with a floating title bar is drawn into first.
 pub struct Gpu {
-    surface: wgpu::Surface<'static>,
+    /// The surface is `None` while the window is hidden: Wayland has no
+    /// "unmap this toplevel" request, so minimizing to the tray drops the
+    /// window and this surface with it, and a tray Show attaches a new one to
+    /// the new window. The instance and adapter stay, because they are what
+    /// makes the new surface; so do the device and the renderer, whose
+    /// textures are the app's font atlas and mail images.
+    instance: wgpu::Instance,
+    adapter: wgpu::Adapter,
+    surface: Option<wgpu::Surface<'static>>,
     config: wgpu::SurfaceConfiguration,
     device: wgpu::Device,
     queue: wgpu::Queue,
@@ -163,7 +171,9 @@ impl Gpu {
         let corners = CornerMask::new(&device, config.format, alpha);
 
         Self {
-            surface,
+            instance,
+            adapter,
+            surface: Some(surface),
             config,
             device,
             queue,
@@ -181,7 +191,38 @@ impl Gpu {
         }
         self.config.width = size.width;
         self.config.height = size.height;
-        self.surface.configure(&self.device, &self.config);
+        if let Some(surface) = &self.surface {
+            surface.configure(&self.device, &self.config);
+        }
+        self.scene = None;
+    }
+
+    /// Drop the surface — and with it the window it was made on — while
+    /// keeping the device, the renderer and every texture it has uploaded.
+    pub fn detach_surface(&mut self) {
+        self.surface = None;
+        self.scene = None;
+    }
+
+    /// Make a surface for a window the app has just reopened on Wayland. The
+    /// format and alpha mode are the ones the pipelines and the corner mask
+    /// were built for; the same compositor is offering the same capabilities,
+    /// so a different one is a broken invariant rather than a fallback.
+    pub fn attach_surface(&mut self, window: Arc<Window>) {
+        let surface = self
+            .instance
+            .create_surface(window.clone())
+            .expect("kimo: the reopened window has no surface this GPU can draw into");
+        let caps = surface.get_capabilities(&self.adapter);
+        assert!(
+            caps.formats.contains(&self.config.format),
+            "kimo: the reopened surface no longer offers the renderer's format"
+        );
+        let size = window.inner_size();
+        self.config.width = size.width.max(1);
+        self.config.height = size.height.max(1);
+        surface.configure(&self.device, &self.config);
+        self.surface = Some(surface);
         self.scene = None;
     }
 
@@ -239,7 +280,11 @@ impl Gpu {
 
         let glass = app.glass().rect_px(pixels_per_point, size);
         let split = app.glass().split(&primitives);
-        let frame = match self.surface.get_current_texture() {
+        let surface = self
+            .surface
+            .as_ref()
+            .expect("kimo: a frame was asked for with no surface attached");
+        let frame = match surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(frame) => frame,
             // Usable, but the swapchain wants reconfiguring: the next frame's
             // `Resized` (or this one's) does it.

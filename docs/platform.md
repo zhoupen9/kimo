@@ -46,15 +46,20 @@ Read when touching `src/portal.rs`, `src/dbus.rs`, `src/tray.rs`, `src/notify.rs
   colors (the purple circle works on any panel). Keep the source large: the
   host scales the pixmap down to its panel size, so a 48px icon looked
   blurry on a HiDPI panel. The cost is 256 KB of ARGB per `IconPixmap`
-  reply, which is nothing on the session bus. Left click raises the window;
-  the right-click menu is a minimal `com.canonical.dbusmenu`
-  object at `/Menu` (Show / Quit) served by the same thread. Missing
+  reply, which is nothing on the session bus. Left click raises the window —
+  reopening it after a Wayland minimize-to-tray hide — and the right-click
+  menu is a minimal `com.canonical.dbusmenu` object at `/Menu` (Show / Quit)
+  served by the same thread. Quit sets the loop's quit request before it wakes
+  it: a hidden window has no close command to receive. Missing
   StatusNotifierWatcher disables the tray silently, and `IconPixmap` must
   stay `a(iiay)` — hosts cannot read a bare byte array. The session bus is
   silent for hours at a time, so `dbus`'s reads ride out an idle read-timeout
   expiry instead of failing on it (`read_exact` turned it into a fatal
   `WouldBlock`, and the icon vanished 30s after startup) — one rule for both
-  D-Bus threads.
+  D-Bus threads. The thread publishes `tray::available()` once registration
+  succeeds, which is what lets minimize-to-tray hide the window only while
+  there is a tray to bring it back; Show and a left click unminimize before
+  they raise.
 
 ## Desktop notifications
 

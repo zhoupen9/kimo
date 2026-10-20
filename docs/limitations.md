@@ -22,6 +22,12 @@ Do not "fix" these casually — they are known:
   conversation only while the list is threading: with the preference off, a
   click opens the one mail it always did.
 
+- **niri ignores `xdg_toplevel.set_minimized`, and Wayland has no unmap
+  request**: with Preferences → General's "Minimize to the tray" off, the
+  minimize button cannot minimize on niri. Turning the option on is the way to
+  hide the window there; it works by dropping and reopening the toplevel
+  (see [preferences.md](preferences.md)).
+
 - TLS finite-field DH covers the 2048-bit groups listed in
   `src/protocol/ffdhe.rs` and nothing else. A server whose DHE group is
   another size, or yet another custom prime, still fails the handshake with
