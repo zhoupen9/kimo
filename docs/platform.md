@@ -63,8 +63,8 @@ Read when touching `src/portal.rs`, `src/dbus.rs`, `src/tray.rs`, `src/notify.rs
   window only while there is a tray to bring it back; Show and a left click
   unminimize before they raise.
 
-- **Unread badge:** when mail arrives that the window has not shown, the
-  tray's icon is replaced by the mark with a red disc on its lower right. There
+- **Unread badge:** while any account's Inbox holds unread mail, the tray's
+  icon is replaced by the mark with a red disc on its lower right. There
   is no second asset: the badge pixmap is composited once at startup from the
   same `assets/app.png` (`tray::badge_argb`), in fractions of the icon's
   width so it scales with the panel, with a ring of transparency between disc
@@ -87,17 +87,24 @@ Read when touching `src/portal.rs`, `src/dbus.rs`, `src/tray.rs`, `src/notify.rs
   finishes a message that has begun arriving, so polling can never swallow
   half a frame.
 
-- **When the badge is up:** for the same batches a notification would be
-  raised from — the folder announces new mail (`announces_new_mail`), and the
-  message is not already held under another folder — but *not* gated on the
-  notification preference: a dot is the quietest way to say the post came,
-  and a reader who turned the pop-ups off asked for less interruption, not
-  for silence. It is gated on the window instead: nothing is badged while
-  Kimo is in front, because mail that arrives on screen is mail being read.
-  The window coming back to the front clears it (`KimoApp::ui`), and a window
-  hidden to the tray is never in front, whatever the last frame heard
-  (`pump_hidden`) — the hide usually happens while the window *is* focused,
-  and mail arriving afterwards is exactly what the badge is for.
+- **When the badge is up:** while **any account's Inbox holds unread mail**,
+  and for no other reason. It follows the mail's own state rather than a
+  fetch: `update_tray_badge` asks the unread counts the navigation column
+  already keeps per folder (`FolderRows`), so it costs a walk over the
+  folders and never one over the mail, and it runs after every drain and
+  again where a click marks a mail read — the moment a click changes it,
+  and a frame that changed nothing writes nothing. Nothing about the window
+  enters into it: not whether there is one, not whether it is focused, not
+  which folder is open. Both earlier rules were wrong in ways worth keeping:
+  the first raised the dot only while the window was *not* in front and
+  cleared it on a focus change, so mail arriving at a focused Kimo was
+  silently never badged; the second badged the mail a fetch had just
+  announced and cleared it when that mail was read, so a restart — or any
+  mail already in the database — badged nothing at all, which is not what
+  "I have unread mail" means. The Inbox is the only folder that counts:
+  unread mail under a label, an archive or a server-side folder of the
+  account's own never lights the dot, and a reader who never opens their
+  Inbox wears the dot until they do.
 
 ## Desktop notifications
 

@@ -840,12 +840,12 @@ pub struct KimoApp {
     /// registered: the tray's Quit is then the only way out
     /// (`crate::tray::available`).
     close_to_tray: bool,
-    /// Whether the window is in front, as the last frame heard it. The tray's
-    /// unread badge means "mail arrived while you were not looking", and this
-    /// is the half of that which decides: mail that arrives on screen is mail
-    /// the reader is looking at, and a window brought back to the front clears
-    /// the badge (`ui`). A hidden window is never in front (`pump_hidden`).
-    focused: bool,
+    /// Whether the tray icon is wearing its unread badge: any account's Inbox
+    /// holds mail nobody has read (`update_tray_badge`). The mail's own state,
+    /// not an event — right at startup, right after a frame that read a mail,
+    /// and right after a sync that found one read somewhere else — so the
+    /// window's visibility and focus play no part in it.
+    tray_badge: bool,
     /// Installed font families for the Appearance pickers; `None` while the
     /// worker scan (`Job::ScanFonts`) is still running.
     font_families: Option<Vec<FontFamily>>,
@@ -2194,8 +2194,8 @@ impl KimoApp {
             minimize_to_tray: settings.minimize_to_tray.unwrap_or(false),
             // Closing quits until the reader asks it to hide instead.
             close_to_tray: settings.close_to_tray.unwrap_or(false),
-            // The first frame hears the truth from egui's own input.
-            focused: false,
+            // Settled on the first frame, from the mail the database loaded.
+            tray_badge: false,
             font_families: None,
             ui_font: settings.ui_font.clone(),
             mono_font: settings.mono_font.clone(),
@@ -2254,12 +2254,11 @@ impl KimoApp {
     /// sync clock keeps turning. The UI itself is not run, so a hidden Kimo
     /// costs no frames.
     pub(crate) fn pump_hidden(&mut self) {
-        // No window is drawing, so nothing of Kimo is in front, whatever the
-        // last frame heard: mail arriving now is mail nobody is looking at,
-        // and the tray's badge is the way it gets said (`announce_new_mail`).
-        self.focused = false;
         let ctx = self.ctx.clone();
         self.drain_events();
+        // A hidden window still hears the mail arrive, and still hears it read
+        // elsewhere: the badge is as right without frames as with them.
+        self.update_tray_badge();
         // egui's own repaint request may be suppressed while no window is
         // drawing, so the clock is put on the event loop's wake channel too.
         if let Some(wait) = self.pump_auto_sync(&ctx) {
@@ -2589,17 +2588,17 @@ impl KimoApp {
         }
     }
 
-    /// Say that mail has arrived: the tray's unread badge, and the desktop
-    /// notifications — one per mail while there are few of them, one counting
-    /// them when there are many (`new_mail_notices`). Nothing is said when the
-    /// folder is one whose new mail is not announced (`announces_new_mail`) or
-    /// for a mail the account already holds under another folder; nothing is
-    /// notified, though the badge still goes up, when the preference is off.
+    /// Raise the desktop notifications for one batch of arrived mail: one per
+    /// mail while there are few of them, one counting them when there are many
+    /// (`new_mail_notices`). Nothing is raised when the preference is off, when
+    /// the folder is one whose new mail is not announced (`announces_new_mail`),
+    /// or for a mail the account already holds under another folder.
     ///
-    /// Neither piece of work happens here: `crate::tray::set_unread` sets a flag
-    /// the tray thread reads, and `crate::notify::show` only posts to the thread
-    /// that talks to the notification daemon, so neither this frame nor a sync
-    /// job ever waits for either.
+    /// The work is `crate::notify`'s and it never happens here: `show` only posts
+    /// to the thread that talks to the notification daemon, so neither this
+    /// frame nor a sync job ever waits for one. The tray's badge is not raised
+    /// here: it follows the Inbox's unread mail rather than the fetch
+    /// (`update_tray_badge`).
     fn announce_new_mail(&self, account_id: &str, folder: &str, arrivals: Vec<Arrival>) {
         if arrivals.is_empty() {
             return;
@@ -2619,16 +2618,6 @@ impl KimoApp {
         if arrivals.is_empty() {
             return;
         }
-        // The tray's badge is not one of the notifications and does not obey
-        // the switch that gates them: a dot is the quietest way to say the
-        // post came, and a reader who turned the pop-ups off asked for less
-        // interruption, not for silence. It does obey the window: mail that
-        // arrives while Kimo is in front is mail already on screen, and there
-        // is nothing left for a badge to point at (`ui` clears it again when
-        // the window comes back to the front).
-        if !self.focused {
-            crate::tray::set_unread(true);
-        }
         if !self.notifications {
             return;
         }
@@ -2636,6 +2625,37 @@ impl KimoApp {
         for (summary, body) in new_mail_notices(&display, &arrivals) {
             crate::notify::show(&summary, &body, scale);
         }
+    }
+
+    /// Publish the tray's unread badge: up while any account's Inbox holds
+    /// mail nobody has read, wherever the window is and whether or not there is
+    /// one. The badge is the mail's own state rather than an event, which is
+    /// what makes it right on the first frame of a session — the database
+    /// loaded the marks — and right again when a sync reports a mail read
+    /// somewhere else.
+    ///
+    /// The flag the tray thread polls is written only when the state changes:
+    /// this runs every frame, and a frame that changed nothing says nothing.
+    fn update_tray_badge(&mut self) {
+        let unread = self.inbox_unread();
+        if unread != self.tray_badge {
+            self.tray_badge = unread;
+            crate::tray::set_unread(unread);
+        }
+    }
+
+    /// Whether any account's Inbox holds unread mail. The unread counts are the
+    /// ones the navigation column already keeps per folder (`FolderRows`),
+    /// derived when an account's mail changed and reused until it does again —
+    /// so asking this every frame walks the folders, never the mail.
+    fn inbox_unread(&mut self) -> bool {
+        self.states.values_mut().any(|state| {
+            let rows = state.nav();
+            rows.listed
+                .iter()
+                .chain(rows.unlisted.iter())
+                .any(|row| matches!(row.kind, FolderKind::Inbox) && row.unread > 0)
+        })
     }
 
     /// The `Message-ID`s the account holds under any folder but this one — the
@@ -2785,6 +2805,11 @@ impl KimoApp {
                 }
             }
         }
+
+        // Reading a mail in the Inbox is what the tray's badge stops saying:
+        // publish that now rather than on a frame that may never come — the
+        // click itself asked for no more than this one.
+        self.update_tray_badge();
 
         // Then hand the flag to a worker: IMAP pushes `\\Seen` to the server,
         // POP3 has nothing to push, and both store it locally.
@@ -9007,19 +9032,10 @@ impl KimoApp {
     pub fn ui(&mut self, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
         let ctx = &ctx;
-        // The window coming back to the front is the reader looking: the
-        // tray's unread badge has done its job and goes. Read before the
-        // events are drained so a batch that arrives in this very frame is
-        // judged against the window as it is now, not as it was before the
-        // click that brought it back.
-        let focused = ctx.input(|i| i.focused);
-        if focused != self.focused {
-            self.focused = focused;
-            if focused {
-                crate::tray::set_unread(false);
-            }
-        }
         self.drain_events();
+        // The badge is the Inbox's unread mail, so it is settled from the state
+        // the frame's events left behind — not from what those events were.
+        self.update_tray_badge();
         self.attach_dropped();
         self.apply_theme(ctx);
         // The automatic sync is a frame's business too: it is what asks for the
@@ -16201,6 +16217,59 @@ mod tests {
             app.selected_mails.is_empty(),
             "and the checks of the old UIDs went with it"
         );
+    }
+
+    /// The tray's badge is the Inbox's own state and nothing else: it is up
+    /// while any account's Inbox holds mail nobody has read, it goes the moment
+    /// that mail is read, and no other folder — and no window state — has a say.
+    #[test]
+    fn the_tray_badge_follows_unread_mail_in_the_inbox() {
+        let ctx = egui::Context::default();
+        crate::fonts::install(&ctx, None, None);
+        let mut app = app_with_two_accounts(&ctx, 1);
+
+        // The fixture's mail is unread: the badge is up before any frame, from
+        // the state the database hands a session at startup.
+        app.update_tray_badge();
+        assert!(app.tray_badge, "an Inbox with unread mail wears the badge");
+
+        // Read everywhere: the Inbox has nothing left to say.
+        for state in app.states.values_mut() {
+            for mail in state
+                .mailbox
+                .folders
+                .iter_mut()
+                .flat_map(|folder| folder.messages.iter_mut())
+            {
+                mail.seen = true;
+            }
+            state.folders_changed();
+        }
+        app.update_tray_badge();
+        assert!(!app.tray_badge, "a read Inbox is not news");
+
+        // Unread mail in another folder is not the Inbox's badge.
+        let state = app.states.get_mut("acct").expect("the fixture's account");
+        state.mailbox.folders.push(storage::Folder {
+            name: "Archive".to_string(),
+            uidvalidity: Some(1),
+            synced: true,
+            listed: true,
+            can_load_older: false,
+            messages: vec![test_message("archived", false)],
+        });
+        state.folders.push("Archive".to_string());
+        state.folders_changed();
+        app.update_tray_badge();
+        assert!(!app.tray_badge, "only the Inbox wears it");
+
+        // And one account's unread Inbox is the whole mailbox's badge, however
+        // far from the account on screen it is.
+        let other = app.states.get_mut("other").expect("the second account");
+        other.mailbox.folders[0].messages[0].seen = false;
+        other.folders_changed();
+        app.update_tray_badge();
+        assert!(app.tray_badge, "every account's Inbox speaks for the badge");
     }
 
     /// The select-all row is the one thing in the column that does not scroll
