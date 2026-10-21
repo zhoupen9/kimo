@@ -840,6 +840,12 @@ pub struct KimoApp {
     /// registered: the tray's Quit is then the only way out
     /// (`crate::tray::available`).
     close_to_tray: bool,
+    /// Whether the window is in front, as the last frame heard it. The tray's
+    /// unread badge means "mail arrived while you were not looking", and this
+    /// is the half of that which decides: mail that arrives on screen is mail
+    /// the reader is looking at, and a window brought back to the front clears
+    /// the badge (`ui`). A hidden window is never in front (`pump_hidden`).
+    focused: bool,
     /// Installed font families for the Appearance pickers; `None` while the
     /// worker scan (`Job::ScanFonts`) is still running.
     font_families: Option<Vec<FontFamily>>,
@@ -2188,6 +2194,8 @@ impl KimoApp {
             minimize_to_tray: settings.minimize_to_tray.unwrap_or(false),
             // Closing quits until the reader asks it to hide instead.
             close_to_tray: settings.close_to_tray.unwrap_or(false),
+            // The first frame hears the truth from egui's own input.
+            focused: false,
             font_families: None,
             ui_font: settings.ui_font.clone(),
             mono_font: settings.mono_font.clone(),
@@ -2246,6 +2254,10 @@ impl KimoApp {
     /// sync clock keeps turning. The UI itself is not run, so a hidden Kimo
     /// costs no frames.
     pub(crate) fn pump_hidden(&mut self) {
+        // No window is drawing, so nothing of Kimo is in front, whatever the
+        // last frame heard: mail arriving now is mail nobody is looking at,
+        // and the tray's badge is the way it gets said (`announce_new_mail`).
+        self.focused = false;
         let ctx = self.ctx.clone();
         self.drain_events();
         // egui's own repaint request may be suppressed while no window is
@@ -2577,17 +2589,19 @@ impl KimoApp {
         }
     }
 
-    /// Raise the desktop notifications for one batch of arrived mail: one per
-    /// mail while there are few of them, one counting them when there are many
-    /// (`new_mail_notices`). Nothing is raised when the preference is off, when
-    /// the folder is one whose new mail is not announced (`announces_new_mail`),
-    /// or for a mail the account already holds under another folder.
+    /// Say that mail has arrived: the tray's unread badge, and the desktop
+    /// notifications — one per mail while there are few of them, one counting
+    /// them when there are many (`new_mail_notices`). Nothing is said when the
+    /// folder is one whose new mail is not announced (`announces_new_mail`) or
+    /// for a mail the account already holds under another folder; nothing is
+    /// notified, though the badge still goes up, when the preference is off.
     ///
-    /// The work is `crate::notify`'s and it never happens here: `show` only posts
-    /// to the thread that talks to the notification daemon, so neither this
-    /// frame nor a sync job ever waits for one.
+    /// Neither piece of work happens here: `crate::tray::set_unread` sets a flag
+    /// the tray thread reads, and `crate::notify::show` only posts to the thread
+    /// that talks to the notification daemon, so neither this frame nor a sync
+    /// job ever waits for either.
     fn announce_new_mail(&self, account_id: &str, folder: &str, arrivals: Vec<Arrival>) {
-        if arrivals.is_empty() || !self.notifications {
+        if arrivals.is_empty() {
             return;
         }
         // The wire form is what the state and the database key a folder by;
@@ -2602,6 +2616,22 @@ impl KimoApp {
             .into_iter()
             .filter(|arrival| !elsewhere.contains(arrival.message_id.as_str()))
             .collect();
+        if arrivals.is_empty() {
+            return;
+        }
+        // The tray's badge is not one of the notifications and does not obey
+        // the switch that gates them: a dot is the quietest way to say the
+        // post came, and a reader who turned the pop-ups off asked for less
+        // interruption, not for silence. It does obey the window: mail that
+        // arrives while Kimo is in front is mail already on screen, and there
+        // is nothing left for a badge to point at (`ui` clears it again when
+        // the window comes back to the front).
+        if !self.focused {
+            crate::tray::set_unread(true);
+        }
+        if !self.notifications {
+            return;
+        }
         let scale = self.ctx.pixels_per_point();
         for (summary, body) in new_mail_notices(&display, &arrivals) {
             crate::notify::show(&summary, &body, scale);
@@ -8977,6 +9007,18 @@ impl KimoApp {
     pub fn ui(&mut self, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
         let ctx = &ctx;
+        // The window coming back to the front is the reader looking: the
+        // tray's unread badge has done its job and goes. Read before the
+        // events are drained so a batch that arrives in this very frame is
+        // judged against the window as it is now, not as it was before the
+        // click that brought it back.
+        let focused = ctx.input(|i| i.focused);
+        if focused != self.focused {
+            self.focused = focused;
+            if focused {
+                crate::tray::set_unread(false);
+            }
+        }
         self.drain_events();
         self.attach_dropped();
         self.apply_theme(ctx);

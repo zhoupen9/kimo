@@ -9,15 +9,21 @@
 //! `assets/app.svg`), embedded at compile time, decoded with the pure-Rust
 //! image crate with its colors kept as-is. It is deliberately large: hosts
 //! scale the pixmap down to their panel size, and the 48 px source this
-//! replaced was blurry on a HiDPI panel. A missing StatusNotifierWatcher
-//! (e.g. GNOME without an extension) simply disables the tray — the app keeps
-//! running.
+//! replaced was blurry on a HiDPI panel.
+//!
+//! The icon has two shapes: the mark, and the mark wearing a red badge when
+//! mail has arrived that the window has not shown yet (`set_unread`). The UI
+//! thread only sets a flag; the swap, and the `NewIcon` signal that is the
+//! only way a host learns to read `IconPixmap` again, happen on the tray
+//! thread. A missing StatusNotifierWatcher (e.g. GNOME without an extension)
+//! simply disables the tray — the app keeps running.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::dbus::{
     build_body, properties_dict, Bus, Unmarshal, Value, FIELD_DESTINATION, FIELD_ERROR_NAME,
-    FIELD_REPLY_SERIAL, FIELD_SIGNATURE, MSG_ERROR, MSG_METHOD_CALL, MSG_METHOD_RETURN,
+    FIELD_INTERFACE, FIELD_MEMBER, FIELD_PATH, FIELD_REPLY_SERIAL, FIELD_SIGNATURE, MSG_ERROR,
+    MSG_METHOD_CALL, MSG_METHOD_RETURN, MSG_SIGNAL,
 };
 
 /// The application icon (256 px, rasterized from `assets/app.svg`), embedded
@@ -41,6 +47,11 @@ static SHOW_REQUESTED: AtomicBool = AtomicBool::new(false);
 /// that into a hide.
 static QUIT_REQUESTED: AtomicBool = AtomicBool::new(false);
 
+/// Set while mail has arrived that the window has not shown: the icon wears
+/// the unread badge (`badge_argb`). The UI thread writes this; the tray thread
+/// reads it at the top of its loop, and is told to within `ICON_POLL`.
+static UNREAD: AtomicBool = AtomicBool::new(false);
+
 /// Whether a tray icon is registered and listening for Show.
 pub(crate) fn available() -> bool {
     AVAILABLE.load(Ordering::Relaxed)
@@ -56,6 +67,15 @@ pub(crate) fn take_quit_request() -> bool {
     QUIT_REQUESTED.swap(false, Ordering::Relaxed)
 }
 
+/// Show (`true`) or clear the unread badge on the tray icon. Nothing is sent
+/// from here: the tray thread owns the connection, and both halves of the
+/// change — the property and the `NewIcon` signal that makes a host read it
+/// again — are its own (`serve`). All this does is set the flag that thread
+/// looks at, so it is safe to call from anywhere.
+pub(crate) fn set_unread(unread: bool) {
+    UNREAD.store(unread, Ordering::Relaxed);
+}
+
 const SNI_INTERFACE: &str = "org.kde.StatusNotifierItem";
 const DBUSMENU_INTERFACE: &str = "com.canonical.dbusmenu";
 const INTROSPECTABLE: &str = "org.freedesktop.DBus.Introspectable";
@@ -63,9 +83,33 @@ const PROPERTIES: &str = "org.freedesktop.DBus.Properties";
 
 /// Where the SNI `Menu` property points: our `com.canonical.dbusmenu` object.
 const MENU_PATH: &str = "/Menu";
+/// Where the item itself is. `RegisterStatusNotifierItem` is handed a bus name
+/// rather than an object path, and the spec puts the item of such a service
+/// here — which is where the `NewIcon` signal has to claim to come from.
+const ITEM_PATH: &str = "/StatusNotifierItem";
 /// Menu node ids (0 is the invisible root that the layout hangs off).
 const MENU_SHOW_ID: i32 = 1;
 const MENU_QUIT_ID: i32 = 2;
+
+/// How long a quiet bus may hold the tray loop before it looks at the icon the
+/// UI asks for (`UNREAD`). Short enough that the badge is on the panel about
+/// when the notification beside it is, long enough that an idle tray wakes
+/// twice a second and does nothing.
+const ICON_POLL: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// The badge, in fractions of the icon's width: where its centre sits (both
+/// axes, from the top-left corner), how wide the disc is, and the clear ring
+/// that separates the disc from the mark. Fractions, not pixels, because the
+/// panel scales the pixmap to whatever size it draws.
+const BADGE_CENTRE: f32 = 0.72;
+const BADGE_RADIUS: f32 = 0.23;
+const BADGE_RING: f32 = 0.04;
+
+/// The badge's red — `danger_hover` in the palette (`crate::theme`), the one
+/// red both schemes share. The tray reads no theme (it is built once, on a
+/// thread with no `egui::Context`) and an icon is drawn over the panel's own
+/// background rather than the app's, so it wears a red that reads on either.
+const BADGE_RED: [u8; 3] = [0xE8, 0x11, 0x23];
 
 const INTROSPECT_XML: &str = concat!(
     "<!DOCTYPE node PUBLIC \"-//freedesktop//DTD D-BUS Object Introspection 1.0//EN\" ",
@@ -184,6 +228,52 @@ fn icon_argb(png: &[u8]) -> Option<Icon> {
         height,
         argb,
     })
+}
+
+/// The icon with the unread badge on it: the same pixmap, plus a red disc on
+/// its lower right — over the plain part of the disc, clear of the feather's
+/// tip — with a ring of transparency between the two so the panel's own
+/// background shows through and the disc reads as a badge laid on the mark
+/// rather than as part of the drawing.
+fn badge_argb(plain: &Icon) -> Icon {
+    let mut icon = Icon {
+        width: plain.width,
+        height: plain.height,
+        argb: plain.argb.clone(),
+    };
+    let size = plain.width as f32;
+    let centre = size * BADGE_CENTRE;
+    let radius = size * BADGE_RADIUS;
+    let ring = radius + size * BADGE_RING;
+    for y in 0..plain.height {
+        for x in 0..plain.width {
+            // Sampled at pixel centres, so the disc comes out symmetric.
+            let dx = x as f32 + 0.5 - centre;
+            let dy = y as f32 + 0.5 - centre;
+            let distance = (dx * dx + dy * dy).sqrt();
+            if distance > ring {
+                continue;
+            }
+            let at = ((y as usize * plain.width as usize) + x as usize) * 4;
+            let coverage = (radius + 0.5 - distance).clamp(0.0, 1.0);
+            if coverage > 0.0 {
+                // The disc, its rim anti-aliased: the mark underneath is
+                // covered rather than blended, because a badge is a thing laid
+                // on the icon and not a tint of it. The pixmap is ARGB — alpha
+                // first, the byte order SNI asks for — so the alpha goes at
+                // `at` and the red at `at + 1`.
+                icon.argb[at] = (coverage * 255.0).round() as u8;
+                icon.argb[at + 1] = BADGE_RED[0];
+                icon.argb[at + 2] = BADGE_RED[1];
+                icon.argb[at + 3] = BADGE_RED[2];
+            } else {
+                // The ring: a hole in the mark, so what shows between the two
+                // is the panel's own background.
+                icon.argb[at..at + 4].fill(0);
+            }
+        }
+    }
+    icon
 }
 
 /// The SNI `IconPixmap` value: `a(iiay)`, one (width, height, ARGB32 data)
@@ -428,10 +518,45 @@ fn all_properties(icon: &Icon) -> Value {
     properties_dict(&props)
 }
 
+/// Tell the host that `IconPixmap` has changed. The signal is the whole of the
+/// protocol here: a panel draws the pixmap it was given and only reads the
+/// property again when `NewIcon` says there is a new one.
+fn announce_icon(bus: &mut Bus) -> Result<(), String> {
+    bus.send(MSG_SIGNAL, &new_icon_fields(), &[])
+}
+
+/// Where the `NewIcon` signal claims to come from: the item's own object, the
+/// SNI interface and the member. A host filters signals on all three, so all
+/// three have to be the ones it registered the item under.
+fn new_icon_fields() -> [(u8, Value); 3] {
+    [
+        (FIELD_PATH, Value::ObjectPath(ITEM_PATH.to_string())),
+        (FIELD_INTERFACE, Value::Str(SNI_INTERFACE.to_string())),
+        (FIELD_MEMBER, Value::Str("NewIcon".to_string())),
+    ]
+}
+
 /// Serve StatusNotifierItem and DBusMenu method calls until the bus goes away.
-fn serve(bus: &mut Bus, ctx: &egui::Context, icon: &Icon) -> Result<(), String> {
+/// `plain` and `badge` are the two icons the host may be given; which one it
+/// has is decided here, from the flag the UI thread sets (`UNREAD`).
+fn serve(bus: &mut Bus, ctx: &egui::Context, plain: &Icon, badge: &Icon) -> Result<(), String> {
+    let mut icon = plain;
+    let mut badged = false;
     loop {
-        let msg = bus.read_message()?;
+        // A quiet bus holds this loop inside the socket until `ICON_POLL` runs
+        // out, which is what gives the top of the loop a turn: the flag and the
+        // icon it should be showing are settled before any request is answered,
+        // so a host that reads `IconPixmap` in reply to `NewIcon` gets the new
+        // one.
+        let wanted = UNREAD.load(Ordering::Relaxed);
+        if wanted != badged {
+            badged = wanted;
+            icon = if badged { badge } else { plain };
+            announce_icon(bus)?;
+        }
+        let Some(msg) = bus.next_message()? else {
+            continue;
+        };
         if msg.kind != MSG_METHOD_CALL {
             continue; // signals / broadcast
         }
@@ -568,10 +693,11 @@ fn serve(bus: &mut Bus, ctx: &egui::Context, icon: &Icon) -> Result<(), String> 
 /// Spawn the tray thread. Failure is non-fatal: it is logged and the app
 /// runs without a tray icon.
 pub fn spawn(ctx: egui::Context) {
-    let Some(icon) = icon_argb(APP_PNG) else {
+    let Some(plain) = icon_argb(APP_PNG) else {
         eprintln!("kimo tray: could not decode the tray icon");
         return;
     };
+    let badge = badge_argb(&plain);
     let result = std::thread::Builder::new()
         .name("kimo-tray".to_string())
         .spawn(move || {
@@ -582,6 +708,14 @@ pub fn spawn(ctx: egui::Context) {
                     return;
                 }
             };
+            // The badge is a flag this thread reads while it is otherwise
+            // blocked on the bus, so it is the socket's idle timeout that
+            // brings the loop back round (`ICON_POLL`). `call` is unaffected:
+            // only an expiry before the first byte of a message counts as the
+            // moment to look at the flag.
+            if let Err(e) = bus.set_read_timeout(ICON_POLL) {
+                eprintln!("kimo tray: shorter read timeout: {e}");
+            }
             let mut run = || -> Result<(), String> {
                 let unique = bus.call(
                     "org.freedesktop.DBus",
@@ -629,7 +763,7 @@ pub fn spawn(ctx: egui::Context) {
                 // Registered and listening: from here until `serve` returns,
                 // minimize- and close-to-tray have a way back.
                 AVAILABLE.store(true, Ordering::Relaxed);
-                let served = serve(&mut bus, &ctx, &icon);
+                let served = serve(&mut bus, &ctx, &plain, &badge);
                 AVAILABLE.store(false, Ordering::Relaxed);
                 served
             };
@@ -827,5 +961,61 @@ mod tests {
         );
         // Corners are outside the circle: fully transparent.
         assert_eq!(&icon.argb[..4], &[0, 0, 0, 0]);
+    }
+
+    /// What the badge is: the same mark, with an opaque red disc on its lower
+    /// right and a clear ring between the two — and everywhere else the mark's
+    /// own pixels, untouched.
+    #[test]
+    fn the_badge_is_a_red_disc_on_the_mark() {
+        let plain = icon_argb(APP_PNG).expect("decodes");
+        let badge = badge_argb(&plain);
+        assert_eq!((badge.width, badge.height), (plain.width, plain.height));
+        let size = plain.width;
+        let pixel = |icon: &Icon, x: i32, y: i32| {
+            let at = ((y as usize * size as usize) + x as usize) * 4;
+            [
+                icon.argb[at],
+                icon.argb[at + 1],
+                icon.argb[at + 2],
+                icon.argb[at + 3],
+            ]
+        };
+        let centre = (size as f32 * BADGE_CENTRE) as i32;
+        // Opaque, and in the pixmap's own order: alpha first, then R, G, B.
+        // Writing it R,G,B,A put 232 in the alpha slot and 255 in the blue
+        // one, which the panel drew faithfully as a blue dot.
+        assert_eq!(
+            pixel(&badge, centre, centre),
+            [255, BADGE_RED[0], BADGE_RED[1], BADGE_RED[2]]
+        );
+        // The ring is a hole in the mark, not a lighter red: what shows there
+        // is the panel's own background.
+        let ring = (size as f32 * (BADGE_CENTRE + BADGE_RADIUS + BADGE_RING / 2.0)) as i32;
+        assert_eq!(pixel(&badge, ring, centre)[3], 0, "the ring must be clear");
+        // The opposite corner belongs to the mark alone.
+        assert_eq!(pixel(&badge, 24, 232), pixel(&plain, 24, 232));
+        assert_eq!(badge.argb.len(), plain.argb.len());
+    }
+
+    /// A host matches the icon signal on sender, path and member; the path is
+    /// the spec's, not one we pick (`RegisterStatusNotifierItem` was given a
+    /// bus name, so the item is at the default object).
+    #[test]
+    fn the_icon_signal_names_the_item() {
+        assert_eq!(
+            new_icon_fields(),
+            [
+                (
+                    FIELD_PATH,
+                    Value::ObjectPath("/StatusNotifierItem".to_string())
+                ),
+                (
+                    FIELD_INTERFACE,
+                    Value::Str("org.kde.StatusNotifierItem".to_string())
+                ),
+                (FIELD_MEMBER, Value::Str("NewIcon".to_string())),
+            ]
+        );
     }
 }

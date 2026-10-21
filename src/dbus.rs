@@ -12,10 +12,12 @@
 use std::io::{ErrorKind, Read, Write};
 use std::os::unix::net::UnixStream;
 
-/// D-Bus message types. (Signals, type 4, are received and skipped.)
+/// D-Bus message types. (Signals, type 4, are received and skipped; sending
+/// one is how the tray tells a host that its icon changed.)
 pub(crate) const MSG_METHOD_CALL: u8 = 1;
 pub(crate) const MSG_METHOD_RETURN: u8 = 2;
 pub(crate) const MSG_ERROR: u8 = 3;
+pub(crate) const MSG_SIGNAL: u8 = 4;
 
 /// Header field codes.
 pub(crate) const FIELD_PATH: u8 = 1;
@@ -427,21 +429,39 @@ pub(crate) fn parse_message(buf: &[u8]) -> Option<Message> {
 /// state, not a broken connection. `read_exact` reports it as a fatal
 /// `WouldBlock`, which killed the tray thread after 30 quiet seconds and
 /// dropped the icon from the panel. Only EOF or a real error may end a read.
-fn read_full(mut stream: &UnixStream, buf: &mut [u8]) -> Result<(), String> {
+fn read_full(stream: &UnixStream, buf: &mut [u8]) -> Result<(), String> {
+    // The idle answer is the normal state here: keep waiting for the bytes.
+    while !read_until_idle(stream, buf)? {}
+    Ok(())
+}
+
+/// As [`read_full`], but report the idle case rather than waiting it out:
+/// `Ok(false)` means the read timeout expired before a single byte of `buf`
+/// arrived, so `buf` is untouched and the caller has been given the moment
+/// back. Only `crate::tray` asks for that — its loop is the one reader with
+/// work of its own to do while the bus is quiet (`Bus::next_message`).
+fn read_until_idle(mut stream: &UnixStream, buf: &mut [u8]) -> Result<bool, String> {
     let mut filled = 0;
     while filled < buf.len() {
         match stream.read(&mut buf[filled..]) {
             Ok(0) => return Err("bus closed the connection".to_string()),
             Ok(n) => filled += n,
+            // An expiry is not an error, and one that comes mid-message is
+            // waited out: half a message is not a message.
             Err(e)
                 if matches!(
                     e.kind(),
                     ErrorKind::WouldBlock | ErrorKind::TimedOut | ErrorKind::Interrupted
-                ) => {}
+                ) =>
+            {
+                if filled == 0 {
+                    return Ok(false);
+                }
+            }
             Err(e) => return Err(format!("bus read: {e}")),
         }
     }
-    Ok(())
+    Ok(true)
 }
 
 pub(crate) struct Bus {
@@ -563,6 +583,24 @@ impl Bus {
     pub(crate) fn read_message(&mut self) -> Result<Message, String> {
         let mut head = [0u8; 16];
         read_full(&self.reader, &mut head)?;
+        self.finish_message(head)
+    }
+
+    /// One message, or `None` when the bus stayed silent for the socket's
+    /// read timeout. A message that has started arriving is always finished
+    /// before this returns — only an idle *first* byte answers `None` — so a
+    /// polling caller cannot lose half a message. Read by `crate::tray`, which
+    /// has an icon to keep up to date while it waits.
+    pub(crate) fn next_message(&mut self) -> Result<Option<Message>, String> {
+        let mut head = [0u8; 16];
+        if !read_until_idle(&self.reader, &mut head)? {
+            return Ok(None);
+        }
+        Ok(Some(self.finish_message(head)?))
+    }
+
+    /// The rest of a message whose sixteen-byte head has been read.
+    fn finish_message(&mut self, head: [u8; 16]) -> Result<Message, String> {
         let body_len = u32::from_le_bytes(head[4..8].try_into().unwrap()) as usize;
         let fields_len = u32::from_le_bytes(head[12..16].try_into().unwrap()) as usize;
         let mut buf = head.to_vec();
@@ -578,6 +616,15 @@ impl Bus {
         read_full(&self.reader, &mut body)?;
         buf.extend_from_slice(&body);
         parse_message(&buf).ok_or_else(|| "malformed message from bus".to_string())
+    }
+
+    /// Bound one read syscall. `crate::tray` shortens it so its loop can
+    /// look at the icon the UI asks for between idle slots; `read_full` rides
+    /// an expiry out, so no other caller can tell the difference.
+    pub(crate) fn set_read_timeout(&self, timeout: std::time::Duration) -> Result<(), String> {
+        self.reader
+            .set_read_timeout(Some(timeout))
+            .map_err(|e| e.to_string())
     }
 }
 
@@ -758,6 +805,50 @@ mod tests {
             serial: 0,
         };
         let msg = bus.read_message().expect("an idle bus is not an error");
+        assert_eq!(msg.serial, 3);
+        assert_eq!(msg.reply_serial, Some(1));
+        sender.join().unwrap();
+    }
+
+    /// What the tray's loop polls with: an idle bus answers `None` instead of
+    /// holding the thread for ever, and a message already half-read is finished
+    /// rather than dropped — a poll may only give up between messages.
+    #[test]
+    fn a_poll_gives_up_on_an_idle_bus_but_never_on_half_a_message() {
+        let (reader, mut writer) = UnixStream::pair().unwrap();
+        reader
+            .set_read_timeout(Some(std::time::Duration::from_millis(50)))
+            .unwrap();
+        let body = build_body(&[Value::Str("kimo".into())]).1;
+        let wire = build_message(
+            MSG_METHOD_RETURN,
+            3,
+            &[
+                (FIELD_REPLY_SERIAL, Value::UInt32(1)),
+                (FIELD_SIGNATURE, Value::Signature("s".into())),
+            ],
+            &body,
+        );
+        let mut bus = Bus {
+            reader: reader.try_clone().unwrap(),
+            writer: reader,
+            serial: 0,
+        };
+        assert!(
+            bus.next_message().unwrap().is_none(),
+            "an idle bus answers None"
+        );
+        // The head of a message, then a silence longer than the timeout: the
+        // next call has to wait the rest of it out rather than answer `None`.
+        writer.write_all(&wire[..8]).unwrap();
+        let sender = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            writer.write_all(&wire[8..]).unwrap();
+        });
+        let msg = bus
+            .next_message()
+            .unwrap()
+            .expect("half a message is finished, not dropped");
         assert_eq!(msg.serial, 3);
         assert_eq!(msg.reply_serial, Some(1));
         sender.join().unwrap();

@@ -63,6 +63,42 @@ Read when touching `src/portal.rs`, `src/dbus.rs`, `src/tray.rs`, `src/notify.rs
   window only while there is a tray to bring it back; Show and a left click
   unminimize before they raise.
 
+- **Unread badge:** when mail arrives that the window has not shown, the
+  tray's icon is replaced by the mark with a red disc on its lower right. There
+  is no second asset: the badge pixmap is composited once at startup from the
+  same `assets/app.png` (`tray::badge_argb`), in fractions of the icon's
+  width so it scales with the panel, with a ring of transparency between disc
+  and mark so the panel's own background shows through and the disc reads as
+  a badge laid on the icon. The pixels are straight ARGB, alpha first, the
+  order SNI asks for — a disc written R,G,B,A put 232 in the alpha slot and
+  255 in the blue one, and the panel duly drew a blue dot. The swap is
+  announced with the `NewIcon` *signal*: a panel draws the pixmap it was
+  given and reads `IconPixmap` again only when told to, so a property
+  changed in silence is never seen. The signal has to name
+  `/StatusNotifierItem` — the registration was handed a bus name, and the spec
+  puts the item of such a service at its default object — because hosts filter
+  on path, interface and member alike. The UI thread only sets a flag
+  (`tray::set_unread`); the connection, and so both halves of the change,
+  belong to the tray thread. That thread is blocked in `read` while the bus is
+  quiet, so it is not woken: its socket timeout is shortened to `ICON_POLL`
+  (500 ms) and it looks at the flag between idle slots.
+  `dbus::Bus::next_message` is what makes that safe — it answers `None` only
+  when a read timed out before the first byte of a message, and always
+  finishes a message that has begun arriving, so polling can never swallow
+  half a frame.
+
+- **When the badge is up:** for the same batches a notification would be
+  raised from — the folder announces new mail (`announces_new_mail`), and the
+  message is not already held under another folder — but *not* gated on the
+  notification preference: a dot is the quietest way to say the post came,
+  and a reader who turned the pop-ups off asked for less interruption, not
+  for silence. It is gated on the window instead: nothing is badged while
+  Kimo is in front, because mail that arrives on screen is mail being read.
+  The window coming back to the front clears it (`KimoApp::ui`), and a window
+  hidden to the tray is never in front, whatever the last frame heard
+  (`pump_hidden`) — the hide usually happens while the window *is* focused,
+  and mail arriving afterwards is exactly what the badge is for.
+
 ## Desktop notifications
 
 - **Desktop notifications:** `src/notify.rs` announces new mail through the
