@@ -7,7 +7,7 @@ Read when touching `preferences_modal`, a key in `settings.json`, or the sync cl
 - `preferences_modal()` is the one place to configure Kimo: an
   `egui::Modal` (backdrop click or Escape closes it) with a sidebar of
   pages — **General** (the mail list's threading, the automatic sync, the
-  notifications and the window's minimize behaviour), **Accounts**
+  notifications and the window's minimize and close behaviour), **Accounts**
   (account list with
   use/edit/remove, and the add/edit account form in place of the list: it is
   pre-filled from the account it was opened on, and `Save & sync` updates that
@@ -30,7 +30,7 @@ Read when touching `preferences_modal`, a key in `settings.json`, or the sync cl
   is deliberately read-only — it is where a reader checks what is running, not
   another place to change it.
 
-## Minimize to the tray
+## Minimize and close to the tray
 
 - **Minimize stays the window manager's unless asked otherwise**: the General
   page's `minimize_to_tray` (off when absent) makes the title bar's minimize
@@ -40,11 +40,21 @@ Read when touching `preferences_modal`, a key in `settings.json`, or the sync cl
   normal minimize. The setting is persisted in `settings.json` like the
   others.
 
+- **Close follows the same rule**: the General page's `close_to_tray` (off
+  when absent) makes the title bar's cross send `Visible(false)` instead of
+  `Close` (`close_command`). The compositor's own close arrives as
+  `WindowEvent::CloseRequested`, and the loop hides the window there too. The
+  tray menu's Quit is then the way out; it sets the loop's quit request instead
+  of sending a close, because close-to-tray would turn that close into a hide.
+  Without a registered tray the cross and the compositor's close both quit as
+  they always did.
+
 - **Wayland has no hide request, so the window is dropped**: winit's
   `set_visible` is a no-op there and niri ignores `set_minimized` outright,
-  which is why the cell cannot simply minimize on niri. On Wayland the
-  `Visible(false)` is taken as the hide request: `Kimo::hide_window` drops the
-  window and its surface, `KimoApp` and the GPU device/renderer (and every
+  which is why the minimize cell cannot simply minimize on niri. On Wayland
+  either `Visible(false)` (the title bar) or `Kimo::hide_to_tray` (the
+  compositor's close) is taken as the hide request: `Kimo::hide_window` drops
+  the window and its surface, `KimoApp` and the GPU device/renderer (and every
   texture they hold) stay, and a tray Show runs `open_window` again. Hidden
   work — draining workers, notifications, the auto-sync clock — runs through
   `KimoApp::pump_hidden`, woken through `src/wake.rs` rather than egui's

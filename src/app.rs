@@ -835,6 +835,11 @@ pub struct KimoApp {
     /// only happens while a tray is registered, because the tray is the way
     /// back (`crate::tray::available`).
     minimize_to_tray: bool,
+    /// Whether closing the window hides it instead of quitting (Preferences →
+    /// General). Off by default, and the hide only happens while a tray is
+    /// registered: the tray's Quit is then the only way out
+    /// (`crate::tray::available`).
+    close_to_tray: bool,
     /// Installed font families for the Appearance pickers; `None` while the
     /// worker scan (`Job::ScanFonts`) is still running.
     font_families: Option<Vec<FontFamily>>,
@@ -2181,6 +2186,8 @@ impl KimoApp {
             // Minimize stays the window manager's until the reader asks for
             // the tray behaviour.
             minimize_to_tray: settings.minimize_to_tray.unwrap_or(false),
+            // Closing quits until the reader asks it to hide instead.
+            close_to_tray: settings.close_to_tray.unwrap_or(false),
             font_families: None,
             ui_font: settings.ui_font.clone(),
             mono_font: settings.mono_font.clone(),
@@ -2226,6 +2233,12 @@ impl KimoApp {
         while let Ok(event) = self.rx.try_recv() {
             self.apply_event(event);
         }
+    }
+
+    /// Whether a close should hide the window instead of quitting. The loop
+    /// asks before it honours a compositor close (`Kimo::window_event`).
+    pub(crate) fn close_to_tray(&self) -> bool {
+        self.close_to_tray
     }
 
     /// The work that has to continue while the window is hidden: worker
@@ -3387,6 +3400,7 @@ impl KimoApp {
             auto_sync_minutes: Some((self.auto_sync_every.as_secs() / SECS_PER_MINUTE) as u32),
             notifications: Some(self.notifications),
             minimize_to_tray: Some(self.minimize_to_tray),
+            close_to_tray: Some(self.close_to_tray),
         });
     }
 
@@ -4170,7 +4184,8 @@ impl KimoApp {
                                 .ctx()
                                 .send_viewport_cmd(egui::ViewportCommand::Maximized(!maximized)),
                             Ctrl::Close => {
-                                row.ctx().send_viewport_cmd(egui::ViewportCommand::Close)
+                                let hide = self.close_to_tray && crate::tray::available();
+                                row.ctx().send_viewport_cmd(close_command(hide));
                             }
                         }
                     }
@@ -8527,8 +8542,8 @@ impl KimoApp {
     }
 
     /// Preferences → General: the mail list, the automatic sync, the
-    /// notifications and the window's minimize behaviour, all persisted on
-    /// change.
+    /// notifications and the window's minimize and close behaviour, all
+    /// persisted on change.
     fn general_page(&mut self, ui: &mut egui::Ui) {
         ui.label(egui::RichText::new("Mail list").strong());
         if ui
@@ -8641,6 +8656,23 @@ impl KimoApp {
                 "The minimize button hides Kimo instead of sending it to the task bar; \
                  click the tray icon, or its Show item, to bring it back. Without a tray \
                  icon, minimize keeps its normal behaviour.",
+            )
+            .small()
+            .weak(),
+        );
+
+        ui.add_space(8.0);
+        if ui
+            .checkbox(&mut self.close_to_tray, "Close to the tray")
+            .changed()
+        {
+            self.persist_settings();
+        }
+        ui.label(
+            egui::RichText::new(
+                "The close button, and the window manager's close, hide Kimo instead of \
+                 quitting; choose Quit from the tray icon's menu to end it. Without a tray \
+                 icon, closing quits as usual.",
             )
             .small()
             .weak(),
@@ -9648,6 +9680,18 @@ fn minimize_command(hide: bool) -> egui::ViewportCommand {
         egui::ViewportCommand::Visible(false)
     } else {
         egui::ViewportCommand::Minimized(true)
+    }
+}
+
+/// What the title bar's close button sends. With close-to-tray on and a tray
+/// registered the window is hidden rather than closed — the tray's Show raises
+/// it again, and only its Quit ends the process — and without a tray it keeps
+/// the normal close, so a window cannot be hidden with no way back.
+fn close_command(hide: bool) -> egui::ViewportCommand {
+    if hide {
+        egui::ViewportCommand::Visible(false)
+    } else {
+        egui::ViewportCommand::Close
     }
 }
 
@@ -17180,6 +17224,14 @@ mod tests {
         );
     }
 
+    /// Closing quits by default; close-to-tray hides the window only while a
+    /// tray is registered, so the tray's Quit is the one way out.
+    #[test]
+    fn close_to_tray_hides_only_when_a_tray_can_bring_the_window_back() {
+        assert_eq!(close_command(false), egui::ViewportCommand::Close);
+        assert_eq!(close_command(true), egui::ViewportCommand::Visible(false));
+    }
+
     /// A click on the minimize cell asks the window manager to minimize when
     /// the preference is off — the cell is a real hit target, not a painted
     /// glyph. The tray path is `minimize_command`'s above.
@@ -17224,6 +17276,51 @@ mod tests {
         assert!(
             commands.contains(&egui::ViewportCommand::Minimized(true)),
             "the minimize cell asks for the normal minimize: {commands:?}"
+        );
+    }
+
+    /// A click on the close cell asks the viewport to close when close-to-tray
+    /// is off; the tray path is `close_command`'s above.
+    #[test]
+    fn the_close_cell_closes_when_close_to_tray_is_off() {
+        let ctx = egui::Context::default();
+        crate::fonts::install(&ctx, None, None);
+        let mut app = app_with_messages(&ctx, 1);
+        // One frame first: the right end is carved out of the window's size.
+        frame_shapes_at(&ctx, &mut app, 1400.0);
+        app.close_to_tray = false;
+
+        let bar = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1400.0, TITLEBAR_HEIGHT));
+        let rects = titlebar_rects(bar, 3);
+        let center = egui::pos2(
+            rects.controls.right() - TITLEBAR_BUTTON_SIZE / 2.0,
+            TITLEBAR_HEIGHT / 2.0,
+        );
+        let button = |pressed| egui::Event::PointerButton {
+            pos: center,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::default(),
+        };
+
+        let mut commands = viewport_commands(&app_frame_output(
+            &ctx,
+            &mut app,
+            vec![egui::Event::PointerMoved(center)],
+        ));
+        commands.extend(viewport_commands(&app_frame_output(
+            &ctx,
+            &mut app,
+            vec![button(true)],
+        )));
+        commands.extend(viewport_commands(&app_frame_output(
+            &ctx,
+            &mut app,
+            vec![button(false)],
+        )));
+        assert!(
+            commands.contains(&egui::ViewportCommand::Close),
+            "the close cell asks for the normal close: {commands:?}"
         );
     }
 

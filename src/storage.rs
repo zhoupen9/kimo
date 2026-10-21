@@ -131,6 +131,12 @@ pub struct Settings {
     /// minimize is the safe default.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub minimize_to_tray: Option<bool>,
+    /// Whether closing Kimo — the title bar's cross, or the compositor's own
+    /// close request — hides it instead of quitting, leaving the tray menu's
+    /// Quit as the way out (`KimoApp::close_to_tray`). Absent means off:
+    /// closing quits, as it always has.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub close_to_tray: Option<bool>,
 }
 
 pub fn load_settings() -> Settings {
@@ -218,6 +224,7 @@ mod tests {
             auto_sync_minutes: Some(30),
             notifications: Some(false),
             minimize_to_tray: Some(true),
+            close_to_tray: Some(true),
         };
         let json = serde_json::to_string(&s).unwrap();
         let back: Settings = serde_json::from_str(&json).unwrap();
@@ -231,6 +238,7 @@ mod tests {
         assert_eq!(back.auto_sync_minutes, Some(30));
         assert_eq!(back.notifications, Some(false));
         assert_eq!(back.minimize_to_tray, Some(true));
+        assert_eq!(back.close_to_tray, Some(true));
         // settings.json with missing keys must still load.
         let missing: Settings = serde_json::from_str("{}").unwrap();
         assert_eq!(missing.theme, "");
@@ -248,6 +256,10 @@ mod tests {
         assert_eq!(
             missing.minimize_to_tray, None,
             "absent means the app's default, which is the normal minimize"
+        );
+        assert_eq!(
+            missing.close_to_tray, None,
+            "absent means the app's default, which is to quit on close"
         );
         // A key a version wrote and no setting stands behind any more — the
         // web view renderer left a `render_mode` behind — is ignored rather

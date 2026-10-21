@@ -51,9 +51,9 @@ enum Wake {
 
 /// The window, its GPU context, egui's input state and the app. The app and
 /// the GPU renderer outlive the window: Wayland cannot hide a toplevel, so
-/// minimize-to-tray drops the window (and its surface) and a tray Show opens a
-/// new one, keeping the mail state, the compose draft and every uploaded
-/// texture.
+/// minimize- or close-to-tray drops the window (and its surface) and a tray
+/// Show opens a new one, keeping the mail state, the compose draft and every
+/// uploaded texture.
 struct Kimo {
     egui_ctx: egui::Context,
     window: Option<Arc<Window>>,
@@ -174,7 +174,18 @@ impl ApplicationHandler<Wake> for Kimo {
             window.request_redraw();
         }
         match event {
-            WindowEvent::CloseRequested => event_loop.exit(),
+            // The compositor's close takes the same route as the title bar's
+            // cross: with close-to-tray on and a tray to bring the window back,
+            // the close is a hide. Only the tray's Quit ends the process then.
+            WindowEvent::CloseRequested => {
+                let hide = self.app.as_ref().is_some_and(|app| app.close_to_tray())
+                    && crate::tray::available();
+                if hide {
+                    self.hide_to_tray(&window);
+                } else {
+                    event_loop.exit();
+                }
+            }
             WindowEvent::Resized(size) => {
                 if size.width > 0 && size.height > 0 {
                     self.window_size = size.to_logical(window.scale_factor());
@@ -280,6 +291,17 @@ impl Kimo {
         self.redraw_at = None;
     }
 
+    /// Hide the window for the tray. X11 can unmap it and keep it for a later
+    /// Show; Wayland has no unmap request, so the toplevel is dropped and a
+    /// tray Show builds a new one through `open_window`.
+    fn hide_to_tray(&mut self, window: &Window) {
+        if is_wayland(window) {
+            self.hide_window();
+        } else {
+            window.set_visible(false);
+        }
+    }
+
     /// The app's work that needs no pixels: drain what the workers sent and
     /// keep the automatic sync clock turning. The UI itself is not run, so a
     /// hidden Kimo costs no frames.
@@ -347,9 +369,11 @@ impl Kimo {
         // rather than ending anything, because in eframe that recording is the
         // app's chance to refuse the close (`CancelClose`). Kimo has no such
         // chance to offer, and only the loop can end itself, so the recording is
-        // read here — this is the path the title bar's close button and the
-        // tray's Quit take, while the compositor's own close arrives as
-        // `WindowEvent::CloseRequested`.
+        // read here — this is the path the title bar's close button takes when
+        // close-to-tray is off, while the compositor's own close arrives as
+        // `WindowEvent::CloseRequested`. The tray's Quit does not send this
+        // command: close-to-tray would hide the window instead of ending it,
+        // and a hidden window has no viewport to receive a close anyway.
         let close_requested = self.viewport.close_requested();
         self.viewport.events.clear();
         if close_requested {

@@ -33,9 +33,13 @@ Read when touching `src/main.rs`, `src/gpu.rs`, `src/glass.rs`, the title bar, t
   handle: a close is only *recorded* by it, as a `ViewportEvent::Close` in the
   `ViewportInfo` it is handed (in eframe that recording is the app's chance to
   refuse the close, via `CancelClose`), so the loop reads it and ends itself —
-  the tray's Quit takes the same path — and that info has to be refreshed from
-  the window every frame (`egui_winit::update_viewport_info`) and handed to
-  egui as `RawInput::viewports`, because `egui-winit` itself fills in nothing
+  unless the title bar sent `Visible(false)` instead, because close-to-tray is
+  on — and the compositor's own `WindowEvent::CloseRequested` takes the same
+  hide-or-quit decision. The tray's Quit does not send a close at all: it sets
+  the loop's quit request, which close-to-tray must not be able to swallow.
+  That info has to be refreshed from the window every frame
+  (`egui_winit::update_viewport_info`) and handed to egui as
+  `RawInput::viewports`, because `egui-winit` itself fills in nothing
   but the scale factor: without it `i.viewport().maximized`, which draws the
   title bar's maximize/restore glyph, is always `None` and the maximize button
   can never restore. The renderer is wgpu, and its 0.36-era API
@@ -94,8 +98,9 @@ Read when touching `src/main.rs`, `src/gpu.rs`, `src/glass.rs`, the title bar, t
   double-click maximize, and the
   minimize/maximize/close buttons sent as `ViewportCommand`s — minimize is
   `Minimized(true)`, or `Visible(false)` with minimize-to-tray on and a tray
-  registered (`minimize_command`). On Wayland that `Visible(false)` drops and
-  reopens the window instead of unmapping it (see
+  registered (`minimize_command`), and close is `Close`, or the same
+  `Visible(false)` with close-to-tray (`close_command`). On Wayland that
+  `Visible(false)` drops and reopens the window instead of unmapping it (see
   [preferences.md](preferences.md)); the loop's `wake` channel is what keeps a
   hidden Kimo alive.
   **The two middle groups are anchored to the columns under them**, not to the

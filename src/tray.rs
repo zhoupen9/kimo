@@ -36,8 +36,9 @@ static AVAILABLE: AtomicBool = AtomicBool::new(false);
 /// is gone, so the request has to recreate it rather than send it a command.
 static SHOW_REQUESTED: AtomicBool = AtomicBool::new(false);
 
-/// Set when Quit is chosen. The loop may have no window to receive the close
-/// command, so it reads this and exits itself.
+/// Set when Quit is chosen. The loop reads this and exits itself; the request
+/// does not go through the close command, because close-to-tray would turn
+/// that into a hide.
 static QUIT_REQUESTED: AtomicBool = AtomicBool::new(false);
 
 /// Whether a tray icon is registered and listening for Show.
@@ -353,8 +354,8 @@ fn menu_events(member: &str, body: &[u8]) -> Vec<(i32, String)> {
 }
 
 /// Bring the main window back and focus it. The window may have been hidden
-/// by minimize-to-tray or minimised by the window manager, so both states are
-/// undone before it is raised.
+/// by minimize- or close-to-tray or minimised by the window manager, so both
+/// states are undone before it is raised.
 fn show_window(ctx: &egui::Context) {
     SHOW_REQUESTED.store(true, Ordering::Relaxed);
     ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
@@ -366,13 +367,11 @@ fn show_window(ctx: &egui::Context) {
     crate::wake::now();
 }
 
-/// Ask for the main viewport to close. The loop ends the process; when the
-/// window is hidden there is no viewport to receive the command, so the quit
-/// request travels through the wake channel too.
-fn quit(ctx: &egui::Context) {
+/// Ask the loop to end. The request travels through the wake channel rather
+/// than a viewport close: close-to-tray would otherwise hide the window rather
+/// than quit, and a hidden window has no viewport to receive the command.
+fn quit() {
     QUIT_REQUESTED.store(true, Ordering::Relaxed);
-    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-    ctx.request_repaint();
     crate::wake::now();
 }
 
@@ -521,7 +520,7 @@ fn serve(bus: &mut Bus, ctx: &egui::Context, icon: &Icon) -> Result<(), String> 
                     }
                     match id {
                         MENU_SHOW_ID => show_window(ctx),
-                        MENU_QUIT_ID => quit(ctx),
+                        MENU_QUIT_ID => quit(),
                         _ => {}
                     }
                 }
@@ -628,7 +627,7 @@ pub fn spawn(ctx: egui::Context) {
                     Ok(_) => {}
                 }
                 // Registered and listening: from here until `serve` returns,
-                // minimize-to-tray has a way back.
+                // minimize- and close-to-tray have a way back.
                 AVAILABLE.store(true, Ordering::Relaxed);
                 let served = serve(&mut bus, &ctx, &icon);
                 AVAILABLE.store(false, Ordering::Relaxed);
