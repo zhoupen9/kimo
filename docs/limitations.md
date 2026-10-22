@@ -209,6 +209,16 @@ Do not "fix" these casually — they are known:
   `first_num` floor, so the messages a first sync skipped arrive only when
   `Load older mail` asks for them.
 
+- **The GPU pick is per Vulkan driver, and only PCI display controllers are
+  offered.** An ICD manifest names a library, not a card, so two cards of one
+  vendor share the one driver that is loaded; the pick then still chooses the
+  card for rendering (by PCI bus id), but cannot keep the other card's driver
+  out. A GPU that is not a PCI display controller — an ARM platform device, for
+  one — has no `PCI_ID` in sysfs and is not listed, leaving Automatic as the
+  only choice there. A pick that no longer resolves (the card unplugged, a
+  `settings.json` from another machine) falls back to every driver, and only
+  the log says which value was ignored.
+
 - Flags of mail that is already stored are not read back from the server. IMAP
   `\Seen` **and** `\Flagged` are taken for a message as it is fetched — the two
   states `fetched_state` reads off the `FETCH`, and the flag is kept for a row the

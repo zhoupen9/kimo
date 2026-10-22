@@ -95,21 +95,38 @@ impl Gpu {
     /// The device, the surface and everything the frame needs, for a window that
     /// has just been created.
     pub fn new(window: Arc<Window>, display: winit::event_loop::OwnedDisplayHandle) -> Self {
-        // The display handle matters on the GL backend, which needs it to
-        // present on Wayland at all.
-        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_with_display_handle(
-            Box::new(display),
-        ));
-        let surface = instance
-            .create_surface(window.clone())
-            .expect("kimo: the window has no surface this GPU can draw into");
-        let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
-            power_preference: wgpu::PowerPreference::default(),
-            compatible_surface: Some(&surface),
-            force_fallback_adapter: false,
-            apply_limit_buckets: false,
-        }))
-        .expect("kimo: no GPU adapter (is a driver or a software rasterizer installed?)");
+        // One backend at a time, Vulkan first. `Backends::all()` asks the GL
+        // backend to come up as well: it initialises EGL and GBM, loads Mesa's
+        // GL driver and the shader cache compiled for it — about twenty
+        // megabytes resident beside the one device that draws the window. The
+        // display handle is what GL needs to present on Wayland at all, so the
+        // GL attempt only happens when Vulkan yields nothing.
+        // The card picked in Preferences → Graphics, when the plan this process
+        // started with honoured one. The other cards' Vulkan drivers were never
+        // loaded, so this is a preference *within* what is here rather than a
+        // way to bring a driver in (`crate::gpus`).
+        let wanted = crate::gpus::startup_plan().card().cloned();
+        let (instance, surface, adapter) = [wgpu::Backends::VULKAN, wgpu::Backends::GL]
+            .into_iter()
+            .find_map(|backends| {
+                let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
+                    backends,
+                    ..wgpu::InstanceDescriptor::new_with_display_handle(Box::new(display.clone()))
+                });
+                let surface = instance.create_surface(window.clone()).ok()?;
+                let adapter = pick_adapter(&instance, backends, &surface, wanted.as_ref())?;
+                Some((instance, surface, adapter))
+            })
+            .expect("kimo: no GPU adapter on Vulkan or GL (is a driver or a software rasterizer installed?)");
+        // Which stack answered, once, because it decides how much of the
+        // machine is resident behind this window: Vulkan loads every installed
+        // ICD, and a GL backend alongside it brings its own driver. Without
+        // this line that has to be guessed from `/proc/<pid>/smaps`.
+        let info = adapter.get_info();
+        eprintln!(
+            "kimo: adapter \"{}\" ({:?}, {:?} backend, {} / {})",
+            info.name, info.device_type, info.backend, info.driver, info.driver_info
+        );
         let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
             label: Some("kimo"),
             ..Default::default()
@@ -495,6 +512,53 @@ impl Gpu {
             bind_group,
         });
     }
+}
+
+/// The adapter to draw with: the picked card's, when it is here and can present
+/// on this surface, and the loader's own choice otherwise — which is what it
+/// was before Preferences → Graphics existed.
+fn pick_adapter(
+    instance: &wgpu::Instance,
+    backends: wgpu::Backends,
+    surface: &wgpu::Surface<'static>,
+    wanted: Option<&crate::gpus::Card>,
+) -> Option<wgpu::Adapter> {
+    if let Some(card) = wanted {
+        // `enumerate_adapters` rather than `request_adapter`: the latter answers
+        // with wgpu's idea of the best adapter, and this is the one card the
+        // reader asked for.
+        let picked = pollster::block_on(instance.enumerate_adapters(backends))
+            .into_iter()
+            .find(|adapter| {
+                serves(card, &adapter.get_info()) && adapter.is_surface_supported(surface)
+            });
+        if picked.is_some() {
+            return picked;
+        }
+        eprintln!(
+            "kimo: the picked GPU {} has no adapter this surface can use; letting wgpu choose",
+            card.pci
+        );
+    }
+    pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+        power_preference: wgpu::PowerPreference::default(),
+        compatible_surface: Some(surface),
+        force_fallback_adapter: false,
+        apply_limit_buckets: false,
+    }))
+    .ok()
+}
+
+/// Whether an adapter is the picked card. Its PCI bus id is the exact answer —
+/// two cards of one vendor share a driver, not a slot — and is what wgpu reads
+/// from `VK_EXT_pci_bus_info`; a backend that does not report it falls back to
+/// the vendor and device ids, which every Vulkan driver reports.
+fn serves(card: &crate::gpus::Card, info: &wgpu::AdapterInfo) -> bool {
+    let pci = info.device_pci_bus_id.trim();
+    if !pci.is_empty() {
+        return crate::gpus::same_slot(pci, &card.pci);
+    }
+    info.vendor == card.vendor && info.device == card.device
 }
 
 impl Composite {

@@ -489,8 +489,15 @@ fn scheme_id() -> egui::Id {
 /// the desktop itself rather than letting egui ask a second time (`set_theme`
 /// is only called when it would change, so this stays cheap per frame).
 pub fn install(ctx: &egui::Context, scheme: ColorScheme) {
-    ctx.set_visuals_of(egui::Theme::Light, LIGHT.visuals());
-    ctx.set_visuals_of(egui::Theme::Dark, DARK.visuals());
+    let mut light = LIGHT.visuals();
+    let mut dark = DARK.visuals();
+    // Glyph rasterisation follows the display, not the theme: see
+    // [`crate::fonts::tune_text`] for why the density decides it.
+    let pixels_per_point = ctx.pixels_per_point();
+    crate::fonts::tune_text(&mut light.text_options, pixels_per_point);
+    crate::fonts::tune_text(&mut dark.text_options, pixels_per_point);
+    ctx.set_visuals_of(egui::Theme::Light, light);
+    ctx.set_visuals_of(egui::Theme::Dark, dark);
     let wanted = if scheme.dark {
         egui::ThemePreference::Dark
     } else {
@@ -797,6 +804,48 @@ mod tests {
         install(&ctx, LIGHT);
         assert_eq!(of(&ctx), LIGHT);
         assert_eq!(ctx.style_of(ctx.theme()).visuals.panel_fill, LIGHT.panel);
+    }
+
+    /// The density is what decides hinting, and it only reaches
+    /// `Context::pixels_per_point` once a frame has begun — which is where the
+    /// app calls `install` from, so the test begins one too.
+    #[test]
+    fn the_installed_style_rasterises_glyphs_for_the_display() {
+        let ctx = egui::Context::default();
+        let frame = |ctx: &egui::Context| {
+            let mut output = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(800.0, 600.0),
+                    )),
+                    ..Default::default()
+                },
+                |_| {},
+            );
+            // The atlas the frame uploaded is not going anywhere here, and
+            // epaint panics on a delta that is dropped unapplied.
+            output.textures_delta.clear();
+        };
+        frame(&ctx);
+        assert_eq!(ctx.pixels_per_point(), 1.0);
+        install(&ctx, LIGHT);
+        assert!(
+            ctx.style_of(egui::Theme::Light)
+                .visuals
+                .text_options
+                .font_hinting,
+            "a 1x window keeps egui's hinting"
+        );
+
+        ctx.set_pixels_per_point(2.0);
+        frame(&ctx);
+        install(&ctx, LIGHT);
+        for theme in [egui::Theme::Light, egui::Theme::Dark] {
+            let options = ctx.style_of(theme).visuals.text_options;
+            assert!(!options.font_hinting, "hinting survives 2x, {theme:?}");
+            assert!(!options.subpixel_binning, "binning survives 2x, {theme:?}");
+        }
     }
 
     #[test]

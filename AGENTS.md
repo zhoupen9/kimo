@@ -84,6 +84,7 @@ done. There is no CI yet — that discipline is on you.
 ```
 src/main.rs             entry point; the winit event loop, the window, egui's input state
 src/gpu.rs              the wgpu side: device, surface, egui's renderer, and one frame
+src/gpus.rs             the machine's graphics cards and the Vulkan drivers a pick may load
 src/app.rs              all UI: KimoApp state, panels, preferences modal, event handling
 src/models.rs           Account / Protocol / TlsMode / MailMessage (plain types: nothing is serialised any more)
 src/error.rs            MailError + MailResult
@@ -126,7 +127,7 @@ src/protocol/smtp.rs    minimal SMTP submission client (EHLO capabilities, START
 | [docs/architecture.md](docs/architecture.md) | `src/sync.rs`, `Job`/`Event`, anything crossing the UI/worker line |
 | [docs/storage.md](docs/storage.md) | `src/db.rs`, `src/storage.rs`, `src/search.rs`, a schema migration, an XDG path |
 | [docs/protocols.md](docs/protocols.md) | `src/protocol/`, a TLS setting, a charset, the mapping of a server's refusal |
-| [docs/ui-shell.md](docs/ui-shell.md) | `src/main.rs`, `src/gpu.rs`, `src/glass.rs`, the title bar, the column plan, the navigation column |
+| [docs/ui-shell.md](docs/ui-shell.md) | `src/main.rs`, `src/gpu.rs`, `src/gpus.rs`, `src/glass.rs`, the title bar, the column plan, the navigation column |
 | [docs/ui-mail.md](docs/ui-mail.md) | a list row, threading, select mode, the search box and its popup, the reading pane, attachments, labels, flags, filters, sort |
 | [docs/ui-style.md](docs/ui-style.md) | drawing a widget: an icon or a disclosure, a mail address field, the Cc/Bcc fold |
 | [docs/compose.md](docs/compose.md) | `compose_card`, `src/outgoing.rs`, `Job::SendMessage` |

@@ -531,7 +531,7 @@ fn bench_render() {
 
     let ctx = egui::Context::default();
     ctx.set_pixels_per_point(SCALE);
-    crate::fonts::install(&ctx, None, None);
+    crate::fonts::install(&ctx, None, None, None);
 
     let mut simple_rows = Vec::new();
     let mut blitz_rows = Vec::new();

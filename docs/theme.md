@@ -88,3 +88,40 @@ Read when touching `src/theme.rs`, `src/fonts.rs`, or adding a color to a widget
   → SC), because taking the collection's first face means the Japanese one —
   which is how Chinese mail came out with Japanese glyphs for 复 and friends.
   Do not go back to an index-free `read(path)`.
+
+- **The face can be picked** (`cjk_font`, see [preferences.md](preferences.md)).
+  The pick replaces the automatic file and the automatic path stays untouched
+  when nothing is picked. It is a *trade*, measured on a box that had all of
+  these (`cmap` coverage, Han URO / kana / Hangul / Bopomofo):
+
+  | Family | File | Han | kana | Hangul | Bopomofo |
+  | --- | --- | --- | --- | --- | --- |
+  | Noto Sans CJK, each SC/TC/JP/KR face | 18.6 MB | 100 % | 97–100 % | 100 % | 100 % |
+  | WenQuanYi Zen Hei | 16 MB | 100 % | 99 % | 100 % | 100 % |
+  | WenQuanYi Micro Hei | 5.0 MB | 100 %* | 94 % | 100 % | **0 %** |
+  | a Simplified-Chinese-only font (MS YaHei here) | 15 MB | 100 % | 97 % | **0 %** | 100 % |
+
+  *Han URO only: the 5 MB file has no Ext-A block, which is the "no rare Han"
+  the size buys. Only reading `cmap` can know this — the scanner deliberately
+  does not — so the picker probes the picked file once and says what it lacks
+  (`fonts::missing_cjk_samples`), instead of substituting silently. A Korean
+  mail in a Chinese-only face is tofu, not Korean glyphs; that is the failure
+  mode the warning exists for.
+
+- **Rasterisation follows the display, not the theme.** egui antialiases every
+  glyph with coverage, and by default also hints it and keeps up to four
+  horizontal subpixel offsets of its bitmap. Both pay at one pixel per point,
+  where a stem is one or two pixels wide and snapping it to the grid is what
+  keeps 11 pt text crisp. At two pixels per point the same row is 20–40 px
+  tall: hinting then only bends the designer's outline — a stem that should be
+  2.5 px wide is pushed to 2 or 3, and one stroke of a letter comes out lighter
+  than the next — and the quarter-pixel bitmaps differ where no eye can see it,
+  for up to four atlas entries per glyph. `fonts::tune_text` switches both off
+  at two pixels per point and above; `theme::install` calls it every frame with
+  the context's `pixels_per_point`, so the rule follows the window to another
+  monitor. The alternative a FreeType stack would use — `hintslight` — is not
+  reachable here: skrifa's auto-hinter renders the `light` and `normal` targets
+  identically (verified byte for byte), and a font that ships TrueType
+  instructions ignores the smooth mode. The real choice is the hinted outline
+  or the drawn one, and at 2× the drawn one is what GTK and macOS show. At 1×
+  the hinting stays on: that is where it earns its keep.

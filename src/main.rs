@@ -13,6 +13,7 @@ mod folders;
 mod fonts;
 mod glass;
 mod gpu;
+mod gpus;
 mod html;
 mod mail;
 mod models;
@@ -29,6 +30,7 @@ mod storage;
 mod sync;
 mod theme;
 mod tray;
+mod trim;
 mod wake;
 
 use std::sync::{Arc, Mutex};
@@ -84,6 +86,15 @@ fn main() -> Result<(), winit::error::EventLoopError> {
     // servers like Sina's need (the default provider, aws-lc-rs, is a C
     // library and intentionally not compiled in).
     let _ = protocol::ffdhe::crypto_provider().install_default();
+
+    // Before the first allocation that could raise the allocator's mmap
+    // threshold; see `crate::trim`.
+    trim::init();
+
+    // Which Vulkan drivers this process may load, decided before the event loop
+    // exists: the loader reads the list as it builds the first instance, and a
+    // driver it has opened stays open (`crate::gpus`, Preferences → Graphics).
+    gpus::choose_drivers();
 
     let event_loop = EventLoop::<Wake>::with_user_event().build()?;
     let proxy = event_loop.create_proxy();

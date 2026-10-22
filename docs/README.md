@@ -20,6 +20,7 @@ are where new reasoning goes when a change is done.
 | [preferences.md](preferences.md) | the preferences modal and the automatic sync |
 | [testing.md](testing.md) | running the app, the headless UI dumps, the render and frame benchmarks |
 | [limitations.md](limitations.md) | the states that are accepted on purpose — read before "fixing" them |
+| [fix.md](fix.md) | the memory plan: what a running instance's resident set is made of, and the order to fix it in |
 
 ## Keeping these docs
 

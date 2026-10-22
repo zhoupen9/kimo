@@ -90,12 +90,18 @@ pub enum Job {
     /// mark yet is never part of the sweep. For POP3, the new messages of the
     /// drop. `purge` drops the account's stored mail before fetching — for a
     /// new account, or one whose endpoint just moved to another mailbox.
+    /// `save` writes the account row first, and only the add/edit form's job
+    /// sets it: a sync that wrote it would put a removed account back the
+    /// moment a job spawned before the removal reached the database — the
+    /// sweep of a second window does exactly that — and the account would
+    /// return at the next start.
     Sync {
         account: Account,
         purge: bool,
         /// A folder to fetch even though it has no mark; ignored when the
         /// server no longer lists it.
         folder: Option<String>,
+        save: bool,
     },
     /// Fetch one specific IMAP folder.
     SyncFolder { account: Account, folder: String },
@@ -202,8 +208,9 @@ pub enum Job {
         mail: Box<Outgoing>,
     },
     /// Remove an account: its row, its folders and, through the cascades, every
-    /// message cached for it.
-    DeleteAccount { account_id: String },
+    /// message cached for it. The account travels with the job so a failure can
+    /// hand it back ([`Event::AccountRemoveFailed`]).
+    DeleteAccount { account: Account },
     /// Ask the desktop for the files to attach to the mail being written: the
     /// XDG portal's own file chooser, which runs in the *compositor's* process
     /// (`crate::portal`). It is a job because the call does not come back until
@@ -224,6 +231,10 @@ pub enum Job {
     /// Enumerate the installed font families for the Preferences pickers
     /// (see `crate::fonts`). Results come back as `Event::FontsScanned`.
     ScanFonts,
+    /// Look at the machine's graphics cards and the Vulkan drivers installed
+    /// for them — Preferences → Graphics' list and what its foot says the pick
+    /// will load (`crate::gpus`). Results come back as `Event::Gpus`.
+    ScanGpus,
     /// Run a search against the mail database (see `crate::search`). Results
     /// come back as `Event::SearchResults`, tagged with `seq`.
     Search {
@@ -271,6 +282,15 @@ pub enum Event {
     },
     SyncFailed {
         account_id: String,
+        error: String,
+    },
+    /// Removing an account failed, so its row is still in the database and the
+    /// next start will load it again. The whole account travels back with the
+    /// error: the window took it out of the list on the click, and a failure
+    /// has to put it back where the reader can see it, rather than let it
+    /// reappear at the next start with nothing said.
+    AccountRemoveFailed {
+        account: Account,
         error: String,
     },
     /// Whether the server has older mail below what one folder holds — the
@@ -345,6 +365,9 @@ pub enum Event {
     },
     /// The installed font families, sorted by name.
     FontsScanned(Vec<crate::fonts::FontFamily>),
+    /// The machine's graphics cards and Vulkan drivers, as Preferences →
+    /// Graphics lists them.
+    Gpus(crate::gpus::Scan),
     /// The hits of one search. `seq` identifies the request: the UI drops an
     /// answer for a query it has already replaced.
     SearchResults {
@@ -420,6 +443,10 @@ pub fn spawn(job: Job, ctx: egui::Context, tx: Sender<Event>) {
         }
         Job::ScanFonts => {
             let _ = tx.send(Event::FontsScanned(crate::fonts::scan()));
+            worker_wake(&ctx);
+        }
+        Job::ScanGpus => {
+            let _ = tx.send(Event::Gpus(crate::gpus::scan()));
             worker_wake(&ctx);
         }
         Job::Search { seq, query } => {
@@ -498,10 +525,15 @@ pub fn spawn(job: Job, ctx: egui::Context, tx: Sender<Event>) {
             }
             worker_wake(&ctx);
         }
-        Job::DeleteAccount { account_id } => {
-            if let Err(error) = db::delete_account(&account_id) {
-                let _ = tx.send(Event::SyncFailed {
-                    account_id,
+        Job::DeleteAccount { account } => {
+            if let Err(error) = db::delete_account(&account.id) {
+                // The row is still there, so this has to be said: the window
+                // has already taken the account out of the list, and the next
+                // start would load it back with nothing on screen to explain
+                // why (see `Event::AccountRemoveFailed`).
+                eprintln!("kimo: cannot remove account {}: {error}", account.id);
+                let _ = tx.send(Event::AccountRemoveFailed {
+                    account,
                     error: error.to_string(),
                 });
             }
@@ -667,6 +699,7 @@ pub fn spawn(job: Job, ctx: egui::Context, tx: Sender<Event>) {
                 | Job::FetchStylesheet { .. }
                 | Job::RenderHtml { .. }
                 | Job::ScanFonts
+                | Job::ScanGpus
                 | Job::Search { .. }
                 | Job::MarkSeen { .. }
                 | Job::DeleteMessage { .. }
@@ -687,12 +720,20 @@ pub fn spawn(job: Job, ctx: egui::Context, tx: Sender<Event>) {
                     account,
                     purge,
                     folder,
+                    save,
                 } => {
-                    // The account row comes first: the mail below refers to it,
-                    // and a brand-new account has to be durable before its mail
-                    // is. Purging, when the endpoint moved, is part of the same
-                    // job so nothing can reorder those steps.
-                    db::save_account(&account).and_then(|()| {
+                    // The form's job writes the account row before the mail
+                    // below refers to it, and a brand-new account has to be
+                    // durable before its mail is. Purging, when the endpoint
+                    // moved, is part of the same job so nothing can reorder
+                    // those steps. Every other sync leaves the row alone: see
+                    // the variant's comment for what writing it there costs.
+                    let written = if save {
+                        db::save_account(&account)
+                    } else {
+                        Ok(())
+                    };
+                    written.and_then(|()| {
                         if purge {
                             db::purge_mail(&account.id)?;
                         }
@@ -707,6 +748,7 @@ pub fn spawn(job: Job, ctx: egui::Context, tx: Sender<Event>) {
                 | Job::FetchStylesheet { .. }
                 | Job::RenderHtml { .. }
                 | Job::ScanFonts
+                | Job::ScanGpus
                 | Job::Search { .. }
                 | Job::MarkSeen { .. }
                 | Job::DeleteMessage { .. }

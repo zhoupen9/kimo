@@ -1,6 +1,6 @@
 # UI shell — window, title bar and columns
 
-Read when touching `src/main.rs`, `src/gpu.rs`, `src/glass.rs`, the title bar, the columns' layout plan, or the navigation column.
+Read when touching `src/main.rs`, `src/gpu.rs`, `src/gpus.rs`, `src/glass.rs`, the title bar, the columns' layout plan, or the navigation column.
 
 - **GUI:** egui (immediate mode, pinned to the 0.36 line), driven directly
   through winit + `egui-winit` + `egui-wgpu` instead of through eframe, because
@@ -51,6 +51,39 @@ Read when touching `src/main.rs`, `src/gpu.rs`, `src/glass.rs`, the title bar, t
   because epaint panics on one that is dropped unapplied. Keep `egui`,
   `egui-winit`, `egui-wgpu` and `wgpu` in lockstep when bumping, and read the
   egui CHANGELOG before doing it.
+
+- The instance asks for **one backend at a time**: Vulkan first, and GL only
+  when Vulkan yields no adapter or no surface (`Gpu::new`). `Backends::all()`
+  brings up the GL backend as well — EGL and GBM initialised, Mesa's GL driver
+  and the compiled shader cache resident — beside the one device that draws;
+  measured on the machine in [fix.md](fix.md), that was about 21 MB of a window
+  that used none of it. The GL attempt stays because a machine whose Vulkan
+  loader is broken but whose GL driver works must still start. Which adapter
+  answered is logged once at start-up (`kimo: adapter "…" (DiscreteGpu,
+  Vulkan backend, … / …)`): it decides how much of the machine is resident
+  behind the window, and without the line that can only be guessed from
+  `/proc/<pid>/smaps`.
+
+- **The GPU is picked, and so is how much of the Vulkan stack is opened**
+  (Preferences → Graphics, `src/gpus.rs`). The loader opens every installed ICD
+  as it creates the instance, so on a machine with two cards the drivers of the
+  card that will not draw are resident as well — on the box measured in
+  [fix.md](fix.md), most of rows 1–2. The pick is saved as the
+  card's PCI address and read in `main` before the event loop: `gpus::apply`
+  sets `VK_DRIVER_FILES` (and the old `VK_ICD_FILENAMES` name) to the manifests
+  whose library belongs to that card's vendor, so the loader opens nothing else.
+  `Gpu::new` then takes the adapter whose PCI bus id (`VK_EXT_pci_bus_info`,
+  which wgpu reports as `device_pci_bus_id`) — or vendor and device ids — are
+  that card's. Every way a pick can fail falls back to loading every driver:
+  absent, malformed, the card unplugged, no installed driver for it, or a
+  session that set `VK_DRIVER_FILES` itself. A preference must never be the
+  reason there is no GPU at all. Should the picked card's adapter turn out to be
+  unusable, `Gpu::new` falls back to wgpu's own choice and then to GL — the
+  other cards' drivers cannot be brought back into the process, so that is the
+  path a broken driver has always taken. Measured on this box with an empty
+  database: every driver 190 MB RSS, the Intel card picked 110 MB, and no
+  `libGLX_nvidia`, `libnvidia-*`, `libvulkan_lvp` or `libLLVM` in the
+  process.
 
 ## The window and its title bar
 

@@ -66,7 +66,17 @@ Read when touching `src/db.rs`, `src/storage.rs`, `src/search.rs`, a schema migr
   purged only when the form's endpoint (protocol, host, port, username)
   changed, because only then can it describe somebody else's mailbox
   (`AccountForm::points_elsewhere` — the purge runs inside the same sync job,
-  `Job::Sync { purge }`, so nothing can reorder those two steps). An account's
+  `Job::Sync { purge }`, so nothing can reorder those two steps). `save`, on
+  that job, is what writes the account row, and only the form's job sets it:
+  the row has to exist before the mail below can refer to it, and a sync that
+  wrote it would put a *removed* account back the moment a job spawned before
+  the removal reached the database — the sweep of a second window, or one
+  queued just before the click — so the account would return at the next
+  start. A removal that fails is answered rather than swallowed: the job sends
+  `Event::AccountRemoveFailed` with the account, the window puts it back in
+  the list, and Preferences → Accounts says why (`KimoApp::account_error`) —
+  the row is still there, so hiding the account would be a lie the next start
+  would correct. An account's
   outgoing server is `Account.smtp` (`None` is an account that cannot send,
   which is what leaves the compose card's Send disabled): five columns written
   together by `save_account_on` and read by `smtp_from_row`, where a NULL host
@@ -86,9 +96,13 @@ Read when touching `src/db.rs`, `src/storage.rs`, `src/search.rs`, a schema migr
   (whether new mail is announced on the desktop; absent means on — see
   [platform.md](platform.md)), and the font
   families picked in Preferences →
-  Appearance (`ui_font`, `mono_font`; absent means egui's built-in font plus
-  the CJK fallback). Family *names* are stored, not paths, so the file survives font
-  updates; a name that no longer resolves is simply ignored. Older files may
+  Appearance (`ui_font`, `mono_font`, `cjk_font`; absent means egui's built-in
+  font plus the automatic CJK fallback), and `gpu`, the PCI address of the
+  graphics card Preferences → Graphics picked (`"0000:03:00.0"`; absent means
+  the Vulkan loader's own choice, and a value that names no installed card is
+  ignored — see [preferences.md](preferences.md)). Family *names* are stored,
+  not paths, so the file survives font updates; a name that no longer resolves
+  is simply ignored. Older files may
   still carry a `render_mode` field from the removed WebKitGTK renderer; it
   is ignored on load — do not reuse that name. The palette that the theme
   resolves to is *not* in this file; it is a compiled-in default — see

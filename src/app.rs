@@ -19,7 +19,9 @@
 //! Appearance page the theme (which resolves to a `theme::ColorScheme`), the
 //! HTML renderer and the fonts. That renderer draws the mail either as egui
 //! widgets (`crate::html`) or rasterized by Blitz (`crate::blitz_render`) on a
-//! worker thread. The pen is the compose card: a draft, and the Send button
+//! worker thread. The Graphics page picks which of the machine's cards Kimo
+//! draws with, and with it which Vulkan drivers are loaded at all
+//! (`crate::gpus`). The pen is the compose card: a draft, and the Send button
 //! that hands it to a worker (`Job::SendMessage`) — the one modal that can put
 //! a mail on the wire, and the one that says what the server said when it did
 //! not.
@@ -32,6 +34,7 @@ use std::time::{Duration, Instant};
 use crate::folders::{self, FolderKind};
 use crate::fonts::FontFamily;
 use crate::glass::Glass;
+use crate::gpus::Status;
 use crate::models::{Account, Attachment, MailMessage, Protocol, SmtpLogin, SmtpSettings, TlsMode};
 use crate::outgoing::{self, Outgoing, OutgoingAttachment};
 use crate::search::{Scope, SearchHit, SearchQuery, SEARCH_LIMIT};
@@ -135,6 +138,7 @@ enum PrefsTab {
     General,
     Accounts,
     Appearance,
+    Graphics,
     About,
 }
 
@@ -796,6 +800,10 @@ pub struct KimoApp {
     /// Why the mail database is not being written to disk, when that is the
     /// case; drawn as a one-line banner above the message list.
     storage_warning: Option<String>,
+    /// Why the last account removal failed, when it did. The account is put
+    /// back in the list at the same time, because its row is still there: the
+    /// line stands at the top of Preferences → Accounts, where the click was.
+    account_error: Option<String>,
     /// Where a downloaded attachment went — or that a mail was sent — and when
     /// it said so: one line above the message list for `NOTICE_TIME`. A file
     /// that lands in a directory the user was not watching is a file they cannot
@@ -853,6 +861,28 @@ pub struct KimoApp {
     /// egui's built-in font (plus the CJK fallback).
     ui_font: Option<String>,
     mono_font: Option<String>,
+    /// The CJK fallback picked in Preferences; `None` means the automatic
+    /// choice (the first installed candidate, with the face the locale asks
+    /// for).
+    cjk_font: Option<String>,
+    /// What the picked CJK face has no glyph for, computed when the pick is
+    /// applied rather than per frame (`fonts::missing_cjk_samples` reads the
+    /// whole file). The name is kept so a warning left from an earlier pick is
+    /// never shown under a newer one.
+    cjk_missing: Option<(String, Vec<char>)>,
+    /// The graphics card picked in Preferences → Graphics, as its PCI address
+    /// (`0000:03:00.0`); `None` is the Vulkan loader's own choice. Read at
+    /// start-up by `crate::gpus`, so a change here applies to the next start:
+    /// the drivers are opened when the instance is made and cannot be unloaded.
+    gpu: Option<String>,
+    /// What `crate::gpus::scan` found for that page — the cards, the drivers
+    /// and the cards' names. Loaded the first time the page is drawn, on a
+    /// worker thread (`Job::ScanGpus`), because it reads sysfs, the manifest
+    /// directories and `pci.ids`.
+    gpu_scan: Option<crate::gpus::Scan>,
+    /// Whether that scan is in flight, so the page asks for it once rather than
+    /// every frame.
+    gpu_scanning: bool,
     /// Blitz-rendered pages, keyed by message and geometry; `blitz_order`
     /// holds the insertion order so old pages can be evicted (textures are
     /// megabytes each).
@@ -2046,7 +2076,7 @@ impl KimoApp {
         // egui's built-in fonts only cover Latin/Cyrillic/Greek, so the CJK
         // fallback goes in immediately; the families picked in Preferences are
         // applied once the worker scan below has resolved their files.
-        crate::fonts::install(ctx, None, None);
+        crate::fonts::install(ctx, None, None, None);
 
         let settings = storage::load_settings();
         // The accounts and their mail live in the database; this is the one
@@ -2084,6 +2114,7 @@ impl KimoApp {
                     account,
                     purge: false,
                     folder: None,
+                    save: false,
                 },
                 app.ctx.clone(),
                 app.tx.clone(),
@@ -2175,6 +2206,7 @@ impl KimoApp {
             accent: Accent::parse(settings.accent.as_deref().unwrap_or_default()),
             system_dark: system_prefers_dark(),
             storage_warning: crate::db::warning(),
+            account_error: None,
             notice: None,
             images: HashMap::new(),
             stylesheets: HashMap::new(),
@@ -2199,6 +2231,11 @@ impl KimoApp {
             font_families: None,
             ui_font: settings.ui_font.clone(),
             mono_font: settings.mono_font.clone(),
+            cjk_font: settings.cjk_font.clone(),
+            cjk_missing: None,
+            gpu: settings.gpu.clone(),
+            gpu_scan: None,
+            gpu_scanning: false,
             blitz_pages: HashMap::new(),
             blitz_order: Vec::new(),
             blitz_cancel: crate::blitz_render::Cancellation::default(),
@@ -2414,6 +2451,16 @@ impl KimoApp {
                     state.error = Some(error);
                 }
             }
+            Event::AccountRemoveFailed { account, error } => {
+                // The row is still in the database, so the next start would
+                // load the account back. Put it back now instead, and say why:
+                // a click that silently undid itself is worse than a click
+                // that failed loudly.
+                self.account_error = Some(format!("Could not remove {}: {error}", account.name));
+                if !self.accounts.iter().any(|a| a.id == account.id) {
+                    self.accounts.push(account);
+                }
+            }
             Event::MessageDeleted {
                 account_id,
                 folder,
@@ -2580,6 +2627,10 @@ impl KimoApp {
                     self.search_error = Some(error);
                 }
             }
+            Event::Gpus(scan) => {
+                self.gpu_scanning = false;
+                self.gpu_scan = Some(scan);
+            }
             Event::FontsScanned(families) => {
                 self.font_families = Some(families);
                 // settings.json may name families that only now resolve.
@@ -2707,6 +2758,7 @@ impl KimoApp {
                     account,
                     purge: false,
                     folder: open,
+                    save: false,
                 },
                 self.ctx.clone(),
                 self.tx.clone(),
@@ -2778,6 +2830,7 @@ impl KimoApp {
                     account,
                     purge: false,
                     folder: None,
+                    save: false,
                 },
             };
             sync::spawn(job, self.ctx.clone(), self.tx.clone());
@@ -2826,26 +2879,28 @@ impl KimoApp {
         }
     }
 
-    fn delete_account(&mut self, account_id: &str) {
+    fn delete_account(&mut self, account: Account) {
+        let account_id = account.id.clone();
         self.accounts.retain(|a| a.id != account_id);
-        self.states.remove(account_id);
+        self.states.remove(&account_id);
         // Whatever was checked of it is not on screen any more.
         self.cancel_select();
-        if self.selected_account.as_deref() == Some(account_id) {
+        if self.selected_account.as_deref() == Some(account_id.as_str()) {
             self.selected_account = self.accounts.first().map(|a| a.id.clone());
             self.selected_folder = Some("INBOX".to_string());
             self.selected_message = None;
         }
+        self.account_error = None;
         // The account row, and through its cascades every message of it, goes
-        // on a worker thread; the UI has already dropped its own copy.
+        // on a worker thread; the UI has already dropped its own copy. A
+        // failure comes back as `Event::AccountRemoveFailed`, which puts the
+        // account back — the row survived, so the list has to say so.
         sync::spawn(
-            Job::DeleteAccount {
-                account_id: account_id.to_string(),
-            },
+            Job::DeleteAccount { account },
             self.ctx.clone(),
             self.tx.clone(),
         );
-        self.forget_blitz_pages(account_id);
+        self.forget_blitz_pages(&account_id);
     }
 
     /// Export the mail the reading pane shows: a worker asks the desktop where
@@ -3035,6 +3090,7 @@ impl KimoApp {
     /// one, or replace the edited account in place, then sync it so the
     /// window shows what the credentials actually reach.
     fn save_account_form(&mut self) {
+        self.account_error = None;
         let form = self.account_form.clone();
         let edited = form
             .editing
@@ -3076,6 +3132,7 @@ impl KimoApp {
                 account,
                 purge: switches_mailbox,
                 folder: None,
+                save: true,
             },
             self.ctx.clone(),
             self.tx.clone(),
@@ -3450,30 +3507,40 @@ impl KimoApp {
             html_renderer: Some(self.html_renderer.as_str().to_string()),
             ui_font: self.ui_font.clone(),
             mono_font: self.mono_font.clone(),
+            cjk_font: self.cjk_font.clone(),
             threaded: Some(self.threaded),
             auto_sync: Some(self.auto_sync),
             auto_sync_minutes: Some((self.auto_sync_every.as_secs() / SECS_PER_MINUTE) as u32),
             notifications: Some(self.notifications),
             minimize_to_tray: Some(self.minimize_to_tray),
             close_to_tray: Some(self.close_to_tray),
+            gpu: self.gpu.clone(),
         });
     }
 
     /// Re-install the egui fonts from the picked family names. Reads one file
     /// per pick, which is cheap; the directory scan behind
     /// `font_families` is a worker job.
-    fn apply_fonts(&self) {
+    fn apply_fonts(&mut self) {
         let families = self.font_families.as_deref().unwrap_or_default();
         let pick = |name: &Option<String>| {
             name.as_deref()
                 .and_then(|name| crate::fonts::find(families, name))
                 .cloned()
         };
-        crate::fonts::install(
-            &self.ctx,
-            pick(&self.ui_font).as_ref(),
-            pick(&self.mono_font).as_ref(),
-        );
+        let ui = pick(&self.ui_font);
+        let mono = pick(&self.mono_font);
+        let cjk = pick(&self.cjk_font);
+        // The coverage note is about the face that is actually installed, not
+        // about the name in settings.json: a pick that no longer resolves falls
+        // through to the automatic face (see `fonts::install`).
+        self.cjk_missing = cjk.as_ref().map(|family| {
+            (
+                family.name.clone(),
+                crate::fonts::missing_cjk_samples(family),
+            )
+        });
+        crate::fonts::install(&self.ctx, ui.as_ref(), mono.as_ref(), cjk.as_ref());
     }
 
     /// Apply the selected theme to the context, resolving "system" against
@@ -8262,6 +8329,7 @@ impl KimoApp {
                         (PrefsTab::General, "General"),
                         (PrefsTab::Accounts, "Accounts"),
                         (PrefsTab::Appearance, "Appearance"),
+                        (PrefsTab::Graphics, "Graphics"),
                         (PrefsTab::About, "About"),
                     ] {
                         if ui.selectable_label(self.prefs_tab == tab, label).clicked() {
@@ -8277,6 +8345,7 @@ impl KimoApp {
                         PrefsTab::General => self.general_page(ui),
                         PrefsTab::Accounts => self.accounts_page(ui),
                         PrefsTab::Appearance => self.appearance_page(ui),
+                        PrefsTab::Graphics => self.graphics_page(ui),
                         PrefsTab::About => self.about_page(ui),
                     }
                 });
@@ -8299,7 +8368,14 @@ impl KimoApp {
 
         let mut switch_to: Option<Account> = None;
         let mut edit: Option<String> = None;
-        let mut remove: Option<String> = None;
+        let mut remove: Option<Account> = None;
+
+        // A removal that failed left the account (and its row) in place; this
+        // is the line that says why it came back.
+        if let Some(error) = &self.account_error {
+            ui.label(egui::RichText::new(error).color(ui.visuals().error_fg_color));
+            ui.add_space(4.0);
+        }
 
         ui.label(
             egui::RichText::new("Every account syncs; the one in use fills the window.")
@@ -8333,7 +8409,7 @@ impl KimoApp {
                         };
                         if ui.button(label).clicked() {
                             if confirming {
-                                remove = Some(account.id.clone());
+                                remove = Some(account.clone());
                             } else {
                                 self.confirm_delete = Some(account.id.clone());
                             }
@@ -8376,8 +8452,8 @@ impl KimoApp {
         if let Some(id) = edit {
             self.open_edit_account_form(&id);
         }
-        if let Some(id) = remove {
-            self.delete_account(&id);
+        if let Some(account) = remove {
+            self.delete_account(account);
             self.confirm_delete = None;
         }
     }
@@ -8813,14 +8889,74 @@ impl KimoApp {
             .spacing([10.0, 6.0])
             .show(ui, |ui| {
                 ui.label("Interface");
-                fonts_changed |= font_picker(ui, "ui-font", &self.font_families, &mut self.ui_font);
+                fonts_changed |= font_picker(
+                    ui,
+                    "ui-font",
+                    &self.font_families,
+                    &mut self.ui_font,
+                    "Default",
+                );
                 ui.end_row();
 
                 ui.label("Fixed-width");
-                fonts_changed |=
-                    font_picker(ui, "mono-font", &self.font_families, &mut self.mono_font);
+                fonts_changed |= font_picker(
+                    ui,
+                    "mono-font",
+                    &self.font_families,
+                    &mut self.mono_font,
+                    "Default",
+                );
+                ui.end_row();
+
+                // The fallback, not an override: mail that names its own
+                // family still wins, and the picked face is appended last.
+                ui.label("CJK fallback");
+                fonts_changed |= font_picker(
+                    ui,
+                    "cjk-font",
+                    &self.font_families,
+                    &mut self.cjk_font,
+                    "Automatic",
+                );
                 ui.end_row();
             });
+        // What the pick does not cover, said rather than filtered: a reader who
+        // picks a Latin family has to see why their mail turned into boxes. The
+        // scripts are named rather than drawn — the sample characters are
+        // exactly what this face cannot show, so the warning would be boxes too.
+        if let Some((name, missing)) = &self.cjk_missing {
+            if !missing.is_empty() {
+                let scripts: Vec<&str> = missing
+                    .iter()
+                    .map(|character| crate::fonts::script_of_sample(*character))
+                    .collect();
+                ui.label(
+                    egui::RichText::new(format!(
+                        "{} has no glyphs for {}; CJK mail will show boxes there.",
+                        name,
+                        scripts.join(", ")
+                    ))
+                    .small()
+                    .color(ui.visuals().warn_fg_color),
+                );
+            }
+        }
+        // A name from a settings.json this machine may not have: rendering
+        // falls through to the automatic face, and saying so is better than a
+        // picker that names nothing installed.
+        let unresolved_cjk = match (&self.cjk_font, &self.font_families) {
+            (Some(name), Some(families)) => crate::fonts::find(families, name).is_none(),
+            _ => false,
+        };
+        if unresolved_cjk {
+            ui.label(
+                egui::RichText::new(
+                    "That family is not installed; the automatic fallback is used.",
+                )
+                .small()
+                .weak(),
+            );
+        }
         ui.add_space(4.0);
         // Previews, rendered through the named families that fonts::install
         // binds for exactly this purpose.
@@ -8836,8 +8972,9 @@ impl KimoApp {
         ui.add_space(4.0);
         ui.label(
             egui::RichText::new(
-                "Applies to the app UI and to monospace text in the Simple renderer; \
-                 Blitz mail keeps its own font set.",
+                "Interface and fixed-width apply to the app UI and to monospace text in the \
+                 Simple renderer; the CJK fallback also covers CJK mail there. Blitz mail \
+                 keeps its own font set.",
             )
             .small()
             .weak(),
@@ -8852,6 +8989,174 @@ impl KimoApp {
         ui.add_space(8.0);
 
         color_scheme_preview(ui, self.scheme());
+    }
+
+    /// Preferences → Graphics: which of the machine's cards Kimo draws with.
+    ///
+    /// The choice belongs to the *next* start, and the page says so: the
+    /// Vulkan drivers are opened when the instance is made, and the ones a card
+    /// does not need are exactly what this page keeps out of the process
+    /// (`crate::gpus`). The scan is a worker job — sysfs, the manifest
+    /// directories and `pci.ids` are filesystem work — so the page draws a
+    /// spinner until it answers rather than reading them itself.
+    fn graphics_page(&mut self, ui: &mut egui::Ui) {
+        if self.gpu_scan.is_none() {
+            if !self.gpu_scanning {
+                self.gpu_scanning = true;
+                sync::spawn(Job::ScanGpus, self.ctx.clone(), self.tx.clone());
+            }
+            ui.horizontal(|ui| {
+                ui.add(egui::Spinner::new().color(theme::of(ui.ctx()).accent));
+                ui.label(
+                    egui::RichText::new("Looking for graphics cards…")
+                        .small()
+                        .weak(),
+                );
+            });
+            return;
+        }
+
+        ui.label(egui::RichText::new("Graphics card").strong());
+        ui.add_space(4.0);
+
+        // The click is collected and applied after the list: the radios read
+        // `self.gpu`, and a pick must not change the page mid-draw.
+        let mut pick: Option<Option<String>> = None;
+        {
+            let scan = self.gpu_scan.as_ref().expect("just checked");
+            if scan.cards.is_empty() {
+                ui.label(
+                    egui::RichText::new(
+                        "No graphics card with a kernel driver was found on this machine.",
+                    )
+                    .small()
+                    .weak(),
+                );
+                ui.add_space(4.0);
+            }
+            if ui.radio(self.gpu.is_none(), "Automatic").clicked() {
+                pick = Some(None);
+            }
+            ui.add_space(4.0);
+            for card in &scan.cards {
+                let selected = self
+                    .gpu
+                    .as_deref()
+                    .is_some_and(|saved| saved.eq_ignore_ascii_case(&card.pci));
+                if ui.radio(selected, card.title(&scan.names)).clicked() {
+                    pick = Some(Some(card.pci.clone()));
+                }
+                ui.label(
+                    egui::RichText::new(card.subtitle(&scan.names))
+                        .small()
+                        .weak(),
+                );
+                ui.add_space(4.0);
+            }
+        }
+        if let Some(pick) = pick {
+            self.gpu = pick;
+            self.persist_settings();
+        }
+
+        let scan = self.gpu_scan.as_ref().expect("just checked");
+        let plan = crate::gpus::plan(self.gpu.as_deref(), &scan.cards, &scan.icds, scan.locked);
+        match &plan.status {
+            Status::Automatic => {
+                let text = if plan.all.is_empty() {
+                    "No Vulkan driver is installed here; Kimo uses its GL fallback.".to_string()
+                } else {
+                    format!(
+                        "The Vulkan loader opens all {} installed drivers.",
+                        plan.all.len()
+                    )
+                };
+                ui.label(egui::RichText::new(text).small().weak());
+            }
+            Status::Picked(_) => match plan.restriction() {
+                Some(drivers) => {
+                    let left = plan.all.len() - drivers.len();
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "Loads {} of the {} installed Vulkan drivers ({}). The other {} {} \
+                             not loaded.",
+                            drivers.len(),
+                            plan.all.len(),
+                            crate::gpus::manifest_names(drivers),
+                            left,
+                            if left == 1 { "is" } else { "are" },
+                        ))
+                        .small()
+                        .weak(),
+                    );
+                }
+                None => {
+                    ui.label(
+                        egui::RichText::new(
+                            "Every installed Vulkan driver serves this card, so nothing is \
+                             left out.",
+                        )
+                        .small()
+                        .weak(),
+                    );
+                }
+            },
+            Status::NotPresent(saved) => {
+                ui.label(
+                    egui::RichText::new(format!(
+                        "The GPU saved in settings.json ({saved}) is not installed here; every \
+                         Vulkan driver is loaded instead."
+                    ))
+                    .small()
+                    .color(ui.visuals().warn_fg_color),
+                );
+            }
+            Status::Malformed(saved) => {
+                ui.label(
+                    egui::RichText::new(format!(
+                        "settings.json names a GPU Kimo does not recognise ({saved:?}); every \
+                         Vulkan driver is loaded instead."
+                    ))
+                    .small()
+                    .color(ui.visuals().warn_fg_color),
+                );
+            }
+            Status::NoDriver(card) => {
+                ui.label(
+                    egui::RichText::new(format!(
+                        "No Vulkan driver is installed for {} ({}); every Vulkan driver is \
+                         loaded instead.",
+                        card.title(&scan.names),
+                        card.pci,
+                    ))
+                    .small()
+                    .color(ui.visuals().warn_fg_color),
+                );
+            }
+            // Said by the note below: the session's own list is not a failure
+            // of the pick, and drawing it twice would read like one.
+            Status::Environment => {}
+        }
+        if scan.locked {
+            ui.label(
+                egui::RichText::new(
+                    "This session already names the Vulkan drivers (VK_DRIVER_FILES), so the \
+                     choice above is not applied.",
+                )
+                .small()
+                .weak(),
+            );
+        }
+        ui.add_space(8.0);
+        ui.label(
+            egui::RichText::new(
+                "Kimo chooses its GPU when it starts. A card you pick opens only that card's \
+                 Vulkan drivers, so a card you do not use never enters this process. A change \
+                 applies the next time Kimo starts.",
+            )
+            .small()
+            .weak(),
+        );
     }
 
     /// Preferences → About: the app's icon, the version it was built as, and
@@ -11977,23 +12282,27 @@ fn paint_close_icon(p: &egui::Painter, rect: egui::Rect, color: egui::Color32) {
     );
 }
 
-/// A Preferences font picker: "Default" plus every installed family, each
-/// entry drawn in its own shape so fixed-width families stand out. Returns
-/// true when the selection changed.
+/// A Preferences font picker: the unset entry (`default_label`) plus every
+/// installed family, each entry drawn in its own shape so fixed-width families
+/// stand out. Returns true when the selection changed.
 fn font_picker(
     ui: &mut egui::Ui,
     id: &str,
     families: &Option<Vec<FontFamily>>,
     current: &mut Option<String>,
+    default_label: &str,
 ) -> bool {
     let mut changed = false;
     egui::ComboBox::from_id_salt(id)
-        .selected_text(current.clone().unwrap_or_else(|| "Default".to_string()))
+        .selected_text(current.clone().unwrap_or_else(|| default_label.to_string()))
         .width(240.0)
         .height(320.0)
         .show_ui(ui, |ui| {
             ui.set_min_width(260.0);
-            if ui.selectable_label(current.is_none(), "Default").clicked() {
+            if ui
+                .selectable_label(current.is_none(), default_label)
+                .clicked()
+            {
                 *current = None;
                 changed = true;
             }
@@ -13287,6 +13596,52 @@ mod tests {
         app
     }
 
+    /// A scan of two cards and the four manifests a Mesa + NVIDIA installation
+    /// carries — the Graphics page's input, without reading this machine's
+    /// sysfs in a test.
+    fn gpu_scan_fixture() -> crate::gpus::Scan {
+        let cards = vec![
+            crate::gpus::Card {
+                pci: "0000:03:00.0".to_string(),
+                vendor: 0x8086,
+                device: 0xe20b,
+                driver: "xe".to_string(),
+            },
+            crate::gpus::Card {
+                pci: "0000:0b:00.0".to_string(),
+                vendor: 0x10de,
+                device: 0x1e84,
+                driver: "nvidia".to_string(),
+            },
+        ];
+        let names = crate::gpus::names_from(
+            concat!(
+                "8086  Intel Corporation\n",
+                "\te20b  Battlemage G21 [Arc B580]\n",
+                "10de  NVIDIA Corporation\n",
+                "\t1e84  TU104 [GeForce RTX 2070 SUPER]\n",
+            ),
+            &cards,
+        );
+        let icd = |file: &str, vendor: Option<u32>, software: bool| crate::gpus::Icd {
+            path: std::path::PathBuf::from(format!("/usr/share/vulkan/icd.d/{file}")),
+            library: file.to_string(),
+            vendor,
+            software,
+        };
+        crate::gpus::Scan {
+            cards,
+            icds: vec![
+                icd("intel_hasvk_icd.json", Some(0x8086), false),
+                icd("intel_icd.json", Some(0x8086), false),
+                icd("lvp_icd.json", None, true),
+                icd("nvidia_icd.json", Some(0x10de), false),
+            ],
+            names,
+            locked: false,
+        }
+    }
+
     /// The wire names of a group of rows, for the assertions about which
     /// folders are in which.
     fn names_of(rows: &[FolderRow]) -> Vec<&str> {
@@ -13451,7 +13806,7 @@ mod tests {
     #[test]
     fn an_unfetched_folder_says_so_instead_of_standing_empty() {
         let ctx = egui::Context::default();
-        crate::fonts::install(&ctx, None, None);
+        crate::fonts::install(&ctx, None, None, None);
         let account = Account {
             id: "acct".to_string(),
             name: "Test".to_string(),
@@ -13497,7 +13852,7 @@ mod tests {
     #[test]
     fn the_column_opens_on_the_folder_list_the_database_cached() {
         let ctx = egui::Context::default();
-        crate::fonts::install(&ctx, None, None);
+        crate::fonts::install(&ctx, None, None, None);
         let mut app = app_with_folders(
             &ctx,
             &[("INBOX", true, 1), ("Sent", true, 0), ("Archive", false, 1)],
@@ -13523,7 +13878,7 @@ mod tests {
     #[test]
     fn an_account_with_no_folders_yet_is_offered_its_inbox() {
         let ctx = egui::Context::default();
-        crate::fonts::install(&ctx, None, None);
+        crate::fonts::install(&ctx, None, None, None);
         let mut app = app_with_folders(&ctx, &[]);
 
         assert!(frame_texts(&ctx, &mut app)
@@ -13535,13 +13890,56 @@ mod tests {
         assert!(nav.unlisted.is_empty());
     }
 
+    /// A removal that fails has to undo itself on screen: the row is still in
+    /// the database, so the next start would load the account back either way,
+    /// and a click that quietly did nothing is worse than one that says so.
+    #[test]
+    fn a_failed_removal_puts_the_account_back_and_says_why() {
+        let ctx = egui::Context::default();
+        crate::fonts::install(&ctx, None, None, None);
+        let mut app = app_with_folders(&ctx, &[("INBOX", true, 1)]);
+        let account = app.accounts[0].clone();
+        // What the click does first: the account leaves the list at once, and
+        // the worker's answer is what settles it.
+        app.accounts.retain(|a| a.id != account.id);
+        app.states.remove(&account.id);
+        app.confirm_delete = None;
+
+        app.apply_event(Event::AccountRemoveFailed {
+            account: account.clone(),
+            error: "database is locked".to_string(),
+        });
+        assert!(
+            app.accounts.iter().any(|a| a.id == account.id),
+            "the account did not come back"
+        );
+        assert_eq!(
+            app.account_error.as_deref(),
+            Some("Could not remove Test: database is locked")
+        );
+
+        // And the line stands where the click was: Preferences → Accounts.
+        app.show_preferences = true;
+        app.prefs_tab = PrefsTab::Accounts;
+        // The modal is an `Area`: it lays itself out on the frame it opens on
+        // and draws on the next, like the dump's Preferences pages.
+        frame_texts(&ctx, &mut app);
+        let texts = frame_texts(&ctx, &mut app);
+        assert!(
+            texts
+                .iter()
+                .any(|text| text.contains("Could not remove Test")),
+            "the Accounts page does not say why: {texts:?}"
+        );
+    }
+
     /// A sync that reports the mailboxes the column already shows is not a
     /// change: the rows stay the ones already derived. One that reports
     /// different mailboxes is, and it brings the counts with it.
     #[test]
     fn only_a_real_change_rebuilds_the_folder_rows() {
         let ctx = egui::Context::default();
-        crate::fonts::install(&ctx, None, None);
+        crate::fonts::install(&ctx, None, None, None);
         let mut app = app_with_folders(&ctx, &[("INBOX", true, 1)]);
         run_app_frame(&ctx, &mut app, Vec::new());
         assert_eq!(
@@ -13589,7 +13987,7 @@ mod tests {
     #[test]
     fn a_folder_the_server_dropped_keeps_its_row_and_its_mail() {
         let ctx = egui::Context::default();
-        crate::fonts::install(&ctx, None, None);
+        crate::fonts::install(&ctx, None, None, None);
         let mut app = app_with_folders(&ctx, &[("INBOX", true, 1), ("Archive", true, 2)]);
 
         // The next `LIST` does not name Archive.
@@ -13622,7 +14020,7 @@ mod tests {
     #[test]
     fn collapsing_the_navigation_slides_it_out() {
         let ctx = egui::Context::default();
-        crate::fonts::install(&ctx, None, None);
+        crate::fonts::install(&ctx, None, None, None);
         let mut app = app_with_messages(&ctx, 3);
 
         run_app_frame(&ctx, &mut app, Vec::new());
@@ -13707,7 +14105,7 @@ mod tests {
     #[test]
     fn the_pane_is_capped_and_comes_back_at_its_own_width() {
         let ctx = egui::Context::default();
-        crate::fonts::install(&ctx, None, None);
+        crate::fonts::install(&ctx, None, None, None);
         let mut app = app_with_messages(&ctx, 3);
         let settle = |app: &mut KimoApp, width: f32| {
             for _ in 0..30 {
@@ -13752,7 +14150,7 @@ mod tests {
     #[test]
     fn the_reading_pane_becomes_a_popup_over_the_list() {
         let ctx = egui::Context::default();
-        crate::fonts::install(&ctx, None, None);
+        crate::fonts::install(&ctx, None, None, None);
         let mut app = app_with_messages(&ctx, 3);
         for _ in 0..10 {
             run_app_frame_sized(&ctx, &mut app, Vec::new(), egui::vec2(500.0, 900.0));
@@ -13887,7 +14285,7 @@ mod tests {
     #[test]
     fn the_line_above_the_list_says_where_a_download_went_and_is_timed() {
         let ctx = egui::Context::default();
-        crate::fonts::install(&ctx, None, None);
+        crate::fonts::install(&ctx, None, None, None);
         let mut app = app_with_messages(&ctx, 1);
         app.apply_event(Event::AttachmentDownloaded {
             path: std::path::PathBuf::from("/home/ada/Downloads/report.pdf"),
@@ -13935,7 +14333,7 @@ mod tests {
     #[test]
     fn every_attachment_is_a_card_under_the_body() {
         let ctx = egui::Context::default();
-        crate::fonts::install(&ctx, None, None);
+        crate::fonts::install(&ctx, None, None, None);
         let mut app = app_with_messages(&ctx, 1);
         app.states
             .get_mut("acct")
@@ -14025,7 +14423,7 @@ mod tests {
     #[test]
     fn the_automatic_sync_sweeps_when_its_interval_is_up() {
         let ctx = egui::Context::default();
-        crate::fonts::install(&ctx, None, None);
+        crate::fonts::install(&ctx, None, None, None);
         let mut app = app_with_messages(&ctx, 1);
         // A port with nothing behind it: the sweep reaches the job, which fails
         // to connect and says so on the account. What the clock does is the
@@ -14083,7 +14481,7 @@ mod tests {
     #[test]
     fn the_sync_cell_asks_for_a_sweep_at_any_time() {
         let ctx = egui::Context::default();
-        crate::fonts::install(&ctx, None, None);
+        crate::fonts::install(&ctx, None, None, None);
         let mut app = app_with_messages(&ctx, 1);
         // A port with nothing behind it, so the job fails at connect rather
         // than reaching a server: that it *starts* is the question.
@@ -14122,7 +14520,7 @@ mod tests {
     #[test]
     fn the_attachment_cards_wrap_across_the_mails_column() {
         let ctx = egui::Context::default();
-        crate::fonts::install(&ctx, None, None);
+        crate::fonts::install(&ctx, None, None, None);
         let mut app = app_with_messages(&ctx, 1);
         let part = |name: &str| Attachment {
             name: name.to_string(),
@@ -14202,7 +14600,7 @@ mod tests {
     #[test]
     fn an_attachment_card_shows_the_whole_name() {
         let ctx = egui::Context::default();
-        crate::fonts::install(&ctx, None, None);
+        crate::fonts::install(&ctx, None, None, None);
         let mut app = app_with_messages(&ctx, 1);
         let part = |name: &str| Attachment {
             name: name.to_string(),
@@ -14267,7 +14665,7 @@ mod tests {
     #[test]
     fn clicking_an_attachment_card_starts_a_download() {
         let ctx = egui::Context::default();
-        crate::fonts::install(&ctx, None, None);
+        crate::fonts::install(&ctx, None, None, None);
         let mut app = app_with_messages(&ctx, 1);
         app.states
             .get_mut("acct")
@@ -14332,7 +14730,7 @@ mod tests {
     #[test]
     fn a_mail_with_attachments_carries_a_clip_in_the_list() {
         let ctx = egui::Context::default();
-        crate::fonts::install(&ctx, None, None);
+        crate::fonts::install(&ctx, None, None, None);
         let mut app = app_with_messages(&ctx, 1);
 
         let with_parts = |app: &mut KimoApp, count: usize| {
@@ -14421,7 +14819,7 @@ mod tests {
     #[test]
     fn the_rows_three_lines_are_centred_in_the_row() {
         let ctx = egui::Context::default();
-        crate::fonts::install(&ctx, None, None);
+        crate::fonts::install(&ctx, None, None, None);
         let mut app = app_with_messages(&ctx, 2);
         let shapes = frame_shapes_at(&ctx, &mut app, 1400.0);
         let column = app.list_column;
@@ -14458,7 +14856,7 @@ mod tests {
     #[test]
     fn the_lists_card_is_as_tall_as_the_mail_it_holds() {
         let ctx = egui::Context::default();
-        crate::fonts::install(&ctx, None, None);
+        crate::fonts::install(&ctx, None, None, None);
         let content = theme::of(&ctx).content;
 
         let mut app = app_with_messages(&ctx, 3);
@@ -14503,7 +14901,7 @@ mod tests {
     #[test]
     fn every_row_is_inset_by_the_chevron_column() {
         let ctx = egui::Context::default();
-        crate::fonts::install(&ctx, None, None);
+        crate::fonts::install(&ctx, None, None, None);
         let mut app = app_with_threaded_mail(
             &ctx,
             vec![
@@ -14548,7 +14946,7 @@ mod tests {
     #[test]
     fn the_mails_of_an_open_conversation_step_in_with_a_smaller_avatar() {
         let ctx = egui::Context::default();
-        crate::fonts::install(&ctx, None, None);
+        crate::fonts::install(&ctx, None, None, None);
         let mut app = app_with_one_conversation(&ctx);
         // A frame to derive the rows, then the conversation is opened the way
         // the chevron opens it.
@@ -14846,7 +15244,7 @@ mod tests {
     #[test]
     fn clicking_a_conversation_opens_it_in_the_pane_and_not_in_the_list() {
         let ctx = egui::Context::default();
-        crate::fonts::install(&ctx, None, None);
+        crate::fonts::install(&ctx, None, None, None);
         let mut app = app_with_one_conversation(&ctx);
         let row = a_conversation_row(&mut app, &ctx);
         let before = app.list_rows.as_ref().expect("rows").rows.clone();
@@ -14884,7 +15282,7 @@ mod tests {
     #[test]
     fn a_conversation_draws_one_card_per_mail_on_the_pane() {
         let ctx = egui::Context::default();
-        crate::fonts::install(&ctx, None, None);
+        crate::fonts::install(&ctx, None, None, None);
         let mut app = app_with_one_conversation(&ctx);
         app.selected_message = Some("3".to_string());
         // A frame to settle the columns: the list's own edge is what tells the
@@ -14945,7 +15343,7 @@ mod tests {
     #[test]
     fn the_chevron_opens_and_closes_the_mails_under_a_conversation() {
         let ctx = egui::Context::default();
-        crate::fonts::install(&ctx, None, None);
+        crate::fonts::install(&ctx, None, None, None);
         let mut app = app_with_one_conversation(&ctx);
         let row = a_conversation_row(&mut app, &ctx);
         let chevron = egui::pos2(app.list_column.left() + 12.0, row.y);
@@ -14986,7 +15384,7 @@ mod tests {
     #[test]
     fn the_list_threads_only_when_it_is_asked_to() {
         let ctx = egui::Context::default();
-        crate::fonts::install(&ctx, None, None);
+        crate::fonts::install(&ctx, None, None, None);
         let mails = vec![
             threaded_mail("2", "Re: Hello", "b@example.com", &["a@example.com"], 200),
             threaded_mail("1", "Hello", "a@example.com", &[], 100),
@@ -15067,7 +15465,7 @@ mod tests {
     #[test]
     fn clicking_a_row_opens_that_mail() {
         let ctx = egui::Context::default();
-        crate::fonts::install(&ctx, None, None);
+        crate::fonts::install(&ctx, None, None, None);
         let mut app = app_with_messages(&ctx, 5);
         run_app_frame(&ctx, &mut app, Vec::new());
 
@@ -15101,7 +15499,7 @@ mod tests {
     #[test]
     fn clicking_a_row_after_scrolling_opens_the_mail_that_is_there() {
         let ctx = egui::Context::default();
-        crate::fonts::install(&ctx, None, None);
+        crate::fonts::install(&ctx, None, None, None);
         let mut app = app_with_messages(&ctx, 60);
         run_app_frame(&ctx, &mut app, Vec::new());
 
@@ -15268,7 +15666,7 @@ mod tests {
     #[test]
     fn the_pointer_puts_a_checkbox_where_the_avatar_was() {
         let ctx = egui::Context::default();
-        crate::fonts::install(&ctx, None, None);
+        crate::fonts::install(&ctx, None, None, None);
         let mut app = app_with_messages(&ctx, 3);
 
         let shapes = frame_shapes_at(&ctx, &mut app, 1400.0);
@@ -15305,7 +15703,7 @@ mod tests {
     #[test]
     fn clicking_a_box_enters_select_mode_with_a_box_on_every_row() {
         let ctx = egui::Context::default();
-        crate::fonts::install(&ctx, None, None);
+        crate::fonts::install(&ctx, None, None, None);
         let mut app = app_with_messages(&ctx, 3);
         let _ = frame_shapes_at(&ctx, &mut app, 1400.0);
         let column = app.list_column;
@@ -15370,7 +15768,7 @@ mod tests {
     #[test]
     fn a_click_on_the_row_leaves_select_mode_without_opening_the_mail() {
         let ctx = egui::Context::default();
-        crate::fonts::install(&ctx, None, None);
+        crate::fonts::install(&ctx, None, None, None);
         let mut app = app_with_messages(&ctx, 3);
         app.selected_message = Some("2".to_string());
         let _ = frame_shapes_at(&ctx, &mut app, 1400.0);
@@ -15435,7 +15833,7 @@ mod tests {
     #[test]
     fn a_partly_checked_conversation_draws_a_dash_instead_of_a_check() {
         let ctx = egui::Context::default();
-        crate::fonts::install(&ctx, None, None);
+        crate::fonts::install(&ctx, None, None, None);
         let mut app = app_with_one_conversation(&ctx);
         let _ = frame_shapes_at(&ctx, &mut app, 1400.0);
         // Open the conversation, then check its oldest mail alone: the
@@ -15497,7 +15895,7 @@ mod tests {
     #[test]
     fn a_checked_row_takes_the_selection_fill() {
         let ctx = egui::Context::default();
-        crate::fonts::install(&ctx, None, None);
+        crate::fonts::install(&ctx, None, None, None);
         let mut app = app_with_messages(&ctx, 3);
         app.select_mode = true;
         app.selected_mails
@@ -15525,7 +15923,7 @@ mod tests {
     #[test]
     fn a_conversations_box_takes_its_whole_thread_in_and_out() {
         let ctx = egui::Context::default();
-        crate::fonts::install(&ctx, None, None);
+        crate::fonts::install(&ctx, None, None, None);
         let mut app = app_with_one_conversation(&ctx);
         let _ = frame_shapes_at(&ctx, &mut app, 1400.0);
 
@@ -15573,7 +15971,7 @@ mod tests {
     #[test]
     fn select_mode_leaves_delete_as_the_only_live_action() {
         let ctx = egui::Context::default();
-        crate::fonts::install(&ctx, None, None);
+        crate::fonts::install(&ctx, None, None, None);
         let mut app = app_with_messages(&ctx, 3);
         app.selected_message = Some("0".to_string());
         assert!(
@@ -15616,7 +16014,7 @@ mod tests {
     #[test]
     fn the_title_bar_dims_the_one_mail_actions_in_select_mode() {
         let ctx = egui::Context::default();
-        crate::fonts::install(&ctx, None, None);
+        crate::fonts::install(&ctx, None, None, None);
         let mut app = app_with_messages(&ctx, 3);
         app.selected_message = Some("0".to_string());
         let actions = mail_action_rect(&ctx, &mut app, 1400.0)
@@ -15696,7 +16094,7 @@ mod tests {
     #[test]
     fn a_deleted_mail_leaves_the_selection() {
         let ctx = egui::Context::default();
-        crate::fonts::install(&ctx, None, None);
+        crate::fonts::install(&ctx, None, None, None);
         let mut app = app_with_messages(&ctx, 2);
         app.select_mode = true;
         app.selected_mails
@@ -15721,7 +16119,7 @@ mod tests {
     #[test]
     fn a_search_hit_checks_its_own_folder() {
         let ctx = egui::Context::default();
-        crate::fonts::install(&ctx, None, None);
+        crate::fonts::install(&ctx, None, None, None);
         let mut app = app_with_messages(&ctx, 1);
         app.search.text = "report".to_string();
         app.search_hits = vec![SearchHit {
@@ -15756,7 +16154,7 @@ mod tests {
     #[test]
     fn another_folder_or_query_leaves_select_mode() {
         let ctx = egui::Context::default();
-        crate::fonts::install(&ctx, None, None);
+        crate::fonts::install(&ctx, None, None, None);
         let mut app = app_with_folders(&ctx, &[("INBOX", true, 1), ("Archive", true, 1)]);
         app.select_mode = true;
         app.selected_mails
@@ -15788,7 +16186,7 @@ mod tests {
     #[test]
     fn the_select_all_box_checks_every_mail_in_the_list() {
         let ctx = egui::Context::default();
-        crate::fonts::install(&ctx, None, None);
+        crate::fonts::install(&ctx, None, None, None);
         let mut app = app_with_messages(&ctx, 3);
         let _ = frame_shapes_at(&ctx, &mut app, 1400.0);
 
@@ -15824,7 +16222,7 @@ mod tests {
     #[test]
     fn the_select_all_box_clears_the_whole_selection() {
         let ctx = egui::Context::default();
-        crate::fonts::install(&ctx, None, None);
+        crate::fonts::install(&ctx, None, None, None);
         let mut app = app_with_messages(&ctx, 3);
         app.select_mode = true;
         for uid in ["0", "1", "2"] {
@@ -15858,7 +16256,7 @@ mod tests {
     #[test]
     fn the_select_all_box_shows_off_partial_and_on() {
         let ctx = egui::Context::default();
-        crate::fonts::install(&ctx, None, None);
+        crate::fonts::install(&ctx, None, None, None);
         let mut app = app_with_messages(&ctx, 3);
         app.select_mode = true;
 
@@ -15911,7 +16309,7 @@ mod tests {
     #[test]
     fn select_all_reaches_mail_inside_a_closed_conversation() {
         let ctx = egui::Context::default();
-        crate::fonts::install(&ctx, None, None);
+        crate::fonts::install(&ctx, None, None, None);
         let mut app = app_with_one_conversation(&ctx);
         app.select_mode = true;
         let _ = frame_shapes_at(&ctx, &mut app, 1400.0);
@@ -15938,7 +16336,7 @@ mod tests {
     #[test]
     fn select_all_in_the_search_results_checks_every_hit() {
         let ctx = egui::Context::default();
-        crate::fonts::install(&ctx, None, None);
+        crate::fonts::install(&ctx, None, None, None);
         let mut app = app_with_messages(&ctx, 1);
         app.search.text = "report".to_string();
         app.search_hits = vec![
@@ -16010,7 +16408,7 @@ mod tests {
     #[test]
     fn the_select_all_row_is_only_drawn_in_select_mode() {
         let ctx = egui::Context::default();
-        crate::fonts::install(&ctx, None, None);
+        crate::fonts::install(&ctx, None, None, None);
         let mut app = app_with_messages(&ctx, 3);
         let shapes = frame_shapes_at(&ctx, &mut app, 1400.0);
         let column = app.list_column;
@@ -16046,7 +16444,7 @@ mod tests {
     #[test]
     fn the_select_all_box_lines_up_with_the_row_boxes() {
         let ctx = egui::Context::default();
-        crate::fonts::install(&ctx, None, None);
+        crate::fonts::install(&ctx, None, None, None);
         let mut app = app_with_messages(&ctx, 2);
         app.select_mode = true;
 
@@ -16069,7 +16467,7 @@ mod tests {
     #[test]
     fn unchecking_one_mail_leaves_the_select_all_box_partial() {
         let ctx = egui::Context::default();
-        crate::fonts::install(&ctx, None, None);
+        crate::fonts::install(&ctx, None, None, None);
         let mut app = app_with_messages(&ctx, 3);
         app.select_mode = true;
         let _ = frame_shapes_at(&ctx, &mut app, 1400.0);
@@ -16140,7 +16538,7 @@ mod tests {
     #[test]
     fn a_new_search_drops_checks_the_hits_no_longer_hold() {
         let ctx = egui::Context::default();
-        crate::fonts::install(&ctx, None, None);
+        crate::fonts::install(&ctx, None, None, None);
         let mut app = app_with_messages(&ctx, 2);
         app.search.text = "report".to_string();
         app.select_mode = true;
@@ -16193,7 +16591,7 @@ mod tests {
     #[test]
     fn a_rotated_uidvalidity_drops_its_folder_from_the_selection() {
         let ctx = egui::Context::default();
-        crate::fonts::install(&ctx, None, None);
+        crate::fonts::install(&ctx, None, None, None);
         let mut app = app_with_messages(&ctx, 1);
         app.select_mode = true;
         app.selected_mails
@@ -16225,7 +16623,7 @@ mod tests {
     #[test]
     fn the_tray_badge_follows_unread_mail_in_the_inbox() {
         let ctx = egui::Context::default();
-        crate::fonts::install(&ctx, None, None);
+        crate::fonts::install(&ctx, None, None, None);
         let mut app = app_with_two_accounts(&ctx, 1);
 
         // The fixture's mail is unread: the badge is up before any frame, from
@@ -16278,7 +16676,7 @@ mod tests {
     #[test]
     fn the_select_all_row_stays_while_the_list_scrolls() {
         let ctx = egui::Context::default();
-        crate::fonts::install(&ctx, None, None);
+        crate::fonts::install(&ctx, None, None, None);
         let mut app = app_with_messages(&ctx, 60);
         app.select_mode = true;
         run_app_frame(&ctx, &mut app, Vec::new());
@@ -16331,7 +16729,7 @@ mod tests {
     #[test]
     fn the_pointer_puts_a_delete_button_on_the_row_it_is_on() {
         let ctx = egui::Context::default();
-        crate::fonts::install(&ctx, None, None);
+        crate::fonts::install(&ctx, None, None, None);
         let mut app = app_with_messages(&ctx, 3);
         let date = {
             let msg = &app.folder_messages_of("acct", "INBOX").expect("mail")[1];
@@ -16402,7 +16800,7 @@ mod tests {
     #[test]
     fn the_row_delete_button_is_not_a_click_on_the_mail() {
         let ctx = egui::Context::default();
-        crate::fonts::install(&ctx, None, None);
+        crate::fonts::install(&ctx, None, None, None);
         let mut app = app_with_messages(&ctx, 3);
         let _ = frame_shapes_at(&ctx, &mut app, 1400.0);
 
@@ -16419,7 +16817,7 @@ mod tests {
     #[test]
     fn the_row_delete_button_leaves_select_mode_alone() {
         let ctx = egui::Context::default();
-        crate::fonts::install(&ctx, None, None);
+        crate::fonts::install(&ctx, None, None, None);
         let mut app = app_with_messages(&ctx, 3);
         app.select_mode = true;
         app.selected_mails
@@ -16449,7 +16847,7 @@ mod tests {
     #[test]
     fn a_conversations_delete_button_takes_the_mail_its_row_speaks_for() {
         let ctx = egui::Context::default();
-        crate::fonts::install(&ctx, None, None);
+        crate::fonts::install(&ctx, None, None, None);
         let mut app = app_with_one_conversation(&ctx);
         let _ = frame_shapes_at(&ctx, &mut app, 1400.0);
 
@@ -16509,7 +16907,7 @@ mod tests {
     #[test]
     fn the_row_flag_button_marks_the_mail_it_lists() {
         let ctx = egui::Context::default();
-        crate::fonts::install(&ctx, None, None);
+        crate::fonts::install(&ctx, None, None, None);
         let mut app = app_with_messages(&ctx, 3);
         let _ = frame_shapes_at(&ctx, &mut app, 1400.0);
         let scheme = theme::of(&ctx);
@@ -16585,7 +16983,7 @@ mod tests {
     #[test]
     fn the_row_flag_button_takes_the_mark_off_and_says_which_mail() {
         let ctx = egui::Context::default();
-        crate::fonts::install(&ctx, None, None);
+        crate::fonts::install(&ctx, None, None, None);
         let mut app = app_with_messages(&ctx, 3);
         app.set_flag_on_mail(&MailKey::new("acct", "INBOX", "1"), true);
         let _ = frame_shapes_at(&ctx, &mut app, 1400.0);
@@ -16625,7 +17023,7 @@ mod tests {
     #[test]
     fn a_conversations_flag_button_marks_the_mail_its_row_speaks_for() {
         let ctx = egui::Context::default();
-        crate::fonts::install(&ctx, None, None);
+        crate::fonts::install(&ctx, None, None, None);
         let mut app = app_with_one_conversation(&ctx);
         let _ = frame_shapes_at(&ctx, &mut app, 1400.0);
 
@@ -16650,7 +17048,7 @@ mod tests {
     #[test]
     fn a_search_hits_delete_button_is_not_its_row() {
         let ctx = egui::Context::default();
-        crate::fonts::install(&ctx, None, None);
+        crate::fonts::install(&ctx, None, None, None);
         let mut app = app_with_messages(&ctx, 1);
         app.search.text = "report".to_string();
         app.search_hits = vec![SearchHit {
@@ -16687,7 +17085,7 @@ mod tests {
     #[test]
     fn the_load_older_button_is_offered_at_the_bottom_of_the_list() {
         let ctx = egui::Context::default();
-        crate::fonts::install(&ctx, None, None);
+        crate::fonts::install(&ctx, None, None, None);
         let mut app = app_with_messages(&ctx, 3);
 
         // The marks have not been asked yet: nothing to load, nothing drawn.
@@ -16765,7 +17163,7 @@ mod tests {
     #[test]
     fn the_answer_about_older_mail_is_what_draws_the_button() {
         let ctx = egui::Context::default();
-        crate::fonts::install(&ctx, None, None);
+        crate::fonts::install(&ctx, None, None, None);
         let mut app = app_with_messages(&ctx, 3);
 
         app.apply_event(Event::OlderMail {
@@ -17243,7 +17641,7 @@ mod tests {
     #[test]
     fn every_button_in_the_title_bar_is_the_same_cell() {
         let ctx = egui::Context::default();
-        crate::fonts::install(&ctx, None, None);
+        crate::fonts::install(&ctx, None, None, None);
         let mut app = app_with_messages(&ctx, 4);
         // The run is enabled by the mail the reading pane shows.
         app.selected_message = Some("0".to_string());
@@ -17349,7 +17747,7 @@ mod tests {
     #[test]
     fn the_minimize_cell_minimizes_when_minimize_to_tray_is_off() {
         let ctx = egui::Context::default();
-        crate::fonts::install(&ctx, None, None);
+        crate::fonts::install(&ctx, None, None, None);
         let mut app = app_with_messages(&ctx, 1);
         // One frame first: the right end is carved out of the window's size.
         frame_shapes_at(&ctx, &mut app, 1400.0);
@@ -17395,7 +17793,7 @@ mod tests {
     #[test]
     fn the_close_cell_closes_when_close_to_tray_is_off() {
         let ctx = egui::Context::default();
-        crate::fonts::install(&ctx, None, None);
+        crate::fonts::install(&ctx, None, None, None);
         let mut app = app_with_messages(&ctx, 1);
         // One frame first: the right end is carved out of the window's size.
         frame_shapes_at(&ctx, &mut app, 1400.0);
@@ -17440,7 +17838,7 @@ mod tests {
     #[test]
     fn the_title_bar_draws_no_image() {
         let ctx = egui::Context::default();
-        crate::fonts::install(&ctx, None, None);
+        crate::fonts::install(&ctx, None, None, None);
         let mut app = app_with_messages(&ctx, 2);
         let shapes = frame_shapes_at(&ctx, &mut app, 1400.0);
         let bar = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1400.0, TITLEBAR_HEIGHT));
@@ -17524,7 +17922,7 @@ mod tests {
     #[test]
     fn the_window_edges_ask_the_compositor_to_resize() {
         let ctx = egui::Context::default();
-        crate::fonts::install(&ctx, None, None);
+        crate::fonts::install(&ctx, None, None, None);
         let mut app = app_with_messages(&ctx, 2);
         let view = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1400.0, 900.0));
         // One frame first, so the grips are among the rects the frames below
@@ -17844,7 +18242,7 @@ mod tests {
     #[test]
     fn nothing_in_the_title_bar_is_drawn_into_the_window_controls() {
         let ctx = egui::Context::default();
-        crate::fonts::install(&ctx, None, None);
+        crate::fonts::install(&ctx, None, None, None);
         let mut app = app_with_messages(&ctx, 4);
 
         for width in [1400.0, 1000.0, 900.0, 800.0, 560.0, 480.0, 400.0, 300.0] {
@@ -17907,7 +18305,7 @@ mod tests {
         const FADE_FRAMES: usize = 16;
 
         let ctx = egui::Context::default();
-        crate::fonts::install(&ctx, None, None);
+        crate::fonts::install(&ctx, None, None, None);
         let mut app = app_with_messages(&ctx, 3);
         let pitch = TITLEBAR_BUTTON_SIZE + TITLEBAR_BUTTON_GAP;
         let cell = |actions: egui::Rect, index: usize| {
@@ -18051,7 +18449,7 @@ mod tests {
     #[test]
     fn the_search_box_is_as_wide_as_it_was_planned() {
         let ctx = egui::Context::default();
-        crate::fonts::install(&ctx, None, None);
+        crate::fonts::install(&ctx, None, None, None);
         let mut app = app_with_messages(&ctx, 4);
 
         // A window with room for the whole bar: the box is at its own width.
@@ -18094,7 +18492,7 @@ mod tests {
     #[test]
     fn the_search_box_follows_the_list() {
         let ctx = egui::Context::default();
-        crate::fonts::install(&ctx, None, None);
+        crate::fonts::install(&ctx, None, None, None);
         let mut app = app_with_messages(&ctx, 4);
 
         // A wider navigation column moves the list's left edge, and the box
@@ -18134,7 +18532,7 @@ mod tests {
     #[test]
     fn the_account_row_folds_its_folders_with_a_chevron() {
         let ctx = egui::Context::default();
-        crate::fonts::install(&ctx, None, None);
+        crate::fonts::install(&ctx, None, None, None);
         let mut app = app_with_messages(&ctx, 1);
         run_app_frame(&ctx, &mut app, Vec::new());
         let shapes = frame_shapes_at(&ctx, &mut app, 1400.0);
@@ -18177,7 +18575,7 @@ mod tests {
     #[test]
     fn the_search_popup_is_a_bar_with_a_magnifier_and_a_clear_cross() {
         let ctx = egui::Context::default();
-        crate::fonts::install(&ctx, None, None);
+        crate::fonts::install(&ctx, None, None, None);
         let mut app = app_with_messages(&ctx, 1);
         app.open_search();
         for _ in 0..FADE_FRAMES {
@@ -18298,7 +18696,7 @@ mod tests {
     #[test]
     fn a_splitter_drag_holds_the_body_until_the_geometry_settles() {
         let ctx = egui::Context::default();
-        crate::fonts::install(&ctx, None, None);
+        crate::fonts::install(&ctx, None, None, None);
         let mut app = app_with_messages(&ctx, 20);
         let html =
             "<p>one two three four five six seven eight nine ten eleven twelve</p>".repeat(40);
@@ -18401,7 +18799,7 @@ mod tests {
     #[test]
     fn the_body_is_wrapped_for_the_width_the_cache_holds() {
         let ctx = egui::Context::default();
-        crate::fonts::install(&ctx, None, None);
+        crate::fonts::install(&ctx, None, None, None);
         let mut app = app_with_messages(&ctx, 1);
         let html = format!(
             "<p>{}</p>",
@@ -18765,7 +19163,7 @@ mod tests {
     #[test]
     fn a_blitz_page_is_drawn_on_white_paper_under_the_mail() {
         let ctx = egui::Context::default();
-        crate::fonts::install(&ctx, None, None);
+        crate::fonts::install(&ctx, None, None, None);
         let mut app = app_with_messages(&ctx, 1);
         html_body(&mut app, 0);
 
@@ -18797,7 +19195,7 @@ mod tests {
     #[test]
     fn the_paper_cell_flips_one_mails_paper_and_nothing_else() {
         let ctx = egui::Context::default();
-        crate::fonts::install(&ctx, None, None);
+        crate::fonts::install(&ctx, None, None, None);
         let mut app = app_with_messages(&ctx, 2);
         html_body(&mut app, 0);
         html_body(&mut app, 1);
@@ -18847,7 +19245,7 @@ mod tests {
     #[test]
     fn the_paper_cell_is_only_drawn_for_a_blitz_page() {
         let ctx = egui::Context::default();
-        crate::fonts::install(&ctx, None, None);
+        crate::fonts::install(&ctx, None, None, None);
         let mut app = app_with_messages(&ctx, 2);
         html_body(&mut app, 0);
         app.selected_message = Some("0".to_string());
@@ -18881,7 +19279,7 @@ mod tests {
     #[test]
     fn the_paper_map_holds_only_what_the_reader_changed() {
         let ctx = egui::Context::default();
-        crate::fonts::install(&ctx, None, None);
+        crate::fonts::install(&ctx, None, None, None);
         let mut app = app_with_messages(&ctx, 1);
         let key = MailKey::new("acct", "INBOX", "0");
 
@@ -19192,7 +19590,7 @@ mod tests {
     #[test]
     fn a_sent_mail_closes_the_card_and_a_refusal_keeps_it() {
         let ctx = egui::Context::default();
-        crate::fonts::install(&ctx, None, None);
+        crate::fonts::install(&ctx, None, None, None);
         let mut app = app_with_messages(&ctx, 1);
         app.compose = Some(ComposeDraft::new(Some("acct".to_string())));
         if let Some(draft) = app.compose.as_mut() {
@@ -19249,7 +19647,7 @@ mod tests {
     #[test]
     fn the_appearance_page_shows_the_accents_with_the_one_in_force_ringed() {
         let ctx = egui::Context::default();
-        crate::fonts::install(&ctx, None, None);
+        crate::fonts::install(&ctx, None, None, None);
         let mut app = app_with_messages(&ctx, 1);
         app.show_preferences = true;
         app.prefs_tab = PrefsTab::Appearance;
@@ -19310,7 +19708,7 @@ mod tests {
     #[test]
     fn the_preferences_cross_closes_the_modal() {
         let ctx = egui::Context::default();
-        crate::fonts::install(&ctx, None, None);
+        crate::fonts::install(&ctx, None, None, None);
         let mut app = app_with_messages(&ctx, 1);
         app.show_preferences = true;
         for _ in 0..FADE_FRAMES {
@@ -19328,13 +19726,145 @@ mod tests {
         assert!(!app.show_preferences, "the cross closes the modal");
     }
 
+    /// Preferences → Appearance names the CJK fallback beside the other two
+    /// fonts — "Automatic" until one is picked — and says what a pick does not
+    /// cover instead of quietly letting mail turn into boxes.
+    #[test]
+    fn the_appearance_page_offers_a_cjk_fallback_and_says_what_it_covers() {
+        let ctx = egui::Context::default();
+        crate::fonts::install(&ctx, None, None, None);
+        let mut app = app_with_messages(&ctx, 1);
+        app.show_preferences = true;
+        app.prefs_tab = PrefsTab::Appearance;
+        for _ in 0..FADE_FRAMES {
+            run_app_frame(&ctx, &mut app, Vec::new());
+        }
+        let shapes = frame_shapes_at(&ctx, &mut app, 1400.0);
+        assert!(
+            !text_boxes_of(&shapes, popup_area(), "CJK fallback").is_empty(),
+            "the row is on the page"
+        );
+        assert!(
+            !text_boxes_of(&shapes, popup_area(), "Automatic").is_empty(),
+            "unset is the automatic face, not a family name"
+        );
+
+        // A family whose file is gone: the pick resolves against the scan list,
+        // and a face nothing can read covers none of the sample scripts.
+        app.font_families = Some(vec![FontFamily {
+            name: "Broken Sans".to_string(),
+            path: std::path::PathBuf::from("/nonexistent/BrokenSans.ttf"),
+            index: 0,
+            monospace: false,
+        }]);
+        app.cjk_font = Some("Broken Sans".to_string());
+        app.apply_fonts();
+        for _ in 0..2 {
+            run_app_frame(&ctx, &mut app, Vec::new());
+        }
+        let shapes = frame_shapes_at(&ctx, &mut app, 1400.0);
+        let warning =
+            "Broken Sans has no glyphs for Han, kana, Hangul, Bopomofo; CJK mail will show boxes there.";
+        assert!(
+            !text_boxes_of(&shapes, popup_area(), warning).is_empty(),
+            "the page says what the pick does not cover"
+        );
+    }
+
+    /// Preferences → Graphics names the cards this machine has and says what a
+    /// pick opens: the chosen card's driver manifests, and not the other
+    /// card's.
+    #[test]
+    fn the_graphics_page_lists_the_cards_and_the_drivers_a_pick_loads() {
+        let ctx = egui::Context::default();
+        crate::fonts::install(&ctx, None, None, None);
+        let mut app = app_with_messages(&ctx, 1);
+        app.show_preferences = true;
+        app.prefs_tab = PrefsTab::Graphics;
+        app.gpu_scan = Some(gpu_scan_fixture());
+        app.gpu = Some("0000:03:00.0".to_string());
+        for _ in 0..FADE_FRAMES {
+            run_app_frame(&ctx, &mut app, Vec::new());
+        }
+        let texts = frame_texts(&ctx, &mut app);
+        assert!(
+            texts.iter().any(|text| text == "Battlemage G21 [Arc B580]"),
+            "the card the pick names: {texts:?}"
+        );
+        assert!(
+            texts
+                .iter()
+                .any(|text| text == "TU104 [GeForce RTX 2070 SUPER]"),
+            "and the other one: {texts:?}"
+        );
+        assert!(
+            texts.iter().any(|text| text.contains("intel_icd.json")),
+            "the drivers the pick opens: {texts:?}"
+        );
+        assert!(
+            !texts.iter().any(|text| text.contains("nvidia_icd.json")),
+            "and not the other card's: {texts:?}"
+        );
+    }
+
+    /// The scan answers the page's spinner: the event puts the cards and the
+    /// drivers in the app's state and stops it asking.
+    #[test]
+    fn the_graphics_scan_arrives_in_the_app_state() {
+        let ctx = egui::Context::default();
+        crate::fonts::install(&ctx, None, None, None);
+        let mut app = app_with_messages(&ctx, 1);
+        app.gpu_scanning = true;
+        app.apply_event(Event::Gpus(gpu_scan_fixture()));
+        assert!(!app.gpu_scanning, "the page stops waiting");
+        let scan = app.gpu_scan.expect("the scan is the page's input");
+        assert_eq!(scan.cards.len(), 2);
+        assert_eq!(scan.icds.len(), 4);
+    }
+
+    /// A saved GPU that cannot be honoured — one that is not in the machine, or
+    /// one that is not an address at all — falls back to every driver, and the
+    /// page says which value it ignored instead of leaving a pick that does
+    /// nothing.
+    #[test]
+    fn the_graphics_page_says_when_the_saved_gpu_cannot_be_used() {
+        let ctx = egui::Context::default();
+        crate::fonts::install(&ctx, None, None, None);
+        let mut app = app_with_messages(&ctx, 1);
+        app.show_preferences = true;
+        app.prefs_tab = PrefsTab::Graphics;
+        app.gpu_scan = Some(gpu_scan_fixture());
+
+        app.gpu = Some("0000:0c:00.0".to_string());
+        for _ in 0..FADE_FRAMES {
+            run_app_frame(&ctx, &mut app, Vec::new());
+        }
+        let texts = frame_texts(&ctx, &mut app);
+        assert!(
+            texts
+                .iter()
+                .any(|text| text.contains("0000:0c:00.0") && text.contains("not installed")),
+            "{texts:?}"
+        );
+
+        app.gpu = Some("the nvidia one".to_string());
+        for _ in 0..2 {
+            run_app_frame(&ctx, &mut app, Vec::new());
+        }
+        let texts = frame_texts(&ctx, &mut app);
+        assert!(
+            texts.iter().any(|text| text.contains("does not recognise")),
+            "{texts:?}"
+        );
+    }
+
     /// Preferences → About names the running build and draws the app's icon:
     /// the version is Cargo.toml's, read at compile time, so a release cannot
     /// ship a page that claims another one.
     #[test]
     fn the_about_page_shows_the_build_version_and_the_app_icon() {
         let ctx = egui::Context::default();
-        crate::fonts::install(&ctx, None, None);
+        crate::fonts::install(&ctx, None, None, None);
         let mut app = app_with_messages(&ctx, 1);
         app.show_preferences = true;
         app.prefs_tab = PrefsTab::About;
@@ -19493,7 +20023,7 @@ mod tests {
     #[test]
     fn a_mail_the_account_already_holds_elsewhere_is_not_announced_again() {
         let ctx = egui::Context::default();
-        crate::fonts::install(&ctx, None, None);
+        crate::fonts::install(&ctx, None, None, None);
         let mut app = app_with_folders(&ctx, &[("INBOX", true, 1), ("Receipts", true, 1)]);
         // Each fixture mail carries a Message-ID of its own, so the Inbox's
         // mail — asked about the way a batch that just landed in the Inbox
@@ -19618,7 +20148,7 @@ mod tests {
     #[test]
     fn a_mails_header_answers_it_where_the_mail_is() {
         let ctx = egui::Context::default();
-        crate::fonts::install(&ctx, None, None);
+        crate::fonts::install(&ctx, None, None, None);
         let mut app = app_with_messages(&ctx, 3);
         app.selected_message = Some("0".to_string());
         run_app_frame(&ctx, &mut app, Vec::new());
@@ -19789,7 +20319,7 @@ mod tests {
     #[test]
     fn the_headers_delete_cell_takes_that_one_mail() {
         let ctx = egui::Context::default();
-        crate::fonts::install(&ctx, None, None);
+        crate::fonts::install(&ctx, None, None, None);
         let mut app = app_with_messages(&ctx, 3);
         app.selected_message = Some("1".to_string());
         run_app_frame(&ctx, &mut app, Vec::new());
@@ -19810,7 +20340,7 @@ mod tests {
     #[test]
     fn a_mails_card_puts_its_sender_first_with_the_actions_on_that_row() {
         let ctx = egui::Context::default();
-        crate::fonts::install(&ctx, None, None);
+        crate::fonts::install(&ctx, None, None, None);
         let mut app = app_with_messages(&ctx, 3);
         app.selected_message = Some("0".to_string());
         let shapes = frame_shapes_at(&ctx, &mut app, 1400.0);
@@ -20081,7 +20611,7 @@ mod tests {
     #[test]
     fn the_answer_sits_right_under_the_mail_it_answers() {
         let ctx = egui::Context::default();
-        crate::fonts::install(&ctx, None, None);
+        crate::fonts::install(&ctx, None, None, None);
         let mut app = app_with_one_conversation(&ctx);
         app.selected_message = Some("3".to_string());
         // A frame to settle the columns; then the conversation is two cards.
@@ -20152,7 +20682,7 @@ mod tests {
     #[test]
     fn an_answer_opened_on_the_spot_is_revealed_and_typed_into_at_its_body() {
         let ctx = egui::Context::default();
-        crate::fonts::install(&ctx, None, None);
+        crate::fonts::install(&ctx, None, None, None);
         let mut app = app_with_messages(&ctx, 1);
         // A mail long enough that the card under it opens below the pane.
         let long: String = (0..60).map(|line| format!("line {line}\n")).collect();
@@ -20222,7 +20752,7 @@ mod tests {
     #[test]
     fn a_forward_opened_on_the_spot_starts_at_to() {
         let ctx = egui::Context::default();
-        crate::fonts::install(&ctx, None, None);
+        crate::fonts::install(&ctx, None, None, None);
         let mut app = app_with_messages(&ctx, 1);
         app.selected_message = Some("0".to_string());
         run_app_frame(&ctx, &mut app, Vec::new());
@@ -20258,7 +20788,7 @@ mod tests {
     #[test]
     fn the_files_row_waits_under_the_mail_written_on_the_spot() {
         let ctx = egui::Context::default();
-        crate::fonts::install(&ctx, None, None);
+        crate::fonts::install(&ctx, None, None, None);
         let mut app = app_with_messages(&ctx, 1);
         app.selected_message = Some("0".to_string());
         run_app_frame(&ctx, &mut app, Vec::new());
@@ -20304,7 +20834,7 @@ mod tests {
     #[test]
     fn the_answers_body_fills_the_writing_area() {
         let ctx = egui::Context::default();
-        crate::fonts::install(&ctx, None, None);
+        crate::fonts::install(&ctx, None, None, None);
         let mut app = app_with_messages(&ctx, 1);
         app.selected_message = Some("0".to_string());
         run_app_frame(&ctx, &mut app, Vec::new());
@@ -20338,7 +20868,7 @@ mod tests {
     #[test]
     fn the_answers_card_ends_where_its_content_does() {
         let ctx = egui::Context::default();
-        crate::fonts::install(&ctx, None, None);
+        crate::fonts::install(&ctx, None, None, None);
         let mut app = app_with_messages(&ctx, 1);
         app.selected_message = Some("0".to_string());
         run_app_frame(&ctx, &mut app, Vec::new());
@@ -20377,7 +20907,7 @@ mod tests {
     #[test]
     fn a_quiet_field_wears_its_line_only_under_the_pointer_or_the_keyboard() {
         let ctx = egui::Context::default();
-        crate::fonts::install(&ctx, None, None);
+        crate::fonts::install(&ctx, None, None, None);
         let mut app = app_with_messages(&ctx, 1);
         app.accent = Accent::parse("teal");
         // A new mail in the popup: its form's fields are the quiet ones, and its
@@ -20483,7 +21013,7 @@ mod tests {
     #[test]
     fn the_answers_body_box_is_the_writing_area_and_not_the_mail() {
         let ctx = egui::Context::default();
-        crate::fonts::install(&ctx, None, None);
+        crate::fonts::install(&ctx, None, None, None);
         let mut app = app_with_messages(&ctx, 1);
         app.selected_message = Some("0".to_string());
         run_app_frame(&ctx, &mut app, Vec::new());
@@ -20530,7 +21060,7 @@ mod tests {
     #[test]
     fn the_answers_body_keeps_its_height_in_a_short_window() {
         let ctx = egui::Context::default();
-        crate::fonts::install(&ctx, None, None);
+        crate::fonts::install(&ctx, None, None, None);
         let mut app = app_with_messages(&ctx, 1);
         app.selected_message = Some("0".to_string());
         let short = egui::vec2(1400.0, 320.0);
@@ -20589,7 +21119,7 @@ mod tests {
     #[test]
     fn the_replys_to_row_folds_cc_and_bcc_out() {
         let ctx = egui::Context::default();
-        crate::fonts::install(&ctx, None, None);
+        crate::fonts::install(&ctx, None, None, None);
         let mut app = app_with_messages(&ctx, 1);
         // A mail with two recipients, one of them the user's own address, so
         // a Reply all has somebody else to copy.
@@ -20677,7 +21207,7 @@ mod tests {
     #[test]
     fn the_answers_from_list_ends_with_the_to_rows_chevron() {
         let ctx = egui::Context::default();
-        crate::fonts::install(&ctx, None, None);
+        crate::fonts::install(&ctx, None, None, None);
         let mut app = app_with_messages(&ctx, 1);
         app.selected_message = Some("0".to_string());
         run_app_frame(&ctx, &mut app, Vec::new());
@@ -20827,7 +21357,7 @@ mod tests {
     #[test]
     fn the_answer_draws_no_rule_and_says_its_piece_over_the_buttons() {
         let ctx = egui::Context::default();
-        crate::fonts::install(&ctx, None, None);
+        crate::fonts::install(&ctx, None, None, None);
         let mut app = app_with_messages(&ctx, 1);
         app.selected_message = Some("0".to_string());
         run_app_frame(&ctx, &mut app, Vec::new());
@@ -20885,7 +21415,7 @@ mod tests {
     #[test]
     fn the_answers_buttons_paint_their_word_in_their_ink() {
         let ctx = egui::Context::default();
-        crate::fonts::install(&ctx, None, None);
+        crate::fonts::install(&ctx, None, None, None);
         let mut app = app_with_messages(&ctx, 1);
         app.selected_message = Some("0".to_string());
         run_app_frame(&ctx, &mut app, Vec::new());
@@ -20945,7 +21475,7 @@ mod tests {
     #[test]
     fn the_answers_buttons_open_the_foot_at_the_cards_left_edge() {
         let ctx = egui::Context::default();
-        crate::fonts::install(&ctx, None, None);
+        crate::fonts::install(&ctx, None, None, None);
         let mut app = app_with_messages(&ctx, 1);
         if let Some(account) = app.accounts.first_mut() {
             account.username = "ada@example.com".to_string();
@@ -20995,7 +21525,7 @@ mod tests {
     #[test]
     fn an_answer_leaves_the_pane_with_its_mail() {
         let ctx = egui::Context::default();
-        crate::fonts::install(&ctx, None, None);
+        crate::fonts::install(&ctx, None, None, None);
         let mut app = app_with_messages(&ctx, 3);
         app.selected_message = Some("0".to_string());
         run_app_frame(&ctx, &mut app, Vec::new());
@@ -21331,7 +21861,7 @@ mod tests {
     #[test]
     fn the_labels_are_the_navigation_columns_last_group() {
         let ctx = egui::Context::default();
-        crate::fonts::install(&ctx, None, None);
+        crate::fonts::install(&ctx, None, None, None);
         let mut app = app_with_two_accounts(&ctx, 2);
         label_mail(&mut app, "acct", "INBOX", "acct-0", "Work");
         label_mail(&mut app, "acct", "INBOX", "acct-1", "Work");
@@ -21386,7 +21916,7 @@ mod tests {
     #[test]
     fn clicking_a_label_narrows_the_list_to_its_mail() {
         let ctx = egui::Context::default();
-        crate::fonts::install(&ctx, None, None);
+        crate::fonts::install(&ctx, None, None, None);
         let mut app = app_with_two_accounts(&ctx, 2);
         // The two accounts' mail, one labelled each: the folder's own list is
         // never what the filter shows.
@@ -21422,7 +21952,7 @@ mod tests {
     #[test]
     fn two_labels_filter_with_an_and_and_a_click_takes_one_back() {
         let ctx = egui::Context::default();
-        crate::fonts::install(&ctx, None, None);
+        crate::fonts::install(&ctx, None, None, None);
         let mut app = app_with_two_accounts(&ctx, 2);
         label_mail(&mut app, "acct", "INBOX", "acct-0", "Work");
         label_mail(&mut app, "acct", "INBOX", "acct-1", "Work");
@@ -21461,7 +21991,7 @@ mod tests {
     /// frames — the labelled list and card, the label filter and popup, the
     /// flagged list, the list filter's menu and the list it leaves, the sort
     /// menu, the bar with and without a mail open in the pane, and
-    /// Preferences → General, Appearance and About — and write them out as PNGs,
+    /// Preferences → General, Appearance, Graphics and About — and write them out as PNGs,
     /// so the layout can be
     /// looked at. `KIMO_UI_DUMP` picks the directory (default `target`) and
     /// `KIMO_UI_WIDTH` the window's width (default 1400).
@@ -21471,7 +22001,7 @@ mod tests {
     #[ignore = "developer tool: writes PNGs of a few frames and asserts nothing"]
     fn dump_ui() {
         let ctx = egui::Context::default();
-        crate::fonts::install(&ctx, None, None);
+        crate::fonts::install(&ctx, None, None, None);
         let mut app = app_with_two_accounts(&ctx, 3);
         label_mail(&mut app, "acct", "INBOX", "acct-0", "Work");
         label_mail(&mut app, "acct", "INBOX", "acct-1", "Work");
@@ -21748,6 +22278,17 @@ mod tests {
             collect_frame(&ctx, &mut app, &mut textures, Vec::new());
         }
         shot(&mut app, "ui-appearance.png", &mut textures);
+        // And Preferences → Graphics: the cards this machine has and the
+        // drivers a pick opens. The scan is a worker's job in the app; here it
+        // runs inline, so the picture is of the page it fills in, with the
+        // machine's first card picked.
+        app.gpu_scan = Some(crate::gpus::scan());
+        app.gpu = crate::gpus::cards().first().map(|card| card.pci.clone());
+        app.prefs_tab = PrefsTab::Graphics;
+        for _ in 0..2 {
+            collect_frame(&ctx, &mut app, &mut textures, Vec::new());
+        }
+        shot(&mut app, "ui-graphics.png", &mut textures);
         // And Preferences → About: the icon, the build's version and the
         // summary, the one page that configures nothing.
         app.prefs_tab = PrefsTab::About;
@@ -22013,7 +22554,7 @@ mod tests {
     #[test]
     fn a_label_filter_gives_up_an_active_search() {
         let ctx = egui::Context::default();
-        crate::fonts::install(&ctx, None, None);
+        crate::fonts::install(&ctx, None, None, None);
         let mut app = app_with_two_accounts(&ctx, 2);
         label_mail(&mut app, "acct", "INBOX", "acct-0", "Work");
         app.search.text = "acct".to_string();
@@ -22037,7 +22578,7 @@ mod tests {
     #[test]
     fn the_label_cell_labels_the_mail_it_is_on() {
         let ctx = egui::Context::default();
-        crate::fonts::install(&ctx, None, None);
+        crate::fonts::install(&ctx, None, None, None);
         let mut app = app_with_messages(&ctx, 2);
         app.labels = vec!["Travel".to_string(), "Work".to_string()];
         app.selected_message = Some("0".to_string());
@@ -22085,7 +22626,7 @@ mod tests {
     #[test]
     fn a_new_label_is_made_for_the_mail_in_the_popup() {
         let ctx = egui::Context::default();
-        crate::fonts::install(&ctx, None, None);
+        crate::fonts::install(&ctx, None, None, None);
         let mut app = app_with_messages(&ctx, 2);
         app.selected_message = Some("0".to_string());
         run_app_frame(&ctx, &mut app, Vec::new());
@@ -22143,7 +22684,7 @@ mod tests {
     #[test]
     fn the_filter_cell_narrows_the_list() {
         let ctx = egui::Context::default();
-        crate::fonts::install(&ctx, None, None);
+        crate::fonts::install(&ctx, None, None, None);
         let mut app = app_with_messages(&ctx, 3);
         // Mail "0" is unread, flagged and carries a file; "1" is read; "2" is
         // plain unread. The three marks between them are what the views are
@@ -22299,7 +22840,7 @@ mod tests {
     #[test]
     fn the_sort_cell_orders_the_list() {
         let ctx = egui::Context::default();
-        crate::fonts::install(&ctx, None, None);
+        crate::fonts::install(&ctx, None, None, None);
         let mut app = app_with_messages(&ctx, 3);
         app.selected_message = None;
         // Three mails whose three keys all disagree, so that which one the list
@@ -22542,7 +23083,7 @@ mod tests {
     #[test]
     fn a_file_dropped_on_the_compose_card_is_attached() {
         let ctx = egui::Context::default();
-        crate::fonts::install(&ctx, None, None);
+        crate::fonts::install(&ctx, None, None, None);
         let mut app = app_with_messages(&ctx, 1);
         app.open_compose();
         // The card is an `Area` like every other popup: it lays itself out on
@@ -22712,7 +23253,7 @@ mod tests {
     #[test]
     fn a_filter_that_matches_nothing_says_so() {
         let ctx = egui::Context::default();
-        crate::fonts::install(&ctx, None, None);
+        crate::fonts::install(&ctx, None, None, None);
         let mut app = app_with_messages(&ctx, 2);
         app.set_list_filters(ListFilters(vec![ListFilter::Flagged]));
         let texts = frame_texts(&ctx, &mut app);
@@ -22763,7 +23304,7 @@ mod tests {
     #[test]
     fn the_flag_cell_marks_the_mail_it_is_on() {
         let ctx = egui::Context::default();
-        crate::fonts::install(&ctx, None, None);
+        crate::fonts::install(&ctx, None, None, None);
         let mut app = app_with_messages(&ctx, 3);
         let scheme = theme::of(&ctx);
         // The warning fill the list draws, told apart from the chrome: a row is
@@ -22850,7 +23391,7 @@ mod tests {
     #[test]
     fn a_flagged_row_draws_the_flag_beside_its_paperclip() {
         let ctx = egui::Context::default();
-        crate::fonts::install(&ctx, None, None);
+        crate::fonts::install(&ctx, None, None, None);
         let mut app = app_with_messages(&ctx, 2);
         let scheme = theme::of(&ctx);
         let key = MailKey::new("acct", "INBOX", "1");
@@ -22932,7 +23473,7 @@ mod tests {
     #[test]
     fn the_title_bars_label_cell_opens_the_popup_too() {
         let ctx = egui::Context::default();
-        crate::fonts::install(&ctx, None, None);
+        crate::fonts::install(&ctx, None, None, None);
         let mut app = app_with_messages(&ctx, 3);
         app.selected_message = Some("0".to_string());
         run_app_frame(&ctx, &mut app, Vec::new());
@@ -22960,7 +23501,7 @@ mod tests {
     #[test]
     fn a_mails_card_says_what_it_is_labelled_with() {
         let ctx = egui::Context::default();
-        crate::fonts::install(&ctx, None, None);
+        crate::fonts::install(&ctx, None, None, None);
         let mut app = app_with_messages(&ctx, 2);
         app.selected_message = Some("0".to_string());
         let pane = |app: &KimoApp| {

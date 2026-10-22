@@ -108,6 +108,12 @@ pub struct Settings {
     /// means egui's built-in monospace font.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mono_font: Option<String>,
+    /// Family name of the CJK fallback face, as picked in Preferences →
+    /// Appearance. Absent — or a name that is no longer installed — means the
+    /// automatic choice: the first of `fonts::CJK_CANDIDATES` present, with the
+    /// face the locale asks for (`CjkScript`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cjk_font: Option<String>,
     /// Whether the message list groups mail into conversations
     /// (`crate::threads`). Absent means the app's own default, which is on:
     /// threading is what the list does unless it is told otherwise.
@@ -137,6 +143,37 @@ pub struct Settings {
     /// closing quits, as it always has.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub close_to_tray: Option<bool>,
+    /// The PCI address of the graphics card Kimo draws with
+    /// (`0000:03:00.0`), as picked in Preferences → Graphics; absent means the
+    /// Vulkan loader's own choice. Read at start-up, before any Vulkan instance
+    /// exists, so the drivers of the cards it is not are never loaded
+    /// (`crate::gpus`).
+    ///
+    /// Read leniently: a value of the wrong JSON type is treated as absent
+    /// rather than as a broken file — one bad key must not lose every other
+    /// preference — and a string that names no card falls back to every driver
+    /// in `crate::gpus::plan`.
+    #[serde(
+        default,
+        deserialize_with = "lenient_gpu",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub gpu: Option<String>,
+}
+
+/// A `gpu` value that is not a string is no pick at all, and only this key is
+/// lost. Without this reader a file edited to `"gpu": 42` would fail to parse
+/// whole, and `load_settings` would hand back every default instead of the
+/// preferences around it.
+fn lenient_gpu<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = Option::<serde_json::Value>::deserialize(deserializer)?;
+    Ok(value.and_then(|value| match value {
+        serde_json::Value::String(text) => Some(text),
+        _ => None,
+    }))
 }
 
 pub fn load_settings() -> Settings {
@@ -220,11 +257,13 @@ mod tests {
             ui_font: Some("DejaVu Sans".into()),
             threaded: Some(false),
             mono_font: Some("DejaVu Sans Mono".into()),
+            cjk_font: Some("Noto Sans CJK SC".into()),
             auto_sync: Some(true),
             auto_sync_minutes: Some(30),
             notifications: Some(false),
             minimize_to_tray: Some(true),
             close_to_tray: Some(true),
+            gpu: Some("0000:03:00.0".into()),
         };
         let json = serde_json::to_string(&s).unwrap();
         let back: Settings = serde_json::from_str(&json).unwrap();
@@ -234,11 +273,13 @@ mod tests {
         assert_eq!(back.ui_font.as_deref(), Some("DejaVu Sans"));
         assert_eq!(back.threaded, Some(false));
         assert_eq!(back.mono_font.as_deref(), Some("DejaVu Sans Mono"));
+        assert_eq!(back.cjk_font.as_deref(), Some("Noto Sans CJK SC"));
         assert_eq!(back.auto_sync, Some(true));
         assert_eq!(back.auto_sync_minutes, Some(30));
         assert_eq!(back.notifications, Some(false));
         assert_eq!(back.minimize_to_tray, Some(true));
         assert_eq!(back.close_to_tray, Some(true));
+        assert_eq!(back.gpu.as_deref(), Some("0000:03:00.0"));
         // settings.json with missing keys must still load.
         let missing: Settings = serde_json::from_str("{}").unwrap();
         assert_eq!(missing.theme, "");
@@ -246,6 +287,10 @@ mod tests {
         assert_eq!(missing.html_renderer, None);
         assert_eq!(missing.ui_font, None);
         assert_eq!(missing.mono_font, None);
+        assert_eq!(
+            missing.cjk_font, None,
+            "absent means the automatic fallback"
+        );
         assert_eq!(missing.threaded, None, "absent means the app's default");
         assert_eq!(missing.auto_sync, None, "absent means the app's default");
         assert_eq!(missing.auto_sync_minutes, None);
@@ -261,6 +306,10 @@ mod tests {
             missing.close_to_tray, None,
             "absent means the app's default, which is to quit on close"
         );
+        assert_eq!(
+            missing.gpu, None,
+            "absent means the Vulkan loader's own choice"
+        );
         // A key a version wrote and no setting stands behind any more — the
         // web view renderer left a `render_mode` behind — is ignored rather
         // than refused, so the file still loads, and it goes when the file is
@@ -271,6 +320,26 @@ mod tests {
         assert!(!serde_json::to_string(&legacy)
             .unwrap()
             .contains("render_mode"));
+    }
+
+    #[test]
+    fn a_gpu_of_the_wrong_type_keeps_the_other_settings() {
+        // One bad key costs that key alone: before the lenient reader, a `gpu`
+        // that was not a string failed the whole file and every preference fell
+        // back to its default.
+        let settings: Settings =
+            serde_json::from_str(r#"{"theme":"dark","gpu":42,"auto_sync":true}"#)
+                .expect("a non-string gpu is no reason to refuse the file");
+        assert_eq!(settings.gpu, None);
+        assert_eq!(settings.theme, "dark");
+        assert_eq!(settings.auto_sync, Some(true));
+
+        // A string is kept as written, even one no card answers to: which value
+        // was ignored is `crate::gpus`'s fallback to say.
+        let settings: Settings = serde_json::from_str(r#"{"gpu":"the nvidia one"}"#).unwrap();
+        assert_eq!(settings.gpu.as_deref(), Some("the nvidia one"));
+        let settings: Settings = serde_json::from_str(r#"{"gpu":null}"#).unwrap();
+        assert_eq!(settings.gpu, None);
     }
 
     #[test]

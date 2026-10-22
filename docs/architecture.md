@@ -113,3 +113,26 @@ clock turning. Tray Show and Quit use the same wake.
   `~/.local/share/kimo/cache/resources/` (SHA-1 of the URL) and held in
   `KimoApp::images`/`stylesheets`. The renderer reports missing URLs via
   `html::HtmlContext`; never fetch on the UI thread.
+
+## Memory and the allocator
+
+- An idle instance's resident set is mostly not mail. Profiled with `smaps` on
+  the machine in [fix.md](fix.md), 253 MB of RSS held 4.6 MB of cached mail;
+  the rest was GPU drivers, the binary, libc, and a `[heap]` of 46.5 MB with
+  almost half of it zero pages. Nothing there was a leak: it was a start-up
+  transient and what the allocator kept of it.
+- glibc keeps what a burst frees. An allocation above its dynamic `mmap`
+  threshold moves the threshold up (to the size freed, capped at 32 MB), after
+  which blocks that size come from the heap and stay. `trim::init`, called
+  from `main` before anything large is allocated, pins the threshold at the
+  128 KiB default: a 19 MB font read, a rasterised page and a fetched mail
+  become mappings of their own, returned when dropped. Measured: 253 → 208 MB
+  of idle RSS and `[heap]` 46.5 → 17.6 MB, the same as starting with
+  `MALLOC_MMAP_THRESHOLD_=131072`.
+- Do not add `malloc_trim` calls instead. With the threshold pinned they
+  released nothing measurable at the four points where a burst ends, and
+  `malloc_trim` walks the arenas under the allocator's lock, which is a stutter
+  in a frame. `M_TRIM_THRESHOLD=0` measured the same and pays a trim attempt
+  on every `free`.
+- The policy is set once, and only under `#[cfg(target_env = "gnu")]`: musl and
+  macOS keep their own allocator's behaviour, and the same code compiles there.

@@ -444,14 +444,26 @@ pub fn find<'a>(families: &'a [FontFamily], name: &str) -> Option<&'a FontFamily
 /// text), the CJK fallback last (egui's built-ins only cover Latin/Cyrillic/
 /// Greek, and mail needs more).
 ///
+/// `cjk` is the family picked in Preferences and replaces the automatic
+/// fallback. Both are never loaded: a pick would then cost more memory than the
+/// default, which is the one outcome that would make the preference pointless.
+///
 /// Also binds the named families `kimo_ui`/`kimo_mono` mirroring both slots,
 /// so the Preferences page can render previews in the picked fonts — epaint
 /// panics on a named family that is not bound to any font, so they always
 /// exist even when nothing is picked.
-pub fn install(ctx: &egui::Context, ui: Option<&FontFamily>, mono: Option<&FontFamily>) {
+pub fn install(
+    ctx: &egui::Context,
+    ui: Option<&FontFamily>,
+    mono: Option<&FontFamily>,
+    cjk: Option<&FontFamily>,
+) {
     let mut fonts = egui::FontDefinitions::default();
 
-    if let Some((bytes, index)) = cjk_font() {
+    // A picked face replaces the automatic one rather than joining it: loading
+    // both would make a pick cost more memory than the default, the one outcome
+    // that would make the preference pointless.
+    if let Some((bytes, index)) = cjk.and_then(read_family).or_else(cjk_font) {
         fonts
             .font_data
             .insert(CJK_KEY.into(), font_data(bytes, index));
@@ -471,13 +483,11 @@ pub fn install(ctx: &egui::Context, ui: Option<&FontFamily>, mono: Option<&FontF
         let Some(picked) = picked else {
             continue;
         };
-        let Ok(bytes) = std::fs::read(&picked.path) else {
+        let Some((bytes, index)) = read_family(picked) else {
             continue;
         };
         let key = format!("kimo_font_{}", fonts.font_data.len());
-        fonts
-            .font_data
-            .insert(key.clone(), font_data(bytes, picked.index));
+        fonts.font_data.insert(key.clone(), font_data(bytes, index));
         fonts.families.entry(slot).or_default().insert(0, key);
     }
 
@@ -493,6 +503,32 @@ pub fn install(ctx: &egui::Context, ui: Option<&FontFamily>, mono: Option<&FontF
 
     ctx.set_fonts(fonts);
 }
+
+/// Hinting and subpixel binning, set for the display's density.
+///
+/// egui hints every glyph by default and renders it at up to four horizontal
+/// subpixel offsets. Both pay at one pixel per point, where a stem is one or
+/// two pixels wide and snapping it is what makes the text crisp. At two and
+/// above the glyph is 20–40 px tall: hinting then only bends the designer's
+/// outline — a stem that should be 2.5 px wide is pushed to 2 or 3, and one
+/// stroke of a letter comes out lighter than the next — and quarter-pixel
+/// bitmaps differ where no eye can see it, for four atlas entries per glyph.
+/// So above two pixels per point the outline is drawn as drawn, and each
+/// glyph keeps one bitmap per size.
+///
+/// The threshold is the display's density, not the font size: 12 pt is a
+/// 24 px glyph at 2×, and the desktop's own hinting has nothing left to snap
+/// at that size either. Called every frame from [`crate::theme::install`],
+/// because the scale factor changes when the window moves to another monitor.
+pub fn tune_text(options: &mut egui::epaint::text::TextOptions, pixels_per_point: f32) {
+    let dense = pixels_per_point >= DENSE_PIXELS_PER_POINT;
+    options.font_hinting = !dense;
+    options.subpixel_binning = !dense;
+}
+
+/// The density at which snapping a glyph to the pixel grid stops helping:
+/// 12 pt — the list's row titles — is 24 px tall there.
+const DENSE_PIXELS_PER_POINT: f32 = 2.0;
 
 const CJK_KEY: &str = "kimo_cjk";
 
@@ -604,6 +640,59 @@ fn cjk_font() -> Option<(Vec<u8>, u32)> {
     })
 }
 
+/// One installed family's file and the face inside it.
+fn read_family(family: &FontFamily) -> Option<(Vec<u8>, u32)> {
+    std::fs::read(&family.path)
+        .ok()
+        .map(|bytes| (bytes, family.index))
+}
+
+/// The characters the CJK fallback is judged by, one per script it exists for,
+/// with the script's name beside it. The name is what a warning must use: the
+/// sample itself is exactly what a face that lacks it cannot draw, so a message
+/// spelling out 中 あ 한 ㄅ would be four boxes in the very font it warns about.
+pub const CJK_SAMPLES: [(char, &str); 4] = [
+    ('中', "Han"),
+    ('あ', "kana"),
+    ('한', "Hangul"),
+    ('ㄅ', "Bopomofo"),
+];
+
+/// The script a sample character stands for.
+pub fn script_of_sample(sample: char) -> &'static str {
+    CJK_SAMPLES
+        .iter()
+        .find(|(character, _)| *character == sample)
+        .map(|(_, script)| *script)
+        .unwrap_or("CJK")
+}
+
+/// Which of [`CJK_SAMPLES`] an installed face has no glyph for.
+///
+/// The scanner reads only a face's `name`, `OS/2` and `post` tables, so it
+/// cannot say what a family covers; this reads the picked file whole, which is
+/// why it runs when a pick is made rather than per frame. A file that cannot be
+/// read reports every sample missing — it would not draw them either.
+pub fn missing_cjk_samples(family: &FontFamily) -> Vec<char> {
+    let Some((bytes, index)) = read_family(family) else {
+        return CJK_SAMPLES
+            .iter()
+            .map(|(character, _)| *character)
+            .collect();
+    };
+    let Ok(face) = ttf_parser::Face::parse(&bytes, index) else {
+        return CJK_SAMPLES
+            .iter()
+            .map(|(character, _)| *character)
+            .collect();
+    };
+    CJK_SAMPLES
+        .iter()
+        .map(|(character, _)| *character)
+        .filter(|character| face.glyph_index(*character).is_none())
+        .collect()
+}
+
 fn font_data(bytes: Vec<u8>, index: u32) -> std::sync::Arc<egui::FontData> {
     let mut data = egui::FontData::from_owned(bytes);
     data.index = index;
@@ -689,6 +778,23 @@ mod tests {
     }
 
     #[test]
+    fn text_is_hinted_only_on_dense_displays() {
+        let mut options = egui::epaint::text::TextOptions::default();
+        for (pixels_per_point, sharpened) in [
+            (1.0, true),
+            (1.25, true),
+            (1.5, true),
+            (2.0, false),
+            (2.5, false),
+            (3.0, false),
+        ] {
+            tune_text(&mut options, pixels_per_point);
+            assert_eq!(options.font_hinting, sharpened, "at {pixels_per_point}");
+            assert_eq!(options.subpixel_binning, sharpened, "at {pixels_per_point}");
+        }
+    }
+
+    #[test]
     fn the_locale_selects_the_cjk_variant() {
         assert_eq!(script_of_locale("zh_CN.UTF-8"), CjkScript::Simplified);
         assert_eq!(script_of_locale("zh-Hans-CN"), CjkScript::Simplified);
@@ -699,6 +805,56 @@ mod tests {
         assert_eq!(script_of_locale("en_US.UTF-8"), CjkScript::Simplified);
         assert_eq!(script_of_locale("C"), CjkScript::Simplified);
         assert_eq!(script_of_locale(""), CjkScript::Simplified);
+    }
+
+    #[test]
+    fn the_probe_checks_one_character_per_script() {
+        // Han, kana, Hangul and Bopomofo: a pick that covers Chinese but not
+        // Korean has to be called out, which one sample could not do.
+        assert_eq!(
+            CJK_SAMPLES.map(|(character, _)| character),
+            ['中', 'あ', '한', 'ㄅ']
+        );
+        assert_eq!(
+            CJK_SAMPLES.map(|(_, script)| script),
+            ["Han", "kana", "Hangul", "Bopomofo"]
+        );
+    }
+
+    #[test]
+    fn a_fallback_face_that_cannot_be_read_covers_nothing() {
+        // A family whose file has gone — `settings.json` carried from another
+        // machine — must not claim coverage it cannot know.
+        let all: Vec<char> = CJK_SAMPLES
+            .iter()
+            .map(|(character, _)| *character)
+            .collect();
+        assert_eq!(missing_cjk_samples(&family("Gone")), all);
+    }
+
+    /// Runs on whatever fonts the machine has, like
+    /// `the_name_only_reader_agrees_with_ttf_parser`: a pan-CJK collection
+    /// covers every sample, a Latin-only face covers none of them.
+    #[test]
+    fn the_probe_agrees_with_installed_faces() {
+        let families = scan();
+        if let Some(cjk) = families
+            .iter()
+            .find(|family| family.name.contains("CJK") && !family.name.contains("Mono"))
+        {
+            assert!(
+                missing_cjk_samples(cjk).is_empty(),
+                "{} lacks part of the sample set",
+                cjk.name
+            );
+        }
+        if let Some(latin) = families.iter().find(|family| family.name == "DejaVu Sans") {
+            let all: Vec<char> = CJK_SAMPLES
+                .iter()
+                .map(|(character, _)| *character)
+                .collect();
+            assert_eq!(missing_cjk_samples(latin), all);
+        }
     }
 
     #[test]
