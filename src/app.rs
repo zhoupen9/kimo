@@ -37,6 +37,7 @@ use crate::glass::Glass;
 use crate::gpus::Status;
 use crate::models::{Account, Attachment, MailMessage, Protocol, SmtpLogin, SmtpSettings, TlsMode};
 use crate::outgoing::{self, Outgoing, OutgoingAttachment};
+use crate::provider::vendor::{self, VendorKey};
 use crate::search::{Scope, SearchHit, SearchQuery, SEARCH_LIMIT};
 use crate::storage::{self, Settings};
 use crate::sync::{self, Event, Job, SentCopy};
@@ -848,6 +849,11 @@ pub struct KimoApp {
     /// registered: the tray's Quit is then the only way out
     /// (`crate::tray::available`).
     close_to_tray: bool,
+    /// Provider presets switched off in Preferences → Accounts. Custom (plain
+    /// IMAP/POP3/SMTP) is not a vendor and is always available. Persisted as
+    /// keys in `settings.json`; a key this build does not know is ignored, and
+    /// a preset added later starts switched on.
+    disabled_vendors: BTreeSet<VendorKey>,
     /// Whether the tray icon is wearing its unread badge: any account's Inbox
     /// holds mail nobody has read (`update_tray_badge`). The mail's own state,
     /// not an event — right at startup, right after a frame that read a mail,
@@ -1900,6 +1906,10 @@ struct AccountForm {
     /// minted once from its name, and the name of its cache file — so
     /// renaming an account does not move its cached mail.
     editing: Option<String>,
+    /// The provider preset the form opened on, or the one picked since. It is
+    /// transient: the account has no vendor field, because the vendor is
+    /// inferred from the endpoints (`vendor::VendorKey::of`).
+    vendor: VendorKey,
     name: String,
     protocol: Protocol,
     host: String,
@@ -1927,6 +1937,7 @@ impl Default for AccountForm {
     fn default() -> Self {
         Self {
             editing: None,
+            vendor: VendorKey::Custom,
             name: String::new(),
             protocol: Protocol::Imap,
             host: String::new(),
@@ -1951,6 +1962,7 @@ impl AccountForm {
     fn edit(account: &Account) -> Self {
         Self {
             editing: Some(account.id.clone()),
+            vendor: VendorKey::of(account),
             name: account.name.clone(),
             protocol: account.protocol,
             host: account.host.clone(),
@@ -2034,6 +2046,28 @@ impl AccountForm {
                 password: self.smtp_password.clone(),
             }),
         })
+    }
+
+    /// Fill the endpoint fields in from the provider the picker names. Only a
+    /// preset with endpoints changes anything: Custom keeps whatever was typed,
+    /// so switching away from a preset does not erase the server.
+    fn apply_preset(&mut self) {
+        let profile = self.vendor.profile();
+        if let Some(imap) = profile.imap {
+            self.protocol = Protocol::Imap;
+            self.host = imap.host.to_string();
+            self.port_str = imap.port.to_string();
+            self.tls = imap.tls;
+        }
+        if let Some(smtp) = profile.smtp {
+            self.smtp_enabled = true;
+            self.smtp_host = smtp.host.to_string();
+            self.smtp_port_str = smtp.port.to_string();
+            self.smtp_tls = smtp.tls;
+            self.smtp_own_login = true;
+            self.smtp_username.clear();
+            self.smtp_password.clear();
+        }
     }
 
     /// The account this form describes, under an id the caller picks — the
@@ -2226,6 +2260,14 @@ impl KimoApp {
             minimize_to_tray: settings.minimize_to_tray.unwrap_or(false),
             // Closing quits until the reader asks it to hide instead.
             close_to_tray: settings.close_to_tray.unwrap_or(false),
+            // All presets on unless the reader switched one off; a key this
+            // build does not know is ignored, and Custom cannot be switched.
+            disabled_vendors: settings
+                .disabled_vendors
+                .iter()
+                .filter_map(|key| VendorKey::parse(key))
+                .filter(|key| *key != VendorKey::Custom)
+                .collect(),
             // Settled on the first frame, from the mail the database loaded.
             tray_badge: false,
             font_families: None,
@@ -2824,14 +2866,17 @@ impl KimoApp {
             return;
         }
         if let Some(account) = self.accounts.iter().find(|a| a.id == account_id).cloned() {
-            let job = match protocol {
-                Protocol::Imap => Job::SyncFolder { account, folder },
-                Protocol::Pop3 => Job::Sync {
+            // A protocol with folders fetches the one clicked; a drop has only
+            // INBOX, so opening it is the account's sync.
+            let job = if crate::provider::capabilities(protocol).folders {
+                Job::SyncFolder { account, folder }
+            } else {
+                Job::Sync {
                     account,
                     purge: false,
                     folder: None,
                     save: false,
-                },
+                }
             };
             sync::spawn(job, self.ctx.clone(), self.tx.clone());
         }
@@ -3514,8 +3559,35 @@ impl KimoApp {
             notifications: Some(self.notifications),
             minimize_to_tray: Some(self.minimize_to_tray),
             close_to_tray: Some(self.close_to_tray),
+            disabled_vendors: self
+                .disabled_vendors
+                .iter()
+                .map(|key| key.as_str().to_string())
+                .collect(),
             gpu: self.gpu.clone(),
         });
+    }
+
+    /// Whether a provider preset is offered: Custom always is, a vendor only
+    /// while it is switched on in Preferences → Accounts.
+    fn vendor_enabled(&self, key: VendorKey) -> bool {
+        vendor::enabled(key, &self.disabled_vendors)
+    }
+
+    /// The presets the account form offers, in the picker's order.
+    fn enabled_vendors(&self) -> Vec<VendorKey> {
+        VendorKey::ALL
+            .iter()
+            .copied()
+            .filter(|key| self.vendor_enabled(*key))
+            .collect()
+    }
+
+    /// The vendor whose policy applies to an account: Custom when the preset
+    /// its endpoints name is switched off, so a disabled vendor behaves like a
+    /// plain server — no preset in the form, no Sent-mailbox preference.
+    fn effective_vendor(&self, account: &Account) -> VendorKey {
+        vendor::effective_key(VendorKey::of(account), &self.disabled_vendors)
     }
 
     /// Re-install the egui fonts from the picked family names. Reads one file
@@ -5053,8 +5125,16 @@ impl KimoApp {
             draft.sending = true;
             draft.error = None;
         }
+        // The window owns settings.json, so it is the one that says whether the
+        // account's vendor preset is switched on; the worker applies the policy
+        // of the vendor it is handed.
+        let vendor = self.effective_vendor(&account);
         sync::spawn(
-            Job::SendMessage { account, mail },
+            Job::SendMessage {
+                account,
+                mail,
+                vendor,
+            },
             self.ctx.clone(),
             self.tx.clone(),
         );
@@ -8445,6 +8525,36 @@ impl KimoApp {
             self.confirm_delete = None;
         }
 
+        // Which provider presets the form offers. The standard protocols are
+        // not a preset: they have no entry here and cannot be switched off.
+        ui.add_space(12.0);
+        ui.separator();
+        ui.add_space(8.0);
+        ui.label(egui::RichText::new("Provider presets").strong());
+        ui.label(
+            egui::RichText::new(
+                "A preset fills in a provider's servers and sign-in notes in the account \
+                 form. Plain IMAP, POP3 and SMTP servers are always available.",
+            )
+            .small()
+            .weak(),
+        );
+        for key in VendorKey::ALL
+            .iter()
+            .copied()
+            .filter(|key| *key != VendorKey::Custom)
+        {
+            let mut on = self.vendor_enabled(key);
+            if ui.checkbox(&mut on, key.label()).changed() {
+                if on {
+                    self.disabled_vendors.remove(&key);
+                } else {
+                    self.disabled_vendors.insert(key);
+                }
+                self.persist_settings();
+            }
+        }
+
         if let Some(account) = switch_to {
             self.select_folder(account.id.clone(), "INBOX".to_string(), account.protocol);
         }
@@ -8464,6 +8574,11 @@ impl KimoApp {
             return;
         };
         self.account_form = AccountForm::edit(account);
+        // A preset switched off in Preferences is not a choice the form offers
+        // any more; the account edits as the plain server it still is.
+        if !self.vendor_enabled(self.account_form.vendor) {
+            self.account_form.vendor = VendorKey::Custom;
+        }
         self.show_account_form = true;
         self.confirm_delete = None;
     }
@@ -8483,11 +8598,31 @@ impl KimoApp {
         );
         ui.add_space(4.0);
 
+        // A preset that was switched off since this form opened is no longer
+        // offered: fall back to Custom rather than keep a vendor the picker
+        // does not list.
+        if !self.vendor_enabled(self.account_form.vendor) {
+            self.account_form.vendor = VendorKey::Custom;
+        }
+        let providers = self.enabled_vendors();
         let f = &mut self.account_form;
         egui::Grid::new("account_form_grid")
             .num_columns(2)
             .spacing([10.0, 6.0])
             .show(ui, |ui| {
+                ui.label("Provider");
+                egui::ComboBox::from_id_salt("account_provider")
+                    .selected_text(f.vendor.label())
+                    .show_ui(ui, |ui| {
+                        for key in providers.iter().copied() {
+                            if ui.selectable_label(f.vendor == key, key.label()).clicked() {
+                                f.vendor = key;
+                                f.apply_preset();
+                            }
+                        }
+                    });
+                ui.end_row();
+
                 ui.label("Account name");
                 ui.add(Field::new(
                     egui::TextEdit::singleline(&mut f.name).hint_text("Personal mail"),
@@ -8557,6 +8692,20 @@ impl KimoApp {
                 ));
                 ui.end_row();
             });
+
+        // What the provider's sign-in needs. It is advice, not a gate: the
+        // fields stay editable and Save is enabled, because a server that is
+        // not quite what its host suggests is the user's to configure.
+        let profile = f.vendor.profile();
+        if let Some(note) = profile.note {
+            let text = egui::RichText::new(note).small();
+            if profile.auth == vendor::AuthKind::OAuthOnly {
+                let color = ui.visuals().warn_fg_color;
+                ui.colored_label(color, text);
+            } else {
+                ui.label(text.weak());
+            }
+        }
 
         ui.add_space(8.0);
         // Sending is its own group, and off is a real answer: an account that
@@ -19972,6 +20121,170 @@ mod tests {
                 .iter()
                 .any(|clipped| draws_texture(&clipped.shape, icon)),
             "the page draws the icon it loaded"
+        );
+    }
+
+    /// The provider picker is a preset: it fills the endpoints the vendor's
+    /// servers use, enables sending with them, and says what sign-in needs.
+    /// Custom is not a preset — it leaves what was typed alone.
+    #[test]
+    fn picking_a_provider_fills_in_its_endpoints() {
+        let mut form = AccountForm::default();
+        assert_eq!(form.vendor, VendorKey::Custom);
+        form.name = "Personal".to_string();
+        form.username = "me@example.com".to_string();
+
+        form.vendor = VendorKey::Gmail;
+        form.apply_preset();
+        assert_eq!(form.protocol, Protocol::Imap);
+        assert_eq!(form.host, "imap.gmail.com");
+        assert_eq!(form.port_str, "993");
+        assert_eq!(form.tls, TlsMode::Implicit);
+        assert!(form.smtp_enabled, "a provider preset enables sending");
+        assert_eq!(form.smtp_host, "smtp.gmail.com");
+        assert_eq!(form.smtp_port_str, "465");
+        assert_eq!(form.smtp_tls, TlsMode::Implicit);
+
+        // Outlook is the provider Kimo cannot sign in to, and the form says so.
+        form.vendor = VendorKey::Outlook;
+        form.apply_preset();
+        assert_eq!(form.host, "outlook.office365.com");
+        assert_eq!(form.smtp_tls, TlsMode::StartTls);
+        assert_eq!(form.smtp_port_str, "587");
+        assert_eq!(form.vendor.profile().auth, vendor::AuthKind::OAuthOnly);
+
+        // Custom keeps the server the user typed.
+        form.vendor = VendorKey::Custom;
+        let host = form.host.clone();
+        form.apply_preset();
+        assert_eq!(form.host, host);
+    }
+
+    /// The Accounts page's form draws the Provider row and the selected
+    /// provider's sign-in note — the two things the preset adds to the page.
+    #[test]
+    fn the_account_form_draws_the_provider_row_and_its_note() {
+        let ctx = egui::Context::default();
+        crate::fonts::install(&ctx, None, None, None);
+        let mut app = app_with_messages(&ctx, 1);
+        app.show_preferences = true;
+        app.prefs_tab = PrefsTab::Accounts;
+        app.account_form = AccountForm::default();
+        app.show_account_form = true;
+        // Two frames: the modal is an Area and lays itself out on the first.
+        frame_texts(&ctx, &mut app);
+        let texts = frame_texts(&ctx, &mut app);
+        assert!(texts.iter().any(|text| text == "Provider"), "{texts:?}");
+        assert!(
+            texts.iter().any(|text| text == "Custom (IMAP/POP3)"),
+            "the picker opens on Custom: {texts:?}"
+        );
+
+        app.account_form.vendor = VendorKey::Gmail;
+        app.account_form.apply_preset();
+        frame_texts(&ctx, &mut app);
+        let texts = frame_texts(&ctx, &mut app);
+        assert!(texts.iter().any(|text| text == "Gmail"), "{texts:?}");
+        assert!(
+            texts.iter().any(|text| text.contains("app password")),
+            "Gmail's note says what sign-in needs: {texts:?}"
+        );
+
+        // Outlook is the one Kimo cannot sign in to, and the form says so.
+        app.account_form.vendor = VendorKey::Outlook;
+        app.account_form.apply_preset();
+        frame_texts(&ctx, &mut app);
+        let texts = frame_texts(&ctx, &mut app);
+        assert!(
+            texts.iter().any(|text| text.contains("OAuth2")),
+            "Outlook's note is drawn: {texts:?}"
+        );
+    }
+
+    /// The form opens on the vendor its account's endpoints name, so editing a
+    /// Gmail account shows Gmail's note without the account storing a vendor.
+    #[test]
+    fn the_form_infers_the_vendor_from_the_accounts_endpoints() {
+        let account = test_account("imap.gmail.com");
+        assert_eq!(AccountForm::edit(&account).vendor, VendorKey::Gmail);
+        let account = test_account("imap.example.com");
+        assert_eq!(AccountForm::edit(&account).vendor, VendorKey::Custom);
+    }
+
+    /// A provider preset switched off in Preferences → Accounts is no longer
+    /// offered: the form edits its accounts as plain servers, and the vendor
+    /// policy the window hands the send job is Custom. The standard path can
+    /// never be switched off, and the other presets stay on.
+    #[test]
+    fn a_switched_off_provider_is_no_longer_a_preset() {
+        let ctx = egui::Context::default();
+        crate::fonts::install(&ctx, None, None, None);
+        let mut app = app_with_messages(&ctx, 1);
+        let mut account = app.accounts[0].clone();
+        account.host = "imap.gmail.com".to_string();
+        app.accounts[0] = account.clone();
+
+        assert_eq!(app.effective_vendor(&account), VendorKey::Gmail);
+        assert!(app.vendor_enabled(VendorKey::Gmail));
+        assert!(app.enabled_vendors().contains(&VendorKey::Gmail));
+
+        app.disabled_vendors.insert(VendorKey::Gmail);
+        assert!(!app.vendor_enabled(VendorKey::Gmail));
+        assert_eq!(app.effective_vendor(&account), VendorKey::Custom);
+        assert!(!app.enabled_vendors().contains(&VendorKey::Gmail));
+        // The rest of the presets and the standard path are untouched.
+        assert!(app.enabled_vendors().contains(&VendorKey::Custom));
+        assert!(app.enabled_vendors().contains(&VendorKey::Outlook));
+
+        // Editing the account opens the form on Custom, not on a vendor the
+        // picker no longer lists.
+        app.open_edit_account_form(&account.id);
+        assert_eq!(app.account_form.vendor, VendorKey::Custom);
+
+        // And a form that was already set to the vendor falls back too: the
+        // note of a switched-off provider is not drawn.
+        app.show_preferences = true;
+        app.prefs_tab = PrefsTab::Accounts;
+        app.show_account_form = true;
+        app.account_form = AccountForm::default();
+        app.account_form.vendor = VendorKey::Gmail;
+        frame_texts(&ctx, &mut app);
+        let texts = frame_texts(&ctx, &mut app);
+        assert_eq!(app.account_form.vendor, VendorKey::Custom);
+        assert!(
+            !texts.iter().any(|text| text.contains("app password")),
+            "the disabled provider's note is not drawn: {texts:?}"
+        );
+    }
+
+    /// The Accounts page lists every vendor preset with its own switch — a
+    /// switched-off one stays in the list, or there would be no way to switch
+    /// it back on — and the standard path is described rather than toggled.
+    #[test]
+    fn the_accounts_page_offers_a_switch_per_vendor() {
+        let ctx = egui::Context::default();
+        crate::fonts::install(&ctx, None, None, None);
+        let mut app = app_with_messages(&ctx, 1);
+        app.show_preferences = true;
+        app.prefs_tab = PrefsTab::Accounts;
+        app.disabled_vendors.insert(VendorKey::Gmail);
+        frame_texts(&ctx, &mut app);
+        let texts = frame_texts(&ctx, &mut app);
+        assert!(
+            texts.iter().any(|text| text == "Provider presets"),
+            "the section is drawn: {texts:?}"
+        );
+        assert!(
+            texts.iter().any(|text| text == "Gmail"),
+            "a switched-off vendor stays listed so it can come back: {texts:?}"
+        );
+        assert!(
+            texts.iter().any(|text| text == "Outlook / Microsoft 365"),
+            "every vendor is listed: {texts:?}"
+        );
+        assert!(
+            !texts.iter().any(|text| text == "Custom (IMAP/POP3)"),
+            "Custom is not a vendor to switch: {texts:?}"
         );
     }
 

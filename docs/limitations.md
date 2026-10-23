@@ -125,8 +125,20 @@ Do not "fix" these casually — they are known:
 
 - Credentials in plain text in `mail.db` (mode 0600, see [storage.md](storage.md));
   no
-  OAuth2/XOAUTH2. The database is not encrypted, and the app never renames or
-  deletes it on its own: a corrupt file is the user's to move aside.
+  OAuth2/XOAUTH2. Outlook and Microsoft 365 now require OAuth2, so the
+  provider preset fills their endpoints and says in the form that Kimo cannot
+  sign in to them; an account saved anyway fails at the login with the
+  server's own words. The database is not encrypted, and the app never renames
+  or deletes it on its own: a corrupt file is the user's to move aside.
+
+- **The vendor is inferred from the account's hosts, not stored.** A server
+  Kimo does not recognize is Custom — the old name heuristics and the account's
+  own fields, unchanged — so a Google Workspace or Exchange account behind a
+  custom host is Custom too. There is no per-account override. A vendor preset
+  switched off in Preferences → Accounts is simply Custom everywhere (no
+  preset, no Sent-mailbox preference); the account keeps syncing over the
+  standard protocol. See [providers.md](providers.md) for why the column was
+  rejected.
 
 - HTML mail renders through the in-egui subset renderer (`src/html.rs`).
   CSS is the `src/css.rs` subset (colors, fonts, sizes, display/visibility);

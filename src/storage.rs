@@ -143,6 +143,13 @@ pub struct Settings {
     /// closing quits, as it always has.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub close_to_tray: Option<bool>,
+    /// Provider presets switched off in Preferences → Accounts, by their
+    /// `vendor::VendorKey::as_str` keys ("gmail", "outlook", …). Absent means
+    /// every preset is offered, which is what the app ships with; a key this
+    /// build does not know is ignored. `custom` (plain IMAP/POP3/SMTP) is not
+    /// a vendor and is always available.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub disabled_vendors: Vec<String>,
     /// The PCI address of the graphics card Kimo draws with
     /// (`0000:03:00.0`), as picked in Preferences → Graphics; absent means the
     /// Vulkan loader's own choice. Read at start-up, before any Vulkan instance
@@ -263,6 +270,7 @@ mod tests {
             notifications: Some(false),
             minimize_to_tray: Some(true),
             close_to_tray: Some(true),
+            disabled_vendors: vec!["gmail".into(), "outlook".into()],
             gpu: Some("0000:03:00.0".into()),
         };
         let json = serde_json::to_string(&s).unwrap();
@@ -279,6 +287,7 @@ mod tests {
         assert_eq!(back.notifications, Some(false));
         assert_eq!(back.minimize_to_tray, Some(true));
         assert_eq!(back.close_to_tray, Some(true));
+        assert_eq!(back.disabled_vendors, ["gmail", "outlook"]);
         assert_eq!(back.gpu.as_deref(), Some("0000:03:00.0"));
         // settings.json with missing keys must still load.
         let missing: Settings = serde_json::from_str("{}").unwrap();
@@ -305,6 +314,11 @@ mod tests {
         assert_eq!(
             missing.close_to_tray, None,
             "absent means the app's default, which is to quit on close"
+        );
+        assert_eq!(
+            missing.disabled_vendors,
+            Vec::<String>::new(),
+            "absent means every provider preset is offered"
         );
         assert_eq!(
             missing.gpu, None,

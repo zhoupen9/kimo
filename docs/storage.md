@@ -94,7 +94,10 @@ Read when touching `src/db.rs`, `src/storage.rs`, `src/search.rs`, a schema migr
   and `auto_sync_minutes` (the automatic sync's switch and its interval, both
   absent by default — see [preferences.md](preferences.md)), `notifications`
   (whether new mail is announced on the desktop; absent means on — see
-  [platform.md](platform.md)), and the font
+  [platform.md](platform.md)), `disabled_vendors` (the provider presets
+  switched off in Preferences → Accounts, by key — `"gmail"`, `"outlook"`, …;
+  absent means all on, an unknown key is ignored, and `custom` is never
+  written — see [providers.md](providers.md)), and the font
   families picked in Preferences →
   Appearance (`ui_font`, `mono_font`, `cjk_font`; absent means egui's built-in
   font plus the automatic CJK fallback), and `gpu`, the PCI address of the

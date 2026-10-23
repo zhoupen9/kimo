@@ -891,7 +891,7 @@ pub struct FolderSync {
     /// `Load older mail` click walks down. `save_messages` keeps it in step
     /// with the rows, like `uid_next`. POP3: the lowest message number this
     /// drop is synced from, which the first sync picks
-    /// (`sync::BACKFILL_LIMIT` newest messages).
+    /// (`provider::BACKFILL_LIMIT` newest messages).
     pub first_num: Option<u32>,
     /// The oldest message the server had when the folder was last opened:
     /// IMAP, the UID `FETCH 1 (UID)` answered with, POP3 always 1. `None` means

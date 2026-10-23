@@ -21,6 +21,7 @@ mod notify;
 mod outgoing;
 mod portal;
 mod protocol;
+mod provider;
 mod threads;
 // Test-only measurement harness for the two HTML renderers; see the file.
 #[cfg(test)]

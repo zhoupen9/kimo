@@ -17,6 +17,14 @@ Read when touching `src/protocol/`, `src/outgoing.rs`, a TLS setting, a charset,
   (pulling in `encoding_rs`, pure Rust) so GB2312/GBK/GB18030/Big5/
   Shift-JIS/… mail decodes to proper UTF-8 instead of Latin-1 mojibake.
 
+## The provider layer
+
+- The three clients above are reached through `src/provider/` and not from
+  `sync.rs` directly: `MailProvider` is the mailbox interface (IMAP and POP3
+  adapters, one `open` per job), and `src/provider/vendor.rs` says where the big
+  providers' servers are. Everything this page describes about the wire stays
+  true underneath it; see [providers.md](providers.md).
+
 ## Sync, mutations and errors
 
 - Remote mutations are `UID STORE +FLAGS.SILENT (\Seen)` (IMAP), `UID STORE

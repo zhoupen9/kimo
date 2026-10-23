@@ -4,6 +4,11 @@
 //! never writes to the database either: these jobs do that (see `crate::db`).
 //! Besides mail sync, jobs also send written mail over SMTP (`Job::SendMessage`)
 //! and fetch remote HTML-mail resources (images, stylesheets) over HTTPS.
+//!
+//! Mailbox work goes through `crate::provider::MailProvider`: `provider::open`
+//! picks the adapter once, and nothing here branches on a protocol to reach the
+//! wire. This module keeps what the adapters deliberately do not — the database,
+//! the marks' ordering and the `Event`s.
 
 use std::fs;
 use std::io::{Read, Write};
@@ -14,68 +19,18 @@ use std::time::Duration;
 
 use crate::db;
 use crate::error::{MailError, MailResult};
-use crate::folders::{self, FolderKind};
 use crate::mail;
-use crate::models::{Account, MailMessage, Protocol};
+use crate::models::{Account, MailMessage};
 use crate::outgoing::Outgoing;
-use crate::protocol::imap::{decode_mailbox_name, ImapClient};
-use crate::protocol::pop3::Pop3Client;
 use crate::protocol::smtp::SmtpClient;
+use crate::provider;
+use crate::provider::vendor::{sent_mailbox, VendorKey};
 use crate::storage;
 
-/// How many of the newest messages the *first* sync of a folder takes. Later
-/// syncs are incremental — the folder's marks say what is already stored — so
-/// this is the size of the one-off backfill, not of a sync.
-pub const BACKFILL_LIMIT: u32 = 50;
-
-/// The lowest 1-based position a first sync reaches: the newest
-/// `BACKFILL_LIMIT` messages of `total`. Everything older waits for a
-/// `Load older mail` click — see `OLDER_BATCH`.
-fn backfill_start(total: usize) -> usize {
-    total.saturating_sub(BACKFILL_LIMIT as usize) + 1
-}
-
 /// How many older messages one `Load older mail` click fetches. The same size
-/// as a folder's first fetch, so the list grows in the steps it started in.
+/// as a folder's first fetch (`provider::BACKFILL_LIMIT`), so the list grows in
+/// the steps it started in.
 pub const OLDER_BATCH: u32 = 50;
-
-/// The UID range one click takes out of an IMAP folder: the batch below the
-/// floor the folder has been fetched down to, or the server's oldest message,
-/// whichever is closer — and `None` when there is nothing below the floor at
-/// all, either because the floor is the first UID there is or because the
-/// server's oldest message is one we already hold.
-fn older_uids(floor: u32, oldest: u32, batch: u32) -> Option<(u32, u32)> {
-    if floor <= 1 || oldest >= floor {
-        return None;
-    }
-    Some((oldest.max(floor.saturating_sub(batch)), floor - 1))
-}
-
-/// The same for a POP3 drop, whose numbering always starts at 1: the only
-/// question is how far above it the floor is. A floor below one batch's worth
-/// takes the whole of what is left, which is why the subtraction saturates —
-/// the first click of a folder that was backfilled from number 21 asks for
-/// 1..20, not for an underflow.
-fn older_numbers(floor: u32, batch: u32) -> Option<(u32, u32)> {
-    if floor <= 1 {
-        return None;
-    }
-    Some((floor.saturating_sub(batch).max(1), floor - 1))
-}
-
-/// The UID a fetch resumes from, or `None` when the folder has to be fetched
-/// afresh. Both sides have to agree on the UIDVALIDITY generation: a mark from
-/// another one describes mail that is gone, and a server that reports none does
-/// not promise its UIDs survive the session — such a folder keeps the old
-/// behaviour of refetching the newest messages rather than risking a skip.
-fn resume_uid(mark: &db::FolderSync, selected: Option<u32>) -> Option<u32> {
-    match (mark.uidvalidity, selected) {
-        (Some(stored), Some(selected)) if stored == selected => {
-            mark.uid_next.filter(|uid| *uid > 0)
-        }
-        _ => None,
-    }
-}
 
 /// Hard caps for remote mail resources (images / stylesheets).
 pub const MAX_IMAGE_BYTES: u64 = 10 * 1024 * 1024;
@@ -103,7 +58,8 @@ pub enum Job {
         folder: Option<String>,
         save: bool,
     },
-    /// Fetch one specific IMAP folder.
+    /// Fetch one specific folder: the click that opens a folder nobody has
+    /// fetched yet. A protocol without folders (POP3) answers with its drop.
     SyncFolder { account: Account, folder: String },
     /// Fetch the mail below the floor one folder has been fetched down to —
     /// the `Load older mail` button at the bottom of the list. The folder is
@@ -206,6 +162,11 @@ pub enum Job {
     SendMessage {
         account: Account,
         mail: Box<Outgoing>,
+        /// The provider whose policy decides where the Sent copy goes. The
+        /// window owns `settings.json`, so it passes `Custom` when the
+        /// account's vendor is switched off in Preferences: a disabled preset
+        /// then behaves exactly like an ordinary server.
+        vendor: VendorKey,
     },
     /// Remove an account: its row, its folders and, through the cascades, every
     /// message cached for it. The account travels with the job so a failure can
@@ -675,12 +636,16 @@ pub fn spawn(job: Job, ctx: egui::Context, tx: Sender<Event>) {
             }
             worker_wake(&ctx);
         }
-        Job::SendMessage { account, mail } => {
+        Job::SendMessage {
+            account,
+            mail,
+            vendor,
+        } => {
             // Not bracketed with SyncStarted/SyncDone like the other round
             // trips: the card that asked for the send is on screen, cannot be
             // closed while the mail is in flight, and says "Sending…" itself.
             // A failure is that card's to show, not the account row's.
-            match send_message(&account, &mail, &tx) {
+            match send_message(&account, &mail, vendor, &tx) {
                 Ok((recipients, copy)) => {
                     let _ = tx.send(Event::MessageSent { recipients, copy });
                 }
@@ -737,13 +702,10 @@ pub fn spawn(job: Job, ctx: egui::Context, tx: Sender<Event>) {
                         if purge {
                             db::purge_mail(&account.id)?;
                         }
-                        match account.protocol {
-                            Protocol::Imap => sync_imap(&account, folder.as_deref(), &tx),
-                            Protocol::Pop3 => sync_pop3(&account, &tx),
-                        }
+                        sync_account(&account, folder.as_deref(), &tx)
                     })
                 }
-                Job::SyncFolder { account, folder } => sync_imap_folder(&account, &folder, &tx),
+                Job::SyncFolder { account, folder } => sync_folder_job(&account, &folder, &tx),
                 Job::FetchImage { .. }
                 | Job::FetchStylesheet { .. }
                 | Job::RenderHtml { .. }
@@ -839,14 +801,54 @@ fn fetch_text(url: &str) -> MailResult<String> {
     Ok(String::from_utf8_lossy(&bytes).into_owned())
 }
 
-fn with_imap<T>(
-    account: &Account,
-    f: impl FnOnce(&mut ImapClient) -> MailResult<T>,
-) -> MailResult<T> {
-    let mut client = ImapClient::connect(account)?;
-    let result = f(&mut client);
-    client.logout();
-    result
+/// The store's view of a folder, as a provider fetch needs it. The UIDLs are
+/// read only for a protocol whose fetch is what filters them (POP3).
+fn folder_mark(
+    account_id: &str,
+    folder: &str,
+    stored_uids: bool,
+) -> MailResult<provider::FolderMark> {
+    let mark = db::folder_sync(account_id, folder)?;
+    Ok(provider::FolderMark {
+        uidvalidity: mark.uidvalidity,
+        uid_next: mark.uid_next,
+        first_num: mark.first_num,
+        stored: if stored_uids {
+            Some(db::stored_uids(account_id, folder)?)
+        } else {
+            None
+        },
+    })
+}
+
+/// Write the marks a fetch learned. Called before or after the batch, by the
+/// adapter's `marks_before_store`: POP3's floor bounds its next fetch and
+/// nothing rotates it, while an IMAP `save_messages` clears the marks when the
+/// UIDVALIDITY moved, so the new ones have to be written after it.
+fn write_marks(
+    account_id: &str,
+    folder: &str,
+    first_num: Option<u32>,
+    oldest: Option<Option<u32>>,
+) -> MailResult<()> {
+    if let Some(first_num) = first_num {
+        db::set_first_num(account_id, folder, first_num)?;
+    }
+    if let Some(oldest) = oldest {
+        db::set_oldest_uid(account_id, folder, oldest)?;
+    }
+    Ok(())
+}
+
+/// Tell the list whether the server has mail below what this folder holds.
+fn report_older(account_id: &str, folder: &str, tx: &Sender<Event>) -> MailResult<()> {
+    let mark = db::folder_sync(account_id, folder)?;
+    let _ = tx.send(Event::OlderMail {
+        account_id: account_id.to_string(),
+        folder: folder.to_string(),
+        available: db::older_available(mark.first_num, mark.oldest_uid),
+    });
+    Ok(())
 }
 
 /// The folders one sync of an account sweeps, in order: the folder the window
@@ -879,42 +881,49 @@ fn sync_queue(open: Option<&str>, listed: &[String], warmed: &[String]) -> Vec<S
     queue
 }
 
-fn sync_imap(account: &Account, open: Option<&str>, tx: &Sender<Event>) -> MailResult<()> {
-    with_imap(account, |client| {
-        client.login(&account.username, &account.password)?;
+/// One account's sync: the folder list (when the protocol has one), then the
+/// queue `sync_queue` builds, each folder stored and announced as it arrives.
+fn sync_account(account: &Account, open: Option<&str>, tx: &Sender<Event>) -> MailResult<()> {
+    provider::with(account, |provider| {
         // One folder that fails — a mailbox the server refuses, a connection
         // that dropped — must not cost the others their sync. The first error
-        // is reported once the rest is done, and the mailbox list is one of the
-        // things that can fail.
+        // is reported once the rest is done, and the mailbox list is one of
+        // the things that can fail.
         let mut failure: Option<MailError> = None;
-        let folders = match client.list_folders() {
-            Ok(folders) => {
-                // Remember the mailboxes first: a folder the database does not
-                // know would refuse the mail fetched for it below (the messages
-                // table has a foreign key onto folders). The answer also says
-                // which folders the server still has — one it left out keeps
-                // its cached mail and is drawn as one the server no longer
-                // lists.
-                db::save_folder_list(&account.id, &folders)?;
-                let _ = tx.send(Event::Folders {
-                    account_id: account.id.clone(),
-                    folders: folders.clone(),
-                });
-                folders
+        let folders = if provider.capabilities().folders {
+            match provider.folders() {
+                Ok(folders) => {
+                    // Remember the mailboxes first: a folder the database does not
+                    // know would refuse the mail fetched for it below (the messages
+                    // table has a foreign key onto folders). The answer also says
+                    // which folders the server still has — one it left out keeps
+                    // its cached mail and is drawn as one the server no longer
+                    // lists.
+                    db::save_folder_list(&account.id, &folders)?;
+                    let _ = tx.send(Event::Folders {
+                        account_id: account.id.clone(),
+                        folders: folders.clone(),
+                    });
+                    folders
+                }
+                // A `LIST` that failed is not a mailbox list, and it must not be
+                // mistaken for one: the stored list stands — the column keeps
+                // drawing it, unchanged — and the sweep falls back on the mailboxes
+                // the last answer named, so a server that will not list its
+                // mailboxes can still have their mail fetched, INBOX first.
+                Err(error) => {
+                    failure = Some(error);
+                    db::listed_folders(&account.id)?
+                }
             }
-            // A `LIST` that failed is not a mailbox list, and it must not be
-            // mistaken for one: the stored list stands — the column keeps
-            // drawing it, unchanged — and the sweep falls back on the mailboxes
-            // the last answer named, so a server that will not list its
-            // mailboxes can still have their mail fetched, INBOX first.
-            Err(error) => {
-                failure = Some(error);
-                db::listed_folders(&account.id)?
-            }
+        } else {
+            // POP3 has one drop and no LIST: its folder is INBOX, and it never
+            // writes a folder list (the first mail it stores makes the row).
+            vec![provider::INBOX.to_string()]
         };
         let queue = sync_queue(open, &folders, &db::synced_folders(&account.id)?);
         for folder in queue {
-            if let Err(error) = fetch_folder_into(client, &folder, account, tx) {
+            if let Err(error) = fetch_into(&mut *provider, &folder, account, tx) {
                 failure = failure.or(Some(error));
             }
         }
@@ -925,220 +934,117 @@ fn sync_imap(account: &Account, open: Option<&str>, tx: &Sender<Event>) -> MailR
     })
 }
 
-fn sync_imap_folder(account: &Account, folder: &str, tx: &Sender<Event>) -> MailResult<()> {
-    with_imap(account, |client| {
-        client.login(&account.username, &account.password)?;
-        fetch_folder_into(client, folder, account, tx)
+/// Fetch one folder: the click that opens a folder nobody has fetched.
+fn sync_folder_job(account: &Account, folder: &str, tx: &Sender<Event>) -> MailResult<()> {
+    provider::with(account, |provider| {
+        fetch_into(provider, folder, account, tx)
     })
 }
 
-fn fetch_folder_into(
-    client: &mut ImapClient,
+/// Store one folder's fetch and announce it, in the order the adapter says.
+fn fetch_into(
+    provider: &mut dyn provider::MailProvider,
     folder: &str,
     account: &Account,
     tx: &Sender<Event>,
 ) -> MailResult<()> {
-    let info = client.select(folder)?;
-    let resume = resume_uid(&db::folder_sync(&account.id, folder)?, info.uidvalidity);
-    // How far down the mailbox goes is the server's own answer, and this is
-    // where it is asked for: one `FETCH 1 (UID)` per folder, kept in the
-    // database so the list knows about older mail without a round trip of its
-    // own (see `Job::LoadOlder`).
-    let oldest = client.oldest_uid()?;
-    let mut floor: Option<u32> = None;
-    let mut messages = Vec::new();
-    if info.exists > 0 {
-        // A folder that was fetched before is asked for the UIDs it does not
-        // have yet: `<next>:*` is everything from the mark on. A server may
-        // answer that with the last message when the mark is already past the
-        // end, which the filter drops. A folder that was never fetched takes
-        // the newest `BACKFILL_LIMIT` messages, by sequence number — and the
-        // lowest UID of that window is the floor a `Load older mail` click
-        // starts below.
-        let fetched = match resume {
-            Some(next) => client
-                .fetch_bodies(&format!("{next}:*"), true)?
-                .into_iter()
-                .filter(|message| message.uid >= next)
-                .collect(),
-            None => {
-                let start = backfill_start(info.exists as usize) as u32;
-                let fetched = client.fetch_bodies(&format!("{start}:{}", info.exists), false)?;
-                floor = fetched.iter().map(|message| message.uid).min();
-                fetched
-            }
-        };
-        for fetched in fetched {
-            let (seen, flagged) = fetched_state(&fetched.flags);
-            let mut message = mail::parse(&fetched.raw, &fetched.uid.to_string(), seen);
-            message.flagged = flagged;
-            messages.push(message);
-        }
+    let mark = folder_mark(&account.id, folder, provider.capabilities().stored_uids)?;
+    let provider::FolderBatch {
+        uidvalidity,
+        messages,
+        kind,
+        first_num,
+        oldest,
+        marks_before_store,
+    } = provider.fetch_folder(folder, &mark)?;
+    if marks_before_store {
+        write_marks(&account.id, folder, first_num, oldest)?;
     }
     // Store before announcing: nothing may appear in the window that the
     // database does not already have. The batch moves the folder's mark in the
     // same transaction. A warm folder with nothing new is left untouched: no
     // write, and no event for a list that did not change.
-    if resume.is_none() || !messages.is_empty() {
-        db::save_messages(&account.id, folder, info.uidvalidity, &messages)?;
+    if kind == provider::FetchKind::Fill || !messages.is_empty() {
+        db::save_messages(&account.id, folder, uidvalidity, &messages)?;
         let _ = tx.send(Event::Messages {
             account_id: account.id.clone(),
             folder: folder.to_string(),
-            uidvalidity: info.uidvalidity,
+            uidvalidity,
             messages,
             // A fetch that resumed at the folder's mark asked for exactly the
             // UIDs it did not have: what came back arrived since the last one.
             // A folder filled for the first time (or after a UIDVALIDITY
             // rotation) is the folder's backfill, not news.
-            new_mail: resume.is_some(),
+            new_mail: kind == provider::FetchKind::Resume,
         });
     }
-    // The two marks the button is drawn from, written after the batch and its
-    // rotation: a window that was just fetched is the floor, and the answer is
-    // what the server said. Nothing is reported from a generation the store
-    // did not keep — a rotation clears both, and this puts the new ones back.
-    if let Some(floor) = floor {
-        db::set_first_num(&account.id, folder, floor)?;
+    if !marks_before_store {
+        write_marks(&account.id, folder, first_num, oldest)?;
     }
-    db::set_oldest_uid(&account.id, folder, oldest)?;
-    let mark = db::folder_sync(&account.id, folder)?;
-    let _ = tx.send(Event::OlderMail {
-        account_id: account.id.clone(),
-        folder: folder.to_string(),
-        available: db::older_available(mark.first_num, mark.oldest_uid),
-    });
-    Ok(())
+    report_older(&account.id, folder, tx)
 }
 
 /// Fetch the older mail of one folder: the batch below the floor it has been
-/// fetched down to. IMAP names the range by UID, POP3 by message number.
+/// fetched down to. IMAP names the range by UID, POP3 by message number; both
+/// move the floor whether or not the range held anything.
 fn load_older(account: &Account, folder: &str, tx: &Sender<Event>) -> MailResult<()> {
-    match account.protocol {
-        Protocol::Imap => load_older_imap(account, folder, tx),
-        Protocol::Pop3 => load_older_pop3(account, tx),
-    }
-}
-
-fn load_older_imap(account: &Account, folder: &str, tx: &Sender<Event>) -> MailResult<()> {
-    with_imap(account, |client| {
-        client.login(&account.username, &account.password)?;
-        let info = client.select(folder)?;
-        let oldest = client.oldest_uid()?;
-        let mark = db::folder_sync(&account.id, folder)?;
-        // The stored UIDs are the address of the mail this folder holds. Under
-        // another UIDVALIDITY they address different mail, and a batch fetched
-        // now would replace them with a slice out of the middle of the mailbox:
-        // the sync is what rotates a folder, so this only says what it found.
-        let same_generation = matches!(
-            (mark.uidvalidity, info.uidvalidity),
-            (Some(stored), Some(selected)) if stored == selected
-        );
-        if !same_generation {
-            return Err(MailError::Protocol(
-                "the folder changed on the server — sync it before loading older mail".to_string(),
-            ));
-        }
-        // The answer is recorded either way: the button is drawn from it, and
-        // "this mailbox is empty" is an answer.
-        db::set_oldest_uid(&account.id, folder, oldest)?;
-        let mut more = false;
-        let range = match (mark.first_num, oldest) {
-            (Some(floor), Some(oldest)) => {
-                older_uids(floor, oldest, OLDER_BATCH).map(|range| (range, oldest))
-            }
-            _ => None,
-        };
-        if let Some(((low, high), oldest)) = range {
-            let fetched = client.fetch_bodies(&format!("{low}:{high}"), true)?;
-            let mut messages = Vec::new();
-            for fetched in fetched {
-                let (seen, flagged) = fetched_state(&fetched.flags);
-                let mut message = mail::parse(&fetched.raw, &fetched.uid.to_string(), seen);
-                message.flagged = flagged;
-                messages.push(message);
-            }
-            // The floor moves whether or not the range held anything: it is
-            // where this folder has been asked from, and a mailbox with gaps in
-            // it would otherwise be asked for the same empty range forever.
-            db::set_first_num(&account.id, folder, low)?;
-            if !messages.is_empty() {
-                db::save_messages(&account.id, folder, info.uidvalidity, &messages)?;
-                let _ = tx.send(Event::Messages {
-                    account_id: account.id.clone(),
-                    folder: folder.to_string(),
-                    uidvalidity: info.uidvalidity,
-                    messages,
-                    // Older mail: whatever the click was for, it is not news.
-                    new_mail: false,
-                });
-            }
-            more = low > oldest;
+    provider::with(account, |provider| {
+        let mark = folder_mark(&account.id, folder, provider.capabilities().stored_uids)?;
+        let provider::OlderBatch {
+            uidvalidity,
+            messages,
+            first_num,
+            oldest,
+            available,
+        } = provider.fetch_older(folder, &mark, OLDER_BATCH)?;
+        // The marks go first: the floor is where this folder has been asked
+        // from, and a range that came back empty still moves it.
+        write_marks(&account.id, folder, first_num, oldest)?;
+        if !messages.is_empty() {
+            db::save_messages(&account.id, folder, uidvalidity, &messages)?;
+            let _ = tx.send(Event::Messages {
+                account_id: account.id.clone(),
+                folder: folder.to_string(),
+                uidvalidity,
+                messages,
+                // Older mail: whatever the click was for, it is not news.
+                new_mail: false,
+            });
         }
         let _ = tx.send(Event::OlderMail {
             account_id: account.id.clone(),
             folder: folder.to_string(),
-            available: more,
+            available,
         });
         Ok(())
     })
 }
 
-/// The two per-mail states an IMAP `FETCH` reports in its `FLAGS`: whether the
-/// mail has been read, and whether the reader flagged it. Both are handed to
-/// `mail::parse` / set on the message, and both are the *server's* answer only
-/// for a mail the database is storing for the first time: a row that is already
-/// there keeps what the reader did with it (see `MESSAGE_UPSERT`).
-fn fetched_state(flags: &[String]) -> (bool, bool) {
-    let has = |name: &str| flags.iter().any(|flag| flag.eq_ignore_ascii_case(name));
-    (has("\\Seen"), has("\\Flagged"))
-}
-
-/// Store the flag locally and, for IMAP, push it to the server. The local
-/// write happens first: the mail is read either way, and a server that refuses
-/// the `STORE` must not lose that.
+/// Store the flag locally and, for a protocol that keeps it, push it to the
+/// server. The local write happens first: the mail is read either way, and a
+/// server that refuses the `STORE` must not lose that.
 fn mark_seen(account: &Account, folder: &str, uid: &str) -> MailResult<()> {
     db::set_seen(&account.id, folder, uid)?;
-    if account.protocol == Protocol::Imap {
-        let number = uid
-            .parse::<u32>()
-            .map_err(|_| MailError::Protocol(format!("not an IMAP UID: {uid}")))?;
-        imap_mark_seen(account, folder, number)?;
+    if provider::capabilities(account.protocol).server_flags {
+        provider::with(account, |provider| provider.set_seen(folder, uid))?;
     }
     Ok(())
 }
 
-fn imap_mark_seen(account: &Account, folder: &str, uid: u32) -> MailResult<()> {
-    with_imap(account, |client| {
-        client.login(&account.username, &account.password)?;
-        client.select(folder)?;
-        client.uid_store_flags_silent(uid, "+FLAGS.SILENT (\\Seen)")
-    })
-}
-
-/// Store the reader's flag locally and, for IMAP, push it to the server. The
-/// same shape as `mark_seen`, and for the same reason: the local write happens
-/// first, so a server that refuses the `STORE` does not cost the reader the flag
-/// they just set. The command differs in both directions — `+FLAGS` to set the
-/// flag, `-FLAGS` to take it off — because a flag is a state rather than a
-/// latch.
+/// Store the reader's flag locally and, for a protocol that keeps it, push it
+/// to the server. The same shape as `mark_seen`, and for the same reason: the
+/// local write happens first, so a server that refuses the `STORE` does not
+/// cost the reader the flag they just set. The command differs in both
+/// directions — `+FLAGS` to set the flag, `-FLAGS` to take it off — because a
+/// flag is a state rather than a latch.
 fn set_flag(account: &Account, folder: &str, uid: &str, flagged: bool) -> MailResult<()> {
     db::set_flagged(&account.id, folder, uid, flagged)?;
-    if account.protocol == Protocol::Imap {
-        let number = uid
-            .parse::<u32>()
-            .map_err(|_| MailError::Protocol(format!("not an IMAP UID: {uid}")))?;
-        imap_set_flag(account, folder, number, flagged)?;
+    if provider::capabilities(account.protocol).server_flags {
+        provider::with(account, |provider| {
+            provider.set_flagged(folder, uid, flagged)
+        })?;
     }
     Ok(())
-}
-
-fn imap_set_flag(account: &Account, folder: &str, uid: u32, flagged: bool) -> MailResult<()> {
-    let change = if flagged { "+FLAGS" } else { "-FLAGS" };
-    with_imap(account, |client| {
-        client.login(&account.username, &account.password)?;
-        client.select(folder)?;
-        client.uid_store_flags_silent(uid, &format!("{change}.SILENT (\\Flagged)"))
-    })
 }
 
 /// Delete messages of one folder: the remote half goes first and each database
@@ -1147,103 +1053,26 @@ fn imap_set_flag(account: &Account, folder: &str, uid: u32, flagged: bool) -> Ma
 /// never happened. Mail the server no longer has is dropped locally: there is
 /// nothing remote to delete, and the local copy is the only one left.
 ///
-/// The rule is applied one mail at a time, and the two answers are what came of
-/// it: the uids whose local rows are gone (their remote copies are too), and
-/// the first refusal. The rest of the run is asked anyway — a batch that
-/// stopped at the first failure would leave mail checked on screen with
-/// nothing said about the mails it never got to — and one connection carries
-/// the whole batch, because a click that picked twenty mails should not be
-/// twenty logins.
+/// The adapter applies the rule one mail at a time and answers the uids whose
+/// remote copies are gone plus the first refusal; the rest of the run is asked
+/// anyway — a batch that stopped at the first failure would leave mail checked
+/// on screen with nothing said about the mails it never got to — and one
+/// connection carries the whole batch, because a click that picked twenty
+/// mails should not be twenty logins.
 fn delete_messages(
     account: &Account,
     folder: &str,
     uids: &[String],
 ) -> (Vec<String>, Option<MailError>) {
-    match account.protocol {
-        Protocol::Imap => imap_delete_many(account, folder, uids),
-        Protocol::Pop3 => pop3_delete_many(account, folder, uids),
-    }
-}
-
-/// The IMAP half of `delete_messages`: one login, one LIST and one SELECT, and
-/// each uid then takes the probe, flag and expunge
-/// `ImapClient::delete_messages` gives it.
-fn imap_delete_many(
-    account: &Account,
-    folder: &str,
-    uids: &[String],
-) -> (Vec<String>, Option<MailError>) {
-    let mut numbers = Vec::with_capacity(uids.len());
-    let mut first_error = None;
-    for uid in uids {
-        match uid.parse::<u32>() {
-            Ok(number) => numbers.push((uid.as_str(), number)),
-            // A uid the protocol cannot address is a mail that cannot go, and
-            // its local copy stays with it.
-            Err(_) => {
-                first_error = first_error
-                    .or_else(|| Some(MailError::Protocol(format!("not an IMAP UID: {uid}"))))
-            }
-        }
-    }
-    if numbers.is_empty() {
-        return (Vec::new(), first_error);
-    }
-    let asked: Vec<u32> = numbers.iter().map(|(_, number)| *number).collect();
-    let (gone, error) = match with_imap(account, |client| {
-        client.login(&account.username, &account.password)?;
-        Ok(client.delete_messages(folder, &asked))
-    }) {
-        Ok(answer) => answer,
+    let outcome = match provider::with(account, |provider| Ok(provider.delete(folder, uids))) {
+        Ok(outcome) => outcome,
         // The connection itself failed, so the server was never asked: no mail
         // went, and every local copy stays where it is.
-        Err(error) => (Vec::new(), Some(error)),
-    };
-    let mut first_error = first_error.or(error);
-    let mut deleted = Vec::new();
-    for (uid, number) in numbers {
-        if !gone.contains(&number) {
-            continue;
-        }
-        match db::delete_message(&account.id, folder, uid) {
-            Ok(()) => deleted.push(uid.to_string()),
-            Err(error) => first_error = first_error.or(Some(error)),
-        }
-    }
-    (deleted, first_error)
-}
-
-/// The POP3 half of `delete_messages`. POP3 has no folders, so the UIDL is the
-/// whole address of a message, and the deletion is committed by `QUIT`: every
-/// local row goes once the session has ended, never before, because a session
-/// that ends any other way leaves the mail on the server (`quit` sends `QUIT`
-/// whatever happened above it).
-fn pop3_delete_many(
-    account: &Account,
-    folder: &str,
-    uids: &[String],
-) -> (Vec<String>, Option<MailError>) {
-    let mut client = match Pop3Client::connect(account) {
-        Ok(client) => client,
         Err(error) => return (Vec::new(), Some(error)),
     };
-    if let Err(error) = client.login(&account.username, &account.password) {
-        // Nothing can be deleted in a session the server did not open; it is
-        // still ended the polite way.
-        client.quit();
-        return (Vec::new(), Some(error));
-    }
-    let mut marked = Vec::new();
-    let mut first_error = None;
-    for uid in uids {
-        match client.delete_by_uidl(uid) {
-            Ok(()) => marked.push(uid.clone()),
-            Err(error) => first_error = first_error.or(Some(error)),
-        }
-    }
-    client.quit();
+    let mut first_error = outcome.error;
     let mut deleted = Vec::new();
-    for uid in marked {
+    for uid in outcome.gone {
         match db::delete_message(&account.id, folder, &uid) {
             Ok(()) => deleted.push(uid),
             Err(error) => first_error = first_error.or(Some(error)),
@@ -1376,40 +1205,7 @@ fn download_attachment(
 /// the only way back to what the sender sent; the other side of it is that mail
 /// the server no longer has cannot be exported or downloaded at all.
 fn original_source(account: &Account, folder: &str, uid: &str) -> MailResult<Vec<u8>> {
-    match account.protocol {
-        Protocol::Imap => imap_body(account, folder, uid),
-        Protocol::Pop3 => pop3_body(account, uid),
-    }
-}
-
-fn imap_body(account: &Account, folder: &str, uid: &str) -> MailResult<Vec<u8>> {
-    let number = uid
-        .parse::<u32>()
-        .map_err(|_| MailError::Protocol(format!("not an IMAP UID: {uid}")))?;
-    with_imap(account, |client| {
-        client.login(&account.username, &account.password)?;
-        client.select(folder)?;
-        client.uid_body(number)?.ok_or_else(mail_is_gone)
-    })
-}
-
-/// POP3 has no folders, so the UIDL is the whole address of the message. The
-/// `QUIT` at the end is what *would* commit a deletion, and none was sent: the
-/// session ends without touching the drop.
-fn pop3_body(account: &Account, uid: &str) -> MailResult<Vec<u8>> {
-    let mut client = Pop3Client::connect(account)?;
-    let result = (|| -> MailResult<Vec<u8>> {
-        client.login(&account.username, &account.password)?;
-        client.retr_by_uidl(uid)?.ok_or_else(mail_is_gone)
-    })();
-    client.quit();
-    result
-}
-
-/// The server does not answer for this message any more. There is no original
-/// left to export, and the local copy is not a substitute for one.
-fn mail_is_gone() -> MailError {
-    MailError::Protocol("the server no longer has this mail".to_string())
+    provider::with(account, |provider| provider.body(folder, uid))
 }
 
 /// Send one written mail over SMTP and, when the account can keep a copy, put
@@ -1421,6 +1217,7 @@ fn mail_is_gone() -> MailError {
 fn send_message(
     account: &Account,
     mail: &Outgoing,
+    vendor: VendorKey,
     tx: &Sender<Event>,
 ) -> MailResult<(Vec<String>, SentCopy)> {
     let invalid = mail.invalid();
@@ -1455,7 +1252,7 @@ fn send_message(
     }
     client.send(&mail.from_addr, &recipients, &raw)?;
     client.quit();
-    let copy = append_to_sent(account, &raw, tx);
+    let copy = append_to_sent(account, &raw, vendor, tx);
     Ok((recipients, copy))
 }
 
@@ -1475,51 +1272,38 @@ fn unix_now() -> i64 {
 /// POP3 has nowhere to put one: the drop is what arrives, not what leaves. An
 /// IMAP server that lists no Sent mailbox gets none either — a copy filed under
 /// a name the user does not recognize is not a copy they will find.
-fn append_to_sent(account: &Account, raw: &[u8], tx: &Sender<Event>) -> SentCopy {
-    if account.protocol != Protocol::Imap {
+///
+/// `vendor` is the *effective* one: the window passes `Custom` when the
+/// account's preset is switched off in Preferences, which leaves the generic
+/// Sent classification deciding.
+fn append_to_sent(
+    account: &Account,
+    raw: &[u8],
+    vendor: VendorKey,
+    tx: &Sender<Event>,
+) -> SentCopy {
+    if !provider::capabilities(account.protocol).append {
         return SentCopy::None;
     }
-    let mailbox = match db::listed_folders(&account.id).map(|listed| sent_mailbox_in(&listed)) {
-        Ok(Some(mailbox)) => mailbox,
-        // Nothing to append to, and nothing wrong either.
-        Ok(None) => return SentCopy::None,
+    let mailbox = match db::listed_folders(&account.id) {
+        Ok(listed) => match sent_mailbox(vendor.profile(), &listed) {
+            Some(mailbox) => mailbox,
+            // Nothing to append to, and nothing wrong either.
+            None => return SentCopy::None,
+        },
         Err(error) => return SentCopy::Failed(error.to_string()),
     };
-    match imap_save_to_sent(account, &mailbox, raw, tx) {
+    // The copy goes in and comes back on one session: what was sent is in the
+    // folder the user looks in now, not at the next sync. A failed append still
+    // leaves the mail delivered, so the reason is the copy's, not the send's.
+    let result = provider::with(account, |provider| {
+        provider.append(&mailbox, raw)?;
+        fetch_into(provider, &mailbox, account, tx)
+    });
+    match result {
         Ok(()) => SentCopy::Saved { mailbox },
         Err(error) => SentCopy::Failed(error.to_string()),
     }
-}
-
-/// The mailbox a sent copy belongs in, from the folders the last `LIST` named:
-/// the first name whose *decoded* form classifies as Sent — `crate::folders`
-/// is the table that knows `Sent`, `Sent Items` and 已发送邮件 alike. The
-/// answer is the wire form, which is what `APPEND` has to be given.
-fn sent_mailbox_in(listed: &[String]) -> Option<String> {
-    listed
-        .iter()
-        .find(|name| folders::kind_of(&decode_mailbox_name(name)) == FolderKind::Sent)
-        .cloned()
-}
-
-/// Put the copy in the Sent mailbox and fetch it back: what was sent is in the
-/// folder the user looks in now, not at the next sync.
-///
-/// The fetch is a folder's ordinary one (`fetch_folder_into`), run on the
-/// session that just appended — the appended message is newer than the folder's
-/// mark, so it is exactly what comes down, and the mail arrives as
-/// `Event::Messages` like any other fetch.
-fn imap_save_to_sent(
-    account: &Account,
-    mailbox: &str,
-    raw: &[u8],
-    tx: &Sender<Event>,
-) -> MailResult<()> {
-    with_imap(account, |client| {
-        client.login(&account.username, &account.password)?;
-        client.append(mailbox, raw)?;
-        fetch_folder_into(client, mailbox, account, tx)
-    })
 }
 
 /// How many bytes of a subject a file name keeps. A file name is 255 bytes on
@@ -1640,175 +1424,10 @@ fn write_file(dir: &Path, stem: &str, extension: &str, bytes: &[u8]) -> MailResu
     )))
 }
 
-fn load_older_pop3(account: &Account, tx: &Sender<Event>) -> MailResult<()> {
-    let mut client = Pop3Client::connect(account)?;
-    let result = (|| -> MailResult<()> {
-        client.login(&account.username, &account.password)?;
-        let uidls = client.uidl()?;
-        let mark = db::folder_sync(&account.id, "INBOX")?;
-        let mut more = false;
-        if let Some((low, high)) = mark
-            .first_num
-            .and_then(|floor| older_numbers(floor, OLDER_BATCH))
-        {
-            let known = db::stored_uids(&account.id, "INBOX")?;
-            let mut messages = Vec::new();
-            for (num, uid) in uidls {
-                let num = num as u32;
-                if num < low || num > high || known.contains(&uid) {
-                    continue;
-                }
-                let raw = client.retr(num as usize)?;
-                messages.push(mail::parse(&raw, &uid, false));
-            }
-            // As on the IMAP side: the floor moves even when the range held
-            // nothing, or the next click would ask for the same numbers again.
-            db::set_first_num(&account.id, "INBOX", low)?;
-            if !messages.is_empty() {
-                db::save_messages(&account.id, "INBOX", None, &messages)?;
-                let _ = tx.send(Event::Messages {
-                    account_id: account.id.clone(),
-                    folder: "INBOX".to_string(),
-                    uidvalidity: None,
-                    messages,
-                    // Older mail, like the IMAP half above.
-                    new_mail: false,
-                });
-            }
-            more = low > 1;
-        }
-        let _ = tx.send(Event::OlderMail {
-            account_id: account.id.clone(),
-            folder: "INBOX".to_string(),
-            available: more,
-        });
-        Ok(())
-    })();
-    client.quit();
-    result
-}
-
-fn sync_pop3(account: &Account, tx: &Sender<Event>) -> MailResult<()> {
-    let mut client = Pop3Client::connect(account)?;
-    let result = (|| -> MailResult<()> {
-        client.login(&account.username, &account.password)?;
-        let count = client.stat()?;
-        let uidls = client.uidl()?;
-        let mark = db::folder_sync(&account.id, "INBOX")?;
-        let known = db::stored_uids(&account.id, "INBOX")?;
-        // The first sync of a drop takes the newest messages only; the floor it
-        // remembers is what keeps every later sync from coming back for the
-        // thousands it deliberately skipped. UIDL identity is what makes those
-        // later syncs incremental — a message already stored is never
-        // downloaded again, whatever its number. The newest-messages window is
-        // still consulted, so a drop that shrank below the floor (mail deleted
-        // elsewhere, and the numbering with it) cannot disappear.
-        let cold = mark.first_num.is_none();
-        let window = backfill_start(count);
-        let floor = mark
-            .first_num
-            .map_or(window, |floor| (floor as usize).min(window));
-        let mut messages = Vec::new();
-        for (num, uid) in uidls {
-            if num < floor || known.contains(&uid) {
-                continue;
-            }
-            let raw = client.retr(num)?;
-            messages.push(mail::parse(&raw, &uid, false));
-        }
-        // The floor goes first: a folder with a floor and no mail is fetched
-        // from that floor next time, so this order can cost a repeated pass but
-        // never a message. A drop's numbering starts at 1, so it is also where
-        // the server's oldest message is — the answer the `Load older mail`
-        // button is drawn from, and the one thing about a drop nobody has to
-        // ask for.
-        if cold {
-            db::set_first_num(&account.id, "INBOX", window as u32)?;
-            db::set_oldest_uid(&account.id, "INBOX", (count > 0).then_some(1))?;
-        }
-        if cold || !messages.is_empty() {
-            db::save_messages(&account.id, "INBOX", None, &messages)?;
-            let _ = tx.send(Event::Messages {
-                account_id: account.id.clone(),
-                folder: "INBOX".to_string(),
-                uidvalidity: None,
-                messages,
-                // A warm drop's batch is the UIDLs the database did not have;
-                // the first sync of one is the window it chose to fetch, which
-                // is old mail however new it looks.
-                new_mail: !cold,
-            });
-        }
-        let mark = db::folder_sync(&account.id, "INBOX")?;
-        let _ = tx.send(Event::OlderMail {
-            account_id: account.id.clone(),
-            folder: "INBOX".to_string(),
-            available: db::older_available(mark.first_num, mark.oldest_uid),
-        });
-        Ok(())
-    })();
-    client.quit();
-    result
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// The two states an IMAP `FETCH` reports are read off its `FLAGS`, and
-    /// only those two: the rest of the list (`\Answered`, keywords, the
-    /// folder's own `\Deleted`) is not something Kimo keeps. The comparison is
-    /// the wire's, which is not case-sensitive, and a mail with no flags at all
-    /// is neither read nor flagged.
-    #[test]
-    fn a_fetch_reports_its_two_states() {
-        let flags = |list: &[&str]| list.iter().map(|f| f.to_string()).collect::<Vec<_>>();
-        assert_eq!(fetched_state(&flags(&["\\Seen"])), (true, false));
-        assert_eq!(fetched_state(&flags(&["\\Flagged"])), (false, true));
-        assert_eq!(
-            fetched_state(&flags(&["\\Seen", "\\Flagged"])),
-            (true, true)
-        );
-        assert_eq!(fetched_state(&flags(&["\\flagged"])), (false, true));
-        assert_eq!(
-            fetched_state(&flags(&["\\Answered", "$Important"])),
-            (false, false)
-        );
-        assert_eq!(fetched_state(&[]), (false, false));
-    }
-
-    /// A `LIST` answer names the mailbox a copy of a sent mail belongs in: the    /// A `LIST` answer names the mailbox a copy of a sent mail belongs in: the
-    /// first one that classifies as Sent, whatever the server calls it — and it
-    /// answers the *wire* form, which is what `APPEND` has to be given.
-    #[test]
-    fn the_sent_mailbox_is_the_one_the_server_calls_sent() {
-        let listed = |names: &[&str]| {
-            names
-                .iter()
-                .map(|name| name.to_string())
-                .collect::<Vec<_>>()
-        };
-        assert_eq!(
-            sent_mailbox_in(&listed(&["INBOX", "Sent", "Trash"])).as_deref(),
-            Some("Sent")
-        );
-        assert_eq!(
-            sent_mailbox_in(&listed(&["INBOX", "Sent Items"])).as_deref(),
-            Some("Sent Items")
-        );
-        assert_eq!(
-            sent_mailbox_in(&listed(&["INBOX", "[Gmail]/Sent Mail"])).as_deref(),
-            Some("[Gmail]/Sent Mail")
-        );
-        // Modified UTF-7 on the wire, 已发送 on screen.
-        assert_eq!(
-            sent_mailbox_in(&listed(&["INBOX", "&XfJT0ZAB-"])).as_deref(),
-            Some("&XfJT0ZAB-")
-        );
-        // Nothing that classifies as Sent: nowhere to put a copy.
-        assert_eq!(sent_mailbox_in(&listed(&["INBOX", "Archive"])), None);
-        assert_eq!(sent_mailbox_in(&[]), None);
-    }
+    use crate::models::Protocol;
 
     /// A mail that goes out: the account is the envelope's sender, its
     /// credentials are what the submission logs in with, and the message on the
@@ -1892,7 +1511,7 @@ mod tests {
         };
 
         let (tx, rx) = std::sync::mpsc::channel();
-        let (recipients, copy) = send_message(&account, &mail, &tx).unwrap();
+        let (recipients, copy) = send_message(&account, &mail, VendorKey::Custom, &tx).unwrap();
         assert_eq!(recipients, ["bob@example.com"]);
         assert!(
             matches!(copy, SentCopy::None),
@@ -1929,7 +1548,7 @@ mod tests {
         // The two things that stop a send before a socket is opened: an account
         // with no outgoing server, and a field that is not an address.
         account.smtp = None;
-        assert!(send_message(&account, &mail, &tx).is_err());
+        assert!(send_message(&account, &mail, VendorKey::Custom, &tx).is_err());
         account.smtp = Some(crate::models::SmtpSettings {
             host: "127.0.0.1".to_string(),
             port,
@@ -1938,55 +1557,8 @@ mod tests {
         });
         let mut junk = mail.clone();
         junk.to = vec!["not an address".to_string()];
-        let error = send_message(&account, &junk, &tx).unwrap_err();
+        let error = send_message(&account, &junk, VendorKey::Custom, &tx).unwrap_err();
         assert!(error.to_string().contains("not an address"), "{error}");
-    }
-
-    #[test]
-    fn a_first_sync_takes_the_newest_messages() {
-        assert_eq!(backfill_start(0), 1);
-        assert_eq!(backfill_start(1), 1);
-        assert_eq!(backfill_start(BACKFILL_LIMIT as usize), 1);
-        assert_eq!(backfill_start(BACKFILL_LIMIT as usize + 1), 2);
-        assert_eq!(backfill_start(5000), 5000 - BACKFILL_LIMIT as usize + 1);
-    }
-
-    /// What one `Load older mail` click asks an IMAP folder for: the batch
-    /// below the floor, the floor being the oldest UID ever fetched. The
-    /// server's own oldest message is where the walk stops — asking below it
-    /// would be asking for mail that is not there — and a mailbox whose oldest
-    /// message is one already held has nothing to load at all.
-    #[test]
-    fn a_click_asks_for_the_batch_below_the_floor() {
-        // A floor in the middle of a mailbox: one batch, and no further.
-        assert_eq!(older_uids(5000, 1, 50), Some((4950, 4999)));
-        // A mailbox whose mail starts just below the floor: only what there is.
-        assert_eq!(older_uids(5000, 4975, 50), Some((4975, 4999)));
-        // And then the bottom, which is the end of the walk.
-        assert_eq!(older_uids(4975, 4975, 50), None);
-        assert_eq!(older_uids(4975, 4976, 50), None, "deleted elsewhere");
-        assert_eq!(older_uids(1, 1, 50), None, "the floor is the first UID");
-        // A floor of 2 asks for UID 1 alone, whatever the batch size.
-        assert_eq!(older_uids(2, 1, 50), Some((1, 1)));
-        // `older_uids` never proposes UID 0: the range starts at the first UID
-        // the protocol has, whatever the arithmetic below the batch says.
-        assert_eq!(older_uids(2, 1, 500), Some((1, 1)));
-    }
-
-    /// The same walk for a POP3 drop, whose numbering starts at 1 — so the
-    /// floor alone says how much is left below it, and the walk ends there.
-    #[test]
-    fn a_drop_is_walked_down_to_its_first_message() {
-        assert_eq!(older_numbers(4951, 50), Some((4901, 4950)));
-        assert_eq!(older_numbers(60, 50), Some((10, 59)));
-        assert_eq!(older_numbers(51, 50), Some((1, 50)));
-        assert_eq!(older_numbers(50, 50), Some((1, 49)));
-        // A floor *below* one batch — a drop that was backfilled from number
-        // 21, say — takes what is left instead of underflowing.
-        assert_eq!(older_numbers(21, 50), Some((1, 20)));
-        assert_eq!(older_numbers(2, 50), Some((1, 1)));
-        assert_eq!(older_numbers(1, 50), None, "the drop starts at number 1");
-        assert_eq!(older_numbers(0, 50), None);
     }
 
     /// The order a sync sweeps folders in: what the user asked for, INBOX, then
@@ -2028,36 +1600,6 @@ mod tests {
             sync_queue(Some("Gone"), &listed, &warm(&["Old"])),
             ["INBOX"]
         );
-    }
-
-    #[test]
-    fn a_folder_resumes_from_its_mark_unless_the_uidvalidity_moved() {
-        let mark = db::FolderSync {
-            uidvalidity: Some(7),
-            uid_next: Some(13),
-            first_num: None,
-            oldest_uid: None,
-        };
-        assert_eq!(resume_uid(&mark, Some(7)), Some(13));
-        // Another generation: the stored UIDs describe mail that is gone.
-        assert_eq!(resume_uid(&mark, Some(8)), None);
-        // A server that reports no UIDVALIDITY promises nothing about its UIDs
-        // surviving, so the folder is fetched afresh, as it always was.
-        assert_eq!(resume_uid(&mark, None), None);
-
-        // Nothing stored, a mark without a generation, or a nonsense UID.
-        assert_eq!(resume_uid(&db::FolderSync::default(), Some(7)), None);
-        let generation_only = db::FolderSync {
-            uidvalidity: Some(7),
-            ..Default::default()
-        };
-        assert_eq!(resume_uid(&generation_only, Some(7)), None);
-        let nonsense = db::FolderSync {
-            uidvalidity: Some(7),
-            uid_next: Some(0),
-            ..Default::default()
-        };
-        assert_eq!(resume_uid(&nonsense, Some(7)), None, "UID 0 is no UID");
     }
 
     /// An exported file is named after the subject, which keeps its own

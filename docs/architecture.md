@@ -9,11 +9,16 @@ UI (app.rs ui)
    │  spawn(Job)                                   UI thread — no sockets, no DB writes
    ▼
 worker thread (sync.rs)
-   │  ImapClient / Pop3Client / SmtpClient         blocking I/O is fine here
+   │  provider::MailProvider (IMAP or POP3)        blocking I/O is fine here
+   │  protocol::smtp (submission, not a mailbox)
    │  db::save_messages / db::set_seen             the only place the DB is written
    ▼
 Event (mpsc) ──► drain_events() at frame start ──► merge into AccountUiState
 ```
+
+Mailbox work goes through `provider::MailProvider` (`src/provider/`): the
+adapter owns the socket and the protocol, the worker owns the marks, the
+database and the events. See [providers.md](providers.md).
 
 A worker also calls `wake::now()` after sending its event. While the window is
 hidden there is no frame to start: egui can consider an immediate repaint
@@ -32,7 +37,7 @@ clock turning. Tray Show and Quit use the same wake.
   UIDLs it does not already store (`db::stored_uids`). `db::save_messages` moves
   an IMAP folder's mark to one past the highest UID it holds, in the same
   transaction as the batch, so a crash can never advance past mail that did not
-  reach the disk. `BACKFILL_LIMIT` (in `sync.rs`) is the size of a folder's
+  reach the disk. `BACKFILL_LIMIT` (in `src/provider/`) is the size of a folder's
   *first* fetch: the newest messages only, and the rest waits for the button in
   the `Load older mail` button below. `Job::Sync` (startup
   and the title-bar button) fetches the folder list, INBOX and every folder that

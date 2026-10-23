@@ -109,7 +109,11 @@ src/dbus.rs             the session bus: D-Bus wire protocol (marshalling, frami
 src/tray.rs             StatusNotifierItem over the session bus (std::thread) + svg→ARGB icon
 src/wake.rs             the event loop's wake channel, for work that finishes while the window is hidden
 src/notify.rs           new-mail notifications over the session bus (std::thread) + their 48·scale icon
-src/sync.rs             Job/Event enums, worker threads, per-protocol sync logic
+src/sync.rs             Job/Event enums, worker threads, and the database/Event side of every mailbox job
+src/provider/mod.rs     the abstract MailProvider interface: one adapter per read protocol
+src/provider/imap.rs    the IMAP adapter: folders, incremental fetch, flags, delete, append
+src/provider/pop3.rs    the POP3 adapter: the one drop, older mail, delete, body
+src/provider/vendor.rs  the vendor layer: Gmail/Outlook/… presets, sign-in notes, Sent mailbox
 src/protocol/mod.rs     protocol modules
 src/protocol/stream.rs  TcpStream/TLS transport (MailStream, STARTTLS upgrade, buffered Conn)
 src/protocol/ffdhe.rs   FFDHE kx group + DHE-RSA suites, which rustls does not ship
@@ -127,6 +131,7 @@ src/protocol/smtp.rs    minimal SMTP submission client (EHLO capabilities, START
 | [docs/architecture.md](docs/architecture.md) | `src/sync.rs`, `Job`/`Event`, anything crossing the UI/worker line |
 | [docs/storage.md](docs/storage.md) | `src/db.rs`, `src/storage.rs`, `src/search.rs`, a schema migration, an XDG path |
 | [docs/protocols.md](docs/protocols.md) | `src/protocol/`, a TLS setting, a charset, the mapping of a server's refusal |
+| [docs/providers.md](docs/providers.md) | `src/provider/`, a vendor preset, the account form's Provider row, a new mailbox operation |
 | [docs/ui-shell.md](docs/ui-shell.md) | `src/main.rs`, `src/gpu.rs`, `src/gpus.rs`, `src/glass.rs`, the title bar, the column plan, the navigation column |
 | [docs/ui-mail.md](docs/ui-mail.md) | a list row, threading, select mode, the search box and its popup, the reading pane, attachments, labels, flags, filters, sort |
 | [docs/ui-style.md](docs/ui-style.md) | drawing a widget: an icon or a disclosure, a mail address field, the Cc/Bcc fold |
@@ -143,6 +148,12 @@ src/protocol/smtp.rs    minimal SMTP submission client (EHLO capabilities, START
 - Pure parsing helpers (e.g. `extract_uid`, `literal_size`, `html_to_text`)
   live next to their users and get `#[cfg(test)]` unit tests — that is where
   tests go in this codebase; no `tests/` directory yet.
+- A new mailbox operation goes on `provider::MailProvider` with an IMAP and a
+  POP3 implementation; `src/sync.rs` must not branch on `Protocol` to reach the
+  wire. Vendor knowledge (endpoints, sign-in, Sent mailbox) goes in
+  `src/provider/vendor.rs`, not in the account form or an adapter. A preset
+  switched off in Preferences is Custom everywhere: ask `vendor::enabled` /
+  `vendor::effective_key` rather than assuming a preset is on.
 - When touching the UI, actually run `cargo run` and click through it; the
   layout has no golden tests. A rendered dump is not the app — the dumps and
   the benchmarks are in `docs/testing.md`.

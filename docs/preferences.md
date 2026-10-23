@@ -11,7 +11,15 @@ Read when touching `preferences_modal`, a key in `settings.json`, or the sync cl
   (account list with
   use/edit/remove, and the add/edit account form in place of the list: it is
   pre-filled from the account it was opened on, and `Save & sync` updates that
-  account and syncs it), **Appearance** (theme, accent, Simple/Blitz HTML
+  account and syncs it; the form's **Provider** row is a preset — Gmail,
+  Outlook, iCloud, Yahoo, QQ Mail and NetEase fill in their own endpoints and
+  say what their sign-in needs, Outlook's warning being that it requires
+  OAuth2, which Kimo does not support — while Custom leaves the fields alone.
+  Below the account list, **Provider presets** has one switch per vendor: a
+  switched-off vendor is not offered in the form and its Sent-mailbox policy
+  is skipped, while the account keeps syncing over the standard protocol —
+  plain IMAP/POP3/SMTP is not a preset and has no switch; the choice is
+  `disabled_vendors` in `settings.json`), **Appearance** (theme, accent, Simple/Blitz HTML
   renderer, the interface, fixed-width and CJK-fallback fonts — all persisted
   in `settings.json` — plus a preview of the palette the theme and the accent
   resolve to), **Graphics** (the card Kimo draws with — and with it which
