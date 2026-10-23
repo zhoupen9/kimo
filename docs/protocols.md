@@ -74,3 +74,74 @@ Read when touching `src/protocol/`, `src/outgoing.rs`, a TLS setting, a charset,
   `Event`s, state and the database; `imap::decode_mailbox_name` decodes them for
   display only. SELECT/UID STORE must always use the wire form — do not
   re-encode decoded names by hand.
+
+## Actions
+**IMAP (Internet Message Access Protocol)** and **POP3 (Post Office Protocol version 3)** are both standard protocols used by email clients to retrieve messages from a server, but they are designed with completely different philosophies.
+
+POP3 is built for **offline, single-device downloading** (download-and-delete), while IMAP is built for **online, multi-device synchronization** (leave messages on the server and sync state).
+
+---
+
+### 1. Actions Supported in POP3
+
+POP3 is a simple, "store-and-forward" protocol. Its feature set is strictly limited to downloading mail from the primary inbox to a local client. POP3 operates in sequential states (AUTHORIZATION $\rightarrow$ TRANSACTION $\rightarrow$ UPDATE).
+
+* **Authentication:** Log in using username and password (`USER`, `PASS`, or secure SASL methods).
+* **List / View Mailbox Stats:** Get an overview of messages, such as the total count and total size of messages in the inbox (`STAT`, `LIST`).
+* **Retrieve Messages:** Download a specific message or its headers to the local machine (`RETR`, `TOP`).
+* **Mark for Deletion:** Flag specific messages to be deleted from the server (`DELE`). Deletions typically only take effect when the session successfully closes (`QUIT`).
+* **Reset Deletions:** Unmark any messages that were flagged for deletion during the current session (`RSET`).
+* **Session Check:** Ensure connection is alive (`NOOP`).
+
+*What POP3 **Cannot** Do:* It does not support creating, renaming, or deleting server-side folders, syncing read/unread status across multiple devices, searching server-side emails, or accessing anything other than the main `INBOX`.
+
+---
+
+### 2. Actions Supported in IMAP
+
+IMAP is a complex, stateful protocol designed to manage emails directly on the server. Changes made on one device are instantly synchronized across all other connected devices.
+
+* **Folder / Mailbox Management:**
+* Create, delete, or rename folders/directories on the server (`CREATE`, `DELETE`, `RENAME`).
+* Select or examine a specific mailbox folder to work within (`SELECT`, `EXAMINE`).
+* Check folder status like unread counts or UID validity (`STATUS`).
+
+
+* **Message Organization & Flagging:**
+* Copy or move messages between different folders (`COPY`, `MOVE`).
+* Set or clear message flags like `\Seen` (read/unread), `\Answered` (replied), `\Flagged` (starred), or `\Deleted` (`STORE`).
+
+
+* **Selective Retrieval & Fetching:**
+* Fetch specific parts of an email (e.g., download just the headers, text body, or a specific MIME attachment separately) rather than downloading the whole raw file (`FETCH`).
+
+
+* **Server-Side Searching:**
+* Search through emails on the server using parameters like sender, date, text content, or flags without downloading them (`SEARCH`).
+
+
+* **Appending Messages:**
+* Upload and save a new message (like a sent draft or an imported email) directly into a server folder (`APPEND`).
+
+
+* **Real-Time Push Updates (`IDLE`):**
+* Maintain an open connection loop where the server instantly notifies the client the moment a new email arrives or a status changes elsewhere.
+
+
+* **Expunging:**
+* Permanently remove all messages marked with the `\Deleted` flag from the current folder (`EXPUNGE`).
+
+
+
+---
+
+### Summary Comparison of Capabilities
+
+| Action Capability | POP3 | IMAP |
+| --- | --- | --- |
+| **Where emails live** | Downloaded locally, usually deleted from server | Stored on server, synchronized across devices |
+| **Multi-device sync** | ❌ No (Read status on Device A doesn't sync to Device B) | ✅ Yes (Read, replied, and deleted states sync everywhere) |
+| **Folder management** | ❌ No (Inbox only) | ✅ Yes (Create, delete, rename folders/labels) |
+| **Partial message download** | ❌ No (Downloads entire message + attachments) | ✅ Yes (Fetch headers, body, or attachments selectively) |
+| **Server-side search** | ❌ No | ✅ Yes |
+| **Real-time notifications** | ❌ No (Must poll/reconnect) | ✅ Yes (via `IDLE`) |
