@@ -27,9 +27,9 @@ Read when touching a list row, threading, select mode, search in the bar, the re
   epaint itself (`truncate_galley`: one `LayoutJob` whose `max_rows` is 1 and
   whose overflow character is the ellipsis), never by a search that lays a
   galley out per probe to measure it: the list re-lays out every visible row on
-  every frame the column's width moves — a splitter drag, the navigation
-  column's slide — and one shaping pass per line per frame is the whole of what
-  that costs (`bench_nav_slide` measures it). A search's probes are largely
+  every frame its own width moves — a splitter drag on its edge, the window
+  capping or restoring it — and one shaping pass per line per frame is the whole
+  of what that costs (`bench_frame_cost` measures it). A search's probes are largely
   cache-warm from the width of the frame before, but the frames where they are
   not pay `log2(chars)` shapings apiece — its worst frames cost about three
   times what the elision's do. A mail with parts gives the end of its title line

@@ -305,60 +305,69 @@ Read when touching `src/main.rs`, `src/gpu.rs`, `src/gpus.rs`, `src/glass.rs`, t
 
 ## The three columns
 
-- **The columns give way to a narrowing window in one order**
-  (`plan_columns`, read by `KimoApp::ui` every frame): the navigation
-  collapses first, then the reading pane is capped at what leaves the list
-  its `LIST_MIN_WIDTH` (240 pt), then the pane stops being a column and
+- **The three columns are sized in one order** (`plan_columns`, read by
+  `KimoApp::ui` every frame): the navigation has a fixed width, the message
+  list is semi-fixed (a remembered width, capped by the window and by its own
+  maximum), and the reading pane is the remainder. The navigation takes its
+  width first; the list then takes the width its splitter left it
+  (`LIST_DEFAULT_WIDTH`, 460 pt, up to `LIST_MAX_WIDTH`, 600 pt); the pane
+  gets whatever is left, so it is the column that grows when the window
+  does. A narrowing window gives that room up in one order: the navigation
+  collapses first, then the list is capped at what leaves the pane its
+  `CONTENT_MIN_WIDTH` (280 pt), then the pane stops being a column and
   becomes a popup over the list, and the list itself never narrows past its
-  minimum — a window narrower than that scrolls it sideways instead
-  (`mail_list` switches the scroll area to both axes, and the rows keep
-  their minimum width through `virtual_rows`, which lays them out at the
-  union of the viewport and the content's own min rect). The thresholds are
-  the columns' own widths rather than constants: the navigation collapses
-  on crossing below navigation + pane + the list's minimum, where the two
-  widths are what the splitters left the panels at (egui's `PanelState`,
-  read through `panel_width`). The pane's cap is placed by writing that
-  same state (`set_panel_width`) rather than only clamping it, so widening
-  through the cap follows the window back up; and the remembered width to
-  restore to is the app's own (`pane_width`), because egui on its own only
-  ever remembers what a panel last rendered at — the capped width. The
-  splitter is off while the cap holds: the window is the one making that
-  split. The popup layout (`ColumnPlan::popup`: not even the two minimums
-  fit side by side) shows the list alone, and a click on a mail opens the
-  pane over it as an `Area` — above the list, under the title bar (which
-  `move_to_top` keeps there; a new area is otherwise born above it) and
-  under the modals — with a round, chevron-only back button floating over
-  the mail's top-left corner (`POPUP_BACK_DIAMETER`), shadowed with the
-  window's own shadow — the same one the `Load older mail` button floats on —
-  so it reads as on top of the mail rather than as a hole in it; it is the one
-  way back to the list, and closing the mail is what it does.
-  The navigation is not shown at all in that layout. Re-expanding the
-  navigation after any automatic collapse stays a manual choice, exactly as
-  it was when the threshold was a constant.
+  `LIST_MIN_WIDTH` (240 pt) — a window narrower than that scrolls it
+  sideways instead (`mail_list` switches the scroll area to both axes, and
+  the rows keep their minimum width through `virtual_rows`, which lays them
+  out at the union of the viewport and the content's own min rect). The
+  thresholds are the columns' own widths rather than constants: the
+  navigation collapses on crossing below navigation + list + the pane's
+  minimum, where the two widths are what the splitters left the panels at
+  (egui's `PanelState`, read through `panel_width`). The list's cap is
+  placed by writing that same state (`set_panel_width`) rather than only
+  clamping it, so widening through the cap follows the window back up; and
+  the remembered width to restore to is the app's own (`list_width`),
+  because egui on its own only ever remembers what a panel last rendered
+  at — the capped width. The list's splitter is off while the cap holds:
+  the window is the one making that split. The popup layout
+  (`ColumnPlan::popup`: not even the two minimums fit side by side) shows
+  the list alone, and a click on a mail opens the pane over it as an `Area`
+  — above the list, under the title bar (which `move_to_top` keeps there; a
+  new area is otherwise born above it) and under the modals — with a round,
+  chevron-only back button floating over the mail's top-left corner
+  (`POPUP_BACK_DIAMETER`), shadowed with the window's own shadow — the same
+  one the `Load older mail` button floats on — so it reads as on top of
+  the mail rather than as a hole in it; it is the one way back to the list,
+  and closing the mail is what it does. The navigation is not shown at all
+  in that layout. Re-expanding the navigation after any automatic collapse
+  stays a manual choice, exactly as it was when the threshold was a
+  constant.
 
 - Layout is a three-column mail client: left navigation (collapsible via
   the title-bar toggle; auto-collapses when the window is narrower than the
-  three columns need — see the columns-give-way bullet above), the central column
-  (while a search is
-  active the list shows `search_results` instead of the selected folder, and
-  `message_card` paints both kinds of row), and the reading pane on the right
-  with a "No mail selected" placeholder. Collapsing the navigation — by the
-  toggle or by the narrow-window rule — slides the column out rather than
-  dropping it: `Panel::show_collapsible` keeps the rows at the layout they had
-  at the column's full width and slides the whole column off toward the
-  window's edge, clipped, so the list takes its room over the frames of egui's
-  animation time (`Style::animation_time`, 0.2 s), and the width the splitter
-  gave the column survives the slide — a collapsed column reopens as wide as it
-  was. The splitter is not a second way to collapse (`drag_to_open(false)`,
-  and the expanded flag `show_collapsible` writes back is dropped): the toggle
-  stays the one control, the splitter keeps clamping at `min_size` the way it
-  always has, and a collapsed column leaves no invisible grab strip — or resize
-  cursor — over the message list's left edge.
+  three columns need — see the columns bullet above), the message list
+  (while a search is active it shows `search_results` instead of the
+  selected folder, and `message_card` paints both kinds of row), and the
+  reading pane on the right, the flexible column that takes the rest of the
+  window, with a "No mail selected" placeholder. Collapsing the navigation
+  — by the toggle or by the narrow-window rule — slides the column out
+  rather than dropping it: `Panel::show_collapsible` keeps the rows at the
+  layout they had at the column's full width and slides the whole column
+  off toward the window's edge, clipped, so the reading pane grows into its
+  room over the frames of egui's animation time (`Style::animation_time`,
+  0.2 s), and the width the splitter gave the column survives the slide — a
+  collapsed column reopens as wide as it was. The splitter is not a second
+  way to collapse (`drag_to_open(false)`, and the expanded flag
+  `show_collapsible` writes back is dropped): the toggle stays the one
+  control, the splitter keeps clamping at `min_size` the way it always has,
+  and a collapsed column leaves no invisible grab strip — or resize cursor
+  — over the message list's left edge.
   Folders indent under their account (`Ui::indent`) without egui's faint guide
   line down the left of the block (`indent_has_left_vline` cleared in
   `nav`): in this column that line reads as a rule through the folder list.
-  The chrome — title bar and navigation — is the scheme's `panel`; the message
-  list and the reading pane are the lighter `content`. The columns run from the
+  The chrome — title bar, navigation, and the columns behind the two cards —
+  is the scheme's `panel`; the message list's card and the reading pane's
+  cards are the lighter `content`. The columns run from the
   window's own top edge, and the title bar floats over them (see the title bar
   section above): the navigation is inset by the bar's height and never goes
   under it, while the two content columns keep clear of the bar with padding
@@ -376,11 +385,13 @@ Read when touching `src/main.rs`, `src/gpu.rs`, `src/gpus.rs`, `src/glass.rs`, t
   shape and fills it in at the foot of the frame — under the rows, which is
   where it has to be drawn. The card is framed by a hairline down each side,
   drawn for the card's own height rather than the column's, and the reading pane
-  is a card of `content`
-  (`CONTENT_CARD_CORNER_RADIUS`) inset by `CONTENT_GUTTER` into the chrome,
-  whose left side doubles as the splitter; with nothing selected there is no
-  card at all. The first card of what the pane shows starts *below* the floating
-  bar — the bar's height is space above it in the scroll area, not padding
+  is a card of `content` (`CONTENT_CARD_CORNER_RADIUS`) inset by
+  `CONTENT_GUTTER` into the chrome; the list's splitter is on its right
+  edge, and the pane's card is inset from that edge by the same gutter, which
+  is what keeps the mail off the splitter. With nothing selected there is no
+  card at all. The first card of what the pane shows starts *below* the
+  floating bar — the bar's height is space above it in the scroll area, not
+  padding
   inside it — so its top edge and its two rounded corners are on screen; the
   space scrolls away with the card, which is what still lets the mail pass under
   the glass. **A conversation is that card once per mail** — not a card
@@ -406,16 +417,11 @@ Read when touching `src/main.rs`, `src/gpu.rs`, `src/gpus.rs`, `src/glass.rs`, t
   body and the attachment cards at the foot of each mail scroll together, and
   the scroll bar runs down the pane's edge rather than down a card's — and a
   card still hugs its mail: it is exactly as tall as the mail until the mail
-  outgrows the pane. The scroll area scrolls *both* ways, which is
-  what keeps the splitter honest: with horizontal scrolling off, a mail whose
-  layout cannot be narrower than the pane (a fixed-width table — most HTML
-  mail) widened this scroll area, and through it the panel's *content* rect,
-  which is the rect egui persists as the panel's width for the next frame
-  (`PanelState`); a splitter drag therefore sprang back to the mail's width on
-  release, and since egui's `Grid` keeps its column widths between frames the
-  pane could never be dragged narrower than the widest it had ever been for
-  that mail. The horizontal bar appears only when the mail really is wider than
-  the pane, and a newly opened mail resets both offsets. The list lays out only
+  outgrows the pane. The scroll area scrolls *both* ways: a mail whose layout
+  cannot be narrower than the pane (a fixed-width table — most HTML mail) is
+  then scrolled over the pane instead of widening the flexible column, and the
+  horizontal bar appears only when the mail really is wider than the pane. A
+  newly opened mail resets both offsets. The list lays out only
   the rows its viewport shows (`virtual_rows`, which is
   `ScrollArea::show_rows` with this column's arithmetic: the first row starts
   below the title bar's padding, inside the scroll area, so a row range counted

@@ -36,6 +36,6 @@ Read before claiming a UI or renderer change works, or when timing one.
   splitter position and while it is being dragged:
   `cargo test --release -- --ignored --nocapture bench_frame_cost`. Its
   companion `bench_nav_slide` measures those frames through the navigation
-  column's collapse and its slide back open, which moves the message column's
+  column's collapse and its slide back open, which grows the reading pane's
   width the way a drag does
   (`cargo test --release -- --ignored --nocapture bench_nav_slide`).
