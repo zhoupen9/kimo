@@ -137,7 +137,11 @@ Read when touching `preferences_modal`, a key in `settings.json`, or the sync cl
   work — draining workers, notifications, the auto-sync clock — runs through
   `KimoApp::pump_hidden`, woken through `src/wake.rs` rather than egui's
   repaint callback, which can consider an immediate frame already served when
-  there is no window to draw it.
+  there is no window to draw it. `Kimo::hide_window` pumps once as it drops
+  the window: the `redraw_at` deadline it clears is the only timer a
+  windowless Kimo has, and the compositor's own close arrives with no frame to
+  set another — without that pump a hidden Kimo sleeps through every interval
+  until it is opened again.
 
 ## Automatic sync
 
@@ -149,7 +153,8 @@ Read when touching `preferences_modal`, a key in `settings.json`, or the sync cl
   What it adds to the startup sweep and the button is the clock and nothing
   else, and the preferences page's controls are live whether or not it is on.
   `pump_auto_sync` is the
-  clock, called once a frame: `auto_sync_wait` is the whole decision (nothing
+  clock, called once a frame and by `KimoApp::pump_hidden` when there is no
+  window: `auto_sync_wait` is the whole decision (nothing
   while off, otherwise the interval left since the last sweep, never negative),
   and the wait it returns is what the app asks egui to repaint after — no other
   timer runs, and a frame with nothing to draw would otherwise never come. A
