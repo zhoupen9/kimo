@@ -943,8 +943,9 @@ fn fetch_folder_into(
     // How far down the mailbox goes is the server's own answer, and this is
     // where it is asked for: one `FETCH 1 (UID)` per folder, kept in the
     // database so the list knows about older mail without a round trip of its
-    // own (see `Job::LoadOlder`).
-    let oldest = client.oldest_uid()?;
+    // own (see `Job::LoadOlder`). An empty folder is not asked — SELECT already
+    // answered that there is no first message to name.
+    let oldest = client.oldest_uid(info.exists)?;
     let mut floor: Option<u32> = None;
     let mut messages = Vec::new();
     if info.exists > 0 {
@@ -1023,7 +1024,7 @@ fn load_older_imap(account: &Account, folder: &str, tx: &Sender<Event>) -> MailR
     with_imap(account, |client| {
         client.login(&account.username, &account.password)?;
         let info = client.select(folder)?;
-        let oldest = client.oldest_uid()?;
+        let oldest = client.oldest_uid(info.exists)?;
         let mark = db::folder_sync(&account.id, folder)?;
         // The stored UIDs are the address of the mail this folder holds. Under
         // another UIDVALIDITY they address different mail, and a batch fetched
