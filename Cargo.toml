@@ -131,6 +131,12 @@ serde_json = "1"
 # the tree through Blitz (fontique/fontdb), so this pulls in no new build.
 ttf-parser = "0.25"
 
+# WASM plugin engine: a pure-Rust interpreter (no JIT, no C runtime), with
+# validation, fuel metering and linear-memory isolation. `wasmi_core` supplies
+# the ResourceLimiter error type used by the host's memory cap.
+wasmi = "2.0.0"
+wasmi_core = "2.0.0"
+
 [profile.release]
 lto = true
 strip = true

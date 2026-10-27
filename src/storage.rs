@@ -150,6 +150,12 @@ pub struct Settings {
     /// a vendor and is always available.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub disabled_vendors: Vec<String>,
+    /// Installed plugin ids switched off in Preferences → Plugins. A disabled
+    /// id is not compiled or instantiated at startup; the panel still lists
+    /// its manifest so it can be switched back on. Absent means every plugin
+    /// is enabled.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub disabled_plugins: Vec<String>,
     /// The PCI address of the graphics card Kimo draws with
     /// (`0000:03:00.0`), as picked in Preferences → Graphics; absent means the
     /// Vulkan loader's own choice. Read at start-up, before any Vulkan instance
@@ -271,6 +277,7 @@ mod tests {
             minimize_to_tray: Some(true),
             close_to_tray: Some(true),
             disabled_vendors: vec!["gmail".into(), "outlook".into()],
+            disabled_plugins: vec!["org.kimo.echo".into()],
             gpu: Some("0000:03:00.0".into()),
         };
         let json = serde_json::to_string(&s).unwrap();
@@ -288,6 +295,7 @@ mod tests {
         assert_eq!(back.minimize_to_tray, Some(true));
         assert_eq!(back.close_to_tray, Some(true));
         assert_eq!(back.disabled_vendors, ["gmail", "outlook"]);
+        assert_eq!(back.disabled_plugins, ["org.kimo.echo"]);
         assert_eq!(back.gpu.as_deref(), Some("0000:03:00.0"));
         // settings.json with missing keys must still load.
         let missing: Settings = serde_json::from_str("{}").unwrap();
@@ -319,6 +327,11 @@ mod tests {
             missing.disabled_vendors,
             Vec::<String>::new(),
             "absent means every provider preset is offered"
+        );
+        assert_eq!(
+            missing.disabled_plugins,
+            Vec::<String>::new(),
+            "absent means every installed plugin is enabled"
         );
         assert_eq!(
             missing.gpu, None,

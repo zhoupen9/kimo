@@ -46,7 +46,7 @@ impl Write for MailStream {
     }
 }
 
-fn tls_wrap(
+pub(crate) fn tls_wrap(
     tcp: TcpStream,
     host: &str,
 ) -> io::Result<Box<rustls::StreamOwned<rustls::ClientConnection, TcpStream>>> {

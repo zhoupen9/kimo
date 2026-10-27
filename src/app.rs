@@ -138,6 +138,7 @@ impl Paper {
 enum PrefsTab {
     General,
     Accounts,
+    Plugins,
     Appearance,
     Graphics,
     About,
@@ -748,6 +749,13 @@ pub struct KimoApp {
     show_preferences: bool,
     /// Which preferences page is selected.
     prefs_tab: PrefsTab,
+    /// The plugins discovered at startup, with their manifests and load
+    /// errors. The panel is read-only for now; account selection comes later.
+    plugins: crate::plugin::discovery::Registry,
+    /// Installed plugin ids switched off; the module is not compiled on the
+    /// next start. The panel keeps their manifests listed so they can be
+    /// switched back on.
+    disabled_plugins: BTreeSet<String>,
     /// Accounts page: the add/edit account form replaces the account list
     /// while this is set.
     show_account_form: bool,
@@ -2106,7 +2114,7 @@ impl KimoApp {
         &self.glass
     }
 
-    pub fn new(ctx: &egui::Context) -> Self {
+    pub fn new(ctx: &egui::Context, plugins: crate::plugin::discovery::Registry) -> Self {
         // egui's built-in fonts only cover Latin/Cyrillic/Greek, so the CJK
         // fallback goes in immediately; the families picked in Preferences are
         // applied once the worker scan below has resolved their files.
@@ -2127,7 +2135,7 @@ impl KimoApp {
                 .collect::<Vec<_>>(),
         )
         .unwrap_or_default();
-        let app = Self::assemble(ctx, accounts, mailboxes, &settings);
+        let app = Self::assemble(ctx, accounts, mailboxes, &settings, plugins);
 
         // System-tray icon (best effort; StatusNotifierItem over D-Bus).
         crate::tray::spawn(app.ctx.clone());
@@ -2166,6 +2174,7 @@ impl KimoApp {
         accounts: Vec<Account>,
         mailboxes: HashMap<String, storage::Mailbox>,
         settings: &storage::Settings,
+        plugins: crate::plugin::discovery::Registry,
     ) -> Self {
         let mut states = HashMap::new();
         for account in &accounts {
@@ -2219,6 +2228,8 @@ impl KimoApp {
             compose_anchor: None,
             show_preferences: false,
             prefs_tab: PrefsTab::Accounts,
+            plugins,
+            disabled_plugins: settings.disabled_plugins.iter().cloned().collect(),
             show_account_form: false,
             account_form: AccountForm::default(),
             confirm_delete: None,
@@ -3564,6 +3575,7 @@ impl KimoApp {
                 .iter()
                 .map(|key| key.as_str().to_string())
                 .collect(),
+            disabled_plugins: self.disabled_plugins.iter().cloned().collect(),
             gpu: self.gpu.clone(),
         });
     }
@@ -8407,6 +8419,7 @@ impl KimoApp {
                     for (tab, label) in [
                         (PrefsTab::General, "General"),
                         (PrefsTab::Accounts, "Accounts"),
+                        (PrefsTab::Plugins, "Plugins"),
                         (PrefsTab::Appearance, "Appearance"),
                         (PrefsTab::Graphics, "Graphics"),
                         (PrefsTab::About, "About"),
@@ -8423,6 +8436,7 @@ impl KimoApp {
                     match self.prefs_tab {
                         PrefsTab::General => self.general_page(ui),
                         PrefsTab::Accounts => self.accounts_page(ui),
+                        PrefsTab::Plugins => self.plugins_page(ui),
                         PrefsTab::Appearance => self.appearance_page(ui),
                         PrefsTab::Graphics => self.graphics_page(ui),
                         PrefsTab::About => self.about_page(ui),
@@ -8818,6 +8832,96 @@ impl KimoApp {
                 self.save_account_form();
             }
         });
+    }
+
+    /// Preferences → Plugins: what the startup scan found. A disabled plugin
+    /// is listed from its manifest but its module was not compiled or
+    /// instantiated; the switch takes effect at the next start.
+    fn plugins_page(&mut self, ui: &mut egui::Ui) {
+        ui.label(egui::RichText::new("WASM plugins").strong());
+        ui.label(
+            egui::RichText::new(
+                "Kimo loads .wasm modules only. A plugin is trusted enough to read the mail and use the network permissions shown here.",
+            )
+            .small()
+            .weak(),
+        );
+        ui.add_space(6.0);
+
+        for error in self.plugins.errors() {
+            ui.label(
+                egui::RichText::new(format!("Not loaded: {error}"))
+                    .color(ui.visuals().error_fg_color),
+            );
+        }
+
+        let mut rows: Vec<(String, String, String, String, bool)> = Vec::new();
+        for loaded in self.plugins.plugins() {
+            let permissions = loaded.plugin.permissions().names();
+            let permissions = if permissions.is_empty() {
+                "no network or secrets".to_string()
+            } else {
+                permissions.join(", ")
+            };
+            rows.push((
+                loaded.manifest.name.clone(),
+                loaded.manifest.version.clone(),
+                loaded.manifest.id.clone(),
+                format!(
+                    "{} · {permissions} · {} MiB cap",
+                    loaded.manifest.module,
+                    loaded.plugin.limits().memory_bytes / (1024 * 1024)
+                ),
+                true,
+            ));
+        }
+        for manifest in self.plugins.disabled() {
+            rows.push((
+                manifest.name.clone(),
+                manifest.version.clone(),
+                manifest.id.clone(),
+                format!("{} · not compiled at startup", manifest.module),
+                false,
+            ));
+        }
+
+        if rows.is_empty() {
+            ui.label("No plugins found in the plugin directories.");
+            return;
+        }
+
+        let mut changed = false;
+        for (name, version, id, detail, enabled) in rows {
+            egui::Frame::group(ui.style()).show(ui, |ui| {
+                ui.set_min_width(ui.available_width());
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new(&name).strong());
+                    ui.label(egui::RichText::new(format!("v{version}")).small().weak());
+                    let mut on = enabled;
+                    if ui
+                        .checkbox(&mut on, "Enabled")
+                        .on_hover_text("Takes effect at the next start")
+                        .changed()
+                    {
+                        if on {
+                            self.disabled_plugins.remove(&id);
+                        } else {
+                            self.disabled_plugins.insert(id.clone());
+                        }
+                        changed = true;
+                    }
+                });
+                ui.label(
+                    egui::RichText::new(format!("{} · {detail}", id))
+                        .small()
+                        .weak(),
+                );
+            });
+            ui.add_space(2.0);
+        }
+        if changed {
+            self.persist_settings();
+        }
     }
 
     /// Preferences → General: the mail list, the automatic sync, the
@@ -13374,7 +13478,13 @@ mod tests {
         let ids: Vec<String> = accounts.iter().map(|a| a.id.clone()).collect();
         let mailboxes = crate::db::load_mailboxes(&ids).unwrap_or_default();
         let settings = storage::load_settings();
-        let mut app = KimoApp::assemble(ctx, accounts, mailboxes, &settings);
+        let mut app = KimoApp::assemble(
+            ctx,
+            accounts,
+            mailboxes,
+            &settings,
+            crate::plugin::discovery::Registry::empty(),
+        );
         // The folder with the most mail, and the largest HTML body in it: the
         // worst case a splitter drag can be asked to re-lay out.
         let (account_id, folder) = app
@@ -13717,8 +13827,13 @@ mod tests {
                 folders: vec![folder],
             },
         );
-        let mut app =
-            KimoApp::assemble(ctx, vec![account], mailboxes, &storage::Settings::default());
+        let mut app = KimoApp::assemble(
+            ctx,
+            vec![account],
+            mailboxes,
+            &storage::Settings::default(),
+            crate::plugin::discovery::Registry::empty(),
+        );
         // The fixtures below measure geometry, and the warning the app carries
         // when *this machine's* database cannot be written stands at the top of
         // the middle column, over the first row. It is a fact about the machine,
@@ -13990,6 +14105,7 @@ mod tests {
             vec![account],
             HashMap::new(),
             &storage::Settings::default(),
+            crate::plugin::discovery::Registry::empty(),
         );
         assert_eq!(app.selected_folder.as_deref(), Some("INBOX"));
         assert!(app.folder_messages_of("acct", "INBOX").is_none());

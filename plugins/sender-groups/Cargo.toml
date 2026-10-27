@@ -1,0 +1,12 @@
+[package]
+name = "kimo-plugin-sender-groups"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[profile.release]
+lto = true
+strip = true

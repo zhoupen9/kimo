@@ -1,0 +1,14 @@
+{
+  "schema": 1,
+  "id": "org.kimo.sender-groups",
+  "name": "Sender groups reference extension",
+  "version": "0.1.0",
+  "abi": 1,
+  "module": "sender-groups.wasm",
+  "default_enabled": false,
+  "permissions": [],
+  "providers": [],
+  "extensions": [
+    { "id": "sender-groups", "hooks": ["organizer.v1"] }
+  ]
+}

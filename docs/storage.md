@@ -97,7 +97,10 @@ Read when touching `src/db.rs`, `src/storage.rs`, `src/search.rs`, a schema migr
   [platform.md](platform.md)), `disabled_vendors` (the provider presets
   switched off in Preferences → Accounts, by key — `"gmail"`, `"outlook"`, …;
   absent means all on, an unknown key is ignored, and `custom` is never
-  written — see [providers.md](providers.md)), and the font
+  written — see [providers.md](providers.md)), `disabled_plugins` (installed
+  plugin ids switched off in Preferences → Plugins; a disabled module is not
+  compiled or instantiated at startup, and absent means every plugin is
+  enabled — see [mail-spec.md](mail-spec.md)), and the font
   families picked in Preferences →
   Appearance (`ui_font`, `mono_font`, `cjk_font`; absent means egui's built-in
   font plus the automatic CJK fallback), and `gpu`, the PCI address of the

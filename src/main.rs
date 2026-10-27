@@ -19,6 +19,7 @@ mod mail;
 mod models;
 mod notify;
 mod outgoing;
+mod plugin;
 mod portal;
 mod protocol;
 mod provider;
@@ -63,6 +64,9 @@ struct Kimo {
     state: Option<egui_winit::State>,
     gpu: Option<gpu::Gpu>,
     app: Option<app::KimoApp>,
+    /// The startup plugin scan, handed to `KimoApp` when its first window
+    /// opens. `None` after the handoff; a hidden window keeps the app alive.
+    plugins: Option<plugin::discovery::Registry>,
     /// The window egui's repaint callback may ask for a redraw on. It is
     /// cleared when the window is dropped, so the callback does not keep a
     /// hidden window alive.
@@ -91,6 +95,14 @@ fn main() -> Result<(), winit::error::EventLoopError> {
     // Before the first allocation that could raise the allocator's mmap
     // threshold; see `crate::trim`.
     trim::init();
+
+    // Plugins are `.wasm` modules, never native shared libraries. Discovery
+    // validates the manifest and compiles the module now; it does not invoke
+    // a provider until an account or an extension hook needs one.
+    let plugin_settings = storage::load_settings();
+    let plugin_registry =
+        plugin::discovery::Registry::discover_with_disabled(&plugin_settings.disabled_plugins);
+    plugin_registry.log_startup();
 
     // Which Vulkan drivers this process may load, decided before the event loop
     // exists: the loader reads the list as it builds the first instance, and a
@@ -127,6 +139,7 @@ fn main() -> Result<(), winit::error::EventLoopError> {
         state: None,
         gpu: None,
         app: None,
+        plugins: Some(plugin_registry),
         window_slot,
         window_size: LogicalSize::new(1280.0, 800.0),
         viewport: egui::ViewportInfo::default(),
@@ -270,7 +283,11 @@ impl Kimo {
             }
         }
         if self.app.is_none() {
-            self.app = Some(app::KimoApp::new(&self.egui_ctx));
+            let plugins = self
+                .plugins
+                .take()
+                .unwrap_or_else(plugin::discovery::Registry::empty);
+            self.app = Some(app::KimoApp::new(&self.egui_ctx, plugins));
         }
         self.state = Some(state);
         self.window = Some(window.clone());

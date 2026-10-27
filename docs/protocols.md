@@ -25,6 +25,13 @@ Read when touching `src/protocol/`, `src/outgoing.rs`, a TLS setting, a charset,
   providers' servers are. Everything this page describes about the wire stays
   true underneath it; see [providers.md](providers.md).
 
+- The draft that generalizes this adapter layer into a capability-based,
+  WASM-loaded provider ABI — including Gmail's `X-GM` extensions, Microsoft
+  Graph and the GUI extension hooks — is [mail-spec.md](mail-spec.md). Its
+  host/ABI lives in `src/plugin/`; the protocol modules are not converted to
+  it yet, so this page and [providers.md](providers.md) still describe the
+  code an account uses today.
+
 ## Sync, mutations and errors
 
 - Remote mutations are `UID STORE +FLAGS.SILENT (\Seen)` (IMAP), `UID STORE
