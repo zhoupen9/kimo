@@ -21,6 +21,13 @@ use crate::smtp;
 /// The newest mail a folder's first fetch takes, one window of the same size
 /// the host's own adapters use.
 const BACKFILL_LIMIT: u32 = 50;
+/// How much body one `mailbox.sync` call may read. It is a fuel bound, not a
+/// protocol one: the interpreter has 500 M instructions per invoke, and a
+/// twenty-megabyte backfill spent all of them base64ing mail into one JSON
+/// answer. Four megabytes leaves room for the copies and encoding around the
+/// bytes, and the host asks again from the new mark. A first mail larger than
+/// this is read whole anyway — the cap never starves a folder.
+const SYNC_BUDGET_BYTES: usize = 4 * 1024 * 1024;
 /// A Gmail search expression longer than this is not a search anyone typed.
 const RAW_QUERY_CAP: usize = 1024;
 /// Token responses are small; this is the HTTP buffer the plugin offers.
@@ -489,19 +496,29 @@ fn sync_folder(client: &mut imap::Client, folder: &str, mark: &Value) -> Result<
     let oldest = client.oldest_uid(info.exists).map_err(failed)?;
 
     let mut floor = None;
+    let mut more = false;
     let fetched = if info.exists > 0 {
         match resume {
-            Some(next) => client
-                .fetch_full(&format!("{next}:*"), true)
-                .map_err(failed)?
-                .into_iter()
-                .filter(|message| message.uid >= next)
-                .collect::<Vec<Fetched>>(),
+            Some(next) => {
+                let (fetched, unfinished) = client
+                    .fetch_bounded(&format!("{next}:*"), true, SYNC_BUDGET_BYTES)
+                    .map_err(failed)?;
+                more = unfinished;
+                fetched
+                    .into_iter()
+                    .filter(|message| message.uid >= next)
+                    .collect::<Vec<Fetched>>()
+            }
             None => {
                 let start = info.exists.saturating_sub(BACKFILL_LIMIT) + 1;
-                let fetched = client
-                    .fetch_full(&format!("{start}:{}", info.exists), false)
+                // From the window's lowest sequence upward: a call that stops
+                // at the byte budget leaves the newer half of the window to
+                // the resume mark, which walks up it on the next call. The
+                // other direction would leave a hole no mark covers.
+                let (fetched, unfinished) = client
+                    .fetch_bounded(&format!("{start}:*"), false, SYNC_BUDGET_BYTES)
                     .map_err(failed)?;
+                more = unfinished;
                 floor = fetched.iter().map(|message| message.uid).min();
                 fetched
             }
@@ -516,6 +533,9 @@ fn sync_folder(client: &mut imap::Client, folder: &str, mark: &Value) -> Result<
         "first_num": floor,
         "oldest": oldest,
         "marks_before_store": false,
+        // The range was not finished: the host calls again with the mark this
+        // batch just moved, and the rest comes in another bounded call.
+        "more": more,
         "messages": fetched.iter().map(message_json).collect::<Vec<_>>(),
     }))
 }
@@ -806,14 +826,15 @@ fn auth_refresh(request: &Request) -> Response {
         return Response::error("config", "no Google OAuth client id to refresh with");
     }
     let client_secret = text(params, "client_secret").filter(|secret| !secret.is_empty());
-    let refreshed =
-        abi::http_envelope(&oauth::refresh_request(client_id, client_secret, refresh_token), HTTP_CAP)
-        .map_err(|message| Response::error("network", format!("token endpoint: {message}")))
-        .and_then(|envelope| {
-            tokens_of(&envelope).map_err(|message| {
-                Response::error("auth_failed", format!("token endpoint: {message}"))
-            })
-        });
+    let refreshed = abi::http_envelope(
+        &oauth::refresh_request(client_id, client_secret, refresh_token),
+        HTTP_CAP,
+    )
+    .map_err(|message| Response::error("network", format!("token endpoint: {message}")))
+    .and_then(|envelope| {
+        tokens_of(&envelope)
+            .map_err(|message| Response::error("auth_failed", format!("token endpoint: {message}")))
+    });
     match refreshed {
         Ok(tokens) => Response {
             ok: true,
@@ -877,6 +898,18 @@ fn uids_of(params: &Value) -> Vec<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Mutex, MutexGuard};
+
+    /// The OAuth pending sign-in is one global, so a test that writes it must
+    /// not run beside one that spends it: whichever lost the race used to fail
+    /// on a pending state the other had already taken.
+    static OAUTH_PENDING: Mutex<()> = Mutex::new(());
+
+    fn oauth_lock() -> MutexGuard<'static, ()> {
+        OAUTH_PENDING
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
 
     fn request(method: &str, operation: Option<&str>, params: Value) -> Vec<u8> {
         // The tests write credentials inside `params` for readability; the
@@ -973,6 +1006,7 @@ mod tests {
 
     #[test]
     fn auth_begin_builds_the_url_the_host_opens() {
+        let _oauth = oauth_lock();
         set_pending(None);
         let challenge = result_of(&dispatch(&request(
             "auth.begin",
@@ -1055,6 +1089,7 @@ mod tests {
 
     #[test]
     fn auth_begin_carries_the_secret_into_the_exchange() {
+        let _oauth = oauth_lock();
         set_pending(None);
         dispatch(&request(
             "auth.begin",
@@ -1079,6 +1114,7 @@ mod tests {
 
     #[test]
     fn auth_continue_checks_the_state_before_spending_the_code() {
+        let _oauth = oauth_lock();
         set_pending(None);
         dispatch(&request(
             "auth.begin",

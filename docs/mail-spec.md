@@ -1214,6 +1214,11 @@ when the call ends. A plugin never reads a file from disk to obtain one.
   a wall-clock deadline. JSON request and response are capped at 32 MiB each
   (excluding blobs), an effect list at 10,000 entries, and a page at 1,000
   mailboxes or messages.
+- A provider operation must fit its call's budget. `mailbox.sync` returns a
+  page; `more: true` says the module stopped before the range was done, and
+  the host calls again with the mark the page stored. Fetching a whole
+  folder's bodies in one call exhausts the fuel long before the mailbox is
+  synced — the Gmail module pages at 4 MiB for exactly this reason.
 - The host traps a module that runs past its fuel or deadline. A provider that
   traps or times out repeatedly is marked unhealthy for the session and its
   instance is dropped.

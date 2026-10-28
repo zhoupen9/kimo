@@ -96,6 +96,8 @@ impl MailProvider for Pop3Provider {
             // A drop's numbering starts at 1, so the window is also the floor;
             // both marks are its cold-start answers and nothing moves them again.
             first_num: cold.then_some(window as u32),
+            // One RETR loop walks the window; there is no range left to page.
+            more: false,
             oldest: cold.then_some((count > 0).then_some(1)),
             // The floor goes first: a folder with a floor and no mail is fetched
             // from that floor next time, so this order can cost a repeated pass

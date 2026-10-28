@@ -20,6 +20,7 @@ mod imap;
 mod oauth;
 mod ops;
 mod smtp;
+mod wire;
 
 /// The request buffer the host copies into. One allocation is alive at a
 /// time — the host allocates, writes, invokes — so a bump arena that is

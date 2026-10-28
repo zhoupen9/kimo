@@ -261,7 +261,7 @@ impl NetStream {
         Ok(())
     }
 
-    pub fn close(self) {
+    pub fn close(&self) {
         unsafe { raw::net_close(self.id as i32) }
     }
 }

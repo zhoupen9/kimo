@@ -30,6 +30,15 @@ UI / sync jobs                src/app.rs, src/sync.rs
   it. Do not unify the order in `sync.rs`: the two sequences are each
   protocol's own trap.
 
+- **A batch may be a page.** `FolderBatch::more` says the adapter stopped
+  short of the range it was asked for; `sync.rs` stores the page and asks
+  again with the mark it just wrote, up to `sync::MAX_SYNC_BATCHES`. The
+  built-in adapters finish their range in one call, but a plugin's invoke has
+  a byte and fuel budget, so its `mailbox.sync` pages a backfill (4 MiB in
+  the Gmail module) and a large folder arrives over several calls.
+  `new_mail` is the first page's `kind` for the whole run: a paged backfill
+  must not announce its later pages as news.
+
 - **One session per job.** `provider::open` connects, negotiates TLS and logs
   in; `provider::with` runs one closure and logs out on success and failure
   alike, which is the connection hygiene `with_imap` used to carry by hand.

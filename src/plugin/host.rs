@@ -70,14 +70,16 @@ pub struct Limits {
 impl Limits {
     pub fn for_manifest(manifest: &Manifest) -> Self {
         Self {
-            // A provider's one invoke is a whole IMAP session's worth of
-            // interpreted parsing — a folder sync base64-encodes every body —
-            // so its instruction budget is an order above an extension
-            // hook's, which answers with a small plan.
+            // A provider's one invoke is interpreted IMAP work: a folder page
+            // of up to 4 MiB of bodies, base64-encoded into one answer — and
+            // when one mail is larger than a page, that mail alone. Its budget
+            // is an order above an extension hook's, which answers with a
+            // small plan; the page size, not this ceiling, is what keeps an
+            // ordinary sync inside it.
             fuel: if manifest.is_extension_only() {
                 50_000_000
             } else {
-                500_000_000
+                1_000_000_000
             },
             memory_bytes: if manifest.is_extension_only() {
                 64 * 1024 * 1024

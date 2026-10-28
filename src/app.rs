@@ -3350,7 +3350,10 @@ impl KimoApp {
         if sign_in || (account.is_plugin() && account.access_token.is_none()) {
             self.plugin_signing_in = Some(account.id.clone());
             sync::spawn(
-                Job::PluginSignIn { account },
+                Job::PluginSignIn {
+                    account,
+                    purge: switches_mailbox,
+                },
                 self.ctx.clone(),
                 self.tx.clone(),
             );

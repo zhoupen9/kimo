@@ -177,7 +177,11 @@ pub enum Job {
     /// catches the loopback redirect, and the module exchanges the code for
     /// tokens, which land in the account row. The browser leg is why this is
     /// a job like any other — it waits minutes, not milliseconds.
-    PluginSignIn { account: Account },
+    ///
+    /// The row is written first — the tokens are an UPDATE on it — and
+    /// `purge` is the form's `switches_mailbox`: the cache describes the
+    /// endpoint the old settings reached and goes before the browser opens.
+    PluginSignIn { account: Account, purge: bool },
     /// Ask the desktop for the files to attach to the mail being written: the
     /// XDG portal's own file chooser, which runs in the *compositor's* process
     /// (`crate::portal`). It is a job because the call does not come back until
@@ -513,11 +517,26 @@ pub fn spawn(job: Job, ctx: egui::Context, tx: Sender<Event>) {
             }
             worker_wake(&ctx);
         }
-        Job::PluginSignIn { account } => {
+        Job::PluginSignIn { account, purge } => {
             // No SyncStarted/SyncDone: the thing the user waits for is a
             // browser, and the account form is what reports the outcome.
+            //
+            // The row is written before the browser opens, not after the
+            // grant: the tokens are an UPDATE on it, so a new account whose
+            // row was only ever in the window would have its tokens land in
+            // nothing and be gone at the next start. A sign-in the user
+            // abandons leaves the saved account behind, which is what
+            // "Save & connect" asked for.
             let account_id = account.id.clone();
-            let error = plugin_sign_in(&account)
+            let error = db::save_account(&account)
+                .and_then(|()| {
+                    if purge {
+                        db::purge_mail(&account.id)
+                    } else {
+                        Ok(())
+                    }
+                })
+                .and_then(|()| plugin_sign_in(&account))
                 .err()
                 .map(|error| error.to_string());
             let _ = tx.send(Event::PluginAuth { account_id, error });
@@ -966,6 +985,12 @@ fn sync_folder_job(account: &Account, folder: &str, tx: &Sender<Event>) -> MailR
     })
 }
 
+/// How many bounded calls one folder sync may make. Each is its own invoke
+/// with its own fuel and response cap; the cap keeps a module that keeps
+/// saying "more" from holding the worker forever. What is left is picked up
+/// by the next sync, from the mark the last batch stored.
+const MAX_SYNC_BATCHES: usize = 64;
+
 /// Store one folder's fetch and announce it, in the order the adapter says.
 fn fetch_into(
     provider: &mut dyn provider::MailProvider,
@@ -973,40 +998,56 @@ fn fetch_into(
     account: &Account,
     tx: &Sender<Event>,
 ) -> MailResult<()> {
-    let mark = folder_mark(&account.id, folder, provider.capabilities().stored_uids)?;
-    let provider::FolderBatch {
-        uidvalidity,
-        messages,
-        kind,
-        first_num,
-        oldest,
-        marks_before_store,
-    } = provider.fetch_folder(folder, &mark)?;
-    if marks_before_store {
-        write_marks(&account.id, folder, first_num, oldest)?;
-    }
-    // Store before announcing: nothing may appear in the window that the
-    // database does not already have. The batch moves the folder's mark in the
-    // same transaction. A warm folder with nothing new is left untouched: no
-    // write, and no event for a list that did not change.
-    if kind == provider::FetchKind::Fill || !messages.is_empty() {
-        db::save_messages(&account.id, folder, uidvalidity, &messages)?;
-        let _ = tx.send(Event::Messages {
-            account_id: account.id.clone(),
-            folder: folder.to_string(),
+    let mut mark = folder_mark(&account.id, folder, provider.capabilities().stored_uids)?;
+    // The first batch decides what the whole fetch is. A plugin with a byte
+    // budget pages a large folder over several calls; the later pages resume
+    // at the mark, and their `Resume` must not turn a backfill into news.
+    let mut news: Option<bool> = None;
+    for _ in 0..MAX_SYNC_BATCHES {
+        let provider::FolderBatch {
             uidvalidity,
             messages,
-            // A fetch that resumed at the folder's mark asked for exactly the
-            // UIDs it did not have: what came back arrived since the last one.
-            // A folder filled for the first time (or after a UIDVALIDITY
-            // rotation) is the folder's backfill, not news.
-            new_mail: kind == provider::FetchKind::Resume,
-        });
+            kind,
+            first_num,
+            oldest,
+            marks_before_store,
+            more,
+        } = provider.fetch_folder(folder, &mark)?;
+        let new_mail = *news.get_or_insert(kind == provider::FetchKind::Resume);
+        let empty = messages.is_empty();
+        if marks_before_store {
+            write_marks(&account.id, folder, first_num, oldest)?;
+        }
+        // Store before announcing: nothing may appear in the window that the
+        // database does not already have. The batch moves the folder's mark in
+        // the same transaction. A warm folder with nothing new is left
+        // untouched: no write, and no event for a list that did not change.
+        if kind == provider::FetchKind::Fill || !empty {
+            db::save_messages(&account.id, folder, uidvalidity, &messages)?;
+            let _ = tx.send(Event::Messages {
+                account_id: account.id.clone(),
+                folder: folder.to_string(),
+                uidvalidity,
+                messages,
+                // A fetch that resumed at the folder's mark asked for exactly
+                // the UIDs it did not have: what came back arrived since the
+                // last one. A folder filled for the first time (or after a
+                // UIDVALIDITY rotation) is the folder's backfill, not news.
+                new_mail,
+            });
+        }
+        if !marks_before_store {
+            write_marks(&account.id, folder, first_num, oldest)?;
+        }
+        report_older(&account.id, folder, tx)?;
+        if !more || empty {
+            return Ok(());
+        }
+        // The next page resumes where this one stopped; an empty page means
+        // the range is done even when the module thought otherwise.
+        mark = folder_mark(&account.id, folder, provider.capabilities().stored_uids)?;
     }
-    if !marks_before_store {
-        write_marks(&account.id, folder, first_num, oldest)?;
-    }
-    report_older(&account.id, folder, tx)
+    Ok(())
 }
 
 /// Fetch the older mail of one folder: the batch below the floor it has been

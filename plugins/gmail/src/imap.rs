@@ -112,44 +112,72 @@ impl Client {
 
     /// XOAUTH2 with the error continuation: Gmail answers a bad token with
     /// `+ <base64 JSON>` and only refuses after the client sends an empty
-    /// line. Skipping that step leaves the session wedged, so it is here.
+    /// line. Skipping that step leaves the session wedged, so it is here —
+    /// and after the token, which is where Gmail actually puts it. The first
+    /// version only read it before the token, so a refused token became a
+    /// sixty-second read timeout instead of an authentication failure.
     pub fn authenticate_xoauth2(&mut self, user: &str, token: &str) -> Result<(), Failed> {
         use base64::Engine as _;
         let tag = self.next_tag();
         self.write_line(&format!("{tag} AUTHENTICATE XOAUTH2"))?;
         let answer = self.read_line()?;
-        if let Some(payload) = answer.strip_prefix('+') {
-            let payload = payload.trim();
-            if payload.is_empty() {
-                let blob = base64::engine::general_purpose::STANDARD
-                    .encode(crate::oauth::xoauth2(user, token));
-                self.write_line(&blob)?;
-            } else {
-                // The server's own error, base64-encoded JSON: decode it for
-                // the message, then finish the exchange so the connection
-                // says NO instead of hanging.
-                let reason = base64::engine::general_purpose::STANDARD
-                    .decode(payload)
-                    .ok()
-                    .and_then(|bytes| String::from_utf8(bytes).ok())
-                    .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
-                    .and_then(|json| {
-                        json.get("sasl")
-                            .or_else(|| json.get("error"))
-                            .and_then(serde_json::Value::as_str)
-                            .map(str::to_string)
-                    })
-                    .unwrap_or_else(|| "the token was refused".to_string());
-                self.write_line("")?;
-                let _ = self.read_until_tag(&tag);
-                return Err(Failed::Auth(reason));
-            }
-        } else {
+        if !answer.starts_with('+') {
             return Err(Failed::Protocol(format!(
                 "the server did not ask for the token: {answer}"
             )));
         }
-        self.expect_tag(&tag)
+        // The first continuation is the empty one. A payload in it is the
+        // server refusing before it ever asked for the token.
+        if !answer[1..].trim().is_empty() {
+            return Err(self.refuse_auth(&tag, &answer[1..]));
+        }
+        let blob =
+            base64::engine::general_purpose::STANDARD.encode(crate::oauth::xoauth2(user, token));
+        self.write_line(&blob)?;
+        // After the token: the tagged answer, or one more continuation with
+        // the base64 JSON refusal that has to be cancelled before the tag.
+        loop {
+            let line = self.read_line()?;
+            if let Some(payload) = line.strip_prefix('+') {
+                return Err(self.refuse_auth(&tag, payload));
+            }
+            let Some(status) = line.strip_prefix(&format!("{tag} ")) else {
+                continue;
+            };
+            let reason = status
+                .split_once(' ')
+                .map(|(_, rest)| rest.to_string())
+                .unwrap_or_else(|| status.to_string());
+            return if status.starts_with("OK") {
+                Ok(())
+            } else if status.starts_with("NO") {
+                Err(Failed::Auth(reason))
+            } else {
+                Err(Failed::Protocol(reason))
+            };
+        }
+    }
+
+    /// The base64 JSON in a refusal continuation: its own word for the
+    /// message, then the empty line the SASL exchange needs to end, and the
+    /// tagged answer read so the session is not left half-way.
+    fn refuse_auth(&mut self, tag: &str, payload: &str) -> Failed {
+        use base64::Engine as _;
+        let reason = base64::engine::general_purpose::STANDARD
+            .decode(payload.trim())
+            .ok()
+            .and_then(|bytes| String::from_utf8(bytes).ok())
+            .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
+            .and_then(|json| {
+                json.get("sasl")
+                    .or_else(|| json.get("error"))
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string)
+            })
+            .unwrap_or_else(|| "the token was refused".to_string());
+        let _ = self.write_line("");
+        let _ = self.read_until_tag(tag);
+        Failed::Auth(reason)
     }
 
     /// The app-password path: plain LOGIN, no less a citizen than OAuth.
@@ -216,26 +244,69 @@ impl Client {
     /// The full fetch the sync runs: flags, bodies and — when the extension
     /// is there — labels and both Gmail ids.
     pub fn fetch_full(&mut self, set: &str, by_uid: bool) -> Result<Vec<Fetched>, Failed> {
+        self.fetch_bounded(set, by_uid, usize::MAX)
+            .map(|(messages, _)| messages)
+    }
+
+    /// The same fetch, stopping once `budget` bytes of body have been read.
+    /// The second value says the range was not finished, so the caller's new
+    /// mark picks the rest up in the next call: one interpreted call has one
+    /// fuel budget, and a backfill of fifty full mails is more than it can
+    /// base64 in one go. A range whose first mail alone is over budget is
+    /// still read — progress before the cap.
+    pub fn fetch_bounded(
+        &mut self,
+        set: &str,
+        by_uid: bool,
+        budget: usize,
+    ) -> Result<(Vec<Fetched>, bool), Failed> {
         let items = if self.has(GM_EXT) {
             "(UID FLAGS X-GM-LABELS X-GM-THRID X-GM-MSGID BODY.PEEK[])"
         } else {
             "(UID FLAGS BODY.PEEK[])"
         };
-        let command = if by_uid {
-            format!("UID FETCH {set} {items}")
-        } else {
-            format!("FETCH {set} {items}")
-        };
+        let verb = if by_uid { "UID FETCH" } else { "FETCH" };
+        let tag = self.next_tag();
+        self.write_line(&format!("{tag} {verb} {set} {items}"))?;
+        let prefix = format!("{tag} ");
         let mut messages = Vec::new();
-        for line in self.run(&command)? {
+        let mut bytes = 0usize;
+        loop {
+            let text = self.read_line()?;
+            if let Some(status) = text.strip_prefix(&prefix) {
+                if status.starts_with("OK") {
+                    return Ok((messages, false));
+                }
+                let reason = status
+                    .split_once(' ')
+                    .map(|(_, rest)| rest.to_string())
+                    .unwrap_or_else(|| status.to_string());
+                return Err(Failed::Protocol(reason));
+            }
+            let mut line = Line {
+                text,
+                literal: None,
+            };
+            if let Some(size) = trailing_literal(&line.text) {
+                // The next body does not fit. Leave it unread: dropping the
+                // client closes the stream, and the mark resumes at it.
+                if bytes >= budget && !messages.is_empty() {
+                    return Ok((messages, true));
+                }
+                line.literal = Some(self.read_exact(size)?);
+                bytes += size;
+                line.text.push_str(&self.read_line()?);
+            }
             if abi::cancelled() {
                 return Err(Failed::Protocol("the call was cancelled".to_string()));
             }
             if let Some(fetched) = parse_fetch(&line.text, line.literal.as_deref()) {
                 messages.push(fetched);
             }
+            if bytes >= budget && !messages.is_empty() {
+                return Ok((messages, true));
+            }
         }
-        Ok(messages)
     }
 
     pub fn uid_store_flags(&mut self, uid: u32, add: bool, flag: &str) -> Result<(), Failed> {
@@ -371,11 +442,8 @@ impl Client {
 
     fn read_line(&mut self) -> Result<String, Failed> {
         loop {
-            if let Some(position) = find_line_end(&self.buffer) {
-                let line: Vec<u8> = self.buffer.drain(..=position).collect();
-                let mut line = line;
-                line.truncate(line.len().saturating_sub(2)); // drop \r\n
-                return Ok(String::from_utf8_lossy(&line).into_owned());
+            if let Some(line) = crate::wire::take_line(&mut self.buffer) {
+                return Ok(line);
             }
             let mut chunk = [0u8; 4096];
             let read = self.stream.read(&mut chunk).map_err(Failed::Network)?;
@@ -401,8 +469,13 @@ impl Client {
     }
 }
 
-fn find_line_end(buffer: &[u8]) -> Option<usize> {
-    buffer.windows(2).position(|pair| pair == b"\r\n")
+impl Drop for Client {
+    /// The host keeps every open stream in a table keyed by id; one left open
+    /// is a socket and its TLS state held for the whole job. Every operation
+    /// ends with logout(), so the drop is what actually closes the wire.
+    fn drop(&mut self) {
+        self.stream.close();
+    }
 }
 
 /// `{3417}` at the end of a line: the literal size that follows.

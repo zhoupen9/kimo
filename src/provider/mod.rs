@@ -117,6 +117,11 @@ pub struct FolderBatch {
     /// it. IMAP writes them after, because `db::save_messages` clears both
     /// marks when the UIDVALIDITY moved and the new ones have to survive it.
     pub marks_before_store: bool,
+    /// The adapter stopped short of the range it was asked for and has more
+    /// to give: a plugin whose one call has a byte budget pages a large
+    /// folder this way. The built-in adapters always finish their range, so
+    /// they leave this false.
+    pub more: bool,
 }
 
 /// One `Load older mail` fetch, before anything is stored or announced.

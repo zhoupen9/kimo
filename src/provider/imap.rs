@@ -96,6 +96,7 @@ impl MailProvider for ImapProvider {
                 FetchKind::Fill
             },
             first_num: floor,
+            more: false,
             // The answer is recorded either way: an empty mailbox is one.
             oldest: Some(oldest),
             // `save_messages` clears both marks when the generation moved, so

@@ -425,6 +425,9 @@ impl MailProvider for WasmProvider {
                 .get("marks_before_store")
                 .and_then(Value::as_bool)
                 .unwrap_or(false),
+            // An additive field: an older module that pages nothing leaves
+            // the folder finished in one call.
+            more: result.get("more").and_then(Value::as_bool).unwrap_or(false),
         })
     }
 

@@ -315,6 +315,9 @@ mod tests {
         assert!(decoded.starts_with("grant_type=authorization_code&code=c%2Fde&"));
         assert!(decoded.contains("code_verifier=v-v"));
         // The secret rides last: Google will not trade the code without it.
-        assert!(decoded.contains("&client_id=cid&client_secret=secret-1"), "{decoded}");
+        assert!(
+            decoded.contains("&client_id=cid&client_secret=secret-1"),
+            "{decoded}"
+        );
     }
 }

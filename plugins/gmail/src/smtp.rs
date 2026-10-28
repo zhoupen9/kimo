@@ -127,11 +127,8 @@ impl Client {
 
     fn read_line(&mut self) -> Result<String, String> {
         loop {
-            if let Some(position) = self.buffer.windows(2).position(|pair| pair == b"\r\n") {
-                let line: Vec<u8> = self.buffer.drain(..=position).collect();
-                let mut line = line;
-                line.truncate(line.len().saturating_sub(2));
-                return Ok(String::from_utf8_lossy(&line).into_owned());
+            if let Some(line) = crate::wire::take_line(&mut self.buffer) {
+                return Ok(line);
             }
             let mut chunk = [0u8; 4096];
             let read = self.stream.read(&mut chunk)?;
@@ -140,6 +137,14 @@ impl Client {
             }
             self.buffer.extend_from_slice(&chunk[..read]);
         }
+    }
+}
+
+impl Drop for Client {
+    /// The host stream lives in a table keyed by its id until it is closed;
+    /// a submission that finished or failed must not leave the socket there.
+    fn drop(&mut self) {
+        self.stream.close();
     }
 }
 
