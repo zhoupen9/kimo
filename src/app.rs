@@ -14795,6 +14795,55 @@ mod tests {
         );
     }
 
+    /// The hidden half of the same clock. With the window dropped there is no
+    /// frame to run `pump_auto_sync`, so `pump_hidden` is what starts an overdue
+    /// sweep — the path `Kimo::hide_window` arms by pumping as it drops the
+    /// window. A hide that ran no frame (the compositor's close) used to clear
+    /// the only deadline the loop had and sleep through every interval.
+    #[test]
+    fn a_hidden_clock_sweeps_when_its_interval_is_up() {
+        let ctx = egui::Context::default();
+        crate::fonts::install(&ctx, None, None, None);
+        let mut app = app_with_messages(&ctx, 1);
+        // A port with nothing behind it: the sweep reaches the job, which fails
+        // to connect. That it starts is the question, as in the visible test.
+        app.accounts[0].host = "127.0.0.1".to_string();
+        app.accounts[0].port = 1;
+        app.auto_sync_every = Duration::from_secs(10 * SECS_PER_MINUTE);
+        let quiet = |app: &mut KimoApp| {
+            while app.rx.try_recv().is_ok() {}
+        };
+
+        // Switched on, not yet due: a hidden tick sweeps nothing.
+        app.auto_sync = true;
+        app.auto_synced_at = Instant::now();
+        quiet(&mut app);
+        app.pump_hidden();
+        assert!(
+            !sync_starts_within(&mut app, Duration::from_millis(300)),
+            "the interval has not passed"
+        );
+
+        // Due: the sweep starts with no frame involved.
+        app.auto_synced_at = Instant::now() - Duration::from_secs(601);
+        quiet(&mut app);
+        app.pump_hidden();
+        assert!(
+            sync_starts_within(&mut app, Duration::from_secs(5)),
+            "a hidden clock starts its sweep once the interval is up"
+        );
+
+        // And the preference still has the last word.
+        app.auto_sync = false;
+        app.auto_synced_at = Instant::now() - Duration::from_secs(3600);
+        quiet(&mut app);
+        app.pump_hidden();
+        assert!(
+            !sync_starts_within(&mut app, Duration::from_millis(300)),
+            "nothing sweeps on a clock nobody asked for"
+        );
+    }
+
     /// The title bar's Sync asks for a sweep at any time — the app syncs at
     /// startup on its own, and this is the same sweep by hand. It is what the
     /// cell means now: "sync now", not "the mode that needs a manual sync".

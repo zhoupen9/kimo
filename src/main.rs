@@ -318,6 +318,12 @@ impl Kimo {
         self.window = None;
         self.actions.clear();
         self.redraw_at = None;
+        // The deadline just cleared was the only timer a windowless Kimo had,
+        // and the compositor's close reaches here without a frame to set
+        // another. Pumping now puts the next auto-sync wait on the wake
+        // channel (`pump_hidden`): without it the loop sleeps through every
+        // interval until the window is opened again.
+        self.pump_hidden();
     }
 
     /// Hide the window for the tray. X11 can unmap it and keep it for a later

@@ -127,9 +127,18 @@ impl ImapClient {
     /// The oldest message the selected mailbox holds: `FETCH 1 (UID)` asks for
     /// the *first* message by sequence number, and sequence numbers run in UID
     /// order, so the first one is the oldest — one line of answer instead of a
-    /// UID set the size of the mailbox. `None` is an empty mailbox, which is an
-    /// answer too.
-    pub fn oldest_uid(&mut self) -> MailResult<Option<u32>> {
+    /// UID set the size of the mailbox.
+    ///
+    /// `exists` is the SELECT's own answer, and it is what keeps an empty
+    /// mailbox from being asked: `FETCH 1` would name the sequence number of a
+    /// message that is not there, and not every server answers that with
+    /// nothing. Sina's says `BAD ... sequence ... out of range`, which failed
+    /// every empty folder's sync. `None` is an empty mailbox, which is an
+    /// answer too — the one SELECT already gave.
+    pub fn oldest_uid(&mut self, exists: u32) -> MailResult<Option<u32>> {
+        if exists == 0 {
+            return Ok(None);
+        }
         let (_, untagged) = self.run("FETCH 1 (UID)")?;
         Ok(untagged.iter().find_map(|line| extract_uid(line)))
     }
@@ -799,8 +808,10 @@ mod tests {
 
     /// The oldest message is asked for by *sequence* number — `FETCH 1 (UID)`,
     /// not a UID set — because a sequence number is what is ordered by UID and
-    /// can name the oldest message in one line. An empty mailbox answers with
-    /// no FETCH line at all, which is not an error.
+    /// can name the oldest message in one line. A mailbox with no messages is
+    /// not asked at all: `FETCH 1` would name a sequence number that does not
+    /// exist, which Sina answers `BAD ... sequence ... out of range` — so the
+    /// SELECT's count is the whole answer, and no command follows it.
     #[test]
     fn the_oldest_uid_is_the_first_message_by_sequence_number() {
         let (account, server) = one_shot_server(vec![
@@ -820,11 +831,11 @@ mod tests {
         ]);
         let mut client = ImapClient::connect(&account).unwrap();
         client.list_folders().unwrap();
-        client.select("INBOX").unwrap();
-        assert_eq!(client.oldest_uid().unwrap(), Some(480));
+        let info = client.select("INBOX").unwrap();
+        assert_eq!(client.oldest_uid(info.exists).unwrap(), Some(480));
         server.join().unwrap();
 
-        // The same mailbox, empty: the server answers the FETCH with nothing.
+        // The same mailbox, empty: nothing to name, so nothing is sent.
         let (account, server) = one_shot_server(vec![
             (
                 "LIST \"\" \"*\"",
@@ -835,13 +846,18 @@ mod tests {
                 "SELECT \"INBOX\"",
                 "* 0 EXISTS\r\n{tag} OK [READ-WRITE] SELECT completed\r\n".to_string(),
             ),
-            ("FETCH 1 (UID)", "{tag} OK FETCH completed\r\n".to_string()),
         ]);
         let mut client = ImapClient::connect(&account).unwrap();
         client.list_folders().unwrap();
-        client.select("INBOX").unwrap();
-        assert_eq!(client.oldest_uid().unwrap(), None);
-        server.join().unwrap();
+        let info = client.select("INBOX").unwrap();
+        assert_eq!(info.exists, 0);
+        assert_eq!(client.oldest_uid(info.exists).unwrap(), None);
+        let commands = server.join().unwrap();
+        assert_eq!(
+            commands.len(),
+            2,
+            "an empty mailbox is not asked: {commands:?}"
+        );
     }
 
     /// A server without UIDPLUS rejects `UID EXPUNGE`; the message has just

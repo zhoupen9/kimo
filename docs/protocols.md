@@ -43,6 +43,18 @@ Read when touching `src/protocol/`, `src/outgoing.rs`, a TLS setting, a charset,
   is one connection carrying every mail of one folder. See the deletion bullet in
   [ui-mail.md](ui-mail.md) for the whole rule.
 
+- **A sequence number is only asked for when it exists.** Positional FETCHes
+  are the cheap way to do two jobs — `FETCH 1 (UID)` names the oldest message
+  (`oldest_uid`), and the first sync of a folder takes the newest
+  `BACKFILL_LIMIT` by position — but a position past `EXISTS` is not something
+  every server ignores. Sina answers `FETCH 1` in an empty mailbox with `BAD
+  Bongus sequence in FETCH: Sequence out of range`, which failed every empty
+  folder's sync; SELECT had already said the mailbox holds nothing. So
+  `oldest_uid` takes the SELECT's count and answers `None` without a command
+  when it is zero, and the backfill range is only asked for when the count is
+  non-zero. `UID FETCH` is exempt: RFC 3501 has a server ignore a UID the
+  mailbox no longer has, which is why the delete probe stays one line.
+
 - Errors: return `MailResult<T>`; convert with `?` (From impls exist for
   io/rustls/serde_json/rusqlite). `MailError::Db` is SQLite's own error and
   `MailError::Storage` everything else the storage layer can fail at. Map
