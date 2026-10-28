@@ -1,0 +1,18 @@
+{
+  "schema": 1,
+  "id": "org.kimo.gmail",
+  "name": "Gmail",
+  "version": "0.1.0",
+  "abi": 1,
+  "module": "gmail.wasm",
+  "default_enabled": false,
+  "permissions": ["net.http", "net.tls", "secrets"],
+  "providers": [{ "id": "gmail", "name": "Gmail" }],
+  "extensions": [],
+  "network": [
+    { "transport": "https", "host": "accounts.google.com" },
+    { "transport": "https", "host": "oauth2.googleapis.com" },
+    { "transport": "tls", "host": "imap.gmail.com", "port": 993 },
+    { "transport": "tls", "host": "smtp.gmail.com", "port": 465 }
+  ]
+}

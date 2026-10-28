@@ -4,6 +4,9 @@
 //! the same operation vocabulary.
 
 pub mod abi;
+#[allow(dead_code)]
+// The account form wires the OAuth flow in the next step; tests exercise it now.
+pub mod auth;
 pub mod discovery;
 pub mod extension;
 #[allow(dead_code)] // The account form wires this adapter in the next step; tests exercise it now.

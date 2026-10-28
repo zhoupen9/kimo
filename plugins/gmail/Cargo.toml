@@ -1,0 +1,23 @@
+[package]
+name = "kimo-plugin-gmail"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+# The module is interpreted by Kimo's wasmi host, never run natively, so the
+# release profile is the one that matters: small and fully stripped. The
+# dependencies are pure Rust (hard rule 1 applies to a plugin module too —
+# nothing here may link a C library, and on wasm32 nothing does).
+[profile.release]
+lto = true
+strip = true
+opt-level = "s"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+base64 = "0.22"
+sha2 = "0.10"

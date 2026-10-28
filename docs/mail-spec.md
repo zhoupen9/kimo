@@ -7,10 +7,14 @@ instance, permissions, fuel and memory limits, extension-plan validation and a
 switches plugins on and off (a disabled module is not compiled at startup),
 and the host has a real HTTP/TLS backend, manifest network rules are enforced
 as an endpoint allowlist, [`plugins/echo`](../plugins/echo/) is a minimal
-reference provider, and [`plugins/sender-groups`](../plugins/sender-groups/) is
-a minimal reference extension. The reference IMAP/POP3/SMTP/Gmail/Graph
-modules and account selection are not built yet; the current client still
-reads IMAP/POP3 through `src/protocol/` and has no plugin-backed account. The target specification version is 1.0; this file is the 0.1 review
+reference provider, [`plugins/sender-groups`](../plugins/sender-groups/) is
+a minimal reference extension, and [`plugins/gmail`](../plugins/gmail/) is
+the first real provider: XOAUTH2, all four `X-GM-EXT-1` extensions, Gmail
+submission, and an OAuth2 authorization-code flow whose browser leg the
+host runs (`src/plugin/auth.rs`: loopback redirect, the desktop's OpenURI
+portal, `xdg-open` fallback). The IMAP/POP3/SMTP/Graph reference modules
+and account selection are not built yet; the current client still reads
+IMAP/POP3 through `src/protocol/` and has no plugin-backed account. The target specification version is 1.0; this file is the 0.1 review
 copy.
 
 Read this when designing or reviewing a provider plugin, an extension, a new
@@ -699,6 +703,13 @@ The host renders the challenge, opens URLs in the user's browser (never an
 embedded web view), collects secrets and stores the returned credentials. The
 provider never sees an OAuth refresh token it did not need; it can request
 `auth.refresh` through the host when a token expires.
+
+A flow that redirects to a loopback gets its port from the host: the socket
+is bound before `auth.begin` runs, and its port arrives in the call's
+`params.redirect_port`, so the redirect URI the provider builds names a port
+something is listening on. The redirect's `code` and `state` go back in
+`auth.continue`'s params; the state is what ties the answer to this window,
+and a provider consumes its pending flow with the call, win or lose.
 
 ### 5.5 Provider operations
 

@@ -72,7 +72,15 @@ pub struct Limits {
 impl Limits {
     pub fn for_manifest(manifest: &Manifest) -> Self {
         Self {
-            fuel: 50_000_000,
+            // A provider's one invoke is a whole IMAP session's worth of
+            // interpreted parsing — a folder sync base64-encodes every body —
+            // so its instruction budget is an order above an extension
+            // hook's, which answers with a small plan.
+            fuel: if manifest.is_extension_only() {
+                50_000_000
+            } else {
+                500_000_000
+            },
             memory_bytes: if manifest.is_extension_only() {
                 64 * 1024 * 1024
             } else {
@@ -92,16 +100,11 @@ pub struct WasmPlugin {
     limits: Limits,
     engine: Engine,
     module: Module,
-    network: Arc<dyn HostNetwork>,
     allowed: Vec<NetworkRule>,
 }
 
 impl WasmPlugin {
-    pub fn load(
-        manifest: Manifest,
-        bytes: &[u8],
-        network: Arc<dyn HostNetwork>,
-    ) -> Result<Self, HostError> {
+    pub fn load(manifest: Manifest, bytes: &[u8]) -> Result<Self, HostError> {
         let permissions = manifest
             .validate()
             .map_err(|error| HostError::Manifest(error.to_string()))?;
@@ -120,7 +123,6 @@ impl WasmPlugin {
             limits,
             engine,
             module,
-            network,
             allowed: manifest.network,
         })
     }
@@ -133,7 +135,19 @@ impl WasmPlugin {
         self.limits
     }
 
+    /// Instantiate with the deny-everything backend: the startup probe and the
+    /// extension hooks. A provider account passes its own `StdNetwork`.
     pub fn instantiate(&self) -> Result<PluginInstance, HostError> {
+        self.instantiate_with(Arc::new(DeniedNetwork))
+    }
+
+    /// Instantiate with the caller's network backend. The backend is per
+    /// instance, not per module: discovery compiles once with no network at
+    /// all, and an account that opens the provider hands it the real one.
+    pub fn instantiate_with(
+        &self,
+        network: Arc<dyn HostNetwork>,
+    ) -> Result<PluginInstance, HostError> {
         let state = HostState {
             permissions: self.permissions,
             logs: Vec::new(),
@@ -141,7 +155,7 @@ impl WasmPlugin {
             cancel: Arc::new(AtomicBool::new(false)),
             blobs: HashMap::new(),
             next_blob: 1,
-            network: Arc::clone(&self.network),
+            network,
             allowed: self.allowed.clone(),
             limiter: MemoryLimiter::new(self.limits.memory_bytes),
         };
@@ -798,17 +812,14 @@ impl std::error::Error for HostError {}
 
 /// Read a manifest from a plugin directory and compile its module. This is
 /// the loader the registry uses; tests can call it with a WAT fixture.
-pub fn load_directory(
-    directory: &std::path::Path,
-    network: Arc<dyn HostNetwork>,
-) -> Result<(Manifest, WasmPlugin), HostError> {
+pub fn load_directory(directory: &std::path::Path) -> Result<(Manifest, WasmPlugin), HostError> {
     let manifest_path = directory.join(MANIFEST_FILE);
     let manifest =
         Manifest::load(&manifest_path).map_err(|error| HostError::Manifest(error.to_string()))?;
     let module_path = manifest.module_path(directory);
     let bytes = std::fs::read(&module_path)
         .map_err(|error| HostError::Module(format!("{}: {error}", module_path.display())))?;
-    let plugin = WasmPlugin::load(manifest.clone(), &bytes, network)?;
+    let plugin = WasmPlugin::load(manifest.clone(), &bytes)?;
     Ok((manifest, plugin))
 }
 
@@ -914,12 +925,7 @@ mod tests {
 
     #[test]
     fn invokes_the_json_abi() {
-        let plugin = WasmPlugin::load(
-            manifest(true, &[]),
-            echo_module().as_bytes(),
-            Arc::new(DeniedNetwork),
-        )
-        .unwrap();
+        let plugin = WasmPlugin::load(manifest(true, &[]), echo_module().as_bytes()).unwrap();
         let mut instance = plugin.instantiate().unwrap();
         let response = instance
             .invoke(&PluginRequest::operation(
@@ -940,11 +946,7 @@ mod tests {
             (func (export "kimo_alloc") (param i32) (result i32) i32.const 4096)
             (func (export "kimo_free") (param i32 i32))
             (func (export "kimo_invoke") (param i32 i32) (result i64) i64.const 0))"#;
-        let error = match WasmPlugin::load(
-            manifest(true, &[]),
-            module.as_bytes(),
-            Arc::new(DeniedNetwork),
-        ) {
+        let error = match WasmPlugin::load(manifest(true, &[]), module.as_bytes()) {
             Ok(_) => panic!("a network import without permission was accepted"),
             Err(error) => error,
         };
@@ -976,12 +978,7 @@ mod tests {
                     i64.or))"#,
             response.len()
         );
-        let plugin = WasmPlugin::load(
-            manifest(true, &[]),
-            module.as_bytes(),
-            Arc::new(DeniedNetwork),
-        )
-        .unwrap();
+        let plugin = WasmPlugin::load(manifest(true, &[]), module.as_bytes()).unwrap();
         let mut instance = plugin.instantiate().unwrap();
         instance
             .invoke(&PluginRequest::new("provider.describe"))
@@ -995,12 +992,8 @@ mod tests {
     fn organizer_plan_is_validated_before_it_reaches_the_list() {
         let response =
             r#"{"ok":true,"result":{"groups":[{"id":"g","title":"Group","message_ids":["m1"]}]}}"#;
-        let plugin = WasmPlugin::load(
-            manifest(false, &[]),
-            response_module(response).as_bytes(),
-            Arc::new(DeniedNetwork),
-        )
-        .unwrap();
+        let plugin =
+            WasmPlugin::load(manifest(false, &[]), response_module(response).as_bytes()).unwrap();
         let mut instance = plugin.instantiate().unwrap();
         let plan = instance
             .organizer(&PluginRequest::new("extension.invoke"), &["m1".to_string()])
@@ -1011,12 +1004,8 @@ mod tests {
     #[test]
     fn display_plan_is_validated_before_it_reaches_the_pane() {
         let response = r#"{"ok":true,"result":{"content":{"mode":"keep"}}}"#;
-        let plugin = WasmPlugin::load(
-            manifest(false, &[]),
-            response_module(response).as_bytes(),
-            Arc::new(DeniedNetwork),
-        )
-        .unwrap();
+        let plugin =
+            WasmPlugin::load(manifest(false, &[]), response_module(response).as_bytes()).unwrap();
         let mut instance = plugin.instantiate().unwrap();
         let plan = instance
             .display(&PluginRequest::new("extension.invoke"))
@@ -1033,7 +1022,6 @@ mod tests {
         let plugin = WasmPlugin::load(
             manifest,
             include_bytes!("../../plugins/sender-groups/sender-groups.wasm"),
-            Arc::new(DeniedNetwork),
         )
         .unwrap();
         let mut instance = plugin.instantiate().unwrap();
@@ -1049,7 +1037,6 @@ mod tests {
         let plugin = WasmPlugin::load(
             manifest(true, &["net.http"]),
             http_module(request).as_bytes(),
-            Arc::new(DeniedNetwork),
         )
         .unwrap();
         let mut instance = plugin.instantiate().unwrap();
@@ -1068,12 +1055,7 @@ mod tests {
             host: "example.com".to_string(),
             port: None,
         }];
-        let plugin = WasmPlugin::load(
-            manifest,
-            http_module(request).as_bytes(),
-            Arc::new(DeniedNetwork),
-        )
-        .unwrap();
+        let plugin = WasmPlugin::load(manifest, http_module(request).as_bytes()).unwrap();
         let mut instance = plugin.instantiate().unwrap();
         instance
             .invoke(&PluginRequest::new("provider.describe"))
@@ -1083,12 +1065,7 @@ mod tests {
 
     #[test]
     fn traps_a_runaway_module() {
-        let plugin = WasmPlugin::load(
-            manifest(true, &[]),
-            loop_module().as_bytes(),
-            Arc::new(DeniedNetwork),
-        )
-        .unwrap();
+        let plugin = WasmPlugin::load(manifest(true, &[]), loop_module().as_bytes()).unwrap();
         let mut instance = plugin.instantiate().unwrap();
         let error = instance
             .invoke(&PluginRequest::new("provider.describe"))

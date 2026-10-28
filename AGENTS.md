@@ -58,8 +58,10 @@ Kimo is a desktop **email client** GUI written in pure Rust:
    Sent mailbox (`APPEND`, IMAP accounts only). Deliberately still out of
    scope, each its own decision by the project owner: drafts of any kind
    (nothing about a draft is persisted), an outbox/queue or any retry, HTML
-   bodies, DKIM or any signing, and OAuth2/XOAUTH2 — SMTP
-   authentication is `AUTH PLAIN`/`AUTH LOGIN` over TLS.
+   bodies, and DKIM or any signing. The *built-in* SMTP path authenticates
+   with `AUTH PLAIN`/`AUTH LOGIN` over TLS only. OAuth2/XOAUTH2 is decided
+   and allowed **for plugin providers** (the Gmail module; browser flow in
+   `src/plugin/auth.rs`) — do not add it to the built-in clients.
 5. **Keep the dependency tree small.** Every new crate needs a concrete
    justification; prefer std where reasonable.
 6. **UI strings are English.** CJK rendering is handled by the best-effort
@@ -110,6 +112,9 @@ src/tray.rs             StatusNotifierItem over the session bus (std::thread) + 
 src/wake.rs             the event loop's wake channel, for work that finishes while the window is hidden
 src/notify.rs           new-mail notifications over the session bus (std::thread) + their 48·scale icon
 src/sync.rs             Job/Event enums, worker threads, and the database/Event side of every mailbox job
+src/plugin/             the WASM plugin host: manifest/ABI, discovery, the wasmi instance,
+                        the HTTP/TLS backend an account hands its instances, the OAuth
+                        browser flow (loopback + OpenURI), the MailProvider adapter
 src/provider/mod.rs     the abstract MailProvider interface: one adapter per read protocol
 src/provider/imap.rs    the IMAP adapter: folders, incremental fetch, flags, delete, append
 src/provider/pop3.rs    the POP3 adapter: the one drop, older mail, delete, body
@@ -132,6 +137,7 @@ src/protocol/smtp.rs    minimal SMTP submission client (EHLO capabilities, START
 | [docs/storage.md](docs/storage.md) | `src/db.rs`, `src/storage.rs`, `src/search.rs`, a schema migration, an XDG path |
 | [docs/protocols.md](docs/protocols.md) | `src/protocol/`, a TLS setting, a charset, the mapping of a server's refusal |
 | [docs/providers.md](docs/providers.md) | `src/provider/`, a vendor preset, the account form's Provider row, a new mailbox operation |
+| [docs/mail-spec.md](docs/mail-spec.md) | `src/plugin/`, a provider or extension plugin under `plugins/`, the WASM ABI, an OAuth flow, an X-GM mapping |
 | [docs/ui-shell.md](docs/ui-shell.md) | `src/main.rs`, `src/gpu.rs`, `src/gpus.rs`, `src/glass.rs`, the title bar, the column plan, the navigation column |
 | [docs/ui-mail.md](docs/ui-mail.md) | a list row, threading, select mode, the search box and its popup, the reading pane, attachments, labels, flags, filters, sort |
 | [docs/ui-style.md](docs/ui-style.md) | drawing a widget: an icon or a disclosure, a mail address field, the Cc/Bcc fold |

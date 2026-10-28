@@ -6,10 +6,9 @@
 //! collected with its path and never stops the rest of Kimo from starting.
 
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 
 use super::abi::{Manifest, MANIFEST_FILE};
-use super::host::{DeniedNetwork, WasmPlugin};
+use super::host::WasmPlugin;
 
 /// A plugin that passed manifest validation and module compilation.
 pub struct LoadedPlugin {
@@ -115,17 +114,16 @@ impl Registry {
                         continue;
                     }
                 };
-                let plugin =
-                    match WasmPlugin::load(manifest.clone(), &bytes, Arc::new(DeniedNetwork)) {
-                        Ok(plugin) => plugin,
-                        Err(error) => {
-                            errors.push(DiscoveryError {
-                                path: directory,
-                                message: error.to_string(),
-                            });
-                            continue;
-                        }
-                    };
+                let plugin = match WasmPlugin::load(manifest.clone(), &bytes) {
+                    Ok(plugin) => plugin,
+                    Err(error) => {
+                        errors.push(DiscoveryError {
+                            path: directory,
+                            message: error.to_string(),
+                        });
+                        continue;
+                    }
+                };
                 if let Err(error) = plugin.instantiate() {
                     errors.push(DiscoveryError {
                         path: directory,
@@ -234,12 +232,8 @@ mod tests {
     #[test]
     fn the_echo_sample_is_a_loadable_wasm_module() {
         let manifest = Manifest::parse(include_str!("../../plugins/echo/plugin.json")).unwrap();
-        let plugin = WasmPlugin::load(
-            manifest,
-            include_bytes!("../../plugins/echo/echo.wasm"),
-            Arc::new(DeniedNetwork),
-        )
-        .unwrap();
+        let plugin =
+            WasmPlugin::load(manifest, include_bytes!("../../plugins/echo/echo.wasm")).unwrap();
         let mut instance = plugin.instantiate().unwrap();
         let response = instance
             .invoke(&crate::plugin::abi::PluginRequest::new("plugin.describe"))
@@ -248,11 +242,54 @@ mod tests {
     }
 
     #[test]
-    fn the_two_samples_are_discovered_from_their_directories() {
+    fn the_gmail_sample_describes_and_signs_in_through_the_abi() {
+        let manifest = Manifest::parse(include_str!("../../plugins/gmail/plugin.json")).unwrap();
+        let plugin =
+            WasmPlugin::load(manifest, include_bytes!("../../plugins/gmail/gmail.wasm")).unwrap();
+        let mut instance = plugin.instantiate().unwrap();
+
+        let described = instance
+            .invoke(&crate::plugin::abi::PluginRequest::new("provider.describe"))
+            .unwrap();
+        assert!(described.ok);
+        let profiles: Vec<&str> = described.result["profiles"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|profile| profile.as_str())
+            .collect();
+        assert!(profiles.contains(&"kimo-gmail/1"));
+        let capabilities: Vec<&str> = described.result["capabilities"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|capability| capability["name"].as_str())
+            .collect();
+        assert!(capabilities.contains(&"message.set_labels"));
+        assert!(capabilities.contains(&"query.raw"));
+        assert!(capabilities.contains(&"thread.native"));
+
+        // The sign-in URL is the one thing the host opens a browser for; it
+        // has to name the loopback port the host is holding a socket for.
+        let mut request = crate::plugin::abi::PluginRequest::new("auth.begin");
+        request.params = serde_json::json!({
+            "redirect_port": 8914,
+            "client_id": "test-client.apps.googleusercontent.com"
+        });
+        let challenge = instance.invoke(&request).unwrap();
+        assert!(challenge.ok, "{:?}", challenge.error);
+        let url = challenge.result["url"].as_str().unwrap();
+        assert!(url.starts_with("https://accounts.google.com/"), "{url}");
+        assert!(url.contains("redirect_uri=http%3A%2F%2Flocalhost%3A8914%2F"));
+        assert!(url.contains("code_challenge_method=S256"));
+    }
+
+    #[test]
+    fn the_samples_are_discovered_from_their_directories() {
         let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
         let registry = Registry::discover_from(&[root.join("plugins")]);
         assert_eq!(registry.errors().len(), 0, "{:?}", registry.errors());
-        assert_eq!(registry.plugins().len(), 2);
+        assert_eq!(registry.plugins().len(), 3);
         let ids: Vec<&str> = registry
             .plugins()
             .iter()
@@ -260,6 +297,7 @@ mod tests {
             .collect();
         assert!(ids.contains(&"org.kimo.echo"));
         assert!(ids.contains(&"org.kimo.sender-groups"));
+        assert!(ids.contains(&"org.kimo.gmail"));
     }
 
     #[test]
@@ -270,7 +308,8 @@ mod tests {
             &["org.kimo.echo".to_string()],
         );
         assert_eq!(registry.errors().len(), 0, "{:?}", registry.errors());
-        assert_eq!(registry.plugins().len(), 1);
+        // The other two samples (sender-groups and gmail) still load.
+        assert_eq!(registry.plugins().len(), 2);
         assert_eq!(registry.disabled().len(), 1);
         assert_eq!(registry.disabled()[0].id, "org.kimo.echo");
     }

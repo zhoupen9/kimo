@@ -49,8 +49,68 @@ pub fn save_file(name: &str, folder: &Path) -> MailResult<Option<PathBuf>> {
     let mut files = ask(&mut bus, SAVE_FILE, &save_args(&next_token(), name, folder))?;
     // A save answers with exactly one URI — the interface says so — and the
     // first is that file. More than one would be a portal contradicting itself,
-    // and the first is still the file it was asked about.
+    // and the first is still the file it was asked for.
     Ok(files.pop())
+}
+
+/// Ask the desktop to open a web page in the user's own browser. This is the
+/// one thing an OAuth2 sign-in needs from the platform: the consent page must
+/// be Google's, shown by a browser Google trusts, and Kimo must never see
+/// anything the user types into it. An embedded web view would be a browser of
+/// Kimo's own — a much larger promise than a mail client wants to make — so the
+/// page goes to `org.freedesktop.portal.OpenURI` and the desktop picks the
+/// browser. The answer is waited for only to know the desktop had one to ask;
+/// what the user does on the page is between them and the browser.
+pub fn open_uri(uri: &str) -> MailResult<()> {
+    let mut bus = chooser()?;
+    let serial = bus
+        .call_no_reply(
+            PORTAL_BUS,
+            PORTAL_PATH,
+            "org.freedesktop.portal.OpenURI",
+            "OpenURI",
+            &[
+                // The same empty parent the file dialog sends: no window to
+                // own the browser, which is exactly right here.
+                Value::Str(String::new()),
+                Value::Str(uri.to_string()),
+                Value::Array {
+                    signature: "{sv}".to_string(),
+                    values: Vec::new(),
+                },
+            ],
+        )
+        .map_err(|error| {
+            MailError::Protocol(format!("the browser could not be asked for: {error}"))
+        })?;
+    loop {
+        let message = bus
+            .read_message()
+            .map_err(|error| MailError::Protocol(format!("the browser went quiet: {error}")))?;
+        if message.reply_serial == Some(serial) {
+            if message.kind == dbus::MSG_ERROR {
+                return Err(MailError::Protocol(format!(
+                    "the desktop refused to open the page: {}",
+                    message.error_name.as_deref().unwrap_or("error")
+                )));
+            }
+            // The request object: the outcome arrives on it, as a signal.
+            continue;
+        }
+        if message.member.as_deref() != Some(RESPONSE) {
+            continue;
+        }
+        // `(u response, a{sv} results)`: `0` is the page opened, `1` is the
+        // desktop declining or having nothing to open it with.
+        let mut reader = dbus::Unmarshal::new(&message.body);
+        return if reader.uint32() == Some(0) {
+            Ok(())
+        } else {
+            Err(MailError::Protocol(
+                "the desktop did not open the page".to_string(),
+            ))
+        };
+    }
 }
 
 /// The two calls this makes. `OpenFile` and `SaveFile` are the names the

@@ -7,6 +7,7 @@
 
 use base64::Engine as _;
 use serde_json::{json, Value};
+use std::sync::Arc;
 
 use crate::error::{MailError, MailResult};
 use crate::mail;
@@ -16,7 +17,7 @@ use crate::provider::{
 };
 
 use super::abi::PluginRequest;
-use super::host::{HostError, PluginInstance, WasmPlugin};
+use super::host::{HostError, HostNetwork, PluginInstance, WasmPlugin};
 
 /// One plugin-backed mailbox session. The instance is single-threaded, just
 /// like the existing adapters; `sync.rs` calls it from a worker only.
@@ -32,8 +33,9 @@ impl WasmProvider {
         plugin: &WasmPlugin,
         account: &Account,
         capabilities: crate::provider::Capabilities,
+        network: Arc<dyn HostNetwork>,
     ) -> Result<Self, HostError> {
-        let instance = plugin.instantiate()?;
+        let instance = plugin.instantiate_with(network)?;
         Ok(Self {
             instance,
             account: account.clone(),
@@ -337,10 +339,15 @@ mod tests {
         let plugin = WasmPlugin::load(
             manifest,
             module(r#"{"ok":true,"result":["INBOX"]}"#).as_bytes(),
-            std::sync::Arc::new(crate::plugin::host::DeniedNetwork),
         )
         .unwrap();
-        let mut provider = WasmProvider::open(&plugin, &account(), capabilities()).unwrap();
+        let mut provider = WasmProvider::open(
+            &plugin,
+            &account(),
+            capabilities(),
+            Arc::new(crate::plugin::host::DeniedNetwork),
+        )
+        .unwrap();
         assert_eq!(provider.folders().unwrap(), vec!["INBOX"]);
     }
 }

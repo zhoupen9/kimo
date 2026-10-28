@@ -206,7 +206,8 @@ static GMAIL: VendorProfile = VendorProfile {
     auth: AuthKind::AppPassword,
     note: Some(
         "Gmail refuses the account password: create an app password (Google Account → \
-         Security → 2-Step Verification → App passwords). OAuth2 is not supported.",
+         Security → 2-Step Verification → App passwords). OAuth2 is the Gmail plugin's \
+         path, not this built-in one.",
     ),
     preferred_sent: &["[Gmail]/Sent Mail"],
 };
