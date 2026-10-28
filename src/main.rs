@@ -66,7 +66,9 @@ struct Kimo {
     app: Option<app::KimoApp>,
     /// The startup plugin scan, handed to `KimoApp` when its first window
     /// opens. `None` after the handoff; a hidden window keeps the app alive.
-    plugins: Option<plugin::discovery::Registry>,
+    /// The same scan is installed for worker threads (`discovery::install`),
+    /// which open a plugin provider without a UI hand-off.
+    plugins: Option<std::sync::Arc<plugin::discovery::Registry>>,
     /// The window egui's repaint callback may ask for a redraw on. It is
     /// cleared when the window is dropped, so the callback does not keep a
     /// hidden window alive.
@@ -100,9 +102,14 @@ fn main() -> Result<(), winit::error::EventLoopError> {
     // validates the manifest and compiles the module now; it does not invoke
     // a provider until an account or an extension hook needs one.
     let plugin_settings = storage::load_settings();
-    let plugin_registry =
-        plugin::discovery::Registry::discover_with_disabled(&plugin_settings.disabled_plugins);
+    let plugin_registry = std::sync::Arc::new(plugin::discovery::Registry::discover_with_disabled(
+        &plugin_settings.disabled_plugins,
+    ));
     plugin_registry.log_startup();
+    // Worker threads resolve plugin accounts through the installed scan
+    // rather than a hand-off through the UI, which a job spawned from the
+    // tray or the sync clock has no path for.
+    plugin::discovery::install(plugin_registry.clone());
 
     // Which Vulkan drivers this process may load, decided before the event loop
     // exists: the loader reads the list as it builds the first instance, and a
@@ -286,7 +293,7 @@ impl Kimo {
             let plugins = self
                 .plugins
                 .take()
-                .unwrap_or_else(plugin::discovery::Registry::empty);
+                .unwrap_or_else(|| std::sync::Arc::new(plugin::discovery::Registry::empty()));
             self.app = Some(app::KimoApp::new(&self.egui_ctx, plugins));
         }
         self.state = Some(state);

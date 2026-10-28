@@ -197,6 +197,11 @@ mod tests {
             password: "secret".to_string(),
             tls: TlsMode::Plain,
             smtp: None,
+            provider: None,
+            provider_config: None,
+            access_token: None,
+            refresh_token: None,
+            token_expires_at: None,
         };
         (account, server)
     }

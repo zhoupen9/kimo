@@ -52,7 +52,7 @@ use crate::models::{
 use crate::storage::{self, Folder, Mailbox};
 
 /// The schema version this build writes and understands.
-pub const SCHEMA_VERSION: i64 = 9;
+pub const SCHEMA_VERSION: i64 = 10;
 
 /// How long a statement waits for another writer before giving up. Jobs hold
 /// the connection only around their SQL, so this is a backstop, not a plan.
@@ -83,6 +83,15 @@ CREATE TABLE IF NOT EXISTS accounts (
     smtp_tls      TEXT CHECK (smtp_tls IN ('implicit', 'start_tls', 'plain')),
     smtp_username TEXT,
     smtp_password TEXT,
+    -- Plugin-backed accounts (schema v10). A NULL provider is the built-in
+    -- client the protocol column names, which is every account before this.
+    -- The three token columns are a plugin provider's OAuth2 sign-in; the
+    -- config column is the plugin's own JSON (the OAuth client id, hints).
+    provider          TEXT,
+    provider_config   TEXT,
+    access_token      TEXT,
+    refresh_token     TEXT,
+    token_expires_at  INTEGER,
     -- The navigation column's order. New accounts append; editing one keeps it.
     position INTEGER NOT NULL
 );
@@ -316,6 +325,21 @@ CREATE TABLE IF NOT EXISTS message_labels (
 /// lands at the end of the table, which is where `SCHEMA_SQL` puts it too.
 const MIGRATE_V9_SQL: &str = r#"
 ALTER TABLE messages ADD COLUMN flagged INTEGER NOT NULL DEFAULT 0;
+"#;
+
+/// The step from `user_version` 9 to 10: plugin-backed accounts. `provider`
+/// names the plugin contribution that owns the account's sessions (NULL is
+/// the built-in client, which is every account so far); `provider_config`
+/// is the plugin's own JSON; the three token columns are the OAuth2 sign-in
+/// a plugin provider ran in the browser. Nothing is derived — a database
+/// from before this step has no plugin accounts — and every column lands
+/// NULL.
+const MIGRATE_V10_SQL: &str = r#"
+ALTER TABLE accounts ADD COLUMN provider          TEXT;
+ALTER TABLE accounts ADD COLUMN provider_config   TEXT;
+ALTER TABLE accounts ADD COLUMN access_token      TEXT;
+ALTER TABLE accounts ADD COLUMN refresh_token     TEXT;
+ALTER TABLE accounts ADD COLUMN token_expires_at  INTEGER;
 "#;
 
 /// IMAP's floor as the mail a database from before version 4 already implies:
@@ -634,6 +658,12 @@ fn migrate(conn: &mut Connection, legacy: Option<(&Path, &Path)>) -> MailResult<
         tx.pragma_update(None, "user_version", 9)?;
         tx.commit()?;
     }
+    if start < 10 {
+        let tx = conn.transaction()?;
+        tx.execute_batch(MIGRATE_V10_SQL)?;
+        tx.pragma_update(None, "user_version", 10)?;
+        tx.commit()?;
+    }
     Ok(())
 }
 
@@ -678,7 +708,8 @@ pub fn load_accounts() -> MailResult<Vec<Account>> {
 fn load_accounts_on(conn: &Connection) -> MailResult<Vec<Account>> {
     let mut stmt = conn.prepare(
         "SELECT id, name, protocol, host, port, username, password, tls,
-                smtp_host, smtp_port, smtp_tls, smtp_username, smtp_password
+                smtp_host, smtp_port, smtp_tls, smtp_username, smtp_password,
+                provider, provider_config, access_token, refresh_token, token_expires_at
            FROM accounts ORDER BY position, id",
     )?;
     let rows = stmt.query_map([], |row| {
@@ -696,6 +727,11 @@ fn load_accounts_on(conn: &Connection) -> MailResult<Vec<Account>> {
             row.get::<_, Option<String>>(10)?,
             row.get::<_, Option<String>>(11)?,
             row.get::<_, Option<String>>(12)?,
+            row.get::<_, Option<String>>(13)?,
+            row.get::<_, Option<String>>(14)?,
+            row.get::<_, Option<String>>(15)?,
+            row.get::<_, Option<String>>(16)?,
+            row.get::<_, Option<i64>>(17)?,
         ))
     })?;
     let mut accounts = Vec::new();
@@ -714,6 +750,11 @@ fn load_accounts_on(conn: &Connection) -> MailResult<Vec<Account>> {
             smtp_tls,
             smtp_username,
             smtp_password,
+            provider,
+            provider_config,
+            access_token,
+            refresh_token,
+            token_expires_at,
         ) = row?;
         let protocol = Protocol::parse(&protocol).ok_or_else(|| {
             MailError::Storage(format!("account {id}: unknown protocol {protocol:?}"))
@@ -730,6 +771,10 @@ fn load_accounts_on(conn: &Connection) -> MailResult<Vec<Account>> {
             smtp_username,
             smtp_password,
         )?;
+        let token_expires_at = token_expires_at
+            .map(u64::try_from)
+            .transpose()
+            .map_err(|_| MailError::Storage(format!("account {id}: token expiry out of range")))?;
         accounts.push(Account {
             id,
             name,
@@ -740,6 +785,11 @@ fn load_accounts_on(conn: &Connection) -> MailResult<Vec<Account>> {
             password,
             tls,
             smtp,
+            provider,
+            provider_config,
+            access_token,
+            refresh_token,
+            token_expires_at,
         });
     }
     Ok(accounts)
@@ -812,8 +862,11 @@ fn save_account_on(conn: &Connection, account: &Account) -> MailResult<()> {
     conn.execute(
         "INSERT INTO accounts (id, name, protocol, host, port, username, password, tls,
                                smtp_host, smtp_port, smtp_tls, smtp_username, smtp_password,
+                               provider, provider_config,
+                               access_token, refresh_token, token_expires_at,
                                position)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13,
+                 ?14, ?15, ?16, ?17, ?18,
                  (SELECT COALESCE(MAX(position), -1) + 1 FROM accounts))
          ON CONFLICT(id) DO UPDATE SET
              name          = excluded.name,
@@ -827,7 +880,12 @@ fn save_account_on(conn: &Connection, account: &Account) -> MailResult<()> {
              smtp_port     = excluded.smtp_port,
              smtp_tls      = excluded.smtp_tls,
              smtp_username = excluded.smtp_username,
-             smtp_password = excluded.smtp_password",
+             smtp_password = excluded.smtp_password,
+             provider      = excluded.provider,
+             provider_config = excluded.provider_config,
+             access_token  = excluded.access_token,
+             refresh_token = excluded.refresh_token,
+             token_expires_at = excluded.token_expires_at",
         params![
             account.id,
             account.name,
@@ -842,6 +900,44 @@ fn save_account_on(conn: &Connection, account: &Account) -> MailResult<()> {
             smtp_tls,
             smtp_username,
             smtp_password,
+            account.provider,
+            account.provider_config,
+            account.access_token,
+            account.refresh_token,
+            account.token_expires_at.map(|at| at as i64),
+        ],
+    )?;
+    Ok(())
+}
+
+/// Store a plugin provider's sign-in tokens. The refresh path of a live
+/// session writes them mid-flight; a token that reaches the database is one
+/// the next job does not have to ask the browser for again.
+pub fn save_account_tokens(
+    id: &str,
+    access_token: Option<&str>,
+    refresh_token: Option<&str>,
+    expires_at: Option<u64>,
+) -> MailResult<()> {
+    let db = db()?;
+    save_account_tokens_on(db.conn(), id, access_token, refresh_token, expires_at)
+}
+
+fn save_account_tokens_on(
+    conn: &Connection,
+    id: &str,
+    access_token: Option<&str>,
+    refresh_token: Option<&str>,
+    expires_at: Option<u64>,
+) -> MailResult<()> {
+    conn.execute(
+        "UPDATE accounts SET access_token = ?2, refresh_token = ?3, token_expires_at = ?4
+          WHERE id = ?1",
+        params![
+            id,
+            access_token,
+            refresh_token,
+            expires_at.map(|at| at as i64)
         ],
     )?;
     Ok(())
@@ -1704,8 +1800,14 @@ impl LegacyAccount {
             username: self.username.clone(),
             password: self.password.clone(),
             tls,
-            // The old accounts.json never described an outgoing server.
+            // The old accounts.json never described an outgoing server,
+            // and never a plugin provider: both were born after it.
             smtp: None,
+            provider: None,
+            provider_config: None,
+            access_token: None,
+            refresh_token: None,
+            token_expires_at: None,
         })
     }
 }
@@ -1880,6 +1982,17 @@ pub(crate) mod test_support {
         if version < 9 {
             sql.push_str("ALTER TABLE messages DROP COLUMN flagged;\n");
         }
+        if version < 10 {
+            for column in [
+                "provider",
+                "provider_config",
+                "access_token",
+                "refresh_token",
+                "token_expires_at",
+            ] {
+                sql.push_str(&format!("ALTER TABLE accounts DROP COLUMN {column};\n"));
+            }
+        }
         conn.execute_batch(&sql).unwrap();
         conn.pragma_update(None, "user_version", version).unwrap();
     }
@@ -1896,6 +2009,11 @@ pub(crate) mod test_support {
             password: "secret".to_string(),
             tls: TlsMode::Implicit,
             smtp: None,
+            provider: None,
+            provider_config: None,
+            access_token: None,
+            refresh_token: None,
+            token_expires_at: None,
         }
     }
 
@@ -1951,6 +2069,11 @@ mod tests {
             password: "secret".to_string(),
             tls: TlsMode::Implicit,
             smtp: None,
+            provider: None,
+            provider_config: None,
+            access_token: None,
+            refresh_token: None,
+            token_expires_at: None,
         }
     }
 
@@ -3111,6 +3234,84 @@ mod tests {
         assert_eq!(kept.subject, "Hello again", "the fetch updated the row");
         assert!(kept.flagged, "and left the reader's own mark alone");
         integrity_check_on(&conn).unwrap();
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A database from version 9 gains the plugin account columns, every one
+    /// NULL: no account there has a provider, a config or a token, and none
+    /// could have meant one — a plugin account is the thing this step is for.
+    #[test]
+    fn a_version_9_database_gains_the_plugin_account_columns() {
+        let (mut conn, dir) = test_db("migrate-v10");
+        save_account_on(&conn, &account("work")).unwrap();
+        rewind_to(&conn, 9);
+        assert!(
+            conn.prepare("SELECT provider FROM accounts").is_err(),
+            "the column is what the step is for"
+        );
+
+        migrate(&mut conn, None).unwrap();
+        assert_eq!(
+            count(&conn, "SELECT * FROM pragma_user_version"),
+            SCHEMA_VERSION
+        );
+        let accounts = load_accounts_on(&conn).unwrap();
+        assert_eq!(accounts.len(), 1);
+        let account = &accounts[0];
+        assert_eq!(account.provider, None);
+        assert_eq!(account.provider_config, None);
+        assert_eq!(account.access_token, None);
+        assert_eq!(account.refresh_token, None);
+        assert_eq!(account.token_expires_at, None);
+        assert!(
+            !account.is_plugin(),
+            "a migrated account is the built-in kind"
+        );
+        integrity_check_on(&conn).unwrap();
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A plugin account round-trips through its row: the provider, its config
+    /// and the tokens a sign-in left are one account, read back whole.
+    #[test]
+    fn a_plugin_account_round_trips_with_its_tokens() {
+        let (conn, dir) = test_db("plugin-account");
+        let mut gmail = account("work");
+        gmail.provider = Some("gmail".to_string());
+        gmail.provider_config = Some(r#"{"client_id":"cid-1"}"#.to_string());
+        gmail.access_token = Some("access".to_string());
+        gmail.refresh_token = Some("refresh".to_string());
+        gmail.token_expires_at = Some(1_700_000_000_000);
+        save_account_on(&conn, &gmail).unwrap();
+
+        let accounts = load_accounts_on(&conn).unwrap();
+        assert_eq!(accounts, vec![gmail]);
+        assert!(accounts[0].is_plugin());
+        assert!(
+            accounts[0].can_send(),
+            "the module files its own submission"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A refreshed token lands in the row without disturbing anything else.
+    #[test]
+    fn refreshed_tokens_replace_only_the_tokens() {
+        let (conn, dir) = test_db("token-save");
+        save_account_on(&conn, &account("work")).unwrap();
+        save_account_tokens_on(
+            &conn,
+            "work",
+            Some("new access"),
+            Some("new refresh"),
+            Some(1_800_000_000_000),
+        )
+        .unwrap();
+        let accounts = load_accounts_on(&conn).unwrap();
+        assert_eq!(accounts[0].access_token.as_deref(), Some("new access"));
+        assert_eq!(accounts[0].refresh_token.as_deref(), Some("new refresh"));
+        assert_eq!(accounts[0].token_expires_at, Some(1_800_000_000_000));
+        assert_eq!(accounts[0].name, "Account work");
         let _ = fs::remove_dir_all(&dir);
     }
 

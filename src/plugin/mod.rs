@@ -4,14 +4,13 @@
 //! the same operation vocabulary.
 
 pub mod abi;
-#[allow(dead_code)]
-// The account form wires the OAuth flow in the next step; tests exercise it now.
 pub mod auth;
 pub mod discovery;
+// The extension hooks (organizer.v1 / display.v1) have no UI worker yet;
+// the plans and the two instance methods that validate them are the
+// published half of that contract.
+#[allow(dead_code)]
 pub mod extension;
-#[allow(dead_code)] // The account form wires this adapter in the next step; tests exercise it now.
 pub mod host;
-#[allow(dead_code)] // The account form wires this adapter in the next step; tests exercise it now.
 pub mod net;
-#[allow(dead_code)] // The account form wires this adapter in the next step; tests exercise it now.
 pub mod provider;

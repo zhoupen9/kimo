@@ -172,6 +172,12 @@ pub enum Job {
     /// message cached for it. The account travels with the job so a failure can
     /// hand it back ([`Event::AccountRemoveFailed`]).
     DeleteAccount { account: Account },
+    /// Sign a plugin provider account in with OAuth2: the module builds the
+    /// authorization URL, the host opens the desktop's browser on it and
+    /// catches the loopback redirect, and the module exchanges the code for
+    /// tokens, which land in the account row. The browser leg is why this is
+    /// a job like any other — it waits minutes, not milliseconds.
+    PluginSignIn { account: Account },
     /// Ask the desktop for the files to attach to the mail being written: the
     /// XDG portal's own file chooser, which runs in the *compositor's* process
     /// (`crate::portal`). It is a job because the call does not come back until
@@ -253,6 +259,13 @@ pub enum Event {
     AccountRemoveFailed {
         account: Account,
         error: String,
+    },
+    /// A plugin provider sign-in finished. `error: None` is tokens in the
+    /// account row and mail about to sync; `Some` is the browser flow's own
+    /// words — refused, timed out, no plugin — for the account form to say.
+    PluginAuth {
+        account_id: String,
+        error: Option<String>,
     },
     /// Whether the server has older mail below what one folder holds — the
     /// answer the list's `Load older mail` button is drawn from. Sent by every
@@ -500,6 +513,16 @@ pub fn spawn(job: Job, ctx: egui::Context, tx: Sender<Event>) {
             }
             worker_wake(&ctx);
         }
+        Job::PluginSignIn { account } => {
+            // No SyncStarted/SyncDone: the thing the user waits for is a
+            // browser, and the account form is what reports the outcome.
+            let account_id = account.id.clone();
+            let error = plugin_sign_in(&account)
+                .err()
+                .map(|error| error.to_string());
+            let _ = tx.send(Event::PluginAuth { account_id, error });
+            worker_wake(&ctx);
+        }
         Job::LoadOlder { account, folder } => {
             // A round trip like any other: the account's spinner says the
             // server is being asked while it happens.
@@ -674,6 +697,7 @@ pub fn spawn(job: Job, ctx: egui::Context, tx: Sender<Event>) {
                 | Job::LoadOlder { .. }
                 | Job::SetLabels { .. }
                 | Job::DeleteAccount { .. }
+                | Job::PluginSignIn { .. }
                 | Job::SetFlag { .. }
                 | Job::PickFiles => unreachable!(),
             };
@@ -720,6 +744,7 @@ pub fn spawn(job: Job, ctx: egui::Context, tx: Sender<Event>) {
                 | Job::LoadOlder { .. }
                 | Job::SetLabels { .. }
                 | Job::DeleteAccount { .. }
+                | Job::PluginSignIn { .. }
                 | Job::SetFlag { .. }
                 | Job::PickFiles => unreachable!(),
             };
@@ -1227,11 +1252,6 @@ fn send_message(
             invalid.join(", ")
         )));
     }
-    let Some(smtp) = &account.smtp else {
-        return Err(MailError::Protocol(
-            "this account has no outgoing server".to_string(),
-        ));
-    };
     let recipients: Vec<String> = mail.recipients().into_iter().map(str::to_string).collect();
     // The files are read here, on the worker: the card holds their paths
     // (`OutgoingAttachment`) and the UI thread reads no files at all. One that
@@ -1242,18 +1262,64 @@ fn send_message(
     // there is somewhere to keep it — into the Sent mailbox: a copy that
     // differs from what was delivered is worse than no copy at all.
     let raw = crate::outgoing::render(mail, &attachments, unix_now());
-    let mut client = SmtpClient::connect(&smtp.host, smtp.port, smtp.tls)?;
-    // No username is a submission server that wants no login — a local relay,
-    // or a server that authenticates by address alone.
-    if let Some((user, pass)) = account.smtp_login() {
-        if !user.is_empty() {
-            client.login(user, pass)?;
+    // A plugin provider submits through its own module (XOAUTH2 on Gmail,
+    // `sendMail` on Graph); everything else is SMTP submission, as it always
+    // was.
+    if account.is_plugin() {
+        crate::plugin::provider::submit_for_account(account, &mail.from_addr, &recipients, &raw)?;
+    } else {
+        let Some(smtp) = &account.smtp else {
+            return Err(MailError::Protocol(
+                "this account has no outgoing server".to_string(),
+            ));
+        };
+        let mut client = SmtpClient::connect(&smtp.host, smtp.port, smtp.tls)?;
+        // No username is a submission server that wants no login — a local
+        // relay, or a server that authenticates by address alone.
+        if let Some((user, pass)) = account.smtp_login() {
+            if !user.is_empty() {
+                client.login(user, pass)?;
+            }
         }
+        client.send(&mail.from_addr, &recipients, &raw)?;
+        client.quit();
     }
-    client.send(&mail.from_addr, &recipients, &raw)?;
-    client.quit();
     let copy = append_to_sent(account, &raw, vendor, tx);
     Ok((recipients, copy))
+}
+
+/// One OAuth2 sign-in for a plugin provider account: the module's URL, the
+/// desktop's browser, the loopback redirect, the module's token exchange —
+/// and the account row the tokens land in.
+fn plugin_sign_in(account: &Account) -> MailResult<()> {
+    let provider = account
+        .provider
+        .as_deref()
+        .ok_or_else(|| MailError::Protocol("the account names no plugin provider".to_string()))?;
+    let missing = || {
+        MailError::Protocol(format!(
+            "the {provider} provider plugin is not installed or enabled"
+        ))
+    };
+    let registry = crate::plugin::discovery::installed().ok_or_else(missing)?;
+    let loaded = registry.provider(provider).ok_or_else(missing)?;
+    let client_id = crate::plugin::provider::client_id_of(account);
+    let params = serde_json::json!({
+        "client_id": client_id,
+        "login_hint": account.username,
+    });
+    let credentials = crate::plugin::auth::sign_in(
+        &loaded.plugin,
+        std::sync::Arc::new(crate::plugin::net::StdNetwork::default()),
+        params,
+    )?;
+    db::save_account_tokens(
+        &account.id,
+        Some(&credentials.access_token),
+        credentials.refresh_token.as_deref(),
+        credentials.expires_at,
+    )?;
+    Ok(())
 }
 
 /// The current time in unix seconds: what the `Date:` header says. A clock
@@ -1498,6 +1564,11 @@ mod tests {
                 tls: crate::models::TlsMode::Plain,
                 login: None,
             }),
+            provider: None,
+            provider_config: None,
+            access_token: None,
+            refresh_token: None,
+            token_expires_at: None,
         };
         let mail = Outgoing {
             from_name: account.name.clone(),
@@ -1841,6 +1912,11 @@ mod tests {
             password: "secret".to_string(),
             tls: crate::models::TlsMode::Plain,
             smtp: None,
+            provider: None,
+            provider_config: None,
+            access_token: None,
+            refresh_token: None,
+            token_expires_at: None,
         };
         let dir = std::env::temp_dir().join(format!("kimo-download-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);

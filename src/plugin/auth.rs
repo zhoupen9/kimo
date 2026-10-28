@@ -150,14 +150,17 @@ pub fn sign_in_with(
 pub fn refresh(
     plugin: &WasmPlugin,
     network: Arc<dyn HostNetwork>,
-    credentials: &Credentials,
+    refresh_token: &str,
+    client_id: &str,
 ) -> MailResult<Credentials> {
     let mut instance = plugin
         .instantiate_with(network)
         .map_err(|error| auth_error("the plugin cannot start", &error))?;
-    let params = serde_json::to_value(credentials)
-        .map_err(|error| MailError::Protocol(format!("the refresh is malformed: {error}")))?;
-    let done = invoke(&mut instance, PluginRequest::new("auth.refresh"), params)?;
+    let done = invoke(
+        &mut instance,
+        PluginRequest::new("auth.refresh"),
+        json!({ "refresh_token": refresh_token, "client_id": client_id }),
+    )?;
     let credentials = done
         .get("credentials")
         .cloned()

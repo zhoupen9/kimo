@@ -12,9 +12,13 @@ a minimal reference extension, and [`plugins/gmail`](../plugins/gmail/) is
 the first real provider: XOAUTH2, all four `X-GM-EXT-1` extensions, Gmail
 submission, and an OAuth2 authorization-code flow whose browser leg the
 host runs (`src/plugin/auth.rs`: loopback redirect, the desktop's OpenURI
-portal, `xdg-open` fallback). The IMAP/POP3/SMTP/Graph reference modules
-and account selection are not built yet; the current client still reads
-IMAP/POP3 through `src/protocol/` and has no plugin-backed account. The target specification version is 1.0; this file is the 0.1 review
+portal, `xdg-open` fallback). The IMAP/POP3/SMTP/Graph reference
+modules are not built yet, and the current client still reads IMAP/POP3
+through `src/protocol/` — but a plugin-backed account is wired: the Gmail
+module's provider is an entry in the account form (a dedicated entry per
+installed provider), its OAuth2 sign-in runs as `Job::PluginSignIn`, its
+tokens live on the account row with refresh on session open, and its
+submission and Sent copy go through the module. The target specification version is 1.0; this file is the 0.1 review
 copy.
 
 Read this when designing or reviewing a provider plugin, an extension, a new

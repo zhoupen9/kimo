@@ -6,9 +6,26 @@
 //! collected with its path and never stops the rest of Kimo from starting.
 
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, OnceLock};
 
 use super::abi::{Manifest, MANIFEST_FILE};
 use super::host::WasmPlugin;
+
+/// The registry the running app resolved at startup, for worker threads that
+/// open a provider session without a UI hand-off. Set once by `main` before
+/// the event loop, exactly like `crate::wake::set`; `None` until then and in
+/// tests that never install one.
+static INSTALLED: OnceLock<Arc<Registry>> = OnceLock::new();
+
+/// Hand the startup scan's result to the threads that will use it.
+pub fn install(registry: Arc<Registry>) {
+    let _ = INSTALLED.set(registry);
+}
+
+/// The registry this process installed at startup, if any.
+pub fn installed() -> Option<Arc<Registry>> {
+    INSTALLED.get().cloned()
+}
 
 /// A plugin that passed manifest validation and module compilation.
 pub struct LoadedPlugin {
@@ -144,6 +161,16 @@ impl Registry {
 
     pub fn plugins(&self) -> &[LoadedPlugin] {
         &self.plugins
+    }
+
+    /// The plugin that contributes the provider an account is configured
+    /// for ("gmail", "outlook", …), or `None` when it is not installed —
+    /// which is also what a disabled plugin is, because a disabled module
+    /// is never compiled into the registry at all.
+    pub fn provider(&self, id: &str) -> Option<&LoadedPlugin> {
+        self.plugins
+            .iter()
+            .find(|loaded| loaded.manifest.providers.iter().any(|c| c.id == id))
     }
 
     pub fn disabled(&self) -> &[Manifest] {

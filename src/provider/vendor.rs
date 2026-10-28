@@ -38,6 +38,18 @@ pub enum VendorKey {
 }
 
 impl VendorKey {
+    /// The vendor profile a plugin provider replaces, when it has one: the
+    /// Gmail plugin fills its endpoint columns from the Gmail profile, an
+    /// Outlook plugin would from Outlook's. A plugin with no vendor entry
+    /// keeps whatever endpoints the form already holds.
+    pub fn for_provider(id: &str) -> Option<VendorKey> {
+        match id {
+            "gmail" => Some(VendorKey::Gmail),
+            "outlook" => Some(VendorKey::Outlook),
+            _ => None,
+        }
+    }
+
     /// The picker's order: the fallback first, then the providers whose
     /// presets exist.
     pub const ALL: &'static [VendorKey] = &[
@@ -517,6 +529,11 @@ mod tests {
                 tls: TlsMode::Implicit,
                 login: None,
             }),
+            provider: None,
+            provider_config: None,
+            access_token: None,
+            refresh_token: None,
+            token_expires_at: None,
         };
         assert_eq!(VendorKey::of(&account), VendorKey::Gmail);
         assert_eq!(VendorKey::of(&account).profile().name, "Gmail");

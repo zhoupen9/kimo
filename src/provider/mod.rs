@@ -190,8 +190,14 @@ pub trait MailProvider {
     fn logout(&mut self);
 }
 
-/// Open one account's mailbox: connect, negotiate TLS, log in.
+/// Open one account's mailbox: connect, negotiate TLS, log in. A plugin
+/// provider account (`provider` set) opens through its WASM module — the
+/// built-in client below never sees it, which is the whole point: the module
+/// owns the wire, the login and the vendor's semantics.
 pub fn open(account: &Account) -> MailResult<Box<dyn MailProvider>> {
+    if account.is_plugin() {
+        return Ok(Box::new(crate::plugin::provider::open_account(account)?));
+    }
     match account.protocol {
         Protocol::Imap => Ok(Box::new(imap::ImapProvider::open(account)?)),
         Protocol::Pop3 => Ok(Box::new(pop3::Pop3Provider::open(account)?)),

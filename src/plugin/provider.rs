@@ -13,7 +13,7 @@ use crate::error::{MailError, MailResult};
 use crate::mail;
 use crate::models::Account;
 use crate::provider::{
-    DeleteOutcome, FetchKind, FolderBatch, FolderMark, MailProvider, OlderBatch,
+    Capabilities, DeleteOutcome, FetchKind, FolderBatch, FolderMark, MailProvider, OlderBatch,
 };
 
 use super::abi::PluginRequest;
@@ -24,24 +24,51 @@ use super::host::{HostError, HostNetwork, PluginInstance, WasmPlugin};
 pub struct WasmProvider {
     instance: PluginInstance,
     account: Account,
-    capabilities: crate::provider::Capabilities,
+    capabilities: Capabilities,
     secrets: bool,
 }
 
 impl WasmProvider {
+    /// Open one session. The capabilities are not a parameter: the module
+    /// describes itself (`provider.describe`), and what it declares is what
+    /// the host dispatches on — a Gmail server without `X-GM-EXT-1` is the
+    /// module's own degrade to answer for.
     pub fn open(
         plugin: &WasmPlugin,
         account: &Account,
-        capabilities: crate::provider::Capabilities,
         network: Arc<dyn HostNetwork>,
     ) -> Result<Self, HostError> {
         let instance = plugin.instantiate_with(network)?;
-        Ok(Self {
+        let mut provider = Self {
             instance,
             account: account.clone(),
-            capabilities,
+            capabilities: Capabilities {
+                folders: false,
+                server_flags: false,
+                append: false,
+                stored_uids: false,
+            },
             secrets: plugin.permissions().secrets,
-        })
+        };
+        if let Ok(described) = provider.call("provider.describe", json!({})) {
+            let declared = |name: &str| {
+                described
+                    .get("capabilities")
+                    .and_then(Value::as_array)
+                    .is_some_and(|list| {
+                        list.iter().any(|capability| {
+                            capability.get("name").and_then(Value::as_str) == Some(name)
+                        })
+                    })
+            };
+            provider.capabilities = Capabilities {
+                folders: declared("mailbox.list"),
+                server_flags: declared("message.set_flags"),
+                append: declared("message.append"),
+                stored_uids: false,
+            };
+        }
+        Ok(provider)
     }
 
     fn call(&mut self, operation: &str, params: Value) -> MailResult<Value> {
@@ -57,27 +84,187 @@ impl WasmProvider {
             }
         }));
         if self.secrets {
-            request.credentials = Some(json!({
-                "kind": "password",
-                "username": self.account.username,
-                "password": self.account.password,
-            }));
+            // An OAuth2 account signs in with its token; the password pair is
+            // the plugin's declared app-password path. Which one this account
+            // has is the account's own state, not a guess.
+            request.credentials = Some(if self.account.access_token.is_some() {
+                json!({
+                    "kind": "oauth2",
+                    "username": self.account.username,
+                    "access_token": self.account.access_token,
+                })
+            } else {
+                json!({
+                    "kind": "password",
+                    "username": self.account.username,
+                    "password": self.account.password,
+                })
+            });
         }
         request.params = params;
         let response = self.instance.invoke(&request).map_err(host_error)?;
         if !response.ok {
-            let message = response
+            let error = response
                 .error
-                .map(|error| format!("{}: {}", error.code, error.message))
-                .unwrap_or_else(|| "plugin returned an error".to_string());
-            return Err(MailError::Protocol(message));
+                .unwrap_or_else(|| crate::plugin::abi::PluginError::new("failed", "no reason"));
+            let message = format!("{}: {}", error.code, error.message);
+            // A refused login is the user's to read plainly; everything else
+            // keeps its code so the caller can tell a network problem from a
+            // protocol one.
+            return Err(if error.code == "auth_failed" {
+                MailError::Auth(message)
+            } else {
+                MailError::Protocol(message)
+            });
         }
         Ok(response.result)
+    }
+
+    /// Submit a fully built message through the module's own submission
+    /// (`send.submit`): XOAUTH2 on Gmail, Graph's `sendMail` on an Outlook
+    /// module. The envelope travels beside the bytes because SMTP wants
+    /// addresses the mail itself may not name exactly (Bcc).
+    pub fn submit(&mut self, from: &str, recipients: &[String], raw: &[u8]) -> MailResult<()> {
+        let encoded = base64::engine::general_purpose::STANDARD.encode(raw);
+        self.call(
+            "send.submit",
+            json!({
+                "envelope": { "from": from, "to": recipients },
+                "rfc822": encoded,
+            }),
+        )?;
+        Ok(())
     }
 }
 
 fn host_error(error: HostError) -> MailError {
     MailError::Protocol(error.to_string())
+}
+
+// ----- the account-level entry points ----------------------------------------
+
+/// Run `f` with the plugin that contributes the provider this account names.
+/// The lookup failure is one message whatever the cause — a disabled module
+/// is not in the registry at all, and to the account the two are the same
+/// thing: no sessions until it is back.
+fn with_plugin<T>(
+    account: &Account,
+    f: impl FnOnce(&WasmPlugin) -> MailResult<T>,
+) -> MailResult<T> {
+    let id = account
+        .provider
+        .as_deref()
+        .ok_or_else(|| MailError::Protocol("the account names no plugin provider".to_string()))?;
+    let missing = || {
+        MailError::Protocol(format!(
+            "the {id} provider plugin is not installed or enabled"
+        ))
+    };
+    let registry = crate::plugin::discovery::installed().ok_or_else(missing)?;
+    let loaded = registry.provider(id).ok_or_else(missing)?;
+    f(&loaded.plugin)
+}
+
+/// Open an account's plugin-backed mailbox session on the real network,
+/// refreshing its sign-in token first when it is about to expire. Every
+/// `provider::with` call lands here, so no caller has to know a token has a
+/// clock.
+pub fn open_account(account: &Account) -> MailResult<WasmProvider> {
+    let account = ensure_tokens(account)?;
+    with_plugin(&account, |plugin| {
+        WasmProvider::open(
+            plugin,
+            &account,
+            Arc::new(super::net::StdNetwork::default()),
+        )
+        .map_err(host_error)
+    })
+}
+
+/// Submit one fully built message through the account's plugin provider.
+pub fn submit_for_account(
+    account: &Account,
+    from: &str,
+    recipients: &[String],
+    raw: &[u8],
+) -> MailResult<()> {
+    let account = ensure_tokens(account)?;
+    with_plugin(&account, |plugin| {
+        let mut provider = WasmProvider::open(
+            plugin,
+            &account,
+            Arc::new(super::net::StdNetwork::default()),
+        )
+        .map_err(host_error)?;
+        provider.submit(from, recipients, raw)
+    })
+}
+
+/// The account's tokens, refreshed when they are inside two minutes of
+/// expiring and persisted when they changed. An account with no expiry known
+/// uses what it has; the server is the one who says whether that was good.
+pub fn ensure_tokens(account: &Account) -> MailResult<Account> {
+    let Some(expires_at) = account.token_expires_at else {
+        return Ok(account.clone());
+    };
+    if now_ms().saturating_add(120_000) < expires_at {
+        return Ok(account.clone());
+    }
+    let Some(refresh_token) = account
+        .refresh_token
+        .clone()
+        .filter(|token| !token.is_empty())
+    else {
+        return Err(MailError::Auth(
+            "the provider sign-in has expired — sign in again in Preferences → Accounts"
+                .to_string(),
+        ));
+    };
+    let client_id = client_id_of(account);
+    let mut refreshed = account.clone();
+    with_plugin(account, |plugin| {
+        let tokens = super::auth::refresh(
+            plugin,
+            Arc::new(super::net::StdNetwork::default()),
+            &refresh_token,
+            &client_id,
+        )?;
+        refreshed.access_token = Some(tokens.access_token);
+        if let Some(token) = tokens.refresh_token {
+            refreshed.refresh_token = Some(token);
+        }
+        refreshed.token_expires_at = tokens.expires_at;
+        Ok(())
+    })?;
+    crate::db::save_account_tokens(
+        &account.id,
+        refreshed.access_token.as_deref(),
+        refreshed.refresh_token.as_deref(),
+        refreshed.token_expires_at,
+    )?;
+    Ok(refreshed)
+}
+
+/// The OAuth client id the account's provider config carries, or nothing.
+pub fn client_id_of(account: &Account) -> String {
+    account
+        .provider_config
+        .as_deref()
+        .and_then(|text| serde_json::from_str::<Value>(text).ok())
+        .and_then(|config| {
+            config
+                .get("client_id")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        })
+        .unwrap_or_default()
+}
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 fn base64_decode(value: &Value) -> MailResult<Vec<u8>> {
@@ -292,6 +479,11 @@ mod tests {
             password: "secret".to_string(),
             tls: TlsMode::Implicit,
             smtp: None,
+            provider: None,
+            provider_config: None,
+            access_token: None,
+            refresh_token: None,
+            token_expires_at: None,
         }
     }
 
@@ -325,6 +517,8 @@ mod tests {
 
     #[test]
     fn a_plugin_can_answer_the_provider_trait() {
+        // The describe response is what the capabilities come from now, so
+        // the fixture has to say both: the list, and what it can do.
         let manifest: crate::plugin::abi::Manifest = serde_json::from_value(serde_json::json!({
             "schema": 1,
             "id": "org.example.provider",
@@ -336,18 +530,14 @@ mod tests {
             "providers": [{ "id": "example" }]
         }))
         .unwrap();
-        let plugin = WasmPlugin::load(
-            manifest,
-            module(r#"{"ok":true,"result":["INBOX"]}"#).as_bytes(),
-        )
-        .unwrap();
-        let mut provider = WasmProvider::open(
+        let describe = r#"{"ok":true,"result":{"capabilities":[{"name":"mailbox.list"},{"name":"message.set_flags"},{"name":"message.append"}]}}"#;
+        let plugin = WasmPlugin::load(manifest, module(describe).as_bytes()).unwrap();
+        let provider = WasmProvider::open(
             &plugin,
             &account(),
-            capabilities(),
             Arc::new(crate::plugin::host::DeniedNetwork),
         )
         .unwrap();
-        assert_eq!(provider.folders().unwrap(), vec!["INBOX"]);
+        assert_eq!(provider.capabilities(), capabilities());
     }
 }

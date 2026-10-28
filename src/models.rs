@@ -130,12 +130,34 @@ pub struct Account {
     /// account that reads mail only: nothing it writes can leave it, and the
     /// compose card's Send says why rather than failing at a socket.
     pub smtp: Option<SmtpSettings>,
+    /// The plugin provider that owns this account's sessions ("gmail",
+    /// "outlook", …), or `None` for the built-in client `protocol` names —
+    /// the only kind of account there was before plugins. A plugin account
+    /// still fills the endpoint columns (from its vendor profile), but every
+    /// session opens through the module, not the built-in client.
+    pub provider: Option<String>,
+    /// The provider's own configuration, as JSON text the plugin validates
+    /// (the OAuth client id, provider hints). Opaque to everything else.
+    pub provider_config: Option<String>,
+    /// OAuth2 tokens a plugin provider signed in with. Plain text in the
+    /// database, as the password always is (`docs/storage.md`); they are
+    /// redacted from logs and errors on both sides of the plugin ABI.
+    pub access_token: Option<String>,
+    pub refresh_token: Option<String>,
+    /// Milliseconds since the epoch, from the plugin (which asked `now_ms`).
+    pub token_expires_at: Option<u64>,
 }
 
 impl Account {
-    /// Whether this account can send mail at all.
+    /// Whether this account's sessions open through a plugin provider.
+    pub fn is_plugin(&self) -> bool {
+        self.provider.is_some()
+    }
+
+    /// Whether this account can send mail at all: through its outgoing
+    /// server, or through the plugin provider that files its own submission.
     pub fn can_send(&self) -> bool {
-        self.smtp.is_some()
+        self.smtp.is_some() || self.is_plugin()
     }
 
     /// The credentials to submit with: the outgoing server's own pair when it
@@ -283,6 +305,11 @@ mod tests {
             password: "secret".into(),
             tls: TlsMode::Implicit,
             smtp: None,
+            provider: None,
+            provider_config: None,
+            access_token: None,
+            refresh_token: None,
+            token_expires_at: None,
         };
         assert!(!account.can_send());
         assert_eq!(account.smtp_login(), None);

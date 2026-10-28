@@ -54,7 +54,11 @@ Read when touching `src/db.rs`, `src/storage.rs`, `src/search.rs`, a schema migr
   mail from before it threads by subject instead (`crate::threads`). The
   version-8 step is the fourth: it adds the two label tables and derives
   nothing, because a database from before it has no labels and no way to have
-  meant one — every mail in it starts unlabelled.
+  meant one — every mail in it starts unlabelled. The version-10 step is the
+  fifth of that kind: five nullable `accounts` columns (`provider`,
+  `provider_config`, and the three OAuth token columns), because a database
+  from before it has no plugin-backed account — every account it holds stays
+  the built-in client its `protocol` names.
 
 - The account list is **in the database, passwords in plain text**. That is a
   documented, accepted limitation; do not add a secrets daemon (rule 1). An

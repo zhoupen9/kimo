@@ -750,8 +750,9 @@ pub struct KimoApp {
     /// Which preferences page is selected.
     prefs_tab: PrefsTab,
     /// The plugins discovered at startup, with their manifests and load
-    /// errors. The panel is read-only for now; account selection comes later.
-    plugins: crate::plugin::discovery::Registry,
+    /// errors — what Preferences → Plugins lists, and what an account's
+    /// provider resolves to (the workers hold the same scan).
+    plugins: std::sync::Arc<crate::plugin::discovery::Registry>,
     /// Installed plugin ids switched off; the module is not compiled on the
     /// next start. The panel keeps their manifests listed so they can be
     /// switched back on.
@@ -1937,6 +1938,16 @@ struct AccountForm {
     smtp_own_login: bool,
     smtp_username: String,
     smtp_password: String,
+    /// The plugin provider this account runs through ("gmail"), picked from
+    /// the Provider row while the plugin is installed. `None` is the
+    /// built-in client the rest of the form describes. This is the dedicated
+    /// entry: an Outlook plugin lands here as its own line, with no form
+    /// changes of its own.
+    plugin: Option<String>,
+    /// The OAuth client id the plugin's config asks for: the deployment's
+    /// own application registered with the provider (a Google Cloud
+    /// Desktop client), not something Kimo can ship.
+    client_id: String,
 }
 
 impl Default for AccountForm {
@@ -1960,6 +1971,8 @@ impl Default for AccountForm {
             smtp_own_login: true,
             smtp_username: String::new(),
             smtp_password: String::new(),
+            plugin: None,
+            client_id: String::new(),
         }
     }
 }
@@ -2010,12 +2023,19 @@ impl AccountForm {
                 .and_then(|smtp| smtp.login.as_ref())
                 .map(|login| login.password.clone())
                 .unwrap_or_default(),
+            plugin: account.provider.clone(),
+            client_id: crate::plugin::provider::client_id_of(account),
         }
     }
 
     /// Every required field is filled in (and the ports are ports). The
     /// outgoing server is required only while the account is meant to send.
     fn is_valid(&self) -> bool {
+        // A plugin account asks for an address and nothing else: the module
+        // owns the endpoints, and the sign-in is the browser's business.
+        if self.plugin.is_some() {
+            return !self.name.trim().is_empty() && !self.username.trim().is_empty();
+        }
         !self.name.trim().is_empty()
             && !self.host.trim().is_empty()
             && !self.username.trim().is_empty()
@@ -2059,6 +2079,22 @@ impl AccountForm {
     /// Fill the endpoint fields in from the provider the picker names. Only a
     /// preset with endpoints changes anything: Custom keeps whatever was typed,
     /// so switching away from a preset does not erase the server.
+    /// A plugin provider picked: its vendor profile (when it has one) fills
+    /// the endpoint columns the row still carries, and the module takes over
+    /// the sign-in and the sending. The Gmail plugin answers to the same
+    /// profile the IMAP preset filled, which is why the entry is a
+    /// replacement rather than an addition.
+    fn apply_plugin(&mut self, id: &str) {
+        self.plugin = Some(id.to_string());
+        if let Some(key) = vendor::VendorKey::for_provider(id) {
+            self.vendor = key;
+            self.apply_preset();
+        }
+        // The module submits on its own; an outgoing server here would be a
+        // second sender the account does not have.
+        self.smtp_enabled = false;
+    }
+
     fn apply_preset(&mut self) {
         let profile = self.vendor.profile();
         if let Some(imap) = profile.imap {
@@ -2079,8 +2115,28 @@ impl AccountForm {
     }
 
     /// The account this form describes, under an id the caller picks — the
-    /// edited account's own, or a fresh one for a new account.
-    fn to_account(&self, id: String) -> Account {
+    /// edited account's own, or a fresh one for a new account. `previous` is
+    /// the account being edited: its tokens survive an edit untouched,
+    /// because the form never edits them, but a change of provider spends
+    /// them — tokens of one provider are not credentials of another.
+    fn to_account(&self, id: String, previous: Option<&Account>) -> Account {
+        let provider = self.plugin.clone();
+        let provider_config = if provider.is_some() && !self.client_id.trim().is_empty() {
+            Some(serde_json::json!({ "client_id": self.client_id.trim() }).to_string())
+        } else {
+            None
+        };
+        let same_provider = previous.is_some_and(|previous| previous.provider == provider);
+        let (access_token, refresh_token, token_expires_at) = if same_provider {
+            let previous = previous.expect("checked");
+            (
+                previous.access_token.clone(),
+                previous.refresh_token.clone(),
+                previous.token_expires_at,
+            )
+        } else {
+            (None, None, None)
+        };
         Account {
             id,
             name: self.name.trim().to_string(),
@@ -2090,7 +2146,18 @@ impl AccountForm {
             username: self.username.trim().to_string(),
             password: self.password.clone(),
             tls: self.tls,
-            smtp: self.smtp(),
+            smtp: if self.plugin.is_some() {
+                // Submission belongs to the module; an outgoing server row
+                // would be a second sender this account does not have.
+                None
+            } else {
+                self.smtp()
+            },
+            provider,
+            provider_config,
+            access_token,
+            refresh_token,
+            token_expires_at,
         }
     }
 
@@ -2100,7 +2167,8 @@ impl AccountForm {
     /// away; the name is only a label and the password is a credential, so
     /// neither disturbs the cache.
     fn points_elsewhere(&self, account: &Account) -> bool {
-        account.protocol != self.protocol
+        account.provider != self.plugin
+            || account.protocol != self.protocol
             || account.host != self.host.trim()
             || account.port != self.port()
             || account.username != self.username.trim()
@@ -2114,7 +2182,10 @@ impl KimoApp {
         &self.glass
     }
 
-    pub fn new(ctx: &egui::Context, plugins: crate::plugin::discovery::Registry) -> Self {
+    pub fn new(
+        ctx: &egui::Context,
+        plugins: std::sync::Arc<crate::plugin::discovery::Registry>,
+    ) -> Self {
         // egui's built-in fonts only cover Latin/Cyrillic/Greek, so the CJK
         // fallback goes in immediately; the families picked in Preferences are
         // applied once the worker scan below has resolved their files.
@@ -2174,7 +2245,7 @@ impl KimoApp {
         accounts: Vec<Account>,
         mailboxes: HashMap<String, storage::Mailbox>,
         settings: &storage::Settings,
-        plugins: crate::plugin::discovery::Registry,
+        plugins: std::sync::Arc<crate::plugin::discovery::Registry>,
     ) -> Self {
         let mut states = HashMap::new();
         for account in &accounts {
@@ -2502,6 +2573,40 @@ impl KimoApp {
                 if let Some(state) = self.states.get_mut(&account_id) {
                     state.syncing = false;
                     state.error = Some(error);
+                }
+            }
+            Event::PluginAuth { account_id, error } => {
+                match error {
+                    Some(error) => self.account_error = Some(error),
+                    None => {
+                        self.account_error = None;
+                        // Tokens are in the row: take them into the window's
+                        // copy and sync the mailbox the sign-in just opened.
+                        if let Ok(accounts) = crate::db::load_accounts() {
+                            if let Some(fresh) = accounts
+                                .into_iter()
+                                .find(|account| account.id == account_id)
+                            {
+                                if let Some(account) = self
+                                    .accounts
+                                    .iter_mut()
+                                    .find(|account| account.id == account_id)
+                                {
+                                    *account = fresh.clone();
+                                }
+                                sync::spawn(
+                                    Job::Sync {
+                                        account: fresh,
+                                        purge: false,
+                                        folder: None,
+                                        save: false,
+                                    },
+                                    self.ctx.clone(),
+                                    self.tx.clone(),
+                                );
+                            }
+                        }
+                    }
                 }
             }
             Event::AccountRemoveFailed { account, error } => {
@@ -3152,9 +3257,10 @@ impl KimoApp {
             .editing
             .clone()
             .and_then(|id| self.accounts.iter().position(|a| a.id == id));
-        let account = match edited {
-            Some(index) => form.to_account(self.accounts[index].id.clone()),
-            None => form.to_account(self.unique_account_id(&slug(&form.name))),
+        let previous = edited.map(|index| self.accounts[index].clone());
+        let account = match &previous {
+            Some(previous) => form.to_account(previous.id.clone(), Some(previous)),
+            None => form.to_account(self.unique_account_id(&slug(&form.name)), None),
         };
         let account_id = account.id.clone();
 
@@ -3181,18 +3287,28 @@ impl KimoApp {
             self.forget_blitz_pages(&account_id);
         }
 
-        // One job saves the account row, purges the mail when the endpoint
-        // moved and then syncs, so no second job can reorder those steps.
-        sync::spawn(
-            Job::Sync {
-                account,
-                purge: switches_mailbox,
-                folder: None,
-                save: true,
-            },
-            self.ctx.clone(),
-            self.tx.clone(),
-        );
+        // One job saves the account row and then syncs, so no second job can
+        // reorder those steps. A plugin account without tokens cannot sync —
+        // its first sync *is* the browser sign-in, and the sync follows the
+        // tokens in (`Event::PluginAuth`).
+        if account.is_plugin() && account.access_token.is_none() {
+            sync::spawn(
+                Job::PluginSignIn { account },
+                self.ctx.clone(),
+                self.tx.clone(),
+            );
+        } else {
+            sync::spawn(
+                Job::Sync {
+                    account,
+                    purge: switches_mailbox,
+                    folder: None,
+                    save: true,
+                },
+                self.ctx.clone(),
+                self.tx.clone(),
+            );
+        }
 
         if edited.is_none() {
             // Adding an account takes the window, like it always did.
@@ -3208,6 +3324,27 @@ impl KimoApp {
             self.cancel_select();
         }
         self.show_account_form = false;
+    }
+
+    /// Save the form and send the account straight to the browser sign-in.
+    /// The row has to exist first — the tokens land in it — so this is the
+    /// form's Save plus the one job that finishes a plugin account.
+    fn start_plugin_sign_in(&mut self) {
+        if !self.account_form.is_valid() {
+            return;
+        }
+        self.save_account_form();
+        let saved = self.account_form.editing.clone();
+        let Some(id) = saved else {
+            return;
+        };
+        if let Some(account) = self.accounts.iter().find(|a| a.id == id).cloned() {
+            sync::spawn(
+                Job::PluginSignIn { account },
+                self.ctx.clone(),
+                self.tx.clone(),
+            );
+        }
     }
 
     /// An id for a new account: the slug of its name, numbered if that is
@@ -3584,6 +3721,28 @@ impl KimoApp {
     /// while it is switched on in Preferences → Accounts.
     fn vendor_enabled(&self, key: VendorKey) -> bool {
         vendor::enabled(key, &self.disabled_vendors)
+    }
+
+    /// The plugin providers an account can run through: every loaded
+    /// module's provider contributions, id and display name. This list is
+    /// the whole of adding a provider to the form — the Outlook module
+    /// lands here as its own entry the day it exists.
+    fn plugin_providers(&self) -> Vec<(String, String)> {
+        self.plugins
+            .plugins()
+            .iter()
+            .flat_map(|loaded| {
+                loaded.manifest.providers.iter().map(|contribution| {
+                    (
+                        contribution.id.clone(),
+                        contribution
+                            .name
+                            .clone()
+                            .unwrap_or_else(|| contribution.id.clone()),
+                    )
+                })
+            })
+            .collect()
     }
 
     /// The presets the account form offers, in the picker's order.
@@ -8618,20 +8777,70 @@ impl KimoApp {
         if !self.vendor_enabled(self.account_form.vendor) {
             self.account_form.vendor = VendorKey::Custom;
         }
-        let providers = self.enabled_vendors();
+        // The plugin providers installed: the dedicated entries. A vendor
+        // whose plugin is here leaves the preset list, so a provider is one
+        // line in the picker, not two that mean different things — and the
+        // next plugin (Outlook) is a line here the day its module is.
+        let plugins = self.plugin_providers();
+        // Everything the plugin branch of the form says, read before the
+        // form is borrowed for drawing: a click on Sign in is a flag the
+        // end of the page acts on, once the borrow is over.
+        let plugin_warning = self
+            .account_form
+            .plugin
+            .as_deref()
+            .filter(|id| self.plugins.provider(id).is_none())
+            .map(|id| {
+                format!(
+                    "The {id} provider plugin is not installed or enabled — enable it in                      Plugins and restart, and this account works again."
+                )
+            });
+        let mut sign_in_clicked = false;
+        let providers = self
+            .enabled_vendors()
+            .into_iter()
+            .filter(|key| {
+                !plugins
+                    .iter()
+                    .any(|(id, _)| vendor::VendorKey::for_provider(id) == Some(*key))
+            })
+            .collect::<Vec<_>>();
         let f = &mut self.account_form;
         egui::Grid::new("account_form_grid")
             .num_columns(2)
             .spacing([10.0, 6.0])
             .show(ui, |ui| {
                 ui.label("Provider");
+                let selected = match &f.plugin {
+                    Some(id) => plugins
+                        .iter()
+                        .find(|(plugin_id, _)| plugin_id == id)
+                        .map(|(_, name)| name.clone())
+                        .unwrap_or_else(|| id.clone()),
+                    None => f.vendor.label().to_string(),
+                };
                 egui::ComboBox::from_id_salt("account_provider")
-                    .selected_text(f.vendor.label())
+                    .selected_text(selected)
                     .show_ui(ui, |ui| {
                         for key in providers.iter().copied() {
-                            if ui.selectable_label(f.vendor == key, key.label()).clicked() {
+                            if ui
+                                .selectable_label(
+                                    f.plugin.is_none() && f.vendor == key,
+                                    key.label(),
+                                )
+                                .clicked()
+                            {
+                                f.plugin = None;
                                 f.vendor = key;
                                 f.apply_preset();
+                            }
+                        }
+                        for (id, name) in plugins.iter() {
+                            if ui
+                                .selectable_label(f.plugin.as_deref() == Some(id.as_str()), name)
+                                .clicked()
+                            {
+                                f.apply_plugin(id);
                             }
                         }
                     });
@@ -8643,104 +8852,39 @@ impl KimoApp {
                 ));
                 ui.end_row();
 
-                ui.label("Protocol");
-                ui.horizontal(|ui| {
-                    let mut changed = false;
-                    if ui
-                        .radio_value(&mut f.protocol, Protocol::Imap, "IMAP")
-                        .changed()
-                    {
-                        changed = true;
-                    }
-                    if ui
-                        .radio_value(&mut f.protocol, Protocol::Pop3, "POP3")
-                        .changed()
-                    {
-                        changed = true;
-                    }
-                    if changed {
-                        f.port_str = f.protocol.default_port(f.tls).to_string();
-                    }
-                });
-                ui.end_row();
-
-                ui.label("Server");
-                ui.add(Field::new(
-                    egui::TextEdit::singleline(&mut f.host).hint_text("imap.example.com"),
-                ));
-                ui.end_row();
-
-                ui.label("Security");
-                ui.horizontal(|ui| {
-                    let mut changed = false;
-                    if ui
-                        .radio_value(&mut f.tls, TlsMode::Implicit, "TLS")
-                        .changed()
-                    {
-                        changed = true;
-                    }
-                    if ui
-                        .radio_value(&mut f.tls, TlsMode::StartTls, "STARTTLS")
-                        .changed()
-                    {
-                        changed = true;
-                    }
-                    if ui.radio_value(&mut f.tls, TlsMode::Plain, "None").changed() {
-                        changed = true;
-                    }
-                    if changed {
-                        f.port_str = f.protocol.default_port(f.tls).to_string();
-                    }
-                });
-                ui.end_row();
-
-                ui.label("Port");
-                ui.add(Field::new(
-                    egui::TextEdit::singleline(&mut f.port_str).hint_text("993"),
-                ));
-                ui.end_row();
-
-                ui.label("Username");
-                ui.add(Field::new(
-                    egui::TextEdit::singleline(&mut f.username).hint_text("you@example.com"),
-                ));
-                ui.end_row();
-            });
-
-        // What the provider's sign-in needs. It is advice, not a gate: the
-        // fields stay editable and Save is enabled, because a server that is
-        // not quite what its host suggests is the user's to configure.
-        let profile = f.vendor.profile();
-        if let Some(note) = profile.note {
-            let text = egui::RichText::new(note).small();
-            if profile.auth == vendor::AuthKind::OAuthOnly {
-                let color = ui.visuals().warn_fg_color;
-                ui.colored_label(color, text);
-            } else {
-                ui.label(text.weak());
-            }
-        }
-
-        ui.add_space(8.0);
-        // Sending is its own group, and off is a real answer: an account that
-        // only reads mail is what every account was before this existed.
-        ui.checkbox(&mut f.smtp_enabled, "Send mail (SMTP)");
-        ui.label(
-            egui::RichText::new(
-                "Mail is sent through the server below. Without one, this account can only receive.",
-            )
-            .small()
-            .weak(),
-        );
-        ui.add_space(4.0);
-        ui.add_enabled_ui(f.smtp_enabled, |ui| {
-            egui::Grid::new("account_smtp_grid")
-                .num_columns(2)
-                .spacing([10.0, 6.0])
-                .show(ui, |ui| {
-                    ui.label("Outgoing server");
+                // A plugin account is its address and a browser; the module
+                // owns every endpoint and both logins.
+                if f.plugin.is_some() {
+                    ui.label("Email");
                     ui.add(Field::new(
-                        egui::TextEdit::singleline(&mut f.smtp_host).hint_text("smtp.example.com"),
+                        egui::TextEdit::singleline(&mut f.username).hint_text("you@gmail.com"),
+                    ));
+                    ui.end_row();
+                } else {
+                    ui.label("Protocol");
+                    ui.horizontal(|ui| {
+                        let mut changed = false;
+                        if ui
+                            .radio_value(&mut f.protocol, Protocol::Imap, "IMAP")
+                            .changed()
+                        {
+                            changed = true;
+                        }
+                        if ui
+                            .radio_value(&mut f.protocol, Protocol::Pop3, "POP3")
+                            .changed()
+                        {
+                            changed = true;
+                        }
+                        if changed {
+                            f.port_str = f.protocol.default_port(f.tls).to_string();
+                        }
+                    });
+                    ui.end_row();
+
+                    ui.label("Server");
+                    ui.add(Field::new(
+                        egui::TextEdit::singleline(&mut f.host).hint_text("imap.example.com"),
                     ));
                     ui.end_row();
 
@@ -8748,67 +8892,191 @@ impl KimoApp {
                     ui.horizontal(|ui| {
                         let mut changed = false;
                         if ui
-                            .radio_value(&mut f.smtp_tls, TlsMode::Implicit, "TLS")
+                            .radio_value(&mut f.tls, TlsMode::Implicit, "TLS")
                             .changed()
                         {
                             changed = true;
                         }
                         if ui
-                            .radio_value(&mut f.smtp_tls, TlsMode::StartTls, "STARTTLS")
+                            .radio_value(&mut f.tls, TlsMode::StartTls, "STARTTLS")
                             .changed()
                         {
                             changed = true;
                         }
-                        if ui
-                            .radio_value(&mut f.smtp_tls, TlsMode::Plain, "None")
-                            .changed()
-                        {
+                        if ui.radio_value(&mut f.tls, TlsMode::Plain, "None").changed() {
                             changed = true;
                         }
                         if changed {
-                            f.smtp_port_str = SmtpSettings::default_port(f.smtp_tls).to_string();
+                            f.port_str = f.protocol.default_port(f.tls).to_string();
                         }
                     });
                     ui.end_row();
 
                     ui.label("Port");
                     ui.add(Field::new(
-                        egui::TextEdit::singleline(&mut f.smtp_port_str).hint_text("587"),
+                        egui::TextEdit::singleline(&mut f.port_str).hint_text("993"),
                     ));
                     ui.end_row();
 
-                    ui.label("Login");
-                    ui.vertical(|ui| {
-                        ui.checkbox(
-                            &mut f.smtp_own_login,
-                            "Use this account's username and password",
-                        );
-                        if !f.smtp_own_login {
-                            ui.horizontal(|ui| {
-                                ui.add(Field::new(
-                                    egui::TextEdit::singleline(&mut f.smtp_username)
-                                        .hint_text("Username")
-                                        .desired_width(150.0),
-                                ));
-                                ui.add(Field::new(
-                                    egui::TextEdit::singleline(&mut f.smtp_password)
-                                        .hint_text("Password")
-                                        .password(true)
-                                        .desired_width(150.0),
-                                ));
-                            });
-                        }
-                    });
+                    ui.label("Username");
+                    ui.add(Field::new(
+                        egui::TextEdit::singleline(&mut f.username).hint_text("you@example.com"),
+                    ));
+                    ui.end_row();
+                }
+            });
+
+        if f.plugin.is_some() {
+            // The plugin's own half of the form: the deployment's client id
+            // and the browser sign-in. An unavailable module is the one thing
+            // that can stop the account working from here, so it is said
+            // plainly rather than left for the sync to fail on.
+            if let Some(warning) = &plugin_warning {
+                ui.colored_label(ui.visuals().warn_fg_color, warning);
+            }
+            ui.add_space(4.0);
+            egui::Grid::new("account_plugin_grid")
+                .num_columns(2)
+                .spacing([10.0, 6.0])
+                .show(ui, |ui| {
+                    ui.label("OAuth client id");
+                    ui.add(Field::new(
+                        egui::TextEdit::singleline(&mut f.client_id)
+                            .hint_text("the deployment's own client, from the provider's console"),
+                    ));
                     ui.end_row();
                 });
-            if f.smtp_tls == TlsMode::Plain {
+            ui.add_space(6.0);
+            let signed_in = f
+                .editing
+                .as_deref()
+                .and_then(|id| self.accounts.iter().find(|account| account.id == id))
+                .is_some_and(|account| account.access_token.is_some());
+            ui.horizontal(|ui| {
+                let label = if signed_in {
+                    "Sign in again"
+                } else {
+                    "Sign in with Google"
+                };
+                if ui.button(label).clicked() {
+                    sign_in_clicked = true;
+                }
                 ui.label(
-                    egui::RichText::new("A plain connection sends the password in the clear.")
-                        .small()
-                        .weak(),
+                    egui::RichText::new(if signed_in {
+                        "Signed in — the browser holds the password, Kimo holds only tokens."
+                    } else {
+                        "Opens your browser to sign in; Kimo never sees the password."
+                    })
+                    .small()
+                    .weak(),
                 );
+            });
+        } else {
+            // What the provider's sign-in needs. It is advice, not a gate: the
+            // fields stay editable and Save is enabled, because a server that is
+            // not quite what its host suggests is the user's to configure.
+            let profile = f.vendor.profile();
+            if let Some(note) = profile.note {
+                let text = egui::RichText::new(note).small();
+                if profile.auth == vendor::AuthKind::OAuthOnly {
+                    let color = ui.visuals().warn_fg_color;
+                    ui.colored_label(color, text);
+                } else {
+                    ui.label(text.weak());
+                }
             }
-        });
+
+            ui.add_space(8.0);
+            // Sending is its own group, and off is a real answer: an account that
+            // only reads mail is what every account was before this existed.
+            ui.checkbox(&mut f.smtp_enabled, "Send mail (SMTP)");
+            ui.label(
+            egui::RichText::new(
+                "Mail is sent through the server below. Without one, this account can only receive.",
+            )
+            .small()
+            .weak(),
+        );
+            ui.add_space(4.0);
+            ui.add_enabled_ui(f.smtp_enabled, |ui| {
+                egui::Grid::new("account_smtp_grid")
+                    .num_columns(2)
+                    .spacing([10.0, 6.0])
+                    .show(ui, |ui| {
+                        ui.label("Outgoing server");
+                        ui.add(Field::new(
+                            egui::TextEdit::singleline(&mut f.smtp_host)
+                                .hint_text("smtp.example.com"),
+                        ));
+                        ui.end_row();
+
+                        ui.label("Security");
+                        ui.horizontal(|ui| {
+                            let mut changed = false;
+                            if ui
+                                .radio_value(&mut f.smtp_tls, TlsMode::Implicit, "TLS")
+                                .changed()
+                            {
+                                changed = true;
+                            }
+                            if ui
+                                .radio_value(&mut f.smtp_tls, TlsMode::StartTls, "STARTTLS")
+                                .changed()
+                            {
+                                changed = true;
+                            }
+                            if ui
+                                .radio_value(&mut f.smtp_tls, TlsMode::Plain, "None")
+                                .changed()
+                            {
+                                changed = true;
+                            }
+                            if changed {
+                                f.smtp_port_str =
+                                    SmtpSettings::default_port(f.smtp_tls).to_string();
+                            }
+                        });
+                        ui.end_row();
+
+                        ui.label("Port");
+                        ui.add(Field::new(
+                            egui::TextEdit::singleline(&mut f.smtp_port_str).hint_text("587"),
+                        ));
+                        ui.end_row();
+
+                        ui.label("Login");
+                        ui.vertical(|ui| {
+                            ui.checkbox(
+                                &mut f.smtp_own_login,
+                                "Use this account's username and password",
+                            );
+                            if !f.smtp_own_login {
+                                ui.horizontal(|ui| {
+                                    ui.add(Field::new(
+                                        egui::TextEdit::singleline(&mut f.smtp_username)
+                                            .hint_text("Username")
+                                            .desired_width(150.0),
+                                    ));
+                                    ui.add(Field::new(
+                                        egui::TextEdit::singleline(&mut f.smtp_password)
+                                            .hint_text("Password")
+                                            .password(true)
+                                            .desired_width(150.0),
+                                    ));
+                                });
+                            }
+                        });
+                        ui.end_row();
+                    });
+                if f.smtp_tls == TlsMode::Plain {
+                    ui.label(
+                        egui::RichText::new("A plain connection sends the password in the clear.")
+                            .small()
+                            .weak(),
+                    );
+                }
+            });
+        }
 
         ui.add_space(6.0);
         ui.label(
@@ -8832,6 +9100,12 @@ impl KimoApp {
                 self.save_account_form();
             }
         });
+
+        // Deferred from the button above: the click happened while the form
+        // was borrowed for drawing, the sign-in needs the whole app.
+        if sign_in_clicked {
+            self.start_plugin_sign_in();
+        }
     }
 
     /// Preferences → Plugins: what the startup scan found. A disabled plugin
@@ -13483,7 +13757,7 @@ mod tests {
             accounts,
             mailboxes,
             &settings,
-            crate::plugin::discovery::Registry::empty(),
+            std::sync::Arc::new(crate::plugin::discovery::Registry::empty()),
         );
         // The folder with the most mail, and the largest HTML body in it: the
         // worst case a splitter drag can be asked to re-lay out.
@@ -13808,6 +14082,11 @@ mod tests {
             password: "secret".to_string(),
             tls: TlsMode::Implicit,
             smtp: None,
+            provider: None,
+            provider_config: None,
+            access_token: None,
+            refresh_token: None,
+            token_expires_at: None,
         };
         let messages = (0..count)
             .map(|index| test_message(&index.to_string(), false))
@@ -13832,7 +14111,7 @@ mod tests {
             vec![account],
             mailboxes,
             &storage::Settings::default(),
-            crate::plugin::discovery::Registry::empty(),
+            std::sync::Arc::new(crate::plugin::discovery::Registry::empty()),
         );
         // The fixtures below measure geometry, and the warning the app carries
         // when *this machine's* database cannot be written stands at the top of
@@ -14098,6 +14377,11 @@ mod tests {
             password: "secret".to_string(),
             tls: TlsMode::Implicit,
             smtp: None,
+            provider: None,
+            provider_config: None,
+            access_token: None,
+            refresh_token: None,
+            token_expires_at: None,
         };
         // No folders at all: the account has never synced.
         let mut app = KimoApp::assemble(
@@ -14105,7 +14389,7 @@ mod tests {
             vec![account],
             HashMap::new(),
             &storage::Settings::default(),
-            crate::plugin::discovery::Registry::empty(),
+            std::sync::Arc::new(crate::plugin::discovery::Registry::empty()),
         );
         assert_eq!(app.selected_folder.as_deref(), Some("INBOX"));
         assert!(app.folder_messages_of("acct", "INBOX").is_none());
@@ -19739,7 +20023,7 @@ mod tests {
         let account = test_account("imap.example.com");
         let form = AccountForm::edit(&account);
         assert_eq!(form.editing.as_deref(), Some("work"));
-        assert_eq!(form.to_account(account.id.clone()), account);
+        assert_eq!(form.to_account(account.id.clone(), Some(&account)), account);
     }
 
     #[test]
@@ -19749,6 +20033,68 @@ mod tests {
         form.name = "Home mail".to_string();
         form.password = "a new secret".to_string();
         assert!(!form.points_elsewhere(&account));
+    }
+
+    #[test]
+    fn a_plugin_form_needs_only_a_name_and_an_address() {
+        let mut form = AccountForm::default();
+        assert!(!form.is_valid());
+        form.plugin = Some("gmail".to_string());
+        form.name = "Work".to_string();
+        assert!(!form.is_valid(), "an address is still required");
+        form.username = "me@gmail.com".to_string();
+        assert!(form.is_valid(), "the module owns every endpoint");
+    }
+
+    #[test]
+    fn a_plugin_account_carries_its_provider_and_config() {
+        let form = AccountForm {
+            plugin: Some("gmail".to_string()),
+            name: "Work".to_string(),
+            username: "me@gmail.com".to_string(),
+            client_id: " cid-1 ".to_string(),
+            smtp_enabled: true,
+            ..AccountForm::default()
+        };
+        let account = form.to_account("work".to_string(), None);
+        assert_eq!(account.provider.as_deref(), Some("gmail"));
+        assert_eq!(
+            account.provider_config.as_deref(),
+            Some(r#"{"client_id":"cid-1"}"#)
+        );
+        assert_eq!(account.smtp, None, "the module files its own submission");
+        assert!(account.is_plugin() && account.can_send());
+    }
+
+    #[test]
+    fn editing_keeps_the_tokens_a_provider_switch_spends_them() {
+        let mut account = test_account("imap.example.com");
+        account.provider = Some("gmail".to_string());
+        account.access_token = Some("access".to_string());
+        account.refresh_token = Some("refresh".to_string());
+
+        let mut form = AccountForm::edit(&account);
+        form.name = "Work mail".to_string();
+        let saved = form.to_account(account.id.clone(), Some(&account));
+        assert_eq!(saved.access_token.as_deref(), Some("access"));
+        assert_eq!(saved.refresh_token.as_deref(), Some("refresh"));
+
+        form.plugin = None;
+        let spent = form.to_account(account.id.clone(), Some(&account));
+        assert_eq!(spent.provider, None);
+        assert_eq!(
+            spent.access_token, None,
+            "another provider's token is not a credential"
+        );
+    }
+
+    #[test]
+    fn a_provider_change_is_another_mailbox() {
+        let account = test_account("imap.example.com");
+        let mut form = AccountForm::edit(&account);
+        assert!(!form.points_elsewhere(&account));
+        form.plugin = Some("gmail".to_string());
+        assert!(form.points_elsewhere(&account));
     }
 
     #[test]
@@ -19787,6 +20133,11 @@ mod tests {
             password: "hunter2".to_string(),
             tls: TlsMode::Implicit,
             smtp: None,
+            provider: None,
+            provider_config: None,
+            access_token: None,
+            refresh_token: None,
+            token_expires_at: None,
         }
     }
 
@@ -20464,7 +20815,7 @@ mod tests {
         form.host = "imap.example.com".to_string();
         form.username = "me@example.com".to_string();
         assert!(form.is_valid(), "reading mail needs no outgoing server");
-        assert_eq!(form.to_account("work".to_string()).smtp, None);
+        assert_eq!(form.to_account("work".to_string(), None).smtp, None);
 
         // Switched on with nothing to reach, and then with something.
         form.smtp_enabled = true;
@@ -20472,7 +20823,7 @@ mod tests {
         form.smtp_host = "smtp.example.com".to_string();
         assert!(form.is_valid());
         assert_eq!(
-            form.to_account("work".to_string()).smtp,
+            form.to_account("work".to_string(), None).smtp,
             Some(SmtpSettings {
                 host: "smtp.example.com".to_string(),
                 port: 465,
@@ -20488,7 +20839,7 @@ mod tests {
         form.smtp_own_login = false;
         form.smtp_username = "code".to_string();
         form.smtp_password = "abcd efgh".to_string();
-        let account = form.to_account("work".to_string());
+        let account = form.to_account("work".to_string(), None);
         assert_eq!(
             account.smtp.as_ref().map(|smtp| smtp.port),
             Some(587),
@@ -22239,6 +22590,11 @@ mod tests {
                 password: "secret".to_string(),
                 tls: TlsMode::Implicit,
                 smtp: None,
+                provider: None,
+                provider_config: None,
+                access_token: None,
+                refresh_token: None,
+                token_expires_at: None,
             })
             .collect();
         let mut states = HashMap::new();

@@ -15,9 +15,7 @@ use wasmi::{
 };
 use wasmi_core::{LimiterError, ResourceLimiter};
 
-use super::abi::{
-    Manifest, NetworkRule, Permissions, PluginRequest, PluginResponse, ABI_VERSION, MANIFEST_FILE,
-};
+use super::abi::{Manifest, NetworkRule, Permissions, PluginRequest, PluginResponse, ABI_VERSION};
 use super::extension::{DisplayPlan, OrganizerPlan};
 
 const PAGE_BYTES: usize = 64 * 1024;
@@ -288,6 +286,7 @@ impl PluginInstance {
 
     /// Invoke an extension's organizer hook and validate its plan before the
     /// UI can see it. The plan is the result value, not the whole envelope.
+    #[allow(dead_code)] // The organizer hook has no UI worker yet.
     pub fn organizer(
         &mut self,
         request: &PluginRequest,
@@ -299,12 +298,14 @@ impl PluginInstance {
     }
 
     /// Invoke an extension's display hook and validate the declarative plan.
+    #[allow(dead_code)] // The display hook has no UI worker yet.
     pub fn display(&mut self, request: &PluginRequest) -> Result<DisplayPlan, HostError> {
         let plan = self.extension_result::<DisplayPlan>(request)?;
         plan.validate().map_err(HostError::Protocol)?;
         Ok(plan)
     }
 
+    #[allow(dead_code)] // With the two hooks above.
     fn extension_result<T: serde::de::DeserializeOwned>(
         &mut self,
         request: &PluginRequest,
@@ -320,16 +321,19 @@ impl PluginInstance {
         serde_json::from_value(response.result).map_err(|error| HostError::Json(error.to_string()))
     }
 
+    #[allow(dead_code)] // The account layer reads these when it surfaces a module's error.
     pub fn logs(&self) -> &[LogLine] {
         &self.store.data().logs
     }
 
+    #[allow(dead_code)] // With `logs` above.
     pub fn last_error(&self) -> Option<&str> {
         self.store.data().last_error.as_deref()
     }
 }
 
 #[derive(Clone, Debug)]
+#[allow(dead_code)] // Read through `PluginInstance::logs`.
 pub struct LogLine {
     pub level: i32,
     pub message: String,
@@ -809,19 +813,6 @@ impl std::fmt::Display for HostError {
 }
 
 impl std::error::Error for HostError {}
-
-/// Read a manifest from a plugin directory and compile its module. This is
-/// the loader the registry uses; tests can call it with a WAT fixture.
-pub fn load_directory(directory: &std::path::Path) -> Result<(Manifest, WasmPlugin), HostError> {
-    let manifest_path = directory.join(MANIFEST_FILE);
-    let manifest =
-        Manifest::load(&manifest_path).map_err(|error| HostError::Manifest(error.to_string()))?;
-    let module_path = manifest.module_path(directory);
-    let bytes = std::fs::read(&module_path)
-        .map_err(|error| HostError::Module(format!("{}: {error}", module_path.display())))?;
-    let plugin = WasmPlugin::load(manifest.clone(), &bytes)?;
-    Ok((manifest, plugin))
-}
 
 #[cfg(test)]
 mod tests {

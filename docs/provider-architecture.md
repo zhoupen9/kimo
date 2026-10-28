@@ -299,7 +299,8 @@ backend while a plugin-backed account gets sockets; the OAuth browser flow is
 `src/plugin/auth.rs` (loopback redirect, the desktop's OpenURI portal with an
 `xdg-open` fallback). [`plugins/gmail`](../plugins/gmail/) is the first real
 provider: XOAUTH2 for IMAP and SMTP, all four `X-GM-EXT-1` extensions, Gmail
-submission, and the authorization-code flow above. The existing account path
-still opens IMAP/POP3 through [providers.md](providers.md) — a plugin-backed
-account is not wired yet. The abstraction above is the target the host is
-built for, not a description of every live path today.
+submission, and the authorization-code flow above. The account path is wired for
+both kinds: a row with `provider` set opens through its module (the form
+gives every installed provider its own entry, the sign-in is a job, tokens
+live on the row), and a row without it opens IMAP/POP3 through
+[providers.md](providers.md) as it always did.

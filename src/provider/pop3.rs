@@ -268,6 +268,11 @@ mod tests {
             password: "secret".to_string(),
             tls: crate::models::TlsMode::Plain,
             smtp: None,
+            provider: None,
+            provider_config: None,
+            access_token: None,
+            refresh_token: None,
+            token_expires_at: None,
         };
         let mut provider = Pop3Provider::open(&account).unwrap();
 

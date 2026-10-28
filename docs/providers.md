@@ -104,6 +104,33 @@ list.
   `[Gmail]/Sent Mail` or `Sent Items`. The answer is the wire form (possibly
   modified UTF-7), which is what `APPEND` has to be given.
 
+## Plugin providers
+
+A provider does not have to be compiled into Kimo: a WASM module under
+`plugins/` can be one (see [mail-spec.md](mail-spec.md)). An account whose
+row carries `provider = "gmail"` opens every session through the module —
+`provider::open` routes it to `WasmProvider` before the built-in clients are
+even considered, so the module owns the wire, the login and the vendor's
+semantics, and no job in `sync.rs` knows which one it talked to.
+
+The account form gives each installed provider module its own entry in the
+Provider row (`plugin_providers`, from the startup scan's manifests — an
+Outlook module is a line in that picker the day it exists). A plugin entry
+replaces the vendor preset of the same provider while its module is
+installed; with the module gone the preset is the entry again, and an
+existing plugin account opens with a plain "plugin not installed" error —
+it never silently becomes a generic IMAP account. The entry asks for the
+address and the deployment's OAuth client id, and its sign-in is a job:
+`Job::PluginSignIn` runs the module's `auth.begin`/`auth.continue` around
+the desktop's browser (`plugin::auth`), and the tokens land in the account
+row. A token inside two minutes of expiring is refreshed on session open
+(`plugin::provider::ensure_tokens`) and persisted, so no caller knows a
+token has a clock.
+
+Submission goes through the module too (`send.submit`): Gmail submits over
+XOAUTH2, and the Sent copy is still the vendor layer's preferred mailbox,
+filed through the same `provider::with` every other append uses.
+
 ## Adding things
 
 - **A mailbox operation** is a method on `MailProvider` with both adapters
@@ -117,17 +144,22 @@ list.
   the vendor needs a wire quirk; then it is a function in `vendor.rs` called
   from the one place that needs it.
 
-- **A backend** (a protocol other than IMAP/POP3) is an implementation of
-  `MailProvider` plus a `Protocol` variant and its database CHECK value —
-  a change of its own, because the schema is where the protocol is stored. The
-  trait is the seam; nothing in `sync.rs` has to learn about it.
+- **A backend** (a protocol other than IMAP/POP3) is either an implementation
+  of `MailProvider` plus a `Protocol` variant and its database CHECK value —
+  a change of its own, because the schema is where the protocol is stored —
+  or, for a vendor with a WASM module, a plugin provider: implement the
+  module (see [mail-spec.md](mail-spec.md)), give the manifest a provider
+  contribution, and map its vendor key in `VendorKey::for_provider`. The
+  form, the dispatch and the sign-in are already in place; nothing in
+  `sync.rs` has to learn about either. The trait is the seam.
 
 ## Limits and extension points
 
-- No OAuth2/XOAUTH2 (hard rule 4): Outlook/Microsoft 365 therefore cannot sign
-  in, and the form says so.
-- No `X-GM-LABELS`, no IMAP `ID` handshake (some Chinese providers ask for
-  it), no special-use `LIST` attributes — the vendor layer is where each
-  would go, and each is a decision to make against a real server.
+- The *built-in* clients have no OAuth2/XOAUTH2 and no `X-GM-LABELS` (hard
+  rule 4 keeps them out): a provider that needs either is a plugin — Gmail's
+  module carries both — and the vendor layer's note says which kind an
+  account is. No IMAP `ID` handshake either (some Chinese providers ask for
+  it); that one would be a wire quirk in `vendor.rs`, and a decision to make
+  against a real server.
 - Syncing is still the sweep it was: this layer moved the protocol knowledge,
   it did not add IDLE, push, or a provider-driven sweep.
