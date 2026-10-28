@@ -814,6 +814,10 @@ pub struct KimoApp {
     /// back in the list at the same time, because its row is still there: the
     /// line stands at the top of Preferences → Accounts, where the click was.
     account_error: Option<String>,
+    /// The account whose browser sign-in is in flight: the form stays open
+    /// on it, saying the browser is the thing to look at, until the job
+    /// answers ([`Event::PluginAuth`]).
+    plugin_signing_in: Option<String>,
     /// Where a downloaded attachment went — or that a mail was sent — and when
     /// it said so: one line above the message list for `NOTICE_TIME`. A file
     /// that lands in a directory the user was not watching is a file they cannot
@@ -2323,6 +2327,7 @@ impl KimoApp {
             system_dark: system_prefers_dark(),
             storage_warning: crate::db::warning(),
             account_error: None,
+            plugin_signing_in: None,
             notice: None,
             images: HashMap::new(),
             stylesheets: HashMap::new(),
@@ -2576,6 +2581,28 @@ impl KimoApp {
                 }
             }
             Event::PluginAuth { account_id, error } => {
+                // The form waited on this account; it is the first place the
+                // answer belongs, whether it reopens for the error or closes
+                // for the tokens.
+                if self.plugin_signing_in.as_deref() == Some(account_id.as_str()) {
+                    self.plugin_signing_in = None;
+                    let waiting_on_it = self.show_account_form
+                        && self.account_form.editing.as_deref() == Some(account_id.as_str());
+                    match (&error, waiting_on_it) {
+                        // A failed sign-in puts the form back on the account
+                        // with the reason beside the button that was clicked.
+                        (Some(_), _) => {
+                            if let Some(account) =
+                                self.accounts.iter().find(|a| a.id == account_id).cloned()
+                            {
+                                self.account_form = AccountForm::edit(&account);
+                                self.show_account_form = true;
+                            }
+                        }
+                        (None, true) => self.show_account_form = false,
+                        (None, false) => {}
+                    }
+                }
                 match error {
                     Some(error) => self.account_error = Some(error),
                     None => {
@@ -3251,6 +3278,15 @@ impl KimoApp {
     /// one, or replace the edited account in place, then sync it so the
     /// window shows what the credentials actually reach.
     fn save_account_form(&mut self) {
+        self.save_account_form_impl(false);
+    }
+
+    /// Save the form. `sign_in` is the Sign-in button's path: the account
+    /// row is written the same way, but the job is the browser flow and the
+    /// form stays open on the account, waiting with the user — a sign-in
+    /// whose window closed behind it looks exactly like one that never
+    /// started.
+    fn save_account_form_impl(&mut self, sign_in: bool) {
         self.account_error = None;
         let form = self.account_form.clone();
         let edited = form
@@ -3276,6 +3312,12 @@ impl KimoApp {
                 true
             }
         };
+        // The sign-in path keeps the form open on the account it saved — a
+        // fresh form's `editing` becomes the row it just minted, so the
+        // answer that comes back finds the form it belongs to.
+        if sign_in && self.account_form.editing.is_none() {
+            self.account_form.editing = Some(account_id.clone());
+        }
 
         if switches_mailbox {
             // What is stored describes the mailbox the old settings reached,
@@ -3287,11 +3329,13 @@ impl KimoApp {
             self.forget_blitz_pages(&account_id);
         }
 
-        // One job saves the account row and then syncs, so no second job can
-        // reorder those steps. A plugin account without tokens cannot sync —
-        // its first sync *is* the browser sign-in, and the sync follows the
-        // tokens in (`Event::PluginAuth`).
-        if account.is_plugin() && account.access_token.is_none() {
+        // One job saves the account row and then does the one thing that is
+        // next, so no second job can reorder those steps. The Sign-in
+        // button's job is the browser flow; a plain Save on a plugin account
+        // without tokens cannot sync, so its first sync *is* the sign-in too
+        // — but through this one spawn, never a second.
+        if sign_in || (account.is_plugin() && account.access_token.is_none()) {
+            self.plugin_signing_in = Some(account.id.clone());
             sync::spawn(
                 Job::PluginSignIn { account },
                 self.ctx.clone(),
@@ -3323,28 +3367,19 @@ impl KimoApp {
             self.selected_message = None;
             self.cancel_select();
         }
-        self.show_account_form = false;
+        if !sign_in {
+            self.show_account_form = false;
+        }
     }
 
     /// Save the form and send the account straight to the browser sign-in.
-    /// The row has to exist first — the tokens land in it — so this is the
-    /// form's Save plus the one job that finishes a plugin account.
+    /// The row has to exist first — the tokens land in it — and the save
+    /// spawns the one job; a second spawn here would be a second browser.
     fn start_plugin_sign_in(&mut self) {
         if !self.account_form.is_valid() {
             return;
         }
-        self.save_account_form();
-        let saved = self.account_form.editing.clone();
-        let Some(id) = saved else {
-            return;
-        };
-        if let Some(account) = self.accounts.iter().find(|a| a.id == id).cloned() {
-            sync::spawn(
-                Job::PluginSignIn { account },
-                self.ctx.clone(),
-                self.tx.clone(),
-            );
-        }
+        self.save_account_form_impl(true);
     }
 
     /// An id for a new account: the slug of its name, numbered if that is
@@ -8805,6 +8840,19 @@ impl KimoApp {
                     .any(|(id, _)| vendor::VendorKey::for_provider(id) == Some(*key))
             })
             .collect::<Vec<_>>();
+        // A sign-in that failed says so here, on the form it started from —
+        // not only on the Accounts page the window already left. While the
+        // browser is the thing happening, the waiting note below says that
+        // instead.
+        if self.plugin_signing_in.is_none() {
+            if let Some(error) = &self.account_error {
+                ui.colored_label(
+                    ui.visuals().error_fg_color,
+                    format!("Sign-in failed: {error}"),
+                );
+                ui.add_space(4.0);
+            }
+        }
         let f = &mut self.account_form;
         egui::Grid::new("account_form_grid")
             .num_columns(2)
@@ -8952,22 +9000,35 @@ impl KimoApp {
                 .as_deref()
                 .and_then(|id| self.accounts.iter().find(|account| account.id == id))
                 .is_some_and(|account| account.access_token.is_some());
+            let waiting = self.plugin_signing_in.is_some();
+            // A sign-in without a client id is refused by the module before
+            // any browser opens — an outcome that must not be reachable as a
+            // click that appears to do nothing. The id field is right above.
+            let has_client_id = !f.client_id.trim().is_empty();
             ui.horizontal(|ui| {
                 let who = match f.plugin.as_deref() {
                     Some("gmail") => "Google",
                     Some("outlook") => "Microsoft",
                     _ => "the provider",
                 };
-                let label = if signed_in {
+                let label = if waiting {
+                    "Signing in…".to_string()
+                } else if signed_in {
                     "Sign in again".to_string()
                 } else {
                     format!("Sign in with {who}")
                 };
-                if ui.button(label).clicked() {
+                let enabled = !waiting && has_client_id;
+                if ui.add_enabled(enabled, egui::Button::new(label)).clicked() {
                     sign_in_clicked = true;
                 }
                 ui.label(
-                    egui::RichText::new(if signed_in {
+                    egui::RichText::new(if waiting {
+                        "The browser should have opened — finish there and this window follows."
+                    } else if !has_client_id {
+                        "An OAuth client id is required first: register an application with the \
+                         provider and paste its id above."
+                    } else if signed_in {
                         "Signed in — the browser holds the password, Kimo holds only tokens."
                     } else {
                         "Opens your browser to sign in; Kimo never sees the password."
@@ -20021,6 +20082,68 @@ mod tests {
         assert!(kde_scheme_is_dark("[General]\nColorScheme=BreezeDark\n"));
         assert!(!kde_scheme_is_dark("[General]\nColorScheme=BreezeLight\n"));
         assert!(!kde_scheme_is_dark("[General]\n"));
+    }
+
+    /// A sign-in that fails puts the form back on the account with the
+    /// reason beside the button that was clicked — the outcome belongs where
+    /// the click happened, not on a page the window already left.
+    #[test]
+    fn a_failed_sign_in_reopens_the_form_with_its_error() {
+        let ctx = egui::Context::default();
+        let mut account = test_account("imap.example.com");
+        account.provider = Some("gmail".to_string());
+        let mut app = KimoApp::assemble(
+            &ctx,
+            vec![account],
+            std::collections::HashMap::new(),
+            &storage::Settings::default(),
+            std::sync::Arc::new(crate::plugin::discovery::Registry::empty()),
+        );
+        app.plugin_signing_in = Some("work".to_string());
+        app.show_account_form = false;
+        app.account_error = None;
+
+        app.apply_event(sync::Event::PluginAuth {
+            account_id: "work".to_string(),
+            error: Some("config: no client id".to_string()),
+        });
+
+        assert!(app.show_account_form, "the form comes back");
+        assert_eq!(app.account_form.editing.as_deref(), Some("work"));
+        assert_eq!(app.account_error.as_deref(), Some("config: no client id"));
+        assert!(app.plugin_signing_in.is_none(), "the wait is over");
+    }
+
+    /// A finished sign-in ends the wait even where the database is not there
+    /// to say more: the form it waited on closes, nothing is left looking
+    /// like a sign-in still in flight.
+    #[test]
+    fn a_finished_sign_in_ends_the_wait() {
+        let ctx = egui::Context::default();
+        let mut account = test_account("imap.example.com");
+        account.provider = Some("outlook".to_string());
+        let mut app = KimoApp::assemble(
+            &ctx,
+            vec![account],
+            std::collections::HashMap::new(),
+            &storage::Settings::default(),
+            std::sync::Arc::new(crate::plugin::discovery::Registry::empty()),
+        );
+        app.plugin_signing_in = Some("work".to_string());
+        app.show_account_form = true;
+        app.account_form.editing = Some("work".to_string());
+
+        app.apply_event(sync::Event::PluginAuth {
+            account_id: "work".to_string(),
+            error: None,
+        });
+
+        assert!(app.plugin_signing_in.is_none());
+        assert!(
+            !app.show_account_form,
+            "a signed-in form has nothing left to ask"
+        );
+        assert!(app.account_error.is_none());
     }
 
     #[test]
