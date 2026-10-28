@@ -257,18 +257,6 @@ mod tests {
     }
 
     #[test]
-    fn the_echo_sample_is_a_loadable_wasm_module() {
-        let manifest = Manifest::parse(include_str!("../../plugins/echo/plugin.json")).unwrap();
-        let plugin =
-            WasmPlugin::load(manifest, include_bytes!("../../plugins/echo/echo.wasm")).unwrap();
-        let mut instance = plugin.instantiate().unwrap();
-        let response = instance
-            .invoke(&crate::plugin::abi::PluginRequest::new("plugin.describe"))
-            .unwrap();
-        assert_eq!(response.result["provider"], "echo");
-    }
-
-    #[test]
     fn the_gmail_sample_describes_and_signs_in_through_the_abi() {
         let manifest = Manifest::parse(include_str!("../../plugins/gmail/plugin.json")).unwrap();
         let plugin =
@@ -316,13 +304,12 @@ mod tests {
         let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
         let registry = Registry::discover_from(&[root.join("plugins")]);
         assert_eq!(registry.errors().len(), 0, "{:?}", registry.errors());
-        assert_eq!(registry.plugins().len(), 4);
+        assert_eq!(registry.plugins().len(), 3);
         let ids: Vec<&str> = registry
             .plugins()
             .iter()
             .map(|loaded| loaded.manifest.id.as_str())
             .collect();
-        assert!(ids.contains(&"org.kimo.echo"));
         assert!(ids.contains(&"org.kimo.sender-groups"));
         assert!(ids.contains(&"org.kimo.gmail"));
         assert!(ids.contains(&"org.kimo.outlook"));
@@ -396,12 +383,12 @@ mod tests {
         let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
         let registry = Registry::discover_from_with_disabled(
             &[root.join("plugins")],
-            &["org.kimo.echo".to_string()],
+            &["org.kimo.gmail".to_string()],
         );
         assert_eq!(registry.errors().len(), 0, "{:?}", registry.errors());
-        // The other samples (sender-groups, gmail, outlook) still load.
-        assert_eq!(registry.plugins().len(), 3);
+        // The other samples (sender-groups, outlook) still load.
+        assert_eq!(registry.plugins().len(), 2);
         assert_eq!(registry.disabled().len(), 1);
-        assert_eq!(registry.disabled()[0].id, "org.kimo.echo");
+        assert_eq!(registry.disabled()[0].id, "org.kimo.gmail");
     }
 }

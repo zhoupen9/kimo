@@ -6,9 +6,8 @@ instance, permissions, fuel and memory limits, extension-plan validation and a
 `MailProvider` adapter. Preferences → Plugins lists what the scan found and
 switches plugins on and off (a disabled module is not compiled at startup),
 and the host has a real HTTP/TLS backend, manifest network rules are enforced
-as an endpoint allowlist, [`plugins/echo`](../plugins/echo/) is a minimal
-reference provider, [`plugins/sender-groups`](../plugins/sender-groups/) is
-a minimal reference extension, [`plugins/gmail`](../plugins/gmail/) is
+as an endpoint allowlist, [`plugins/sender-groups`](../plugins/sender-groups/)
+is a minimal reference extension, [`plugins/gmail`](../plugins/gmail/) is
 the first real provider: XOAUTH2, all four `X-GM-EXT-1` extensions, Gmail
 submission, and an OAuth2 authorization-code flow whose browser leg the
 host runs (`src/plugin/auth.rs`: loopback redirect, the desktop's OpenURI

@@ -277,7 +277,7 @@ mod tests {
             minimize_to_tray: Some(true),
             close_to_tray: Some(true),
             disabled_vendors: vec!["gmail".into(), "outlook".into()],
-            disabled_plugins: vec!["org.kimo.echo".into()],
+            disabled_plugins: vec!["org.kimo.gmail".into()],
             gpu: Some("0000:03:00.0".into()),
         };
         let json = serde_json::to_string(&s).unwrap();
@@ -295,7 +295,7 @@ mod tests {
         assert_eq!(back.minimize_to_tray, Some(true));
         assert_eq!(back.close_to_tray, Some(true));
         assert_eq!(back.disabled_vendors, ["gmail", "outlook"]);
-        assert_eq!(back.disabled_plugins, ["org.kimo.echo"]);
+        assert_eq!(back.disabled_plugins, ["org.kimo.gmail"]);
         assert_eq!(back.gpu.as_deref(), Some("0000:03:00.0"));
         // settings.json with missing keys must still load.
         let missing: Settings = serde_json::from_str("{}").unwrap();
