@@ -12,6 +12,7 @@ are where new reasoning goes when a change is done.
 | [protocols.md](protocols.md) | the IMAP/POP3/SMTP clients, TLS and the finite-field DH fallback, mailbox names, error mapping |
 | [providers.md](providers.md) | the abstract `MailProvider` interface, the IMAP/POP3 adapters, the vendor layer (Gmail, Outlook, …) |
 | [mail-spec.md](mail-spec.md) | the draft provider/extension contract and its WASM host: profiles, operations, Gmail/Graph mappings, plugin ABI, UI hooks |
+| [provider-architecture.md](provider-architecture.md) | the abstraction: actions, effects, capabilities, the WASM boundary, and how providers and extensions sit around the host |
 | [ui-shell.md](ui-shell.md) | the window and its title bar, the three columns and how they give way, the frosted backdrop, the navigation column, the egui 0.36 integration |
 | [ui-mail.md](ui-mail.md) | the message list, rows and threading, select mode, the search box and popup, the reading pane, attachments, labels, flags, filters, sort |
 | [ui-style.md](ui-style.md) | the house rules a drawn widget obeys: chevrons over solid triangles, the mail address fields' outline, the Cc/Bcc fold |
