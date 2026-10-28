@@ -8,11 +8,17 @@ switches plugins on and off (a disabled module is not compiled at startup),
 and the host has a real HTTP/TLS backend, manifest network rules are enforced
 as an endpoint allowlist, [`plugins/echo`](../plugins/echo/) is a minimal
 reference provider, [`plugins/sender-groups`](../plugins/sender-groups/) is
-a minimal reference extension, and [`plugins/gmail`](../plugins/gmail/) is
+a minimal reference extension, [`plugins/gmail`](../plugins/gmail/) is
 the first real provider: XOAUTH2, all four `X-GM-EXT-1` extensions, Gmail
 submission, and an OAuth2 authorization-code flow whose browser leg the
 host runs (`src/plugin/auth.rs`: loopback redirect, the desktop's OpenURI
-portal, `xdg-open` fallback). The IMAP/POP3/SMTP/Graph reference
+portal, `xdg-open` fallback). [`plugins/outlook`](../plugins/outlook/) is
+the second, over Graph: Entra ID OAuth2, POP3-shaped sync by immutable ids,
+flags, soft delete, KQL search, and `sendMail` with its own Sent copy —
+installed but off by default, per §8.8. The capability gates the host's
+sync paths ask (`send.save_copy`, `message.set_flags`, `message.append`)
+come from the module's own descriptor, and the Sent-copy rule of §5.3 is
+enforced there: a module that files its own copy is never handed a second. The IMAP/POP3/SMTP/Graph reference
 modules are not built yet, and the current client still reads IMAP/POP3
 through `src/protocol/` — but a plugin-backed account is wired: the Gmail
 module's provider is an entry in the account form (a dedicated entry per

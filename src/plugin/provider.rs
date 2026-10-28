@@ -65,7 +65,9 @@ impl WasmProvider {
                 folders: declared("mailbox.list"),
                 server_flags: declared("message.set_flags"),
                 append: declared("message.append"),
-                stored_uids: false,
+                // A provider with no UID arithmetic of its own (Graph) is
+                // told which messages the database already holds, POP3-style.
+                stored_uids: declared("sync.stored_uids"),
             };
         }
         Ok(provider)
@@ -179,6 +181,51 @@ pub fn open_account(account: &Account) -> MailResult<WasmProvider> {
         )
         .map_err(host_error)
     })
+}
+
+/// Whether the module declares a capability, for the host's dispatch gates.
+pub fn declares_public(account: &Account, name: &str) -> bool {
+    declares(account, name)
+}
+
+fn declares(account: &Account, name: &str) -> bool {
+    with_plugin(account, |plugin| Ok(declares_in(plugin, name))).unwrap_or(false)
+}
+
+/// Whether the module files its own Sent copy (`send.save_copy`): a provider
+/// that does must not be handed a second copy to `message.append`, which is
+/// how a Gmail or Graph submission would end up filed twice.
+pub fn files_own_sent(account: &Account) -> bool {
+    declares(account, "send.save_copy")
+}
+
+/// Whether the module's messages can be pushed to the server
+/// (`message.set_flags`), for the flag round trips.
+pub fn server_flags(account: &Account) -> bool {
+    declares(account, "message.set_flags")
+}
+
+/// Whether a *module* (not an account) declares a capability: one
+/// `provider.describe` on a throwaway session — a static JSON answer, no
+/// socket, no token — so a gate that only wants to know what the module
+/// can do does not pay for a real one.
+pub fn declares_in(plugin: &WasmPlugin, name: &str) -> bool {
+    let Ok(mut instance) = plugin.instantiate() else {
+        return false;
+    };
+    let mut request = PluginRequest::operation("provider.invoke", "provider.describe");
+    request.params = json!({});
+    let Ok(response) = instance.invoke(&request) else {
+        return false;
+    };
+    response
+        .result
+        .get("capabilities")
+        .and_then(Value::as_array)
+        .is_some_and(|list| {
+            list.iter()
+                .any(|capability| capability.get("name").and_then(Value::as_str) == Some(name))
+        })
 }
 
 /// Submit one fully built message through the account's plugin provider.
@@ -539,5 +586,33 @@ mod tests {
         )
         .unwrap();
         assert_eq!(provider.capabilities(), capabilities());
+    }
+
+    #[test]
+    fn the_real_modules_declare_what_the_send_and_flag_gates_ask() {
+        // The submission modules file their own Sent copy; a module with no
+        // descriptor answer says no, which is the gate's safe default.
+        let gmail =
+            crate::plugin::abi::Manifest::parse(include_str!("../../plugins/gmail/plugin.json"))
+                .unwrap();
+        let gmail =
+            WasmPlugin::load(gmail, include_bytes!("../../plugins/gmail/gmail.wasm")).unwrap();
+        assert!(declares_in(&gmail, "send.save_copy"));
+        assert!(declares_in(&gmail, "message.append"));
+        assert!(declares_in(&gmail, "message.set_flags"));
+        assert!(!declares_in(&gmail, "sync.stored_uids"));
+
+        let outlook =
+            crate::plugin::abi::Manifest::parse(include_str!("../../plugins/outlook/plugin.json"))
+                .unwrap();
+        let outlook = WasmPlugin::load(
+            outlook,
+            include_bytes!("../../plugins/outlook/outlook.wasm"),
+        )
+        .unwrap();
+        assert!(declares_in(&outlook, "send.save_copy"));
+        assert!(declares_in(&outlook, "sync.stored_uids"));
+        assert!(declares_in(&outlook, "message.set_flags"));
+        assert!(!declares_in(&outlook, "message.append"));
     }
 }

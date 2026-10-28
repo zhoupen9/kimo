@@ -626,3 +626,15 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod open_uri_probe {
+    #[test]
+    #[ignore] // Touches the live session: run with --ignored to probe the portal.
+    fn probe_opens_a_page() {
+        let started = std::time::Instant::now();
+        let result = super::open_uri("https://example.com/");
+        eprintln!("open_uri answered in {:?}: {:?}", started.elapsed(), result);
+        assert!(result.is_ok(), "{result:?}");
+    }
+}

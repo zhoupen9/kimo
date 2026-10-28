@@ -530,3 +530,45 @@ mod tests {
         assert!(check_url("accounts.google.com").is_err());
     }
 }
+
+#[cfg(test)]
+mod live_probe {
+    use super::*;
+    use crate::plugin::discovery::{self, Registry};
+
+    /// Everything `plugin_sign_in` does, step by step, against the real
+    /// module and the live desktop — including the browser open. Run with
+    /// `--ignored --nocapture`; a Microsoft login page should appear.
+    #[test]
+    #[ignore]
+    fn probe_the_full_sign_in_leg() {
+        let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let registry = std::sync::Arc::new(Registry::discover_from(&[root.join("plugins")]));
+        discovery::install(std::sync::Arc::clone(&registry));
+        eprintln!("1. registry: {} plugins", registry.plugins().len());
+        let loaded = registry.provider("outlook").expect("outlook loaded");
+        eprintln!("2. plugin resolved: {}", loaded.manifest.id);
+
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("the loopback socket binds");
+        let port = listener.local_addr().unwrap().port();
+        eprintln!("3. loopback port {port}");
+
+        let mut instance = loaded
+            .plugin
+            .instantiate_with(Arc::new(crate::plugin::host::DeniedNetwork))
+            .expect("the module instantiates");
+        let challenge = invoke(
+            &mut instance,
+            PluginRequest::new("auth.begin"),
+            json!({ "redirect_port": port, "client_id": "probe-client-id" }),
+        )
+        .expect("auth.begin answers");
+        eprintln!("4. auth.begin kind: {:?}", challenge.get("kind"));
+        let url = challenge.get("url").and_then(Value::as_str).expect("a url");
+        check_url(url).expect("the url is a page");
+        eprintln!("5. url ok: {url}");
+
+        open_in_browser(url).expect("the browser opens");
+        eprintln!("6. browser leg returned Ok — page should be open now");
+    }
+}

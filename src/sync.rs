@@ -1050,10 +1050,20 @@ fn load_older(account: &Account, folder: &str, tx: &Sender<Event>) -> MailResult
 /// server that refuses the `STORE` must not lose that.
 fn mark_seen(account: &Account, folder: &str, uid: &str) -> MailResult<()> {
     db::set_seen(&account.id, folder, uid)?;
-    if provider::capabilities(account.protocol).server_flags {
+    if flags_reach_the_server(account) {
         provider::with(account, |provider| provider.set_seen(folder, uid))?;
     }
     Ok(())
+}
+
+/// Whether a flag change has a server half to push: the protocol's table for
+/// a built-in account, the module's own descriptor for a plugin one — a
+/// module that declares `message.set_flags` is the one asked to carry it.
+fn flags_reach_the_server(account: &Account) -> bool {
+    if account.is_plugin() {
+        return crate::plugin::provider::server_flags(account);
+    }
+    provider::capabilities(account.protocol).server_flags
 }
 
 /// Store the reader's flag locally and, for a protocol that keeps it, push it
@@ -1064,7 +1074,7 @@ fn mark_seen(account: &Account, folder: &str, uid: &str) -> MailResult<()> {
 /// flag is a state rather than a latch.
 fn set_flag(account: &Account, folder: &str, uid: &str, flagged: bool) -> MailResult<()> {
     db::set_flagged(&account.id, folder, uid, flagged)?;
-    if provider::capabilities(account.protocol).server_flags {
+    if flags_reach_the_server(account) {
         provider::with(account, |provider| {
             provider.set_flagged(folder, uid, flagged)
         })?;
@@ -1348,7 +1358,18 @@ fn append_to_sent(
     vendor: VendorKey,
     tx: &Sender<Event>,
 ) -> SentCopy {
-    if !provider::capabilities(account.protocol).append {
+    if account.is_plugin() {
+        // Graph's `sendMail` and Gmail's own submission file the copy
+        // themselves (`send.save_copy`); appending one here would be the
+        // same mail filed twice. A module without the capability is asked
+        // to append only when it declared `message.append`.
+        if crate::plugin::provider::files_own_sent(account) {
+            return SentCopy::None;
+        }
+        if !crate::plugin::provider::declares_public(account, "message.append") {
+            return SentCopy::None;
+        }
+    } else if !provider::capabilities(account.protocol).append {
         return SentCopy::None;
     }
     let mailbox = match db::listed_folders(&account.id) {

@@ -8953,10 +8953,15 @@ impl KimoApp {
                 .and_then(|id| self.accounts.iter().find(|account| account.id == id))
                 .is_some_and(|account| account.access_token.is_some());
             ui.horizontal(|ui| {
+                let who = match f.plugin.as_deref() {
+                    Some("gmail") => "Google",
+                    Some("outlook") => "Microsoft",
+                    _ => "the provider",
+                };
                 let label = if signed_in {
-                    "Sign in again"
+                    "Sign in again".to_string()
                 } else {
-                    "Sign in with Google"
+                    format!("Sign in with {who}")
                 };
                 if ui.button(label).clicked() {
                     sign_in_clicked = true;

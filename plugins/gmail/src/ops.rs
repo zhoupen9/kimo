@@ -157,6 +157,12 @@ fn health(request: &Request) -> Response {
 }
 
 fn invoke(request: &Request, operation: &str) -> Response {
+    // The descriptor is static: no credentials, no socket. It has to answer
+    // here, before the session, because the host asks for it on its own
+    // (capability gates, the account form) with nothing to log in with.
+    if operation == "provider.describe" {
+        return describe();
+    }
     let session = match session(request) {
         Ok(session) => session,
         Err(response) => return response,

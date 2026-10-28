@@ -1,0 +1,16 @@
+{
+  "schema": 1,
+  "id": "org.kimo.outlook",
+  "name": "Outlook / Microsoft 365",
+  "version": "0.1.0",
+  "abi": 1,
+  "module": "outlook.wasm",
+  "default_enabled": false,
+  "permissions": ["net.http", "secrets"],
+  "providers": [{ "id": "outlook", "name": "Outlook / Microsoft 365" }],
+  "extensions": [],
+  "network": [
+    { "transport": "https", "host": "login.microsoftonline.com" },
+    { "transport": "https", "host": "graph.microsoft.com" }
+  ]
+}

@@ -316,7 +316,7 @@ mod tests {
         let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
         let registry = Registry::discover_from(&[root.join("plugins")]);
         assert_eq!(registry.errors().len(), 0, "{:?}", registry.errors());
-        assert_eq!(registry.plugins().len(), 3);
+        assert_eq!(registry.plugins().len(), 4);
         let ids: Vec<&str> = registry
             .plugins()
             .iter()
@@ -325,6 +325,70 @@ mod tests {
         assert!(ids.contains(&"org.kimo.echo"));
         assert!(ids.contains(&"org.kimo.sender-groups"));
         assert!(ids.contains(&"org.kimo.gmail"));
+        assert!(ids.contains(&"org.kimo.outlook"));
+    }
+
+    #[test]
+    fn the_outlook_sample_describes_and_signs_in_through_the_abi() {
+        let manifest = Manifest::parse(include_str!("../../plugins/outlook/plugin.json")).unwrap();
+        let plugin = WasmPlugin::load(
+            manifest,
+            include_bytes!("../../plugins/outlook/outlook.wasm"),
+        )
+        .unwrap();
+        let mut instance = plugin.instantiate().unwrap();
+
+        let described = instance
+            .invoke(&crate::plugin::abi::PluginRequest::new("provider.describe"))
+            .unwrap();
+        assert!(described.ok);
+        let profiles: Vec<&str> = described.result["profiles"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|profile| profile.as_str())
+            .collect();
+        assert!(profiles.contains(&"kimo-graph/1"));
+        let capabilities: Vec<&str> = described.result["capabilities"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|capability| capability["name"].as_str())
+            .collect();
+        assert!(capabilities.contains(&"sync.stored_uids"));
+        assert!(capabilities.contains(&"send.save_copy"));
+        // A capability is a promise: append is Graph's to file, not this
+        // module's to declare.
+        assert!(!capabilities.contains(&"message.append"));
+
+        // The sign-in URL names Entra and the loopback port the host holds.
+        let mut request = crate::plugin::abi::PluginRequest::new("auth.begin");
+        request.params = serde_json::json!({
+            "redirect_port": 8914,
+            "client_id": "test-client"
+        });
+        let challenge = instance.invoke(&request).unwrap();
+        assert!(challenge.ok, "{:?}", challenge.error);
+        let url = challenge.result["url"].as_str().unwrap();
+        assert!(
+            url.starts_with("https://login.microsoftonline.com/common/oauth2/v2.0/authorize?"),
+            "{url}"
+        );
+        assert!(url.contains("redirect_uri=http%3A%2F%2Flocalhost%3A8914%2F"));
+        assert!(url.contains("code_challenge_method=S256"));
+    }
+
+    #[test]
+    fn the_outlook_sample_is_listed_by_its_provider_contribution() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let registry = Registry::discover_from(&[root.join("plugins")]);
+        // The account form's provider picker is fed by exactly this lookup.
+        let outlook = registry
+            .provider("outlook")
+            .expect("the contribution is loaded");
+        assert_eq!(outlook.manifest.id, "org.kimo.outlook");
+        assert!(registry.provider("gmail").is_some());
+        assert!(registry.provider("no-such-provider").is_none());
     }
 
     #[test]
@@ -335,8 +399,8 @@ mod tests {
             &["org.kimo.echo".to_string()],
         );
         assert_eq!(registry.errors().len(), 0, "{:?}", registry.errors());
-        // The other two samples (sender-groups and gmail) still load.
-        assert_eq!(registry.plugins().len(), 2);
+        // The other samples (sender-groups, gmail, outlook) still load.
+        assert_eq!(registry.plugins().len(), 3);
         assert_eq!(registry.disabled().len(), 1);
         assert_eq!(registry.disabled()[0].id, "org.kimo.echo");
     }

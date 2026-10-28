@@ -114,8 +114,9 @@ even considered, so the module owns the wire, the login and the vendor's
 semantics, and no job in `sync.rs` knows which one it talked to.
 
 The account form gives each installed provider module its own entry in the
-Provider row (`plugin_providers`, from the startup scan's manifests — an
-Outlook module is a line in that picker the day it exists). A plugin entry
+Provider row (`plugin_providers`, from the startup scan's manifests — the
+Outlook module is a line in that picker, and the next provider will be
+too). A plugin entry
 replaces the vendor preset of the same provider while its module is
 installed; with the module gone the preset is the entry again, and an
 existing plugin account opens with a plain "plugin not installed" error —
@@ -128,8 +129,16 @@ row. A token inside two minutes of expiring is refreshed on session open
 token has a clock.
 
 Submission goes through the module too (`send.submit`): Gmail submits over
-XOAUTH2, and the Sent copy is still the vendor layer's preferred mailbox,
-filed through the same `provider::with` every other append uses.
+XOAUTH2, Outlook through Graph's `sendMail`. A module that declares
+`send.save_copy` (both do) files its own Sent copy, and the host then knows
+not to append a second; a module without the capability is asked to append
+only when it declared `message.append`.
+
+A Graph module is the shape of a provider with no protocol client at all:
+POP3-shaped sync by immutable ids (`sync.stored_uids`), `$skip` pages for
+`Load older mail` (the folder mark counts pages), and every request through
+the host's HTTPS import — see `plugins/outlook/README.md` for the mapping
+and its limits (folders resolve by display name, first match wins).
 
 ## Adding things
 
