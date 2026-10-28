@@ -42,8 +42,30 @@ Google issues OAuth client ids to the deployment, not to the software.
 The module ships with none: `auth.begin` refuses to invent one and asks
 for `client_id` in its params (the account form's config field in the
 descriptor), which a deployment fills with a Desktop-type client from its
-own Google Cloud project. App passwords are the separate `auth.password`
-path (IMAP `LOGIN`); they never reach submission.
+own Google Cloud project.
+
+A **Desktop app** client also has a *client secret*, and Google's token
+endpoint refuses the exchange without it (`client_secret is missing`) even
+though the installed-app documentation calls the parameter optional. The
+secret is public by design for an installed app — it ships inside every copy
+of the binary — but it must be sent, so the account form has a second field
+and the module passes whatever it is given as `client_secret` to both
+`auth.continue` and `auth.refresh`. Entra's public clients have no secret,
+which is why the field is optional rather than required.
+
+App passwords are the separate `auth.password` path (IMAP `LOGIN`); they
+never reach submission.
+
+## Network
+
+The module speaks IMAP on `imap.gmail.com:993` and submission on
+`smtp.gmail.com:465`, over TLS, and nothing else — there is no HTTPS mailbox
+API in it the way Graph is for Outlook. A network that filters those ports
+(some do, while leaving 443 wide open) cannot sync Gmail with any client: the
+connection is made and then dropped without a byte, and the module reports it
+as `network: imap.gmail.com:993 closed before the greeting … the network may
+block IMAP`. OAuth is unaffected — it is HTTPS — which is why a sign-in can
+succeed on a network where the mailbox cannot.
 
 ## Building
 

@@ -171,7 +171,10 @@ pub fn cancelled() -> bool {
 /// TLS, timeouts, redirects and size caps. `-1` is every failure, denial
 /// included; the reason stays in the host, so the caller's error message must
 /// not pretend to know it.
-pub fn http(request: &Value, cap: usize) -> Result<Value, String> {
+///
+/// What comes back is the host's *envelope* — `{status, headers, body}`, the
+/// body still base64 — not the endpoint's own JSON. `decoded_body` opens it.
+pub fn http_envelope(request: &Value, cap: usize) -> Result<Value, String> {
     let body = serde_json::to_vec(request).map_err(|error| format!("request: {error}"))?;
     let mut out = vec![0u8; cap];
     let written = unsafe {
@@ -191,6 +194,19 @@ pub fn http(request: &Value, cap: usize) -> Result<Value, String> {
     }
     out.truncate(written);
     serde_json::from_slice(&out).map_err(|error| format!("response: {error}"))
+}
+
+/// The response body, base64-decoded: the host's HTTP envelope carries bytes
+/// as base64 whatever the endpoint answered.
+pub fn decoded_body(envelope: &Value) -> Result<Vec<u8>, String> {
+    use base64::Engine as _;
+    let encoded = envelope
+        .get("body")
+        .and_then(Value::as_str)
+        .ok_or("the response has no body")?;
+    base64::engine::general_purpose::STANDARD
+        .decode(encoded)
+        .map_err(|error| format!("response body: {error}"))
 }
 
 /// A TLS stream the host opened: IMAP and SMTP both ride one, because a

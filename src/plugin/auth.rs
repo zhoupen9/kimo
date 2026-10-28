@@ -25,7 +25,7 @@ use serde_json::{json, Value};
 
 use crate::error::{MailError, MailResult};
 
-use super::abi::{PluginError, PluginRequest};
+use super::abi::{PluginError, PluginRequest, PluginResponse};
 use super::host::{HostNetwork, PluginInstance, WasmPlugin};
 
 /// How long the browser may take to come back with a redirect: the user has
@@ -110,7 +110,7 @@ pub fn sign_in_with(
         params = json!({});
     }
     params["redirect_port"] = json!(port);
-    let challenge = invoke(&mut instance, PluginRequest::new("auth.begin"), params)?;
+    let challenge = invoke(&mut instance, PluginRequest::new("auth.begin"), params)?.result;
     if challenge.get("kind").and_then(Value::as_str) != Some("open_url") {
         return Err(MailError::Protocol(
             "the plugin did not ask for a browser".to_string(),
@@ -136,9 +136,10 @@ pub fn sign_in_with(
         PluginRequest::new("auth.continue"),
         json!({ "code": redirect.code, "state": redirect.state }),
     )?;
+    // The tokens ride the envelope's own `credentials` field, beside `result`
+    // — not inside it: `auth.continue`'s `result` is only `{"kind":"done"}`.
     let credentials = done
-        .get("credentials")
-        .cloned()
+        .credentials
         .ok_or_else(|| MailError::Protocol("the plugin returned no tokens".to_string()))?;
     serde_json::from_value(credentials)
         .map_err(|error| MailError::Protocol(format!("the tokens are malformed: {error}")))
@@ -152,6 +153,7 @@ pub fn refresh(
     network: Arc<dyn HostNetwork>,
     refresh_token: &str,
     client_id: &str,
+    client_secret: &str,
 ) -> MailResult<Credentials> {
     let mut instance = plugin
         .instantiate_with(network)
@@ -159,23 +161,27 @@ pub fn refresh(
     let done = invoke(
         &mut instance,
         PluginRequest::new("auth.refresh"),
-        json!({ "refresh_token": refresh_token, "client_id": client_id }),
+        json!({
+            "refresh_token": refresh_token,
+            "client_id": client_id,
+            "client_secret": client_secret,
+        }),
     )?;
     let credentials = done
-        .get("credentials")
-        .cloned()
+        .credentials
         .ok_or_else(|| MailError::Protocol("the plugin returned no tokens".to_string()))?;
     serde_json::from_value(credentials)
         .map_err(|error| MailError::Protocol(format!("the tokens are malformed: {error}")))
 }
 
-/// One plugin call: `ok` hands back the result, an error keeps its code and
+/// One plugin call: the whole response, so a caller keeps the `credentials`
+/// the module returned beside its `result`; a refusal keeps its code and
 /// message (a token never reaches either, by the plugin's own contract).
 fn invoke(
     instance: &mut PluginInstance,
     mut request: PluginRequest,
     params: Value,
-) -> MailResult<Value> {
+) -> MailResult<PluginResponse> {
     request.params = params;
     let response = instance
         .invoke(&request)
@@ -193,7 +199,7 @@ fn invoke(
             MailError::Protocol(format!("{}: {}", error.code, error.message))
         });
     }
-    Ok(response.result)
+    Ok(response)
 }
 
 fn auth_error(context: &str, error: &impl std::fmt::Display) -> MailError {
@@ -382,6 +388,7 @@ fn percent_decoded(text: &str) -> String {
 mod tests {
     use super::*;
     use crate::plugin::host::DeniedNetwork;
+    use base64::Engine as _;
     use std::sync::mpsc;
 
     /// The real Gmail module, loaded the way discovery loads it.
@@ -513,6 +520,91 @@ mod tests {
         );
     }
 
+    /// The token endpoint as the real backend answers it: the envelope
+    /// `{status, headers, body}` `StdNetwork` serialises, with Google's JSON
+    /// base64'd inside `body`. A grant that stops here never reached the
+    /// module's parser.
+    struct TokenEndpoint;
+
+    impl HostNetwork for TokenEndpoint {
+        fn http(&self, request: &[u8]) -> Result<Vec<u8>, String> {
+            let request: Value =
+                serde_json::from_slice(request).map_err(|error| error.to_string())?;
+            if request["url"].as_str() != Some("https://oauth2.googleapis.com/token") {
+                return Err("the sign-in asked the wrong endpoint".to_string());
+            }
+            let granted = json!({
+                "access_token": "ya29.test",
+                "refresh_token": "1//refresh",
+                "expires_in": 3600,
+                "scope": "https://mail.google.com/",
+                "token_type": "Bearer",
+            });
+            let body = base64::engine::general_purpose::STANDARD
+                .encode(serde_json::to_vec(&granted).unwrap());
+            Ok(serde_json::to_vec(&json!({ "status": 200, "headers": [], "body": body })).unwrap())
+        }
+    }
+
+    #[test]
+    fn a_granted_code_comes_back_as_credentials() {
+        // The whole dance against the real module, with the token endpoint
+        // answering the way Google does. This is the leg the app runs after
+        // the browser closes, and the one a module that forgot to decode the
+        // host's envelope fails.
+        let plugin = gmail();
+        let network = Arc::new(TokenEndpoint);
+        let handed = Arc::new(std::sync::Mutex::new(None::<String>));
+        let slot = Arc::clone(&handed);
+        let open = move |url: &str| -> MailResult<()> {
+            *slot.lock().unwrap() = Some(url.to_string());
+            Ok(())
+        };
+
+        let flow = std::thread::spawn(move || {
+            sign_in_with(
+                &plugin,
+                network,
+                json!({ "client_id": "test-client.apps.googleusercontent.com" }),
+                &open,
+            )
+        });
+
+        let url = loop {
+            if let Some(url) = handed.lock().unwrap().take() {
+                break url;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        let query = |key: &str| -> String {
+            url.split(&format!("{key}="))
+                .nth(1)
+                .and_then(|rest| rest.split('&').next())
+                .map(percent_decoded)
+                .unwrap_or_default()
+        };
+        let port: u16 = query("redirect_uri")
+            .rsplit(':')
+            .next()
+            .and_then(|digits| digits.trim_end_matches('/').parse().ok())
+            .expect("the redirect URI names the loopback port");
+        let state = query("state");
+
+        let mut browser = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        browser
+            .write_all(
+                format!("GET /?code=4%2F0Ax&state={state} HTTP/1.1\r\nHost: localhost\r\n\r\n")
+                    .as_bytes(),
+            )
+            .unwrap();
+        let mut page = String::new();
+        let _ = browser.read_to_string(&mut page);
+
+        let credentials = flow.join().unwrap().expect("the token exchange completes");
+        assert_eq!(credentials.access_token, "ya29.test");
+        assert_eq!(credentials.refresh_token.as_deref(), Some("1//refresh"));
+    }
+
     #[test]
     fn percent_decoding_unescapes_a_query() {
         assert_eq!(percent_decoded("a%2Fb+c%3Dd"), "a/b c=d");
@@ -535,6 +627,61 @@ mod tests {
 mod live_probe {
     use super::*;
     use crate::plugin::discovery::{self, Registry};
+
+    /// The host's own IMAP transport, without a module: connect, then read
+    /// the greeting. Separates a transport fault from a module one.
+    #[test]
+    #[ignore]
+    fn probe_raw_imap_greeting() {
+        use std::io::Read as _;
+        let mut stream = crate::protocol::stream::connect(
+            "imap.gmail.com",
+            993,
+            crate::models::TlsMode::Implicit,
+        )
+        .expect("the transport connects");
+        let mut buffer = [0u8; 512];
+        match stream.read(&mut buffer) {
+            Ok(read) => eprintln!("greeting: {:?}", String::from_utf8_lossy(&buffer[..read])),
+            Err(error) => {
+                eprintln!("read error kind={:?} message={}", error.kind(), error);
+                let mut source = std::error::Error::source(&error);
+                while let Some(inner) = source {
+                    eprintln!("  caused by: {inner}");
+                    source = std::error::Error::source(inner);
+                }
+            }
+        }
+    }
+
+    /// One mailbox listing against the real Gmail with a token that is not
+    /// one: what a sync does up to the server's refusal, with the host's own
+    /// reason printed when it never gets that far.
+    #[test]
+    #[ignore]
+    fn probe_gmail_list_with_a_bogus_token() {
+        let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let registry = std::sync::Arc::new(Registry::discover_from(&[root.join("plugins")]));
+        discovery::install(std::sync::Arc::clone(&registry));
+        let loaded = registry.provider("gmail").expect("gmail loaded");
+        let mut instance = loaded
+            .plugin
+            .instantiate_with(std::sync::Arc::new(
+                crate::plugin::net::StdNetwork::default(),
+            ))
+            .expect("the module instantiates");
+        let mut request = PluginRequest::operation("provider.invoke", "mailbox.list");
+        request.account = Some(json!({ "id": "probe", "name": "probe", "protocol": "imap" }));
+        request.credentials = Some(json!({
+            "kind": "oauth2",
+            "username": "probe@gmail.com",
+            "access_token": "not-a-token",
+        }));
+        request.params = json!({});
+        let response = instance.invoke(&request).expect("the module answers");
+        eprintln!("ok={} error={:?}", response.ok, response.error);
+        eprintln!("host last_error={:?}", instance.last_error());
+    }
 
     /// Everything `plugin_sign_in` does, step by step, against the real
     /// module and the live desktop — including the browser open. Run with
@@ -562,7 +709,8 @@ mod live_probe {
             PluginRequest::new("auth.begin"),
             json!({ "redirect_port": port, "client_id": "probe-client-id" }),
         )
-        .expect("auth.begin answers");
+        .expect("auth.begin answers")
+        .result;
         eprintln!("4. auth.begin kind: {:?}", challenge.get("kind"));
         let url = challenge.get("url").and_then(Value::as_str).expect("a url");
         check_url(url).expect("the url is a page");

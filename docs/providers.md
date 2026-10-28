@@ -121,7 +121,10 @@ replaces the vendor preset of the same provider while its module is
 installed; with the module gone the preset is the entry again, and an
 existing plugin account opens with a plain "plugin not installed" error —
 it never silently becomes a generic IMAP account. The entry asks for the
-address and the deployment's OAuth client id, and its sign-in is a job:
+address, the deployment's OAuth client id, and — when that client has one —
+its secret: Google issues desktop clients a secret and refuses the token
+exchange without it, while an Entra public client has none, so the field is
+optional and only the module that needs it uses it. The sign-in is a job:
 `Job::PluginSignIn` runs the module's `auth.begin`/`auth.continue` around
 the desktop's browser (`plugin::auth`), and the tokens land in the account
 row. A token inside two minutes of expiring is refreshed on session open

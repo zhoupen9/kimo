@@ -1952,6 +1952,13 @@ struct AccountForm {
     /// own application registered with the provider (a Google Cloud
     /// Desktop client), not something Kimo can ship.
     client_id: String,
+    /// The secret that goes with `client_id`, for a deployment whose client
+    /// has one. Google issues desktop clients a secret and refuses the token
+    /// exchange without it; Entra's public clients have none. It is not a
+    /// credential in the desktop sense — Google treats an installed app's
+    /// secret as public — but it is still stored in the provider config, not
+    /// logged.
+    client_secret: String,
 }
 
 impl Default for AccountForm {
@@ -1977,6 +1984,7 @@ impl Default for AccountForm {
             smtp_password: String::new(),
             plugin: None,
             client_id: String::new(),
+            client_secret: String::new(),
         }
     }
 }
@@ -2029,6 +2037,7 @@ impl AccountForm {
                 .unwrap_or_default(),
             plugin: account.provider.clone(),
             client_id: crate::plugin::provider::client_id_of(account),
+            client_secret: crate::plugin::provider::client_secret_of(account),
         }
     }
 
@@ -2126,7 +2135,11 @@ impl AccountForm {
     fn to_account(&self, id: String, previous: Option<&Account>) -> Account {
         let provider = self.plugin.clone();
         let provider_config = if provider.is_some() && !self.client_id.trim().is_empty() {
-            Some(serde_json::json!({ "client_id": self.client_id.trim() }).to_string())
+            let mut config = serde_json::json!({ "client_id": self.client_id.trim() });
+            if !self.client_secret.trim().is_empty() {
+                config["client_secret"] = serde_json::json!(self.client_secret.trim());
+            }
+            Some(config.to_string())
         } else {
             None
         };
@@ -8991,6 +9004,17 @@ impl KimoApp {
                     ui.add(Field::new(
                         egui::TextEdit::singleline(&mut f.client_id)
                             .hint_text("the deployment's own client, from the provider's console"),
+                    ));
+                    ui.end_row();
+
+                    // Google issues a desktop client a secret and refuses the
+                    // token exchange without it; the field stays optional
+                    // because a public client (Entra) has none to give.
+                    ui.label("OAuth client secret");
+                    ui.add(Field::new(
+                        egui::TextEdit::singleline(&mut f.client_secret)
+                            .password(true)
+                            .hint_text("only if the provider's client has one (a Google desktop client does)"),
                     ));
                     ui.end_row();
                 });

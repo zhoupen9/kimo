@@ -58,6 +58,10 @@ pub struct Client {
 /// login is `auth_failed` and everything else is the wire's own words.
 pub enum Failed {
     Auth(String),
+    /// The transport let go: the port is filtered, the peer reset, TLS died.
+    /// Distinct from `Protocol` because it is the network's answer, not the
+    /// server's, and a user can act on the difference.
+    Network(String),
     Protocol(String),
 }
 
@@ -66,14 +70,22 @@ impl Client {
     /// carries the capability list already; asking again is one cheap line
     /// and keeps the answer current after login.
     pub fn connect() -> Result<Self, Failed> {
-        let stream = NetStream::open(HOST, PORT, true).map_err(Failed::Protocol)?;
+        let stream = NetStream::open(HOST, PORT, true).map_err(Failed::Network)?;
         let mut client = Self {
             stream,
             buffer: Vec::new(),
             tag: 0,
             capabilities: Vec::new(),
         };
-        let greeting = client.read_line()?;
+        let greeting = client.read_line().map_err(|error| match error {
+            // The usual shape of a filtered port: the TCP connection is made
+            // and then dropped without a byte. Say where it happened, because
+            // "the host refused the read" helps nobody.
+            Failed::Network(message) | Failed::Protocol(message) => Failed::Network(format!(
+                "{HOST}:{PORT} closed before the greeting ({message}) — the network may block IMAP"
+            )),
+            other => other,
+        })?;
         if !greeting.starts_with("* OK") {
             return Err(Failed::Protocol(format!(
                 "the server did not greet: {greeting}"
@@ -350,11 +362,11 @@ impl Client {
     fn write_line(&mut self, line: &str) -> Result<(), Failed> {
         let mut bytes = line.as_bytes().to_vec();
         bytes.extend_from_slice(b"\r\n");
-        self.stream.write(&bytes).map_err(Failed::Protocol)
+        self.stream.write(&bytes).map_err(Failed::Network)
     }
 
     fn write_bytes(&mut self, bytes: &[u8]) -> Result<(), Failed> {
-        self.stream.write(bytes).map_err(Failed::Protocol)
+        self.stream.write(bytes).map_err(Failed::Network)
     }
 
     fn read_line(&mut self) -> Result<String, Failed> {
@@ -366,9 +378,9 @@ impl Client {
                 return Ok(String::from_utf8_lossy(&line).into_owned());
             }
             let mut chunk = [0u8; 4096];
-            let read = self.stream.read(&mut chunk).map_err(Failed::Protocol)?;
+            let read = self.stream.read(&mut chunk).map_err(Failed::Network)?;
             if read == 0 {
-                return Err(Failed::Protocol("the server closed the connection".into()));
+                return Err(Failed::Network("the server closed the connection".into()));
             }
             self.buffer.extend_from_slice(&chunk[..read]);
         }
@@ -377,9 +389,9 @@ impl Client {
     fn read_exact(&mut self, len: usize) -> Result<Vec<u8>, Failed> {
         while self.buffer.len() < len {
             let mut chunk = [0u8; 16384];
-            let read = self.stream.read(&mut chunk).map_err(Failed::Protocol)?;
+            let read = self.stream.read(&mut chunk).map_err(Failed::Network)?;
             if read == 0 {
-                return Err(Failed::Protocol(
+                return Err(Failed::Network(
                     "the server closed the connection mid-literal".into(),
                 ));
             }

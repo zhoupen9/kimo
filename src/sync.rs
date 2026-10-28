@@ -1314,8 +1314,10 @@ fn plugin_sign_in(account: &Account) -> MailResult<()> {
     let registry = crate::plugin::discovery::installed().ok_or_else(missing)?;
     let loaded = registry.provider(provider).ok_or_else(missing)?;
     let client_id = crate::plugin::provider::client_id_of(account);
+    let client_secret = crate::plugin::provider::client_secret_of(account);
     let params = serde_json::json!({
         "client_id": client_id,
+        "client_secret": client_secret,
         "login_hint": account.username,
     });
     let credentials = crate::plugin::auth::sign_in(

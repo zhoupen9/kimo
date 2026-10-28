@@ -23,6 +23,11 @@ pub const SCOPE: &str = "https://mail.google.com/";
 /// `auth.begin` minted and `auth.continue` needs to finish it.
 pub struct Pending {
     pub client_id: String,
+    /// The secret that goes with the id, when the deployment's client has
+    /// one. Google issues desktop clients a secret and refuses the exchange
+    /// without it, which is why the form asks for it; Entra's public clients
+    /// have none, which is why it is optional.
+    pub client_secret: Option<String>,
     pub redirect_uri: String,
     pub state: String,
     pub verifier: String,
@@ -32,13 +37,19 @@ pub struct Pending {
 /// Everything about a sign-in that is random, in one place: the state the
 /// redirect must echo and the PKCE verifier that makes the code useless to
 /// anyone watching the browser.
-pub fn pending(client_id: &str, port: u16, login_hint: Option<String>) -> Result<Pending, String> {
+pub fn pending(
+    client_id: &str,
+    client_secret: Option<String>,
+    port: u16,
+    login_hint: Option<String>,
+) -> Result<Pending, String> {
     let mut seed = [0u8; 48];
     if !abi::fill_random(&mut seed) {
         return Err("the host refused the random bytes a sign-in needs".to_string());
     }
     Ok(Pending {
         client_id: client_id.to_string(),
+        client_secret,
         redirect_uri: format!("http://localhost:{port}/"),
         state: hex(&seed[..16]),
         verifier: URL_SAFE_NO_PAD.encode(&seed[16..]),
@@ -72,34 +83,45 @@ pub fn challenge(verifier: &str) -> String {
     URL_SAFE_NO_PAD.encode(Sha256::digest(verifier.as_bytes()))
 }
 
-/// The POST the code is traded for tokens with: form-encoded, no secret — a
-/// public client has none, which is what PKCE is for.
+/// The POST the code is traded for tokens with: form-encoded, PKCE, and the
+/// client's secret when the deployment has one. Google's desktop clients do,
+/// and their token endpoint refuses the exchange without it.
 pub fn exchange_request(pending: &Pending, code: &str) -> Value {
+    let mut pairs = vec![
+        ("grant_type", "authorization_code"),
+        ("code", code),
+        ("code_verifier", pending.verifier.as_str()),
+        ("redirect_uri", pending.redirect_uri.as_str()),
+        ("client_id", pending.client_id.as_str()),
+    ];
+    if let Some(secret) = &pending.client_secret {
+        pairs.push(("client_secret", secret.as_str()));
+    }
     json!({
         "method": "POST",
         "url": TOKEN_ENDPOINT,
         "headers": [{ "name": "Content-Type", "value": "application/x-www-form-urlencoded" }],
-        "body": base64_std(form(&[
-            ("grant_type", "authorization_code"),
-            ("code", code),
-            ("code_verifier", &pending.verifier),
-            ("redirect_uri", &pending.redirect_uri),
-            ("client_id", &pending.client_id),
-        ]).as_bytes()),
+        "body": base64_std(form(&pairs).as_bytes()),
     })
 }
 
-/// The POST a refresh token is traded for a fresh access token with.
-pub fn refresh_request(client_id: &str, refresh_token: &str) -> Value {
+/// The POST a refresh token is traded for a fresh access token with. The
+/// secret rides along for the same reason it does the exchange: Google's
+/// desktop clients have one and the endpoint wants it again.
+pub fn refresh_request(client_id: &str, client_secret: Option<&str>, refresh_token: &str) -> Value {
+    let mut pairs = vec![
+        ("grant_type", "refresh_token"),
+        ("refresh_token", refresh_token),
+        ("client_id", client_id),
+    ];
+    if let Some(secret) = client_secret {
+        pairs.push(("client_secret", secret));
+    }
     json!({
         "method": "POST",
         "url": TOKEN_ENDPOINT,
         "headers": [{ "name": "Content-Type", "value": "application/x-www-form-urlencoded" }],
-        "body": base64_std(form(&[
-            ("grant_type", "refresh_token"),
-            ("refresh_token", refresh_token),
-            ("client_id", client_id),
-        ]).as_bytes()),
+        "body": base64_std(form(&pairs).as_bytes()),
     })
 }
 
@@ -224,6 +246,7 @@ mod tests {
     fn the_authorization_url_names_every_part() {
         let pending = Pending {
             client_id: "client-1".to_string(),
+            client_secret: None,
             redirect_uri: "http://localhost:8914/".to_string(),
             state: "s".to_string(),
             verifier: "v".to_string(),
@@ -274,6 +297,7 @@ mod tests {
     fn the_exchange_body_is_form_encoded() {
         let pending = Pending {
             client_id: "cid".to_string(),
+            client_secret: Some("secret-1".to_string()),
             redirect_uri: "http://localhost:1/".to_string(),
             state: String::new(),
             verifier: "v-v".to_string(),
@@ -290,6 +314,7 @@ mod tests {
         .unwrap();
         assert!(decoded.starts_with("grant_type=authorization_code&code=c%2Fde&"));
         assert!(decoded.contains("code_verifier=v-v"));
-        assert!(decoded.ends_with("&client_id=cid"));
+        // The secret rides last: Google will not trade the code without it.
+        assert!(decoded.contains("&client_id=cid&client_secret=secret-1"), "{decoded}");
     }
 }

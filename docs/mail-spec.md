@@ -721,6 +721,19 @@ something is listening on. The redirect's `code` and `state` go back in
 `auth.continue`'s params; the state is what ties the answer to this window,
 and a provider consumes its pending flow with the call, win or lose.
 
+The tokens ride the response envelope's `credentials` field, beside `result`:
+`auth.continue`'s `result` is only `{"kind":"done"}`. A host that looks for them
+inside `result` reports "the plugin returned no tokens" for a sign-in the
+provider did complete.
+
+Where the deployment's OAuth client has a secret, it travels beside the id in
+`auth.begin`'s params as `client_secret` and stays inside the module. Google
+issues one to desktop clients and its token endpoint refuses the exchange
+without it; an Entra public client has none, so a host must offer the field as
+optional rather than demand it. An installed app's secret is public by
+construction — it ships in the binary — so the spec does not class it with the
+credentials the host must protect.
+
 ### 5.5 Provider operations
 
 | Operation | Meaning |
@@ -1118,6 +1131,11 @@ delivery are gated by the manifest:
   timeouts, response-size caps and certificate verification. A plugin cannot
   disable certificate verification or reach plaintext outside a declared
   STARTTLS path.
+- `kimo.http_request` answers an *envelope*, `{"status", "headers", "body"}`,
+  with the endpoint's bytes base64'd into `body` — never the endpoint's JSON
+  itself. A module decodes `body` (`abi::decoded_body`) and only then parses
+  it; reading `access_token` off the envelope compiles, and its only symptom is
+  "the token endpoint answered with nothing usable".
 - Every data-bearing host call takes pointers into the module's linear memory
   and returns a status or byte count. The host copies data in and out before
   returning; no host pointer survives a call.

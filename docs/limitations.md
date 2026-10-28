@@ -29,6 +29,15 @@ Do not "fix" these casually — they are known:
   close button the same hide. Both work by dropping and reopening the toplevel
   (see [preferences.md](preferences.md)).
 
+- **Gmail needs ports 993 and 465.** The Gmail module is IMAP and SMTP over
+  TLS, not an HTTPS mailbox API, and there is no proxy setting in Kimo and no
+  Gmail-over-443 provider to fall back to. On a network that filters those
+  ports — the TCP connection is made, then dropped without a byte, which reads
+  as `network: imap.gmail.com:993 closed before the greeting…` — Gmail cannot
+  sync, while the OAuth sign-in (HTTPS) still works. That asymmetry is the
+  network's, not the module's; a Gmail API module over HTTPS would be the way
+  around it.
+
 - TLS finite-field DH covers the 2048-bit groups listed in
   `src/protocol/ffdhe.rs` and nothing else. A server whose DHE group is
   another size, or yet another custom prime, still fails the handshake with

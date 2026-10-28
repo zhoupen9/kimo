@@ -268,6 +268,7 @@ pub fn ensure_tokens(account: &Account) -> MailResult<Account> {
         ));
     };
     let client_id = client_id_of(account);
+    let client_secret = client_secret_of(account);
     let mut refreshed = account.clone();
     with_plugin(account, |plugin| {
         let tokens = super::auth::refresh(
@@ -275,6 +276,7 @@ pub fn ensure_tokens(account: &Account) -> MailResult<Account> {
             Arc::new(super::net::StdNetwork::default()),
             &refresh_token,
             &client_id,
+            &client_secret,
         )?;
         refreshed.access_token = Some(tokens.access_token);
         if let Some(token) = tokens.refresh_token {
@@ -294,16 +296,22 @@ pub fn ensure_tokens(account: &Account) -> MailResult<Account> {
 
 /// The OAuth client id the account's provider config carries, or nothing.
 pub fn client_id_of(account: &Account) -> String {
+    provider_config_field(account, "client_id")
+}
+
+/// The client secret that goes with the id, for a provider whose token
+/// endpoint wants one (Google's desktop clients do; Entra's public clients
+/// have none), or nothing.
+pub fn client_secret_of(account: &Account) -> String {
+    provider_config_field(account, "client_secret")
+}
+
+fn provider_config_field(account: &Account, key: &str) -> String {
     account
         .provider_config
         .as_deref()
         .and_then(|text| serde_json::from_str::<Value>(text).ok())
-        .and_then(|config| {
-            config
-                .get("client_id")
-                .and_then(Value::as_str)
-                .map(str::to_string)
-        })
+        .and_then(|config| config.get(key).and_then(Value::as_str).map(str::to_string))
         .unwrap_or_default()
 }
 

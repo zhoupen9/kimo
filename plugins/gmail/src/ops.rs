@@ -678,6 +678,7 @@ fn imap_session(session: &Session) -> Result<imap::Client, Response> {
 fn failed(error: Failed) -> Response {
     match error {
         Failed::Auth(message) => Response::error("auth_failed", message),
+        Failed::Network(message) => Response::error("network", message),
         Failed::Protocol(message) => Response::error("protocol", message),
     }
 }
@@ -705,16 +706,51 @@ fn auth_begin(request: &Request) -> Response {
             "no Google OAuth client id: set one in the account's config (a Desktop-type client from the deployment's Google Cloud project)",
         );
     }
+    // Optional: a public client (Entra) has no secret, and asking for one it
+    // does not have would refuse a flow that works. Google's desktop clients
+    // do have one, and their token endpoint will not answer without it.
+    let client_secret = text(params, "client_secret")
+        .filter(|secret| !secret.is_empty())
+        .map(str::to_string);
     let login_hint = text(params, "login_hint")
         .or_else(|| text(params, "email"))
         .map(str::to_string);
-    let pending = match oauth::pending(&client_id, port, login_hint) {
+    let pending = match oauth::pending(&client_id, client_secret, port, login_hint) {
         Ok(pending) => pending,
         Err(message) => return Response::error("protocol", message),
     };
     let url = oauth::authorize_url(&pending);
     set_pending(Some(pending));
     Response::ok(json!({ "kind": "open_url", "url": url }))
+}
+
+/// The token endpoint's answer, opened out of the host's HTTP envelope.
+/// Google says `access_token` on a grant and `error`/`error_description` on a
+/// refusal; the status only explains a body that is not JSON at all.
+fn tokens_of(envelope: &Value) -> Result<oauth::Tokens, String> {
+    let status = envelope.get("status").and_then(Value::as_u64).unwrap_or(0);
+    let bytes = abi::decoded_body(envelope)?;
+    match serde_json::from_slice::<Value>(&bytes) {
+        Ok(body) => oauth::parse_tokens(&body).map_err(explain_refusal),
+        Err(error) => Err(format!(
+            "the endpoint answered HTTP {status} with something that is not JSON ({error})"
+        )),
+    }
+}
+
+/// Google's refusal in words that name the thing to change. `client_secret is
+/// missing` is not a broken flow: Google issues its clients a secret (desktop
+/// ones included) and will not trade the code without it. The account form has
+/// the field; the console shows the secret when it is created.
+fn explain_refusal(message: String) -> String {
+    if message.contains("client_secret is missing") {
+        return "Google wants this OAuth client's secret as well as its id. Copy \
+                the client secret from the same client in the console (a desktop \
+                client's secret is public by design) into the account's \"OAuth \
+                client secret\" field and sign in again."
+            .to_string();
+    }
+    message
 }
 
 fn auth_continue(request: &Request) -> Response {
@@ -733,10 +769,10 @@ fn auth_continue(request: &Request) -> Response {
     if code.is_empty() {
         return Response::error("auth_failed", "the browser's answer carried no code");
     }
-    let exchange = abi::http(&oauth::exchange_request(&pending, code), HTTP_CAP)
+    let exchange = abi::http_envelope(&oauth::exchange_request(&pending, code), HTTP_CAP)
         .map_err(|message| Response::error("network", format!("token endpoint: {message}")))
-        .and_then(|body| {
-            oauth::parse_tokens(&body).map_err(|message| {
+        .and_then(|envelope| {
+            tokens_of(&envelope).map_err(|message| {
                 Response::error("auth_failed", format!("token endpoint: {message}"))
             })
         });
@@ -769,10 +805,12 @@ fn auth_refresh(request: &Request) -> Response {
     if client_id.is_empty() {
         return Response::error("config", "no Google OAuth client id to refresh with");
     }
-    let refreshed = abi::http(&oauth::refresh_request(client_id, refresh_token), HTTP_CAP)
+    let client_secret = text(params, "client_secret").filter(|secret| !secret.is_empty());
+    let refreshed =
+        abi::http_envelope(&oauth::refresh_request(client_id, client_secret, refresh_token), HTTP_CAP)
         .map_err(|message| Response::error("network", format!("token endpoint: {message}")))
-        .and_then(|body| {
-            oauth::parse_tokens(&body).map_err(|message| {
+        .and_then(|envelope| {
+            tokens_of(&envelope).map_err(|message| {
                 Response::error("auth_failed", format!("token endpoint: {message}"))
             })
         });
@@ -958,6 +996,85 @@ mod tests {
         )));
         assert_eq!(code, "config");
         assert!(message.contains("client id"));
+    }
+
+    #[test]
+    fn a_grant_is_read_out_of_the_hosts_envelope() {
+        // What `StdNetwork` really hands a module: status, headers, and the
+        // endpoint's JSON base64'd into `body`. Reading `access_token` off the
+        // envelope itself is the bug this pins down.
+        let granted = json!({
+            "access_token": "ya29.test",
+            "refresh_token": "1//refresh",
+            "expires_in": 3600,
+            "scope": "https://mail.google.com/",
+        });
+        let envelope = json!({
+            "status": 200,
+            "headers": [{ "name": "content-type", "value": "application/json" }],
+            "body": oauth::base64_std(&serde_json::to_vec(&granted).unwrap()),
+        });
+        let tokens = tokens_of(&envelope).expect("the grant parses");
+        assert_eq!(tokens.access_token, "ya29.test");
+        assert_eq!(tokens.refresh_token.as_deref(), Some("1//refresh"));
+        assert!(tokens.expires_at.is_some());
+    }
+
+    #[test]
+    fn a_refusal_keeps_googles_own_words() {
+        let refused = json!({
+            "error": "invalid_grant",
+            "error_description": "Bad Request",
+        });
+        let envelope = json!({
+            "status": 400,
+            "headers": [],
+            "body": oauth::base64_std(&serde_json::to_vec(&refused).unwrap()),
+        });
+        let message = tokens_of(&envelope).expect_err("a refusal is an error");
+        assert_eq!(message, "Bad Request");
+    }
+
+    #[test]
+    fn a_missing_secret_names_the_field_to_fill() {
+        // Google answers a client without its secret with this and nothing
+        // else; the user needs the fix, not the fact.
+        let refused = json!({
+            "error": "invalid_request",
+            "error_description": "client_secret is missing.",
+        });
+        let envelope = json!({
+            "status": 400,
+            "headers": [],
+            "body": oauth::base64_std(&serde_json::to_vec(&refused).unwrap()),
+        });
+        let message = tokens_of(&envelope).expect_err("a refusal is an error");
+        assert!(message.contains("secret"), "{message}");
+        assert!(message.contains("OAuth client secret"), "{message}");
+    }
+
+    #[test]
+    fn auth_begin_carries_the_secret_into_the_exchange() {
+        set_pending(None);
+        dispatch(&request(
+            "auth.begin",
+            None,
+            json!({ "redirect_port": 8914, "client_id": "cid-1", "client_secret": "cs-1" }),
+        ));
+        let pending = take_pending().expect("a sign-in is pending");
+        assert_eq!(pending.client_secret.as_deref(), Some("cs-1"));
+        set_pending(None);
+    }
+
+    #[test]
+    fn a_body_that_is_not_json_names_its_status() {
+        let envelope = json!({
+            "status": 502,
+            "headers": [],
+            "body": oauth::base64_std(b"<html>bad gateway</html>"),
+        });
+        let message = tokens_of(&envelope).expect_err("an HTML error page is an error");
+        assert!(message.contains("502"), "{message}");
     }
 
     #[test]
