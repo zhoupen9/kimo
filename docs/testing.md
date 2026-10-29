@@ -2,6 +2,27 @@
 
 Read before claiming a UI or renderer change works, or when timing one.
 
+## Plugins before the test suite
+
+The host's tests load the real provider and extension modules through the ABI
+with `include_bytes!` from `plugins/<name>/<name>.wasm`. Those binaries are
+build output and are ignored by git, so a fresh worktree has to build and copy
+them before `cargo test` (or `cargo clippy --all-targets`) will even compile:
+
+```sh
+(cd plugins/gmail && cargo build --release --target wasm32-unknown-unknown)
+cp plugins/gmail/target/wasm32-unknown-unknown/release/kimo_plugin_gmail.wasm \
+   plugins/gmail/gmail.wasm
+
+(cd plugins/outlook && cargo build --release --target wasm32-unknown-unknown)
+cp plugins/outlook/target/wasm32-unknown-unknown/release/kimo_plugin_outlook.wasm \
+   plugins/outlook/outlook.wasm
+
+(cd plugins/sender-groups && cargo build --release --target wasm32-unknown-unknown)
+cp plugins/sender-groups/target/wasm32-unknown-unknown/release/kimo_plugin_sender_groups.wasm \
+   plugins/sender-groups/sender-groups.wasm
+```
+
 ## Looking at the UI
 
 - When touching the UI, actually run `cargo run` and click through it; the

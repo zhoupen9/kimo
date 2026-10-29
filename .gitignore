@@ -1,1 +1,6 @@
 /target
+
+# Plugin modules are build output, not source: build them for
+# wasm32-unknown-unknown (see plugins/<name>/README.md). The host's tests load
+# these paths through the real ABI, so a worktree still needs them on disk.
+plugins/*/*.wasm
