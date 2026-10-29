@@ -462,6 +462,7 @@ pub fn run(conn: &rusqlite::Connection, query: &SearchQuery) -> MailResult<Vec<S
             preview,
             attachments,
         ) = row?;
+        let preview = crate::mail::clean_stored_preview(preview);
         hits.push(SearchHit {
             account_id,
             folder,

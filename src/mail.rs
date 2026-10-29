@@ -76,8 +76,7 @@ pub fn parse(raw: &[u8], uid: &str, seen: bool) -> MailMessage {
         } else {
             String::new()
         };
-        let collapsed = source.split_whitespace().collect::<Vec<_>>().join(" ");
-        collapsed.chars().take(PREVIEW_CHARS).collect()
+        clean_preview(&source)
     };
 
     MailMessage {
@@ -201,6 +200,69 @@ fn collect_inline_images(m: &mail_parser::Message<'_>) -> Vec<crate::models::Inl
 
 /// Preview length in characters.
 const PREVIEW_CHARS: usize = 140;
+
+/// Characters a marketing mail pads its preheader with. They draw nothing,
+/// but they are not `White_Space`, so `split_whitespace` keeps them; U+2800
+/// is a Braille *symbol*, and with no glyph in the picked font it draws as a
+/// missing-glyph box in the list. The preview wants the words, not the
+/// padding: Gmail's list shows the same Apple mail without these, and this is
+/// why.
+fn is_preview_padding(c: char) -> bool {
+    matches!(
+        c,
+        '\u{00AD}'                      // soft hyphen
+            | '\u{034F}'                // combining grapheme joiner
+            | '\u{061C}'                // Arabic letter mark
+            | '\u{115F}'..='\u{1160}'   // Hangul choseong/jungseong fillers
+            | '\u{17B4}'..='\u{17B5}'   // Khmer inherent vowels
+            | '\u{180B}'..='\u{180E}'   // Mongolian selectors, vowel separator
+            | '\u{200B}'..='\u{200F}'   // zero-width space/joiners, bidi marks
+            | '\u{202A}'..='\u{202E}'   // bidi embeddings and overrides
+            | '\u{2060}'..='\u{2064}'   // word joiner, invisible operators
+            | '\u{2066}'..='\u{206F}'   // bidi isolates, deprecated format chars
+            | '\u{2800}'                // Braille pattern blank — the padding
+            | '\u{3164}'                // Hangul filler
+            | '\u{FEFF}'                // zero-width no-break space
+            | '\u{FFA0}'                // halfwidth Hangul filler
+            | '\u{E0000}'..='\u{E007F}' // tag characters
+    )
+}
+
+/// The list's one-line preview: invisible preheader padding dropped, all
+/// whitespace collapsed to one space, cut to [`PREVIEW_CHARS`]. A long run of
+/// padding ends the preview — that run is the fence a marketing mail puts
+/// after its teaser, and the copy behind it is meant for the inbox preview
+/// not to show.
+pub(crate) fn clean_preview(text: &str) -> String {
+    /// How many invisible characters in a row count as the preheader fence.
+    const FENCE: usize = 8;
+    let mut visible = String::with_capacity(text.len());
+    let mut run = 0;
+    for c in text.chars() {
+        if is_preview_padding(c) {
+            run += 1;
+            if run >= FENCE {
+                break;
+            }
+        } else {
+            run = 0;
+            visible.push(c);
+        }
+    }
+    let collapsed = visible.split_whitespace().collect::<Vec<_>>().join(" ");
+    collapsed.chars().take(PREVIEW_CHARS).collect()
+}
+
+/// Clean a preview that was already built and stored — the database still
+/// holds rows parsed before this rule. Takes the string so a clean preview is
+/// not copied a second time by the startup load.
+pub(crate) fn clean_stored_preview(text: String) -> String {
+    if text.chars().any(is_preview_padding) {
+        clean_preview(&text)
+    } else {
+        text
+    }
+}
 
 /// Plain text out of an HTML body, for list previews: concatenates text
 /// nodes (bounded), skipping style/script/head/title subtrees.
@@ -393,6 +455,28 @@ mod tests {
         assert!(msg.body_html.is_none());
         assert_eq!(msg.body_text.trim(), "Just text.");
         assert_eq!(msg.preview, "Just text.");
+    }
+
+    #[test]
+    fn preview_drops_the_invisible_padding_a_preheader_uses() {
+        // Apple's "Say hello to Touch on Mac." hides its teaser behind a run
+        // of Braille pattern blanks; with no U+2800 glyph in the picked font
+        // the list drew each one as a missing-glyph box. The CGJ and ZWNJ are
+        // the same trick. The run also fences off the body copy behind it, so
+        // the preview keeps the teaser alone, as Gmail's list does.
+        let raw = "From: Alice <alice@example.com>\r\n\
+                   Subject: Padded\r\n\
+                   \r\n\
+                   Learn how to start preparing your apps today. \
+                   \u{034f}\u{2800}\u{2800}\u{2800}\u{2800}\u{2800}\u{2800}\u{2800}\u{2800}\
+                   \u{2800}\u{2800}\u{2800}\u{2800}\u{200c}Hidden body copy.\r\n";
+        let msg = parse(raw.as_bytes(), "13", false);
+        assert_eq!(msg.preview, "Learn how to start preparing your apps today.");
+    }
+
+    #[test]
+    fn clean_preview_collapses_whitespace_but_keeps_the_words() {
+        assert_eq!(clean_preview("  Hello\r\n\r\n  world  "), "Hello world");
     }
 
     #[test]

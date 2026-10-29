@@ -1218,7 +1218,7 @@ fn load_mailboxes_on(
                     references: split_ids(&row.get::<_, String>(15)?),
                     body_text: row.get(10)?,
                     body_html: row.get(11)?,
-                    preview: row.get(12)?,
+                    preview: crate::mail::clean_stored_preview(row.get(12)?),
                     // Filled in below, from the label tables.
                     labels: BTreeSet::new(),
                     attachments: Vec::new(),

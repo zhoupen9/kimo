@@ -41,6 +41,15 @@ Read when touching a list row, threading, select mode, search in the bar, the re
   from `MailMessage.attachments`, a search hit from the count the query
   returned — so a hit no longer spells the paperclip out in its third line: the
   glyph is the one way the list says it.
+- The preview is `mail::clean_preview`: the invisible run a marketing mail puts
+  after its preheader (Braille pattern blanks, the combining grapheme joiner,
+  zero-width joiners) is dropped before the whitespace collapse. Those
+  characters are not `White_Space`, so `split_whitespace` used to keep them,
+  and with no U+2800 glyph in the picked font epaint drew each one as a
+  missing-glyph box — the square blocks in Apple's "Say hello to Touch on Mac."
+  Gmail's list shows the same mail with the teaser alone, which is the target.
+  `db::load_mailboxes` and the search query call `clean_stored_preview` on what
+  they read, so a row written before this rule comes back clean too.
   **A row offers its own delete button under the pointer**: a `ROW_ACTION_SIZE`
   (24 pt) cell at the right end of its first line, where the timestamp sits —
   the timestamp, and a conversation's count before it, gives way to a muted
