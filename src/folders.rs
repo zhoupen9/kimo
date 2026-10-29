@@ -88,6 +88,65 @@ impl FolderKind {
     ];
 }
 
+/// Gmail's LIST names its system mailboxes under a container called
+/// `[Gmail]`. The container itself is `\Noselect` — it is a namespace, not
+/// a mailbox, and SELECT on it is refused — so it is never a row.
+pub const GMAIL_CONTAINER: &str = "[Gmail]";
+
+/// Whether `name` is Gmail's `[Gmail]` namespace container rather than a
+/// mailbox.
+pub fn is_gmail_container(name: &str) -> bool {
+    name.trim().eq_ignore_ascii_case(GMAIL_CONTAINER)
+}
+
+/// The display name of a Gmail system mailbox: `[Gmail]/All Mail` is
+/// `All Mail`. `None` for anything not nested under the container, so a
+/// user label called `Projects/2026` keeps its own name.
+pub fn gmail_folder(name: &str) -> Option<&str> {
+    let name = name.trim();
+    let head = name.get(..GMAIL_CONTAINER.len())?;
+    if !head.eq_ignore_ascii_case(GMAIL_CONTAINER) {
+        return None;
+    }
+    let rest = name.get(GMAIL_CONTAINER.len()..)?.strip_prefix('/')?;
+    (!rest.is_empty()).then_some(rest)
+}
+
+/// Whether a mailbox of a Gmail account is a label rather than a folder.
+/// Gmail lists its labels beside INBOX and nests only its system mailboxes
+/// under `[Gmail]`, so the name is enough *when the account's list is
+/// Gmail's*. A plain IMAP server's folders are not labels, and callers only
+/// ask this after the list showed a `[Gmail]/` mailbox.
+pub fn is_gmail_label(name: &str) -> bool {
+    let name = name.trim();
+    !name.eq_ignore_ascii_case("INBOX") && !is_gmail_container(name) && gmail_folder(name).is_none()
+}
+
+/// The navigation column's order for a Gmail account: INBOX, then the system
+/// mailboxes Gmail nests under `[Gmail]`, then the labels. Each group is in
+/// name order, the order `imap::order_mailboxes` gives a mailbox list, so a
+/// sync does not shuffle the column. Gmail's labels are the account's own
+/// list; nothing here invents one.
+pub fn order_gmail(folders: &mut Vec<String>) {
+    let mut inbox = Vec::new();
+    let mut rest = Vec::new();
+    for name in folders.drain(..) {
+        if name.trim().eq_ignore_ascii_case("INBOX") {
+            inbox.push(name);
+        } else {
+            rest.push(name);
+        }
+    }
+    let (mut system, mut labels): (Vec<String>, Vec<String>) = rest
+        .into_iter()
+        .partition(|name| gmail_folder(name).is_some());
+    system.sort();
+    labels.sort();
+    folders.extend(inbox);
+    folders.extend(system);
+    folders.extend(labels);
+}
+
 /// Classify a folder by its decoded, display-ready name.
 pub fn kind_of(name: &str) -> FolderKind {
     let name = name.trim();
@@ -257,6 +316,63 @@ mod tests {
         assert_eq!(kind_of(""), FolderKind::Folder);
         // The wire form is not classified: callers decode first.
         assert_eq!(kind_of("&XfJT0ZAB-"), FolderKind::Folder);
+    }
+
+    #[test]
+    fn gmail_system_folders_lose_their_container_prefix() {
+        assert_eq!(gmail_folder("[Gmail]/All Mail"), Some("All Mail"));
+        assert_eq!(gmail_folder("[Gmail]/Sent Mail"), Some("Sent Mail"));
+        assert_eq!(gmail_folder("[Gmail]/已发送邮件"), Some("已发送邮件"));
+        // The container itself, a label, and a name that merely starts the
+        // same way are not system folders.
+        assert_eq!(gmail_folder("[Gmail]"), None);
+        assert_eq!(gmail_folder("[Gmail]x"), None);
+        assert_eq!(gmail_folder("Projects/2026"), None);
+        assert_eq!(gmail_folder("[Gmail]/"), None);
+        // Trimmed like kind_of, and the container is case-insensitive.
+        assert_eq!(gmail_folder("  [gmail]/Trash  "), Some("Trash"));
+    }
+
+    #[test]
+    fn the_container_is_not_a_mailbox_and_labels_are_the_rest() {
+        assert!(is_gmail_container("[Gmail]"));
+        assert!(is_gmail_container(" [gmail] "));
+        assert!(!is_gmail_container("[Gmail]/All Mail"));
+        // On a Gmail account, INBOX and the system mailboxes are folders;
+        // everything else the list names is a label.
+        assert!(!is_gmail_label("INBOX"));
+        assert!(!is_gmail_label("inbox"));
+        assert!(!is_gmail_label("[Gmail]"));
+        assert!(!is_gmail_label("[Gmail]/All Mail"));
+        assert!(is_gmail_label("Receipts"));
+        assert!(is_gmail_label("Projects/2026"));
+        assert!(is_gmail_label("Sent")); // a label may be named like a folder
+    }
+
+    #[test]
+    fn gmail_order_is_inbox_then_system_folders_then_labels() {
+        let mut folders = vec![
+            "Receipts".to_string(),
+            "[Gmail]/Trash".to_string(),
+            "Archive".to_string(),
+            "INBOX".to_string(),
+            "[Gmail]/All Mail".to_string(),
+            "Projects/2026".to_string(),
+            "[Gmail]/Drafts".to_string(),
+        ];
+        order_gmail(&mut folders);
+        assert_eq!(
+            folders,
+            [
+                "INBOX",
+                "[Gmail]/All Mail",
+                "[Gmail]/Drafts",
+                "[Gmail]/Trash",
+                "Archive",
+                "Projects/2026",
+                "Receipts",
+            ]
+        );
     }
 
     #[test]

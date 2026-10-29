@@ -191,13 +191,17 @@ impl Client {
         self.expect_tag(&tag)
     }
 
+    /// The selectable mailboxes, in the server's own order. `[Gmail]` is a
+    /// `\Noselect` container, not a mailbox — SELECT refuses it — so it is
+    /// not part of the answer; the system folders under it are, with their
+    /// wire names, and the account's labels are the other names.
     pub fn list(&mut self) -> Result<Vec<String>, Failed> {
         let mut folders = Vec::new();
         for line in self.run(r#"LIST "" "*""#)? {
             // * LIST (\HasNoChildren) "/" "[Gmail]/All Mail"
             if let Some(rest) = line.text.strip_prefix("* LIST ") {
-                if let Some(name) = rest.rsplit('"').nth(1) {
-                    folders.push(name.to_string());
+                if let Some(name) = listed_mailbox(rest) {
+                    folders.push(name);
                 }
             }
         }
@@ -487,6 +491,74 @@ fn trailing_literal(line: &str) -> Option<usize> {
     line[open + 1..line.len() - 1].parse().ok()
 }
 
+/// The container Gmail nests its system mailboxes under. It is
+/// `\Noselect`: a namespace, not a mailbox, and SELECT on it is refused.
+const GMAIL_CONTAINER: &str = "[Gmail]";
+
+/// One `* LIST (…) "delim" name` answer: the name, and whether the server
+/// lets it be selected.
+struct Listing {
+    name: String,
+    selectable: bool,
+}
+
+/// Parse a LIST answer's tail, after `* LIST `. The attributes are the
+/// parenthesised list; the hierarchy delimiter is a quoted character or NIL;
+/// the name is a quoted string (Gmail always quotes it) or an atom.
+fn parse_listing(rest: &str) -> Option<Listing> {
+    let rest = rest.trim_start().strip_prefix('(')?;
+    let close = rest.find(')')?;
+    let attributes = &rest[..close];
+    let after = rest[close + 1..].trim_start();
+    // The delimiter: "…" (one character, possibly empty for a flat server)
+    // or NIL. Skip it either way; only the name is wanted.
+    let after = if let Some(stripped) = after.strip_prefix('"') {
+        &after[stripped.find('"')? + 2..]
+    } else {
+        let end = after.find(char::is_whitespace)?;
+        &after[end..]
+    };
+    let name = after.trim();
+    if name.is_empty() {
+        return None;
+    }
+    Some(Listing {
+        name: unquote(name)?,
+        selectable: !attributes
+            .split_whitespace()
+            .any(|attribute| attribute.eq_ignore_ascii_case("\\Noselect")),
+    })
+}
+
+/// The mailbox a LIST answer contributes to the folder list, or nothing for
+/// the ones that are not mailboxes: anything the server marked
+/// `\Noselect`, and Gmail's `[Gmail]` container even if the attribute is
+/// missing. A server that names no mailbox this way still names INBOX.
+fn listed_mailbox(rest: &str) -> Option<String> {
+    let listing = parse_listing(rest)?;
+    if !listing.selectable || listing.name.eq_ignore_ascii_case(GMAIL_CONTAINER) {
+        return None;
+    }
+    Some(listing.name)
+}
+
+/// A LIST name token: a quoted string with `\` escapes, or an atom.
+fn unquote(text: &str) -> Option<String> {
+    let Some(rest) = text.strip_prefix('"') else {
+        return Some(text.split_whitespace().next()?.to_string());
+    };
+    let mut out = String::new();
+    let mut characters = rest.chars();
+    while let Some(character) = characters.next() {
+        match character {
+            '"' => return Some(out),
+            '\\' => out.push(characters.next()?),
+            other => out.push(other),
+        }
+    }
+    None
+}
+
 /// An IMAP quoted string, with `\` and `"` escaped.
 pub fn quoted(text: &str) -> String {
     let mut out = String::with_capacity(text.len() + 2);
@@ -695,6 +767,45 @@ mod tests {
         assert!(fetched.labels.is_empty());
         assert!(fetched.thrid.is_none());
         assert_eq!(fetched.raw, b"abc");
+    }
+
+    #[test]
+    fn a_list_answer_names_mailboxes_and_drops_the_gmail_container() {
+        // Gmail's own answer: the container is \Noselect, its children are
+        // the system mailboxes, and the labels come beside INBOX.
+        assert_eq!(
+            listed_mailbox(r#"(\Noselect \HasChildren) "/" "[Gmail]""#),
+            None
+        );
+        assert_eq!(
+            listed_mailbox(r#"(\HasNoChildren) "/" "[Gmail]/All Mail""#),
+            Some("[Gmail]/All Mail".to_string())
+        );
+        assert_eq!(
+            listed_mailbox(r#"(\HasNoChildren) "/" "INBOX""#),
+            Some("INBOX".to_string())
+        );
+        assert_eq!(
+            listed_mailbox(r#"(\HasNoChildren) "/" "Receipts""#),
+            Some("Receipts".to_string())
+        );
+        // Any \Noselect parent is a namespace, not a mailbox.
+        assert_eq!(listed_mailbox(r#"(\Noselect) "/" "Projects""#), None);
+        // Even without the attribute, Gmail's container is never a mailbox.
+        assert_eq!(listed_mailbox(r#"(\HasChildren) "/" "[Gmail]""#), None);
+        // NIL delimiter and unquoted atoms are still parsed.
+        assert_eq!(
+            listed_mailbox(r#"(\HasNoChildren) NIL Sent"#),
+            Some("Sent".to_string())
+        );
+    }
+
+    #[test]
+    fn a_quoted_list_name_with_escapes_keeps_them() {
+        assert_eq!(
+            listed_mailbox(r#"(\HasNoChildren) "/" "work \"receipts\"""#),
+            Some("work \"receipts\"".to_string())
+        );
     }
 
     #[test]

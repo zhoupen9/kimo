@@ -27,3 +27,36 @@ The primary features Gmail provides to specialize IMAP include:
 
 * **What it does:** Standard IMAP search capabilities are basic and limited to standard headers (`FROM`, `SUBJECT`, `SINCE`, etc.).
 * **Capabilities:** Gmail extends the IMAP `SEARCH` command with `X-GM-RAW`, allowing clients to pass full, powerful Gmail search operators directly to Google’s search engine backend (e.g., searching for `X-GM-RAW "has:attachment larger:10M"` or `is:unread`).
+
+### 5. `LIST`, the `[Gmail]` container, and labels as mailboxes
+
+Gmail's IMAP `LIST` has one quirk that is not part of `X-GM-EXT-1`: the
+system mailboxes are nested under a namespace container named `[Gmail]`,
+returned as `\Noselect`.
+
+```
+* LIST (\Noselect \HasChildren) "/" "[Gmail]"
+* LIST (\HasNoChildren \All) "/" "[Gmail]/All Mail"
+* LIST (\HasNoChildren \Drafts) "/" "[Gmail]/Drafts"
+* LIST (\HasNoChildren \Sent) "/" "[Gmail]/Sent Mail"
+* LIST (\HasNoChildren \Junk) "/" "[Gmail]/Spam"
+* LIST (\HasNoChildren \Flagged) "/" "[Gmail]/Starred"
+* LIST (\HasNoChildren \Trash) "/" "[Gmail]/Trash"
+* LIST (\HasNoChildren \Important) "/" "[Gmail]/Important"
+* LIST (\HasNoChildren) "/" "Receipts"
+```
+
+`[Gmail]` is not a mailbox: `SELECT "[Gmail]"` is refused, so it must not be
+offered as a folder. Its children are real mailboxes (`[Gmail]/All Mail`,
+`[Gmail]/Drafts`, `[Gmail]/Sent Mail`, `[Gmail]/Spam`, `[Gmail]/Starred`,
+`[Gmail]/Trash`, `[Gmail]/Important`), and every other name in the answer is
+a user **label**, exposed by the same mechanism. That is why Kimo treats them
+as *synthetic* mail folders: selecting one is selecting the label's view, not
+a directory in Gmail's flat store, and one message carries several of them
+through `X-GM-LABELS` without a copy per label.
+
+The plugin drops the container (and any other `\Noselect` namespace) from
+its `mailbox.list` answer and keeps the wire names of everything else.
+Stripping the `[Gmail]/` prefix, the label glyph and the INBOX → system
+folders → labels order are display rules on the host's side
+(`docs/ui-shell.md`).

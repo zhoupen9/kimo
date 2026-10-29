@@ -1831,6 +1831,10 @@ struct FolderRow {
     name: String,
     display: String,
     kind: FolderKind,
+    /// True for a Gmail label: the server names it like a mailbox (a
+    /// "synthetic" folder), but it is the user's own tag, so the row wears
+    /// the label glyph rather than a folder icon — every label the same one.
+    label: bool,
     unread: usize,
     /// False for a folder the server no longer lists: the row is kept for the
     /// mail cached under it, and is drawn as one that is not there any more.
@@ -1867,13 +1871,27 @@ impl FolderRows {
                 folder.messages.iter().filter(|m| !m.seen).count(),
             );
         }
+        // Gmail names its system mailboxes under a non-selectable '[Gmail]'
+        // container and lists its labels beside INBOX. That shape is the
+        // only sign the account is Gmail's: the container is not a row, the
+        // folders under it drop the prefix, and the rest are labels — drawn
+        // with the label glyph rather than a kind icon, so a label called
+        // "Sent" does not masquerade as the Sent mailbox. An ordinary IMAP
+        // mailbox has no '[Gmail]/' name, and none of this applies to it.
+        let gmail = listed
+            .iter()
+            .chain(mailbox.folders.iter().map(|folder| &folder.name))
+            .any(|name| folders::is_gmail_container(name) || folders::gmail_folder(name).is_some());
         let row = |name: &str, listed: bool| {
-            // `name` is the IMAP wire form (possibly modified UTF-7); decode it
-            // for the label and for the icon lookup, which matches the
-            // readable name.
-            let display = crate::protocol::imap::decode_mailbox_name(name);
+            // `name` is the IMAP wire form (possibly modified UTF-7); the
+            // container prefix is Gmail's display decoration, not part of the
+            // name, so strip it before decoding and classifying.
+            let label = gmail && folders::is_gmail_label(name);
+            let shown = folders::gmail_folder(name).unwrap_or(name);
+            let display = crate::protocol::imap::decode_mailbox_name(shown);
             FolderRow {
                 kind: folders::kind_of(&display),
+                label,
                 display,
                 name: name.to_string(),
                 unread: unread_of.get(name).copied().unwrap_or(0),
@@ -1881,8 +1899,17 @@ impl FolderRows {
             }
         };
 
-        let mut listed_names = listed.to_vec();
+        // The '[Gmail]' container is a namespace, not a mailbox: SELECT
+        // refuses it, so it is never a row — listed or cached.
+        let mut listed_names: Vec<String> = listed
+            .iter()
+            .filter(|name| !folders::is_gmail_container(name))
+            .cloned()
+            .collect();
         crate::protocol::imap::order_mailboxes(&mut listed_names);
+        if gmail {
+            folders::order_gmail(&mut listed_names);
+        }
         let mut rows = Self {
             rev: Some(rev),
             listed: listed_names.iter().map(|name| row(name, true)).collect(),
@@ -1895,10 +1922,17 @@ impl FolderRows {
         let mut unlisted_names: Vec<String> = mailbox
             .folders
             .iter()
-            .filter(|folder| !listed.contains(folder.name.as_str()) && !folder.messages.is_empty())
+            .filter(|folder| {
+                !listed.contains(folder.name.as_str())
+                    && !folder.messages.is_empty()
+                    && !folders::is_gmail_container(&folder.name)
+            })
             .map(|folder| folder.name.clone())
             .collect();
         crate::protocol::imap::order_mailboxes(&mut unlisted_names);
+        if gmail {
+            folders::order_gmail(&mut unlisted_names);
+        }
         rows.unlisted = unlisted_names.iter().map(|name| row(name, false)).collect();
 
         // Nothing to list at all: INBOX is worth offering before the first
@@ -4853,9 +4887,13 @@ impl KimoApp {
                 for row in nav.listed.iter().chain(nav.unlisted.iter()) {
                     let is_selected = selected == Some(row.name.as_str());
                     // Only a generic folder has an open variant; the special
-                    // mailboxes keep one glyph.
-                    let open = is_selected && row.kind == FolderKind::Folder;
-                    let icon = icons.get(&(row.kind, open));
+                    // mailboxes keep one glyph, and a label keeps the tag.
+                    let open = !row.label && is_selected && row.kind == FolderKind::Folder;
+                    let icon = if row.label {
+                        Some(RowIcon::Label)
+                    } else {
+                        icons.get(&(row.kind, open)).map(RowIcon::Texture)
+                    };
                     let response = folder_row(
                         ui,
                         scheme,
@@ -12646,6 +12684,13 @@ fn account_row(
     response
 }
 
+/// What a folder row wears at its left edge: the icon of its kind, or the
+/// label glyph a Gmail label's synthetic folder shares with the label group.
+enum RowIcon<'a> {
+    Texture(&'a egui::TextureHandle),
+    Label,
+}
+
 /// One folder in the navigation column. `listed` is whether the server still
 /// has it: a row kept for the mail cached under a folder it no longer lists is
 /// drawn weak whatever its unread count, and says so on hover — it is here for
@@ -12654,7 +12699,7 @@ fn account_row(
 fn folder_row(
     ui: &mut egui::Ui,
     scheme: ColorScheme,
-    icon: Option<&egui::TextureHandle>,
+    icon: Option<RowIcon<'_>>,
     name: &str,
     unread: usize,
     selected: bool,
@@ -12692,13 +12737,20 @@ fn folder_row(
             egui::pos2(left, rect.center().y - ICON_SIZE / 2.0),
             egui::vec2(ICON_SIZE, ICON_SIZE),
         );
-        // The icon is white on transparency, so this tint is its color.
-        ui.painter().image(
-            icon.id(),
-            icon_rect,
-            egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
-            color,
-        );
+        match icon {
+            // The tag is drawn, not baked: it is the same glyph the label
+            // group and the title bar's label button use, at the row's size.
+            RowIcon::Label => paint_label_icon(ui.painter(), icon_rect, color, ICON_SIZE - 2.0),
+            // The icon is white on transparency, so this tint is its color.
+            RowIcon::Texture(icon) => {
+                ui.painter().image(
+                    icon.id(),
+                    icon_rect,
+                    egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                    color,
+                );
+            }
+        }
         left = icon_rect.right() + 6.0;
     }
 
@@ -14638,6 +14690,117 @@ mod tests {
         let nav = app.states.get_mut("acct").unwrap().nav();
         assert_eq!(names_of(&nav.listed), ["INBOX", "Sent"]);
         assert_eq!(nav.listed[0].unread, 2);
+    }
+
+    /// Gmail's LIST names a '[Gmail]' container that SELECT refuses, nests
+    /// its system mailboxes under it, and lists user labels beside INBOX. The
+    /// column drops the container, shows '[Gmail]/All Mail' as "All Mail",
+    /// gives every label the same tag glyph, and orders INBOX, the system
+    /// folders, then the labels.
+    #[test]
+    fn gmail_folders_lose_their_prefix_and_labels_come_last() {
+        let ctx = egui::Context::default();
+        crate::fonts::install(&ctx, None, None, None);
+        let mut app = app_with_folders(
+            &ctx,
+            &[
+                ("INBOX", true, 1),
+                ("[Gmail]", true, 0),
+                ("[Gmail]/All Mail", true, 0),
+                ("[Gmail]/Drafts", true, 0),
+                ("[Gmail]/Sent Mail", true, 0),
+                ("[Gmail]/Spam", true, 0),
+                ("[Gmail]/Starred", true, 0),
+                ("[Gmail]/Trash", true, 0),
+                ("Receipts", true, 0),
+                ("Projects/2026", true, 0),
+                ("Sent", true, 0),
+            ],
+        );
+        {
+            let nav = app.states.get_mut("acct").unwrap().nav();
+            assert_eq!(
+                names_of(&nav.listed),
+                [
+                    "INBOX",
+                    "[Gmail]/All Mail",
+                    "[Gmail]/Drafts",
+                    "[Gmail]/Sent Mail",
+                    "[Gmail]/Spam",
+                    "[Gmail]/Starred",
+                    "[Gmail]/Trash",
+                    "Projects/2026",
+                    "Receipts",
+                    "Sent",
+                ]
+            );
+            let displays: Vec<&str> = nav.listed.iter().map(|row| row.display.as_str()).collect();
+            assert_eq!(
+                displays,
+                [
+                    "INBOX",
+                    "All Mail",
+                    "Drafts",
+                    "Sent Mail",
+                    "Spam",
+                    "Starred",
+                    "Trash",
+                    "Projects/2026",
+                    "Receipts",
+                    "Sent",
+                ]
+            );
+            // The system folders keep the icons their stripped names classify;
+            // a label wears the tag, even one named like a folder.
+            assert!(!nav.listed[0].label && !nav.listed[1].label);
+            assert_eq!(nav.listed[1].kind, FolderKind::AllMail);
+            assert_eq!(nav.listed[2].kind, FolderKind::Drafts);
+            assert_eq!(nav.listed[6].kind, FolderKind::Trash);
+            for index in 7..10 {
+                assert!(
+                    nav.listed[index].label,
+                    "{} is a label",
+                    nav.listed[index].name
+                );
+            }
+            assert_eq!(
+                nav.listed[9].kind,
+                FolderKind::Sent,
+                "a label can be named Sent"
+            );
+        }
+
+        // What the column draws, in the order it draws it: the prefix is
+        // display decoration, and the container is not a row at all.
+        let shapes = frame_shapes_at(&ctx, &mut app, 1400.0);
+        let nav = nav_column(&app);
+        let mut tops = Vec::new();
+        for shown in [
+            "INBOX",
+            "All Mail",
+            "Drafts",
+            "Sent Mail",
+            "Spam",
+            "Starred",
+            "Trash",
+            "Projects/2026",
+            "Receipts",
+            "Sent",
+        ] {
+            let row = text_boxes_of(&shapes, nav, shown)
+                .into_iter()
+                .next()
+                .unwrap_or_else(|| panic!("{shown} is not drawn: {shapes:?}"));
+            tops.push((shown, row.top()));
+        }
+        assert!(
+            tops.windows(2).all(|pair| pair[0].1 < pair[1].1),
+            "INBOX, then Gmail's folders, then the labels: {tops:?}"
+        );
+        assert!(
+            text_boxes_of(&shapes, nav, "[Gmail]").is_empty(),
+            "the container is not a mailbox"
+        );
     }
 
     /// A folder the server no longer lists keeps its row, in a state of its

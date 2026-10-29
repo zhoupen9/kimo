@@ -508,6 +508,18 @@ Read when touching `src/main.rs`, `src/gpu.rs`, `src/gpus.rs`, `src/glass.rs`, t
   under them, drawn weak whatever their unread count with a tooltip saying why,
   and still clickable. A folder of that second kind is only dropped from the
   column when it holds no mail at all; its row in the database stays.
+  A Gmail account draws one shape more: its `LIST` names the system mailboxes
+  under a `[Gmail]` container that is `\Noselect`, and `SELECT` refuses it, so
+  that name is never a row. The folders under it show without the prefix
+  (`[Gmail]/All Mail` is *All Mail*), and every other listed mailbox is a
+  Gmail label — a synthetic folder, with no mailbox of its own in Gmail's
+  store — drawn with the label tag rather than a folder icon. Those rows come
+  in `folders::order_gmail`'s order: INBOX, the `[Gmail]` system mailboxes,
+  then the labels, each group in name order. A label called `Sent` stays a
+  label (the tag, not the Sent icon), while the system mailboxes keep the
+  icons their stripped names classify. The wire name is untouched —
+  `[Gmail]/All Mail` is still what `SELECT` gets — because the prefix is
+  display, not identity.
   **The labels are the column's last group, under every account**, which is
   where a thing that belongs to no account can be: `label_group_header` is
   the word alone — no disclosure triangle, because there is no section to

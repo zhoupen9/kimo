@@ -12,6 +12,12 @@ extension Kimo uses.
 - **`X-GM-RAW`** — `UID SEARCH X-GM-RAW "…"` for Gmail's own search language
   (`query.raw`, dialect `gmail`); CR/LF and oversized expressions are
   refused before the wire.
+- **`LIST` and `[Gmail]`** — Gmail nests its system mailboxes under a
+  `\Noselect` `[Gmail]` container. `mailbox.list` drops the container (and
+  any other `\Noselect` namespace) because `SELECT` refuses them; the
+  system folders keep their wire names (`[Gmail]/All Mail`, …) and the
+  account's labels are the other names. The host's folder rows strip the
+  prefix for display and draw labels with the label glyph.
 - **XOAUTH2** — IMAP `AUTHENTICATE XOAUTH2` (including the base64 JSON
   error continuation Gmail answers a bad token with) and SMTP
   `AUTH XOAUTH2` for submission.
