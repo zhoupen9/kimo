@@ -934,6 +934,10 @@ pub struct KimoApp {
     /// scroll area at all. The title bar floats over the column once this
     /// leaves the top, and docks again when it comes back.
     list_scroll: f32,
+    /// The same for the navigation column: zero while it is not drawn (the
+    /// popup layout, or a fully collapsed panel), because a column that is not
+    /// there has no content under the bar to turn to glass.
+    nav_scroll: f32,
     /// Whether the list groups the folder's mail into conversations
     /// (Preferences → General, `crate::threads`).
     threaded: bool,
@@ -2421,6 +2425,7 @@ impl KimoApp {
             scrolled_message: None,
             list_column: egui::Rect::ZERO,
             list_scroll: 0.0,
+            nav_scroll: 0.0,
             mail_scroll: 0.0,
             // Absent in settings.json means the app's own default: the list
             // groups mail into conversations.
@@ -4012,24 +4017,24 @@ impl KimoApp {
 
     /// The title bar itself, floating over the columns rather than docked
     /// above them: one `egui::Area` fixed to the window's top edge and drawn
-    /// after the panels, which is what lets the message list scroll under it.
+    /// after the panels, which is what lets the columns scroll under it.
     ///
-    /// While the list is at its top the bar is the solid chrome band it has
-    /// always been; once the list is scrolled it turns to glass — its backdrop
-    /// blurred (`crate::glass`) and its fill translucent — with a line under
-    /// it to say where it ends. Both follow one animated value, so scrolling
-    /// back to the top docks the bar again instead of snapping it.
+    /// While the columns are at their top the bar is the solid chrome band it
+    /// has always been; once one of them is scrolled it turns to glass — its
+    /// backdrop blurred (`crate::glass`) and its fill translucent — with a
+    /// line under it to say where it ends. Both follow one animated value, so
+    /// scrolling back to the top docks the bar again instead of snapping it.
     fn titlebar_area(&mut self, ctx: &egui::Context) {
         let scheme = theme::of(ctx);
         let rect = egui::Rect::from_min_size(
             egui::Pos2::ZERO,
             egui::vec2(ctx.viewport_rect().width(), TITLEBAR_HEIGHT),
         );
-        // Either column scrolling is the trigger: the message list's offset,
-        // or the reading pane's card, which scrolls the whole mail. Any scroll
-        // at all is content under the bar, and the top is the only place where
-        // nothing is.
-        let scrolled = self.list_scroll.max(self.mail_scroll) > 0.5;
+        // Any column scrolling is the trigger: the navigation's folders, the
+        // message list's offset, or the reading pane's card, which scrolls the
+        // whole mail. Any scroll at all is content under the bar, and the top
+        // is the only place where nothing is.
+        let scrolled = self.nav_scroll.max(self.list_scroll).max(self.mail_scroll) > 0.5;
         let floating = ctx.animate_bool_with_time(
             egui::Id::new("titlebar-floating"),
             scrolled,
@@ -4773,11 +4778,11 @@ impl KimoApp {
         // The HTML renderer's lists, the only other users of `indent`, keep
         // theirs.
         ui.visuals_mut().indent_has_left_vline = false;
-        // The title bar floats over the columns, so this one's content starts
-        // below it: what the glass shows here is the panel fill, not folders.
-        ui.add_space(TITLEBAR_HEIGHT);
 
         if self.accounts.is_empty() {
+            // Nothing to scroll here, so the bar keeps its chrome band over
+            // this column and the placeholder sits below it.
+            ui.add_space(TITLEBAR_HEIGHT);
             ui.label("No accounts yet.");
             ui.label(
                 egui::RichText::new("Add one in Preferences (the cog in the title bar).")
@@ -4794,10 +4799,13 @@ impl KimoApp {
             .iter()
             .map(|account| (account.id.clone(), account.name.clone(), account.protocol))
             .collect();
-        egui::ScrollArea::vertical()
+        let output = egui::ScrollArea::vertical()
             .auto_shrink([false, false])
             .show(ui, |ui| {
-                ui.add_space(2.0);
+                // The title bar floats over this column too: its height is
+                // space in the scroll area, not padding above it, so the
+                // folders pass under the glass the way the list's rows do.
+                ui.add_space(TITLEBAR_HEIGHT + 2.0);
                 for (id, name, protocol) in &accounts {
                     self.account_section(ui, scheme, id, name, *protocol);
                 }
@@ -4805,6 +4813,7 @@ impl KimoApp {
                 // account, so they cannot be filed under one.
                 self.label_group(ui, scheme);
             });
+        self.nav_scroll = output.state.offset.y;
     }
 
     /// The navigation column's last group: the user's labels, under every
@@ -10030,6 +10039,10 @@ impl KimoApp {
         self.was_narrow = plan.collapses_nav;
         self.pane_popup = plan.popup;
         self.list_scrolls = plan.list_scrolls;
+        // The navigation records its offset again while it draws; clearing it
+        // here is what keeps a column that is not there — the popup layout, or
+        // a panel the slide has finished closing — from leaving the bar glass.
+        self.nav_scroll = 0.0;
 
         // A compose opened on the spot stays in the pane while the mail it
         // answers is on it; once that mail has left — another folder opened,
@@ -10051,11 +10064,12 @@ impl KimoApp {
         // chrome's gutter — so a separator would only double them.
 
         // No top panel: the title bar is an overlay (`titlebar_area`), so the
-        // columns run from the window's top edge and the message list can
-        // scroll under the bar. What each column keeps clear of the bar is its
-        // own business — the list's top padding scrolls away with its rows
-        // (`LIST_PADDING`), the navigation and the reading pane are inset by
-        // the bar's height.
+        // columns run from the window's top edge and each can scroll under the
+        // bar. What each column keeps clear of the bar is its own business —
+        // the list's top padding scrolls away with its rows (`LIST_PADDING`),
+        // and the navigation and the reading pane put the bar's height inside
+        // their scroll areas as space, so their content passes under the glass
+        // as well.
         // The navigation is the fixed-width column: it takes the width its
         // splitter left it before either of the other two is laid out, and it
         // gives that width up — by sliding out — only when the window can no
@@ -14878,6 +14892,95 @@ mod tests {
             "the column reopened at a width of its own"
         );
     }
+
+    /// The navigation scrolls under the floating title bar exactly as the two
+    /// content columns do: the bar's height is space inside its scroll area,
+    /// so a scrolled column puts folders behind the glass instead of leaving
+    /// the bar over the panel fill.
+    #[test]
+    fn the_navigation_scrolls_under_the_floating_title_bar() {
+        let ctx = egui::Context::default();
+        crate::fonts::install(&ctx, None, None, None);
+        let folders: Vec<String> = (0..60).map(|index| format!("Folder {index:02}")).collect();
+        let refs: Vec<(&str, bool, usize)> = folders
+            .iter()
+            .map(|name| (name.as_str(), true, 0))
+            .collect();
+        let mut app = app_with_folders(&ctx, &refs);
+        run_app_frame(&ctx, &mut app, Vec::new());
+        assert_eq!(app.nav_scroll, 0.0, "the column starts at its top");
+
+        // The first row starts below the bar, at the top: its top edge is on
+        // screen rather than under the glass.
+        let shapes = frame_shapes_at(&ctx, &mut app, 1400.0);
+        let nav = nav_column(&app);
+        let first = text_boxes_of(&shapes, nav, "Folder 00")
+            .into_iter()
+            .next()
+            .expect("the first folder is drawn");
+        assert!(
+            first.top() >= TITLEBAR_HEIGHT,
+            "the first row is not under the bar at rest: {first:?}"
+        );
+
+        // Down the column: the pointer over it, the wheel, then the frames the
+        // scroll area's animation needs to come to rest.
+        run_app_frame(
+            &ctx,
+            &mut app,
+            vec![egui::Event::PointerMoved(egui::pos2(100.0, 400.0))],
+        );
+        run_app_frame(
+            &ctx,
+            &mut app,
+            vec![egui::Event::MouseWheel {
+                unit: egui::MouseWheelUnit::Point,
+                delta: egui::vec2(0.0, -600.0),
+                phase: egui::TouchPhase::Move,
+                modifiers: egui::Modifiers::default(),
+            }],
+        );
+        for _ in 0..30 {
+            run_app_frame(&ctx, &mut app, Vec::new());
+        }
+        assert!(app.nav_scroll > 0.0, "the navigation did not scroll");
+        assert_eq!(app.list_scroll, 0.0, "the list did not scroll");
+        assert_eq!(app.mail_scroll, 0.0, "the pane holds no mail");
+
+        // At least one folder's text is now in the bar's band, which is what
+        // makes the bar glass over this column.
+        let shapes = frame_shapes_at(&ctx, &mut app, 1400.0);
+        let nav = nav_column(&app);
+        let under = folders.iter().any(|name| {
+            text_boxes_of(&shapes, nav, name)
+                .iter()
+                .any(|row| row.top() < TITLEBAR_HEIGHT && row.bottom() > 0.0)
+        });
+        assert!(under, "no folder is drawn under the bar: {shapes:?}");
+        // And the bar over it is glass: the animation's own state, read with
+        // its target taken back down so the next frames do not leave it there.
+        let floating = ctx.animate_bool_with_time(
+            egui::Id::new("titlebar-floating"),
+            false,
+            TITLEBAR_FLOAT_TIME,
+        );
+        assert!(
+            floating > 0.5,
+            "the navigation's scroll did not turn the bar to glass: {floating}"
+        );
+
+        // The slide takes the column away, and with it the content under the
+        // bar: the bar docks again even though the scroll area kept its offset.
+        app.nav_collapsed = true;
+        for _ in 0..20 {
+            run_app_frame(&ctx, &mut app, Vec::new());
+        }
+        assert_eq!(
+            app.nav_scroll, 0.0,
+            "a collapsed column still holds the bar in glass"
+        );
+    }
+
     /// The columns give way to a narrowing window in one order, and each
     /// boundary is where the plan says it is: the navigation collapses while
     /// the list still has its own width, the list is capped beside the reading

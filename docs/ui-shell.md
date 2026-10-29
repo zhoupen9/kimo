@@ -95,11 +95,12 @@ Read when touching `src/main.rs`, `src/gpu.rs`, `src/gpus.rs`, `src/glass.rs`, t
   has always been; once the list is scrolled it turns to glass — the fill keeps
   `GLASS_ALPHA` of the scheme's `panel`, the backdrop behind it is blurred
   (`src/glass.rs`) and a hairline appears along its bottom edge. One animated
-  value (`TITLEBAR_FLOAT_TIME`) drives all three from the two content columns'
-  scroll offsets (`KimoApp::list_scroll` and `mail_scroll`, each captured where
-  its scroll area is built), so scrolling either of them back to the top docks
-  the bar again rather than snapping it, and a column with nothing to scroll —
-  or no list and no mail at all — leaves it docked. The room the bar gives its
+  value (`TITLEBAR_FLOAT_TIME`) drives all three from the columns' scroll
+  offsets (`KimoApp::nav_scroll`, `list_scroll` and `mail_scroll`, each captured
+  where its scroll area is built), so scrolling any of them back to the top
+  docks the bar again rather than snapping it, and a column that is not drawn
+  (the navigation in the popup layout, or one the slide has closed) — or has
+  nothing to scroll — contributes nothing to it. The room the bar gives its
   own content starts at `TITLEBAR_LEFT_INSET` rather than at the window's
   edge. Inside
   the bar, left to right: the nav collapse
@@ -369,11 +370,11 @@ Read when touching `src/main.rs`, `src/gpu.rs`, `src/gpus.rs`, `src/glass.rs`, t
   is the scheme's `panel`; the message list's card and the reading pane's
   cards are the lighter `content`. The columns run from the
   window's own top edge, and the title bar floats over them (see the title bar
-  section above): the navigation is inset by the bar's height and never goes
-  under it, while the two content columns keep clear of the bar with padding
-  *inside* their scroll areas, which scrolls away with what they hold — the
-  list's rows, and the reading pane's cards, their headers included, which
-  is why mail passes under the glass there too. **The list column is a card
+  section above): every column keeps clear of the bar with the bar's height
+  *inside* its scroll area, which scrolls away with what it holds — the
+  navigation's accounts and folders, the list's rows, and the reading pane's
+  cards, their headers included — which is why all three pass under the
+  glass. **The list column is a card
   too** (`list_card`): the panel behind it is chrome, and the card is as tall as
   the list's own content — the bar's height and the rows, and *nothing* below
   the last of them — so a folder with three
@@ -490,7 +491,10 @@ Read when touching `src/main.rs`, `src/gpu.rs`, `src/gpus.rs`, `src/glass.rs`, t
   shows the name and the account's unread total and whose folders are indented
   under it. An account with no cached folder at all still offers INBOX, since
   clicking it is what starts the first fetch. Selecting a folder of another
-  account is what makes it the active one.
+  account is what makes it the active one. The whole column is one scroll
+  area: the title bar's height is space at its top, so the account sections
+  and folders slide under the glass when it is scrolled, and its offset is one
+  of the three the bar floats on.
   What it draws is a cache of the display model, the way the reading pane
   caches the parsed body: `AccountUiState::nav` derives the rows (`FolderRows`)
   from the account's folder list and mail only when `folders_rev` moved, so a
