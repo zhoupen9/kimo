@@ -462,7 +462,7 @@ fn window_attributes(size: LogicalSize<f64>) -> winit::window::WindowAttributes 
     #[allow(unused_mut)]
     let mut attributes = Window::default_attributes()
         .with_title("Kimo")
-        .with_decorations(false) // the custom title bar is drawn in app.rs
+        .with_decorations(false) // the custom title bar is drawn in src/app/titlebar.rs
         // The window's corners are cut out of the frame (see
         // `gpu::CornerMask`), so the surface has to carry an alpha channel: on
         // Wayland this flag is also what stops winit from marking the whole

@@ -76,7 +76,7 @@ struct Seg {
 /// Parsing is html5ever's and it is not cheap: on a 100 KB newsletter it is
 /// about two thirds of what the built-in renderer costs per frame, and the
 /// reading pane draws the same body on every frame. So the pane parses once
-/// per body — `app.rs` keeps one of these — and re-walks the tree each frame,
+/// per body — `src/app/reading.rs` keeps one of these — and re-walks the tree each frame,
 /// which is what actually lays the mail out.
 pub struct Document(Html);
 
@@ -90,7 +90,7 @@ impl Document {
 ///
 /// Test-only: a pane that draws the same body every frame parses it once
 /// ([`Document::parse`]) and lays that out with [`render_document`], which is
-/// what `app.rs` does.
+/// what `src/app/reading.rs` does.
 #[cfg(test)]
 pub fn render(ui: &mut Ui, html: &str, html_ctx: &mut HtmlContext<'_>) {
     render_document(ui, &Document::parse(html), html_ctx);

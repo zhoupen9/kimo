@@ -5,8 +5,8 @@
 //!         cargo test --release -- --ignored --nocapture bench_render
 //!
 //! The built-in renderer draws a message on *every* frame the reading pane is
-//! visible: app.rs lays the body out again each time. It parses it only once
-//! per mail, though, and keeps the width it settled at (`app.rs`'s
+//! visible: `src/app/reading.rs` lays the body out again each time. It parses it
+//! only once per mail, though, and keeps the width it settled at (`app.rs`'s
 //! `BodyCache`), so this bench measures both the way the pane does: the parse
 //! once, and then the layout inside the pane's ScrollArea per frame —
 //! reported with the tessellation that follows and the frame total. Blitz runs
@@ -22,7 +22,7 @@ use crate::blitz_render::{self, Cancellation, PageRequest};
 use crate::html::{self, HtmlContext};
 
 /// Reading-pane width in points: the app's 460 pt right panel minus its
-/// margins and scroll bar. app.rs hands Blitz this value times the pixel
+/// margins and scroll bar. `src/app/blitz.rs` hands Blitz this value times the pixel
 /// scale, quantized to BLITZ_WIDTH_STEP (32) - 864 physical pixels here.
 const PANE_WIDTH_PT: f32 = 432.0;
 /// Vertical room the pane gives a page; only Blitz's viewport units use it.
@@ -318,7 +318,7 @@ struct BlitzStats {
     truncated: bool,
 }
 
-/// Time the built-in renderer the way app.rs drives it: inside the pane's
+/// Time the built-in renderer the way `src/app/reading.rs` drives it: inside the pane's
 /// ScrollArea, once per frame, with the message's inline images as textures.
 fn bench_simple(ctx: &egui::Context, case: &Case) -> SimpleStats {
     let inline = inline_textures(ctx, case);
@@ -423,7 +423,7 @@ fn bench_blitz(case: &Case) -> BlitzStats {
     stats
 }
 
-/// The inline images a message carries, as egui textures (app.rs decodes them
+/// The inline images a message carries, as egui textures (`src/app/reading.rs` decodes them
 /// once per message, so this is not part of the measured frame either).
 fn inline_textures(ctx: &egui::Context, case: &Case) -> HashMap<String, egui::TextureHandle> {
     case.inline
