@@ -5,7 +5,7 @@ Read when touching `src/provider/`, the account form's Provider row, or adding a
 ## The stack
 
 ```
-UI / sync jobs                src/app.rs, src/sync.rs
+UI / sync jobs                src/app/, src/sync.rs
   └─ vendor policy            src/provider/vendor.rs
        └─ MailProvider trait  src/provider/mod.rs
             ├─ ImapProvider   src/provider/imap.rs

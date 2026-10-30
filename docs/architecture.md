@@ -5,7 +5,7 @@ Read when touching `src/sync.rs`, the `Job`/`Event` enums, or anything that move
 ## Data flow
 
 ```
-UI (app.rs ui)
+UI (app.rs ui; src/app/ concerns)
    │  spawn(Job)                                   UI thread — no sockets, no DB writes
    ▼
 worker thread (sync.rs)
@@ -15,6 +15,12 @@ worker thread (sync.rs)
    ▼
 Event (mpsc) ──► drain_events() at frame start ──► merge into AccountUiState
 ```
+
+The app root (`src/app.rs`) owns `KimoApp`, the shared state/models and the
+one-frame `ui` orchestration. The UI itself is split by concern under
+`src/app/`: `events`/`actions`, `titlebar`, `navigation`, `list`,
+`reading`, `compose`, `preferences`, `menus`, `search`, `blitz`, and the
+`layout`/`widgets`/`icons`/`util` leaves; `src/app/tests/` holds their tests.
 
 Mailbox work goes through `provider::MailProvider` (`src/provider/`): the
 adapter owns the socket and the protocol, the worker owns the marks, the

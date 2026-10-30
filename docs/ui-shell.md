@@ -1,6 +1,8 @@
 # UI shell — window, title bar and columns
 
-Read when touching `src/main.rs`, `src/gpu.rs`, `src/gpus.rs`, `src/glass.rs`, the title bar, the columns' layout plan, or the navigation column.
+Read when touching `src/main.rs`, `src/gpu.rs`, `src/gpus.rs`,
+`src/glass.rs`, `src/app/titlebar.rs`, `src/app/layout.rs`,
+`src/app/navigation.rs`, the title bar, or the columns' layout plan.
 
 - **GUI:** egui (immediate mode, pinned to the 0.36 line), driven directly
   through winit + `egui-winit` + `egui-wgpu` instead of through eframe, because
@@ -88,7 +90,7 @@ Read when touching `src/main.rs`, `src/gpu.rs`, `src/gpus.rs`, `src/glass.rs`, t
 ## The window and its title bar
 
 - The window is undecorated on purpose (`with_decorations(false)` in
-  `main.rs`): `titlebar_area()` in `app.rs` draws the custom title bar — an
+  `main.rs`): `titlebar_area()` in `src/app/titlebar.rs` draws the custom title bar — an
   `egui::Area` fixed to the window's top edge and shown *after* the panels, not
   a `TopBottomPanel`, because the bar floats over the columns and the message
   list scrolls under it. At the top of the list it is the solid chrome band it

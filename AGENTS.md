@@ -87,7 +87,9 @@ done. There is no CI yet — that discipline is on you.
 src/main.rs             entry point; the winit event loop, the window, egui's input state
 src/gpu.rs              the wgpu side: device, surface, egui's renderer, and one frame
 src/gpus.rs             the machine's graphics cards and the Vulkan drivers a pick may load
-src/app.rs              all UI: KimoApp state, panels, preferences modal, event handling
+src/app.rs              app root: KimoApp state and shared models, construction, one-frame `ui`
+src/app/                UI by concern: events, actions, titlebar, navigation, list, reading,
+                        compose, preferences, menus, search, blitz, layout, widgets, icons, util
 src/models.rs           Account / Protocol / TlsMode / MailMessage (plain types: nothing is serialised any more)
 src/error.rs            MailError + MailResult
 src/fonts.rs            installed-font discovery (ttf-parser scan) + egui font installation
@@ -151,9 +153,14 @@ src/protocol/smtp.rs    minimal SMTP submission client (EHLO capabilities, START
 
 ## Conventions that are rules
 
+- **App UI code belongs in its concern module under `src/app/`.** `app.rs` is
+  the root: `KimoApp` and the shared state/models, construction and `ui`
+  orchestration. Do not grow it with another feature; add or extend the module
+  that owns the concern, and keep each module under roughly 3,000 lines.
 - Pure parsing helpers (e.g. `extract_uid`, `literal_size`, `html_to_text`)
-  live next to their users and get `#[cfg(test)]` unit tests — that is where
-  tests go in this codebase; no `tests/` directory yet.
+  live next to their users and get `#[cfg(test)]` unit tests. App UI tests
+  live under `src/app/tests/`, grouped by concern; there is no top-level
+  `tests/` directory.
 - A new mailbox operation goes on `provider::MailProvider` with an IMAP and a
   POP3 implementation; `src/sync.rs` must not branch on `Protocol` to reach the
   wire. Vendor knowledge (endpoints, sign-in, Sent mailbox) goes in

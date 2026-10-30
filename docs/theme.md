@@ -23,8 +23,8 @@ Read when touching `src/theme.rs`, `src/fonts.rs`, or adding a color to a widget
   stock widget, while `theme::install` also parks the scheme in the context,
   where the hand-painted UI (title bar, folder rows, message cards, avatars,
   spinners) reads it back through `theme::of`. So a color is added to the
-  scheme and nowhere else — no literals in `app.rs` — and stock-widget slots
-  stay reachable through egui itself (`ui.visuals().error_fg_color` is the
+  scheme and nowhere else — no literals in the `src/app/` UI — and stock-widget
+  slots stay reachable through egui itself (`ui.visuals().error_fg_color` is the
   scheme's `danger`, `widgets.active.bg_fill` its `selection`). egui derives
   its own weak/strong text variants by tinting the body color towards the
   panel, so `RichText::weak()` is close to, but not the same as, the scheme's
@@ -48,8 +48,8 @@ Read when touching `src/theme.rs`, `src/fonts.rs`, or adding a color to a widget
   scale, and the mail rows' edges fainter against the list than a hairline,
   with the top edge fainter than the sides); keep them green when you touch a
   color.
-  **A focused field's box is the accent** (`Field`, app.rs). egui draws a text
-  edit's frame from `Visuals::selection.stroke` while the keyboard is in it —
+  **A focused field's box is the accent** (`Field`, `src/app/widgets.rs`). egui
+  draws a text edit's frame from `Visuals::selection.stroke` while the keyboard is in it —
   the same slot as the colour of *selected text* — so a field that took that
   line for its outline would recolour every selection in the app. Instead the
   field is added with a frame that draws nothing (`field_frame`, whose margin is

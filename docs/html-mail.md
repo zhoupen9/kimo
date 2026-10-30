@@ -23,8 +23,8 @@ Read when touching `src/html.rs`, `src/css.rs`, `src/blitz_render.rs`, or a Blit
   through `blitz_render::MailNet` (a blocking `NetProvider` that reuses the
   on-disk resource cache, and understands `data:` and `cid:` URLs). The page
   comes back as `Event::HtmlRendered` with premultiplied RGBA tiles and link
-  boxes, which `app.rs` uploads as textures. Pages are keyed by mail +
-  quantized *width* — never the pane height, which only feeds Blitz's viewport
+  boxes, which `src/app/reading.rs` uploads as textures. Pages are keyed by
+  mail + quantized *width* — never the pane height, which only feeds Blitz's viewport
   (`vh` and friends): keying on it re-rasterized an identical page on every
   window resize. At most two pages are cached; a cached page is reused, scaled
   down and never up, while the pane stays within `BLITZ_REUSE_RATIO` of the

@@ -11,6 +11,9 @@ Read with [testing.md](testing.md) (how a render change is verified) and
 [architecture.md](architecture.md) (the UI/worker line every item below has to
 stay on the right side of).
 
+The `app.rs:NNNN` citations below are from before `src/app/` was split into
+concern modules; they are historical evidence and have not been remapped.
+
 ## What has landed
 
 The first two items are in the tree, measured on the same box, same mailbox,
