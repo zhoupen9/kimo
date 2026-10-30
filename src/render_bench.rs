@@ -352,6 +352,7 @@ fn bench_simple(ctx: &egui::Context, case: &Case) -> SimpleStats {
                                 stylesheets: &sheets,
                                 missing_images: Vec::new(),
                                 missing_stylesheets: Vec::new(),
+                                context: None,
                             };
                             let start = Instant::now();
                             html::render_document(ui, &document, &mut html_ctx);

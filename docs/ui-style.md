@@ -100,6 +100,23 @@ the popup's form quiet. `the_replys_to_row_folds_cc_and_bcc_out` pins the
 behaviour on the spot, and `a_mails_header_answers_it_where_the_mail_is` the
 popup's — folded on the first frame, out again from the chevron's click.
 
+## A context menu is flat rows at the pointer
+
+**The rule.** A right-click menu is a menu, not a form: flat full-width rows,
+one action each, the scheme's hover under the pointer, and a destructive row
+in the scheme's danger color (turning to `on_danger` on its danger fill).
+There are no stock buttons, no checkboxes and no icons in one unless the
+action already has the app's glyph; the whole row is the target. The menu
+opens at the pointer with `Popup::context_menu` when a widget's response is
+what opened it, or as a `PopupKind::Menu` at a remembered position when the
+things it belongs to are drawn before the menu can be (the mail body). Escape
+and an outside click close it, as with every other menu.
+
+**Where the code stands.** `context_menu_item` is the row. A message row's
+menu is `mail_context_menu`; the reading pane's is `body_context_menu` (its
+rows keep the label selection alive, see [ui-mail.md](ui-mail.md)); a Blitz
+page's link boxes draw theirs in `draw_blitz_page`.
+
 ## Working by these rules
 
 - Draw the shape and take the color from the scheme or from the glyph's own

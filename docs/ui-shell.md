@@ -495,6 +495,18 @@ Read when touching `src/main.rs`, `src/gpu.rs`, `src/gpus.rs`, `src/glass.rs`, t
   area: the title bar's height is space at its top, so the account sections
   and folders slide under the glass when it is scrolled, and its offset is one
   of the three the bar floats on.
+  **Each account row ends with that account's own sync cell**
+  (`ACCOUNT_SYNC_SIZE`): the title bar's sync glyph at the row's scale, shown
+  under the pointer — its room is reserved whether or not it is drawn, so the
+  unread count and the name do not move — with a spinner while that account is
+  syncing and a failure dot when its last sync did not finish, both shown even
+  at rest because they are status rather than the button. A click is
+  `KimoApp::sync_account` — the same `Job::Sync` the title bar's sweep runs, for
+  this account alone, including the open folder when the account is the one in
+  use and that folder has never been fetched. The cell is registered over the
+  row, so a click on it does not fold the section; it is a target on every row,
+  the way the bar's cells always are. Its tooltip names the account and says
+  when its last sync failed.
   What it draws is a cache of the display model, the way the reading pane
   caches the parsed body: `AccountUiState::nav` derives the rows (`FolderRows`)
   from the account's folder list and mail only when `folders_rev` moved, so a

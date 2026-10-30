@@ -30,6 +30,30 @@ pub struct HtmlContext<'a> {
     pub stylesheets: &'a HashMap<String, String>,
     pub missing_images: Vec<String>,
     pub missing_stylesheets: Vec<String>,
+    /// A right-click on the body this frame, and what it landed on. The
+    /// renderer does not draw the menu: the reading pane does, because a menu
+    /// is about a mail — its text, a link, an image — and the app is where the
+    /// mail and the clipboard are. One per frame; a click is one target.
+    pub context: Option<BodyContextRequest>,
+}
+
+/// What a right-click in a mail body landed on.
+#[derive(Clone, Debug)]
+pub enum BodyContext {
+    /// A text run. The selection itself is egui's label selection; the app
+    /// asks it whether there is one when it draws the menu.
+    Text,
+    /// A link's target, as written in the HTML.
+    Link(String),
+    /// An image's `src`, which is a remote URL or a `cid:` reference.
+    Image(String),
+}
+
+/// Where a body right-click happened and what it landed on, in window points.
+#[derive(Clone, Debug)]
+pub struct BodyContextRequest {
+    pub pos: egui::Pos2,
+    pub target: BodyContext,
 }
 
 /// One styled run of text; consecutive runs with equal styling are merged.
@@ -156,16 +180,32 @@ impl Renderer<'_, '_> {
                 let rich = style_rich(&seg);
                 match seg.link {
                     Some(url) => {
-                        if ui.add(egui::Link::new(rich)).clicked() {
+                        let response = ui.add(egui::Link::new(rich));
+                        if response.clicked() {
                             open_url(ui, &url);
                         }
+                        self.context_click(ui, &response, BodyContext::Link(url));
                     }
                     None => {
-                        ui.label(rich);
+                        let response = ui.label(rich);
+                        self.context_click(ui, &response, BodyContext::Text);
                     }
                 }
             }
         });
+    }
+
+    /// Remember a right-click on one of the body's widgets. The menu itself
+    /// is the pane's: this only says what the pointer was on and where it was.
+    fn context_click(&mut self, ui: &Ui, response: &egui::Response, target: BodyContext) {
+        if !response.secondary_clicked() {
+            return;
+        }
+        let pos = response
+            .interact_pointer_pos()
+            .or_else(|| ui.ctx().pointer_hover_pos())
+            .unwrap_or(response.rect.center());
+        self.ctx.context = Some(BodyContextRequest { pos, target });
     }
 
     fn children(&mut self, ui: &mut Ui, node: NodeRef<'_, Node>, style: &Seg) {
@@ -224,7 +264,12 @@ impl Renderer<'_, '_> {
         };
         match texture {
             Some(texture) => {
-                ui.add(egui::Image::from_texture(texture).max_width(ui.available_width().max(1.0)));
+                let response = ui.add(
+                    egui::Image::from_texture(texture)
+                        .max_width(ui.available_width().max(1.0))
+                        .sense(egui::Sense::click()),
+                );
+                self.context_click(ui, &response, BodyContext::Image(src.to_string()));
             }
             None => {
                 if remote {
@@ -760,6 +805,7 @@ mod tests {
             stylesheets,
             missing_images: Vec::new(),
             missing_stylesheets: Vec::new(),
+            context: None,
         }
     }
 

@@ -88,6 +88,18 @@ Read when touching a list row, threading, select mode, search in the bar, the re
   and turning the pointer on the cell previews the mark by filling it with the
   same `flag` tint a flagged row itself is filled with. A click on it is not a
   click on the row.
+  **A right-click on a row is the bar's run at the pointer.** `mail_context_menu`
+  attaches to the row's response with `Popup::context_menu` and offers Open,
+  Reply, Reply all, Forward, Flag/Unflag, Export and Delete — the title bar's
+  actions plus Open, which is what a row adds. It names the mail the row speaks
+  for (a conversation's newest, the same mail its own delete and flag cells
+  take) and returns a `MailMenuAction`; the list applies it only after the
+  borrow of the account state is over, the same shape a row click uses. A
+  search hit and a label's row get it too, keyed by where the hit lives. The
+  menu is the app's flat `context_menu_item` rather than stock buttons —
+  full-width rows, the scheme's hover, Delete in the danger color — and it is
+  about that one row: select mode's Delete remains the bar's whole-selection
+  action.
 
 - The message list is a list of **conversations** by default: `crate::threads::group`
   turns a folder's mail into threads — a reply joins its parent through
@@ -293,6 +305,26 @@ Read when touching a list row, threading, select mode, search in the bar, the re
   (`body_fingerprint`), drops the document and is laid out at the pane's own
   width at once. Do not draw the body outside that scope, and do not "fix" the
   hold by narrowing the card's own ui.
+
+- **The body's context menu is about what the pointer landed on.** The
+  renderer reports the target through `HtmlContext::context` — a text run, a
+  link's href, an image's `src` — and `body_context_menu` draws the menu at the
+  top of the pane's next frame: Copy (egui's label selection), Copy message
+  text, and for a link Open link / Copy link address, for a remote image Open
+  image / Copy image address. A `cid:` image has no address to open; Copy
+  message text is the mail's text part, or its HTML's visible text when it has
+  none. A mail with no HTML is the same menu on its one selectable label.
+  **The menu does not release the selection.** egui's label selection would
+  otherwise drop it on the press that activates a menu row, because the popup
+  is a layer of its own; `keep_label_selection` marks the row as selectable
+  text with an empty transparent label, so the press leaves the range alone.
+  The selected text stays highlighted while the menu is used, and Copy is an
+  ordinary click that queues a copy event before the body is laid out again.
+  The popup is a `PopupKind::Menu` at the pointer, so it closes on an outside
+  click or Escape like the bar's menus; a mail opening or a folder changing
+  drops it. Blitz pages are a raster:
+  `draw_blitz_page` gives each link box its own Open / Copy link address menu,
+  and their text is not selectable.
 
 - Attachments are cards under the body (`attachment_card`), one per part the
   mail named a file for, in the order the parts appear in it: the page glyph,

@@ -214,6 +214,42 @@ impl MailAction {
     }
 }
 
+/// What a message row's context menu asked for. The same actions the title
+/// bar's run offers, plus Open: a right-click is about the row under the
+/// pointer, whether or not that row happens to be the one the pane is showing.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum MailMenuAction {
+    Open,
+    Reply,
+    ReplyAll,
+    Forward,
+    Flag,
+    Export,
+    Delete,
+}
+
+/// The right-click menu a mail body can show, with the mail it belongs to.
+/// The target is what the pointer landed on — text, a link, an image — and the
+/// key is the mail whose body it is, because the menu is drawn a frame later
+/// and the pane may already be looking at something else.
+struct BodyMenu {
+    pos: egui::Pos2,
+    target: crate::html::BodyContext,
+    key: MailKey,
+    /// The mail's text, taken when the menu opened: "Copy message text" is
+    /// about this mail, and the body's own copy is not read again per frame.
+    text: Option<String>,
+}
+
+/// What a body context menu asked for. Copying a selection is an event rather
+/// than a string here: the text belongs to egui's label selection, and the
+/// event is what asks the labels to copy it.
+enum BodyMenuAction {
+    CopySelection,
+    Copy(String),
+    Open(String),
+}
+
 /// What a row's own delete button says: the mail the row speaks for, and — for
 /// a conversation — that it is only that one, since a conversation's row shows
 /// its newest mail and the button takes the same mail the row opens in the
@@ -926,6 +962,12 @@ pub struct KimoApp {
     /// Message the reading pane's scroll offset belongs to, so opening another
     /// mail starts at the top instead of mid-page.
     scrolled_message: Option<String>,
+    /// The body context menu a right-click asked for, and whether the popup
+    /// holds it open. The target and the mail are kept together because the
+    /// menu is drawn on the frame after the click, when the pane may have moved
+    /// on.
+    body_menu: Option<BodyMenu>,
+    body_menu_open: bool,
     /// The message list's own rect this frame, set by `mail_list`. The rows'
     /// rules span it so they reach the column's hairlines; nothing else reads
     /// it.
@@ -2423,6 +2465,8 @@ impl KimoApp {
             blitz_paper: HashMap::new(),
             body: BodyCache::default(),
             scrolled_message: None,
+            body_menu: None,
+            body_menu_open: false,
             list_column: egui::Rect::ZERO,
             list_scroll: 0.0,
             nav_scroll: 0.0,
@@ -2971,6 +3015,50 @@ impl KimoApp {
 
     // ----- actions ----------------------------------------------------------
 
+    /// One account's folder list and new mail — the sync cell on its row in
+    /// the navigation column. The same job the title bar's sweep gives every
+    /// account, with the one difference the cell is about: only this account
+    /// is asked. A folder that has never been fetched is included when it is
+    /// the one the window is showing, because that folder is never part of the
+    /// sweep's queue until it has a mark.
+    fn sync_account(&mut self, account_id: &str) {
+        // A sync already in flight is left alone: the row draws its spinner
+        // while it runs, and a second job would fetch the same mail twice.
+        if self
+            .states
+            .get(account_id)
+            .is_some_and(|state| state.syncing)
+        {
+            return;
+        }
+        let Some(account) = self
+            .accounts
+            .iter()
+            .find(|account| account.id == account_id)
+            .cloned()
+        else {
+            return;
+        };
+        let open = match (&self.selected_account, &self.selected_folder) {
+            (Some(selected), Some(folder))
+                if selected == account_id && !self.selected_folder_synced() =>
+            {
+                Some(folder.clone())
+            }
+            _ => None,
+        };
+        sync::spawn(
+            Job::Sync {
+                account,
+                purge: false,
+                folder: open,
+                save: false,
+            },
+            self.ctx.clone(),
+            self.tx.clone(),
+        );
+    }
+
     /// Every account's folder list and new mail — and, for the account whose
     /// folder is open, that folder's *first* fetch when it has none. The column
     /// says "Not fetched yet — click Sync in the title bar" for exactly that
@@ -3043,6 +3131,8 @@ impl KimoApp {
         self.selected_account = Some(account_id.clone());
         self.selected_folder = Some(folder.clone());
         self.selected_message = None;
+        self.body_menu = None;
+        self.body_menu_open = false;
         // The column is about to show another folder's mail, and a selection is
         // a selection of the list it was made on.
         self.cancel_select();
@@ -3079,6 +3169,10 @@ impl KimoApp {
 
     fn open_message(&mut self, msg: &MailMessage) {
         self.selected_message = Some(msg.uid.clone());
+        // Opening a mail is a click elsewhere: a body menu from the mail that
+        // was there before is not about this one.
+        self.body_menu = None;
+        self.body_menu_open = false;
         if msg.seen {
             return;
         }
@@ -3168,22 +3262,32 @@ impl KimoApp {
         // The reading pane's own lookup, like Delete's: a uid the pane no
         // longer shows is no mail to export, and the mail's subject is what
         // names the file.
-        let Some(msg) = self.selected_message_view() else {
+        if let Some(key) = self.selected_mail_key() {
+            self.export_mail(&key);
+        }
+    }
+
+    /// Export one mail by where it lives — the title bar's cell for the mail
+    /// the pane shows, and a row's context menu for the row it was opened on.
+    /// The subject is looked up from the app's copy because it is what names
+    /// the file; the original itself is fetched by the worker.
+    fn export_mail(&mut self, key: &MailKey) {
+        let Some(msg) = self.mail_by_key(key) else {
             return;
         };
-        let (Some(account_id), Some(folder)) =
-            (self.selected_account.clone(), self.selected_folder.clone())
+        let Some(account) = self
+            .accounts
+            .iter()
+            .find(|account| account.id == key.account)
+            .cloned()
         else {
-            return;
-        };
-        let Some(account) = self.accounts.iter().find(|a| a.id == account_id).cloned() else {
             return;
         };
         sync::spawn(
             Job::ExportMessage {
                 account,
-                folder,
-                uid: msg.uid,
+                folder: key.folder.clone(),
+                uid: key.uid.clone(),
                 // Where the file goes when the desktop has no dialog to offer,
                 // and the folder the dialog is suggested to open on.
                 dir: storage::downloads_dir(),
@@ -3299,6 +3403,23 @@ impl KimoApp {
             self.ctx.clone(),
             self.tx.clone(),
         );
+    }
+
+    /// Do what a message row's context menu asked for, for the mail the menu
+    /// was opened on. The actions are the title bar's own — the same jobs, the
+    /// same local-first flag — and Open is the one a row adds: it is the same
+    /// path a left click takes, so a search hit or a label's mail switches the
+    /// column to where it lives.
+    fn apply_mail_menu(&mut self, key: MailKey, action: MailMenuAction) {
+        match action {
+            MailMenuAction::Open => self.open_mail_at(&key.account, &key.folder, &key.uid),
+            MailMenuAction::Reply => self.compose_about_key(MailAction::Reply, &key),
+            MailMenuAction::ReplyAll => self.compose_about_key(MailAction::ReplyAll, &key),
+            MailMenuAction::Forward => self.compose_about_key(MailAction::Forward, &key),
+            MailMenuAction::Flag => self.toggle_flag_on(&key),
+            MailMenuAction::Export => self.export_mail(&key),
+            MailMenuAction::Delete => self.delete_mail(&key.account, &key.folder, &key.uid),
+        }
     }
 
     /// Delete every checked mail. The selection is grouped by the folder the
@@ -4860,13 +4981,36 @@ impl KimoApp {
         // The rows are derived here and only when the account state changed, so
         // the header's count comes from them too — they are where the counts
         // are computed at all.
-        let (unread, placeholder, syncing, error) = {
+        let (unread, placeholder, syncing, failed, error) = {
             let state = self.states.entry(account_id.to_string()).or_default();
             let nav = state.nav();
             let (unread, placeholder) = (nav.unread, nav.placeholder);
-            (unread, placeholder, state.syncing, state.error.clone())
+            (
+                unread,
+                placeholder,
+                state.syncing,
+                state.error.is_some(),
+                state.error.clone(),
+            )
         };
-        if account_row(ui, scheme, account_name, unread, collapsed).clicked() {
+        let drawn = account_row(
+            ui,
+            scheme,
+            account_id,
+            account_name,
+            AccountRowState {
+                unread,
+                collapsed,
+                syncing,
+                failed,
+            },
+        );
+        if drawn.sync.clicked() {
+            // A click on the cell is the account's own sync, not the section's
+            // fold: the cell is registered over the row, and this is the one
+            // place the two are told apart.
+            self.sync_account(account_id);
+        } else if drawn.row.clicked() {
             if collapsed {
                 self.collapsed_accounts.remove(account_id);
             } else {
@@ -5082,10 +5226,37 @@ impl KimoApp {
     /// card right under that mail, and `ui` moves the draft to the popup
     /// window once that mail has left the pane.
     fn compose_about(&mut self, action: MailAction, spot: ComposeSpot, mail: &MailMessage) {
+        let anchor = self.pane_mail_key(&mail.uid);
+        self.compose_about_with(action, spot, mail, anchor);
+    }
+
+    /// Open a compose about a mail named by where it lives rather than by the
+    /// pane — what a row's context menu does. The account the draft is *from*
+    /// is the one the mail lives in, not whichever account the window happens
+    /// to have open, and the draft is a popup: it was opened from a list row,
+    /// not from a card in the pane.
+    fn compose_about_key(&mut self, action: MailAction, key: &MailKey) {
+        let Some(mail) = self.mail_by_key(key) else {
+            return;
+        };
+        self.compose_about_with(action, ComposeSpot::Popup, &mail, Some(key.clone()));
+    }
+
+    fn compose_about_with(
+        &mut self,
+        action: MailAction,
+        spot: ComposeSpot,
+        mail: &MailMessage,
+        anchor: Option<MailKey>,
+    ) {
         if self.compose.as_ref().is_some_and(|draft| draft.sending) {
             return;
         }
-        let from = compose_from(&self.accounts, self.selected_account.as_deref());
+        let account = anchor
+            .as_ref()
+            .map(|key| key.account.as_str())
+            .or(self.selected_account.as_deref());
+        let from = compose_from(&self.accounts, account);
         // The one address a reply all must not put in Cc: the account's own.
         let self_addr = from
             .as_ref()
@@ -5098,11 +5269,7 @@ impl KimoApp {
             MailAction::Forward => ComposeDraft::forward(mail, from),
             _ => return,
         };
-        self.compose_anchor = self
-            .selected_account
-            .as_deref()
-            .zip(self.selected_folder.as_deref())
-            .map(|(account, folder)| MailKey::new(account, folder, &mail.uid));
+        self.compose_anchor = anchor;
         self.compose = Some(draft);
         self.compose_spot = spot;
     }
@@ -5887,6 +6054,9 @@ impl KimoApp {
         // is the same mail marked where it is listed.
         let mut deleted: Option<MailKey> = None;
         let mut flagged: Option<MailKey> = None;
+        // A row's context menu named a mail and an action; both are applied
+        // once the borrow of the state the rows came from is over.
+        let mut menu: Option<(MailKey, MailMenuAction)> = None;
         // A click on a row in select mode is the way out of it, and nothing
         // else: it does not open the mail under the pointer.
         let mut leave_select = false;
@@ -5944,6 +6114,20 @@ impl KimoApp {
                                     let open = self.open_threads.contains(&conversation.key);
                                     let drawn =
                                         self.thread_row(ui, conversation, messages, open, first);
+                                    // The row's context menu is about the mail
+                                    // the row speaks for — its newest, the one
+                                    // the row opens — and is a right-click of
+                                    // its own, beside the row's left-click
+                                    // actions.
+                                    if let Some(action) =
+                                        mail_context_menu(&drawn.row, conversation.flagged)
+                                    {
+                                        let newest = &messages[conversation.newest];
+                                        menu = Some((
+                                            MailKey::new(account, folder, &newest.uid),
+                                            action,
+                                        ));
+                                    }
                                     // The row's own delete button takes the
                                     // mail the row speaks for, the box
                                     // checks every mail the conversation
@@ -5993,6 +6177,14 @@ impl KimoApp {
                                     };
                                     let drawn =
                                         self.message_row(ui, &messages[index], first, place);
+                                    if let Some(action) =
+                                        mail_context_menu(&drawn.row, messages[index].flagged)
+                                    {
+                                        menu = Some((
+                                            MailKey::new(account, folder, &messages[index].uid),
+                                            action,
+                                        ));
+                                    }
                                     if drawn.flag.clicked() {
                                         flagged = Some(MailKey::new(
                                             account,
@@ -6077,6 +6269,9 @@ impl KimoApp {
         }
         if let Some(key) = deleted {
             self.delete_mail(&key.account, &key.folder, &key.uid);
+        }
+        if let Some((key, action)) = menu {
+            self.apply_mail_menu(key, action);
         }
         if let Some(keys) = select_all_clicked {
             self.toggle_all(keys);
@@ -6347,6 +6542,23 @@ impl KimoApp {
             return None;
         }
         self.pane_mail_key(self.selected_message.as_deref()?)
+    }
+
+    /// One mail by where it lives: the lookup a context menu's actions use
+    /// when the row they were opened on is not the pane's mail, and the one
+    /// the file name of an export comes from.
+    fn mail_by_key(&self, key: &MailKey) -> Option<MailMessage> {
+        self.states
+            .get(&key.account)
+            .and_then(|state| {
+                state
+                    .mailbox
+                    .folders
+                    .iter()
+                    .find(|folder| folder.name == key.folder)
+            })
+            .and_then(|folder| folder.messages.iter().find(|mail| mail.uid == key.uid))
+            .cloned()
     }
 
     /// The labels one mail carries, by name, read from the app's copy of the
@@ -7011,6 +7223,9 @@ impl KimoApp {
         // button beside it marks the mail where the hit lives.
         let mut deleted: Option<MailKey> = None;
         let mut flagged: Option<MailKey> = None;
+        // A hit's context menu named a mail and an action, applied after the
+        // borrow of the hits is over.
+        let mut menu: Option<(MailKey, MailMenuAction)> = None;
         let mut leave_select = false;
         // The select-all row was clicked: every hit is checked — or the
         // selection is cleared — once the borrow of the hits is over.
@@ -7040,6 +7255,12 @@ impl KimoApp {
                             for index in rows {
                                 let hit = &hits[shown[index]];
                                 let drawn = self.search_row(ui, hit, index == 0);
+                                if let Some(action) = mail_context_menu(&drawn.row, hit.flagged) {
+                                    menu = Some((
+                                        MailKey::new(&hit.account_id, &hit.folder, &hit.uid),
+                                        action,
+                                    ));
+                                }
                                 if drawn.flag.clicked() {
                                     flagged =
                                         Some(MailKey::new(&hit.account_id, &hit.folder, &hit.uid));
@@ -7095,6 +7316,9 @@ impl KimoApp {
         if let Some(key) = deleted {
             self.delete_mail(&key.account, &key.folder, &key.uid);
         }
+        if let Some((key, action)) = menu {
+            self.apply_mail_menu(key, action);
+        }
         if let Some(keys) = select_all_clicked {
             self.toggle_all(keys);
             self.ctx.request_repaint();
@@ -7131,6 +7355,9 @@ impl KimoApp {
         let mut checked: Option<Vec<MailKey>> = None;
         let mut deleted: Option<MailKey> = None;
         let mut flagged: Option<MailKey> = None;
+        // A label row's context menu named a mail and an action, applied after
+        // the borrow of the derived view is over.
+        let mut menu: Option<(MailKey, MailMenuAction)> = None;
         let mut leave_select = false;
         let mut select_all_clicked: Option<Vec<MailKey>> = None;
         // The same pinned band the folder's list draws, about this list: one
@@ -7194,6 +7421,12 @@ impl KimoApp {
                             for index in rows {
                                 let mail = &matches[shown[index]];
                                 let drawn = self.labelled_row(ui, mail, index == 0);
+                                if let Some(action) = mail_context_menu(&drawn.row, mail.flagged) {
+                                    menu = Some((
+                                        MailKey::new(&mail.account_id, &mail.folder, &mail.uid),
+                                        action,
+                                    ));
+                                }
                                 if drawn.flag.clicked() {
                                     flagged = Some(MailKey::new(
                                         &mail.account_id,
@@ -7251,6 +7484,9 @@ impl KimoApp {
         }
         if let Some(key) = deleted {
             self.delete_mail(&key.account, &key.folder, &key.uid);
+        }
+        if let Some((key, action)) = menu {
+            self.apply_mail_menu(key, action);
         }
         if let Some(keys) = select_all_clicked {
             self.toggle_all(keys);
@@ -7957,6 +8193,115 @@ impl KimoApp {
     /// window's top edge — the floating title bar lies over them — and the first
     /// one's top padding is the bar's height (see `mail_card`), so a mail
     /// scrolls under the glass exactly like the message list's rows do.
+    /// The body context menu: what a right-click on a mail's text, link or
+    /// image asked for. Drawn at the top of the pane's frame, before the body
+    /// is laid out again, so the copy event it queues is seen by the labels
+    /// drawn later in the same pass. Its rows also keep egui's label selection
+    /// alive across their own press (`keep_label_selection`), so the selected
+    /// text stays highlighted while the menu is used. The menu is a
+    /// `PopupKind::Menu` at the pointer, so it sits above the mail it came
+    /// from and closes on an outside click or Escape like the bar's menus.
+    fn body_context_menu(&mut self, ui: &egui::Ui, conversation: &Conversation) {
+        let Some(menu) = self.body_menu.take() else {
+            return;
+        };
+        let same_mail = self.selected_account.as_deref() == Some(menu.key.account.as_str())
+            && self.selected_folder.as_deref() == Some(menu.key.folder.as_str())
+            && conversation
+                .messages
+                .iter()
+                .any(|mail| mail.uid == menu.key.uid);
+        if !same_mail {
+            self.body_menu = None;
+            self.body_menu_open = false;
+            return;
+        }
+        let id = egui::Id::new((
+            "mail-body-menu",
+            menu.key.account.as_str(),
+            menu.key.folder.as_str(),
+            menu.key.uid.as_str(),
+        ));
+        let mut open = self.body_menu_open;
+        let mut action: Option<BodyMenuAction> = None;
+        let has_selection = ui
+            .ctx()
+            .with_plugin::<egui::text_selection::LabelSelectionState, _>(|selection| {
+                selection.has_selection()
+            })
+            .unwrap_or(false);
+        let remote = |url: &str| url.starts_with("http://") || url.starts_with("https://");
+        egui::Popup::new(
+            id,
+            ui.ctx().clone(),
+            egui::PopupAnchor::Position(menu.pos),
+            egui::LayerId::new(egui::Order::Foreground, id),
+        )
+        .open_bool(&mut open)
+        .kind(egui::PopupKind::Menu)
+        .layout(egui::Layout::top_down_justified(egui::Align::Min))
+        .width(CONTEXT_MENU_WIDTH)
+        .show(|ui| {
+            ui.set_min_width(CONTEXT_MENU_WIDTH);
+            ui.spacing_mut().item_spacing.y = 1.0;
+            let mut separated = false;
+            match &menu.target {
+                crate::html::BodyContext::Link(url) => {
+                    if context_menu_item(ui, "Open link", true, false, true).clicked() {
+                        action = Some(BodyMenuAction::Open(url.clone()));
+                    }
+                    if context_menu_item(ui, "Copy link address", true, false, true).clicked() {
+                        action = Some(BodyMenuAction::Copy(url.clone()));
+                    }
+                    separated = true;
+                }
+                crate::html::BodyContext::Image(src) if remote(src) => {
+                    if context_menu_item(ui, "Open image", true, false, true).clicked() {
+                        action = Some(BodyMenuAction::Open(src.clone()));
+                    }
+                    if context_menu_item(ui, "Copy image address", true, false, true).clicked() {
+                        action = Some(BodyMenuAction::Copy(src.clone()));
+                    }
+                    separated = true;
+                }
+                crate::html::BodyContext::Image(_) | crate::html::BodyContext::Text => {}
+            }
+            if separated {
+                ui.separator();
+            }
+            // The guard on every row is what keeps the selection alive
+            // through the press, so Copy can be an ordinary click and the
+            // selected text stays visible after it.
+            let copy = context_menu_item(ui, "Copy", has_selection, false, true);
+            if copy.clicked() {
+                action = Some(BodyMenuAction::CopySelection);
+            }
+            if let Some(text) = &menu.text {
+                if context_menu_item(ui, "Copy message text", true, false, true).clicked() {
+                    action = Some(BodyMenuAction::Copy(text.clone()));
+                }
+            }
+        });
+        self.body_menu_open = open;
+        if open {
+            self.body_menu = Some(menu);
+        }
+        if let Some(action) = action {
+            match action {
+                BodyMenuAction::CopySelection => {
+                    // The selection is egui's; this event is what makes it
+                    // copy. The labels have not been drawn yet this frame, so
+                    // they will see it before their end-of-pass clears the
+                    // selection.
+                    ui.ctx()
+                        .input_mut(|input| input.events.push(egui::Event::Copy));
+                }
+                BodyMenuAction::Copy(text) => ui.ctx().copy_text(text),
+                BodyMenuAction::Open(url) => crate::html::open_url(ui, &url),
+            }
+        }
+    }
+
     fn mail_content(&mut self, ui: &mut egui::Ui) {
         let scheme = theme::of(ui.ctx());
         // The chrome is painted here rather than by the central panel's frame:
@@ -7978,8 +8323,11 @@ impl KimoApp {
         );
         let Some(conversation) = self.open_conversation() else {
             self.mail_scroll = 0.0;
-            // Nothing on the card, so nothing to keep parsed behind it.
+            // Nothing on the card, so nothing to keep parsed behind it, and no
+            // body to right-click either.
             self.body.forget();
+            self.body_menu = None;
+            self.body_menu_open = false;
             let _ = ui.scope_builder(egui::UiBuilder::new().max_rect(below_bar), |ui| {
                 ui.centered_and_justified(|ui| {
                     ui.label(egui::RichText::new("No mail selected").weak().heading());
@@ -8002,6 +8350,13 @@ impl KimoApp {
         let new_message = self.scrolled_message.as_deref() != Some(message_key.as_str());
         if new_message {
             self.scrolled_message = Some(message_key);
+        }
+
+        // A body right-click from an earlier frame, before the scroll area
+        // draws the body again: Copy has to reach the label selection before
+        // the click that asked for it clears it.
+        if self.body_menu.is_some() {
+            self.body_context_menu(ui, &conversation);
         }
 
         // The cards are laid out with the mails and filled in below, once the
@@ -8223,6 +8578,8 @@ impl KimoApp {
                     self.compose = None;
                 }
                 self.selected_message = None;
+                self.body_menu = None;
+                self.body_menu_open = false;
             }
         }
     }
@@ -8591,6 +8948,7 @@ impl KimoApp {
                 stylesheets: &sheets,
                 missing_images: Vec::new(),
                 missing_stylesheets: Vec::new(),
+                context: None,
             };
             // The body is laid out in a scope of its own, and *that* is what
             // holds its width: the card has already drawn its headers across
@@ -8606,6 +8964,13 @@ impl KimoApp {
             ui.scope_builder(egui::UiBuilder::new().max_rect(body), |ui| {
                 crate::html::render_document(ui, document, &mut html_ctx);
             });
+            // A right-click on the body is the pane's menu to show. It is kept
+            // here with the mail it belongs to, because the menu's actions —
+            // copy the text, open the link, copy the image address — are about
+            // this mail, not the one the pane might show next.
+            if let Some(request) = html_ctx.context.take() {
+                self.set_body_menu(msg, request.target, request.pos);
+            }
             let missing_images = std::mem::take(&mut html_ctx.missing_images);
             let missing_sheets = std::mem::take(&mut html_ctx.missing_stylesheets);
             for url in missing_images {
@@ -8616,11 +8981,45 @@ impl KimoApp {
             }
         } else if !msg.body_text.is_empty() {
             self.body.forget();
-            ui.label(msg.body_text.as_str());
+            let response = ui.label(msg.body_text.as_str());
+            if response.secondary_clicked() {
+                let pos = response
+                    .interact_pointer_pos()
+                    .or_else(|| ui.ctx().pointer_hover_pos())
+                    .unwrap_or(response.rect.center());
+                self.set_body_menu(msg, crate::html::BodyContext::Text, pos);
+            }
         } else {
             self.body.forget();
             ui.label(egui::RichText::new("(no text body)").weak());
         }
+    }
+
+    /// Remember a right-click in one mail's body for the menu the pane draws
+    /// on the next frame. The text is taken here because it is the mail's own,
+    /// and the HTML fallback is only needed for a mail without a text part.
+    fn set_body_menu(
+        &mut self,
+        msg: &MailMessage,
+        target: crate::html::BodyContext,
+        pos: egui::Pos2,
+    ) {
+        let Some(key) = self.pane_mail_key(&msg.uid) else {
+            return;
+        };
+        let text = if !msg.body_text.is_empty() {
+            Some(msg.body_text.clone())
+        } else {
+            let text = crate::mail::html_to_plain(msg.body_html.as_deref().unwrap_or(""));
+            (!text.is_empty()).then_some(text)
+        };
+        self.body_menu = Some(BodyMenu {
+            pos,
+            target,
+            key,
+            text,
+        });
+        self.body_menu_open = true;
     }
 
     /// The preferences modal, opened from the title-bar cog: a sidebar of
@@ -10381,6 +10780,13 @@ const LABEL_POPUP_WIDTH: f32 = 220.0;
 /// the one in force. One width for both, because they hang from adjacent cells
 /// and are read as one control.
 const LIST_MENU_WIDTH: f32 = 240.0;
+/// A context menu's own width and row: one line per action, the row as wide as
+/// the menu, so the whole line is the target. Smaller than the bar's choice
+/// menus because a context menu is read at the pointer rather than from a cell
+/// that stays on screen.
+const CONTEXT_MENU_WIDTH: f32 = 200.0;
+const CONTEXT_ROW_HEIGHT: f32 = 26.0;
+const CONTEXT_ROW_INSET: f32 = 10.0;
 /// The room a menu row takes, the gap between two of them, and how far the row's
 /// content stays clear of its own ends — the mark's inset and the tick's, which
 /// are one number so the two line up down the menu.
@@ -10485,6 +10891,13 @@ const NAV_DEFAULT_WIDTH: f32 = 200.0;
 /// The account row's disclosure chevron (`paint_chevron`), the size of a thread
 /// row's: with it the app draws no solid triangle anywhere (`docs/ui-style.md`).
 const ACCOUNT_CHEVRON: f32 = 10.0;
+/// The sync cell at the end of an account row: the title bar's sync glyph at
+/// the row's scale, and the spinner it becomes while that one account is
+/// syncing. The cell is a real target on every account row, not a hover-only
+/// mark, because it is the one control besides a folder click that reaches a
+/// single account.
+const ACCOUNT_SYNC_SIZE: f32 = 20.0;
+const ACCOUNT_SYNC_SPINNER: f32 = 14.0;
 const CONTENT_MIN_WIDTH: f32 = 280.0;
 const LIST_MIN_WIDTH: f32 = 240.0;
 /// Where a list splitter starts, and the widest it can make the list: the
@@ -11364,7 +11777,21 @@ fn draw_blitz_page(ui: &mut egui::Ui, page: &RasterizedPage, paper: egui::Color3
         if response.clicked() {
             crate::html::open_url(ui, href);
         }
-        response.on_hover_text(href.as_str());
+        let response = response.on_hover_text(href.as_str());
+        // A Blitz page is a raster: its links are the only parts with an
+        // address, so the menu a link offers is the page's context menu.
+        egui::Popup::context_menu(&response)
+            .width(CONTEXT_MENU_WIDTH)
+            .show(|ui| {
+                ui.set_min_width(CONTEXT_MENU_WIDTH);
+                ui.spacing_mut().item_spacing.y = 1.0;
+                if context_menu_item(ui, "Open link", true, false, false).clicked() {
+                    crate::html::open_url(ui, href);
+                }
+                if context_menu_item(ui, "Copy link address", true, false, false).clicked() {
+                    ui.ctx().copy_text(href.clone());
+                }
+            });
     }
 }
 
@@ -12632,23 +13059,53 @@ fn label_chips(ui: &mut egui::Ui, scheme: ColorScheme, labels: &BTreeSet<String>
     });
 }
 
+/// What one account row shows beyond its name and the account it belongs to:
+/// the unread total, whether its folders are folded, and the state of its own
+/// sync.
+struct AccountRowState {
+    unread: usize,
+    collapsed: bool,
+    syncing: bool,
+    failed: bool,
+}
+
 fn account_row(
     ui: &mut egui::Ui,
     scheme: ColorScheme,
+    account_id: &str,
     name: &str,
-    unread: usize,
-    collapsed: bool,
-) -> egui::Response {
+    state: AccountRowState,
+) -> AccountRowResponse {
     const ROW_HEIGHT: f32 = 24.0;
 
     let (rect, response) = ui.allocate_exact_size(
         egui::vec2(ui.available_width(), ROW_HEIGHT),
         egui::Sense::click(),
     );
+    let sync_rect = egui::Rect::from_center_size(
+        egui::pos2(
+            rect.right() - 4.0 - ACCOUNT_SYNC_SIZE / 2.0,
+            rect.center().y,
+        ),
+        egui::Vec2::splat(ACCOUNT_SYNC_SIZE),
+    );
+    // The account's own sync cell, registered after the row so it is the
+    // topmost of the two: a click on it is not a click that folds the account.
+    // It is a target on every row, drawn or not, like the other cells the app
+    // offers at an edge.
+    let sync = ui.interact(
+        sync_rect,
+        egui::Id::new(("account-sync", account_id)),
+        egui::Sense::click(),
+    );
     if !ui.is_rect_visible(rect) {
-        return response;
+        return AccountRowResponse {
+            row: response,
+            sync,
+        };
     }
-    if response.hovered() {
+    let hovered = response.hovered() || sync.hovered();
+    if hovered {
         ui.painter().rect_filled(rect, 3.0_f32, scheme.hover);
     }
 
@@ -12660,17 +13117,17 @@ fn account_row(
         ui.painter(),
         center,
         ACCOUNT_CHEVRON,
-        !collapsed,
+        !state.collapsed,
         scheme.text_weak,
     );
 
     let left = center.x + 10.0;
-    let mut right = rect.right() - 6.0;
-    if unread > 0 {
+    let mut right = sync_rect.left() - 4.0;
+    if state.unread > 0 {
         let small = egui::TextStyle::Small.resolve(ui.style());
-        let count = ui
-            .ctx()
-            .fonts_mut(|fonts| fonts.layout_no_wrap(unread.to_string(), small, scheme.text_weak));
+        let count = ui.ctx().fonts_mut(|fonts| {
+            fonts.layout_no_wrap(state.unread.to_string(), small, scheme.text_weak)
+        });
         right -= count.size().x;
         ui.painter().galley(
             egui::pos2(right, rect.center().y - count.size().y / 2.0),
@@ -12683,7 +13140,7 @@ fn account_row(
     // Always at full strength, unlike a folder row: this is the section's
     // heading, and it stays readable while the mail under it is all read.
     let body = egui::TextStyle::Body.resolve(ui.style());
-    let name = truncate_galley(
+    let label = truncate_galley(
         ui.ctx(),
         name,
         body.size,
@@ -12691,11 +13148,61 @@ fn account_row(
         (right - left).max(1.0),
     );
     ui.painter().galley(
-        egui::pos2(left, rect.center().y - name.size().y / 2.0),
-        name,
+        egui::pos2(left, rect.center().y - label.size().y / 2.0),
+        label,
         scheme.text,
     );
-    response
+
+    // The cell itself: the bar's sync glyph while the account is idle, a
+    // spinner while its own sync is running, and a failure dot when the last
+    // one did not finish. The row's hover fill is already behind it; the
+    // glyph takes the full text colour under the pointer so the cell reads as
+    // a control rather than as decoration.
+    if state.syncing {
+        ui.put(
+            sync_rect,
+            egui::Spinner::new()
+                .color(scheme.accent)
+                .size(ACCOUNT_SYNC_SPINNER),
+        );
+    } else if hovered {
+        // The cell is a hover control: the row keeps its room whether or not
+        // it is shown, so the unread count and the name do not move under the
+        // pointer.
+        let color = if sync.hovered() {
+            scheme.text
+        } else {
+            scheme.text_weak
+        };
+        paint_sync_icon(ui.painter(), sync_rect, color);
+    }
+    if state.failed {
+        ui.painter().circle_filled(
+            egui::pos2(sync_rect.right() - 3.0, sync_rect.top() + 3.0),
+            SYNC_BADGE_RADIUS,
+            scheme.danger,
+        );
+    }
+    let sync = sync
+        .on_hover_cursor(egui::CursorIcon::PointingHand)
+        .on_hover_text(if state.syncing {
+            format!("Syncing {name}…")
+        } else if state.failed {
+            format!("Sync {name} — the last sync failed")
+        } else {
+            format!("Sync {name} only")
+        });
+    AccountRowResponse {
+        row: response,
+        sync,
+    }
+}
+
+/// What one account row's clicks were: the row (which folds the section) and
+/// the sync cell at its end (which syncs that account alone).
+struct AccountRowResponse {
+    row: egui::Response,
+    sync: egui::Response,
 }
 
 /// What a folder row wears at its left edge: the icon of its kind, or the
@@ -13638,6 +14145,156 @@ fn paint_menu_icon(p: &egui::Painter, icon: MenuIcon, rect: egui::Rect, color: e
             p.add(egui::Shape::line(vec![g(4.0, 15.0), g(14.0, 15.0)], stroke));
         }
     }
+}
+
+/// A message row's context menu: the title bar's mail actions under the
+/// pointer that opened it, with Open first — a right-click names the row it
+/// landed on, and the pane is not necessarily showing it yet. The flag's two
+/// states turn over with the row, the way the bar's cell does; Delete is drawn
+/// in the scheme's danger color, and the row is the whole target, not only the
+/// words.
+///
+/// The menu is anchored to the row's own response (`Popup::context_menu`), so
+/// it opens where the pointer is and closes on a click elsewhere without the
+/// list having to track a second piece of state. What it asks for is returned
+/// rather than acted on here: the row is drawn while the list still borrows
+/// the mail, and the caller applies the action once the borrow is over.
+fn mail_context_menu(response: &egui::Response, flagged: bool) -> Option<MailMenuAction> {
+    let mut action = None;
+    egui::Popup::context_menu(response)
+        .width(CONTEXT_MENU_WIDTH)
+        .show(|ui| {
+            ui.set_min_width(CONTEXT_MENU_WIDTH);
+            ui.spacing_mut().item_spacing.y = 1.0;
+            if context_menu_item(ui, "Open", true, false, false).clicked() {
+                action = Some(MailMenuAction::Open);
+            }
+            ui.separator();
+            if context_menu_item(ui, "Reply", true, false, false).clicked() {
+                action = Some(MailMenuAction::Reply);
+            }
+            if context_menu_item(ui, "Reply all", true, false, false).clicked() {
+                action = Some(MailMenuAction::ReplyAll);
+            }
+            if context_menu_item(ui, "Forward", true, false, false).clicked() {
+                action = Some(MailMenuAction::Forward);
+            }
+            ui.separator();
+            if context_menu_item(
+                ui,
+                if flagged { "Unflag" } else { "Flag" },
+                true,
+                false,
+                false,
+            )
+            .clicked()
+            {
+                action = Some(MailMenuAction::Flag);
+            }
+            if context_menu_item(ui, "Export", true, false, false).clicked() {
+                action = Some(MailMenuAction::Export);
+            }
+            if context_menu_item(ui, "Delete", true, true, false).clicked() {
+                action = Some(MailMenuAction::Delete);
+            }
+        });
+    action
+}
+
+/// One line of a context menu: flat, the window's own row height, filled under
+/// the pointer with the scheme's hover — or the danger fill for a destructive
+/// action, whose words turn to `on_danger` there. The whole row is the target,
+/// the way a menu row's is; the menu itself supplies the frame.
+fn context_menu_item(
+    ui: &mut egui::Ui,
+    label: &str,
+    enabled: bool,
+    danger: bool,
+    keep_selection: bool,
+) -> egui::Response {
+    let scheme = theme::of(ui.ctx());
+    let (rect, response) = ui.allocate_exact_size(
+        egui::vec2(ui.available_width(), CONTEXT_ROW_HEIGHT),
+        if enabled {
+            egui::Sense::click()
+        } else {
+            egui::Sense::hover()
+        },
+    );
+    if keep_selection && enabled {
+        keep_label_selection(ui, &response);
+    }
+    if enabled && response.hovered() {
+        ui.painter().rect_filled(
+            rect,
+            egui::CornerRadius::same(3),
+            if danger {
+                scheme.danger_hover
+            } else {
+                scheme.hover
+            },
+        );
+    }
+    let color = if !enabled {
+        scheme.text_weak
+    } else if danger {
+        if response.hovered() {
+            scheme.on_danger
+        } else {
+            scheme.danger
+        }
+    } else {
+        scheme.text
+    };
+    let font = ui
+        .style()
+        .text_styles
+        .get(&egui::TextStyle::Body)
+        .cloned()
+        .unwrap_or_else(|| egui::FontId::proportional(14.0));
+    ui.painter().text(
+        egui::pos2(rect.left() + CONTEXT_ROW_INSET, rect.center().y),
+        egui::Align2::LEFT_CENTER,
+        label,
+        font,
+        color,
+    );
+    if enabled {
+        response.on_hover_cursor(egui::CursorIcon::PointingHand)
+    } else {
+        response
+    }
+}
+
+/// Keep egui's label selection alive while the pointer is over a context-menu
+/// row. `LabelSelectionState` clears a selection on any pointer press outside a
+/// selectable label, and a popup is a layer of its own: without this, clicking
+/// any action in the body's menu would drop the selected text before the menu
+/// could use it (and before the user saw the action take it).
+///
+/// The guard is an empty, transparent "label" over the row's own response. Its
+/// layer is the popup's, so the selection state treats it as a different widget
+/// and never changes the range; all it does is mark the row as hovered for the
+/// one check that decides whether a press clears the selection. The row sets
+/// its own pointing-hand cursor afterwards.
+fn keep_label_selection(ui: &egui::Ui, response: &egui::Response) {
+    let font = ui
+        .style()
+        .text_styles
+        .get(&egui::TextStyle::Body)
+        .cloned()
+        .unwrap_or_else(|| egui::FontId::proportional(14.0));
+    let galley = ui
+        .ctx()
+        .fonts_mut(|fonts| fonts.layout_no_wrap(String::new(), font, egui::Color32::TRANSPARENT));
+    egui::text_selection::LabelSelectionState::label_text_selection(
+        ui,
+        response,
+        response.rect.min,
+        galley,
+        egui::Color32::TRANSPARENT,
+        egui::Stroke::NONE,
+    );
 }
 
 /// One row of either of the bar's menus: the choice's own mark at its left, the
@@ -15526,6 +16183,84 @@ mod tests {
             "the sync cell starts a sweep"
         );
     }
+
+    /// The sync cell on an account's own row is about that account and no
+    /// other: one SyncStarted, carrying the account the cell belongs to, and
+    /// the row stays open — the cell is not the disclosure.
+    #[test]
+    fn an_accounts_sync_cell_syncs_only_that_account() {
+        let ctx = egui::Context::default();
+        crate::fonts::install(&ctx, None, None, None);
+        let mut app = app_with_two_accounts(&ctx, 1);
+        // A port with nothing behind it: the job fails at connect, and that it
+        // starts for this account is the question.
+        for account in &mut app.accounts {
+            account.host = "127.0.0.1".to_string();
+            account.port = 1;
+        }
+        run_app_frame(&ctx, &mut app, Vec::new());
+        let sync = ctx
+            .read_response(egui::Id::new(("account-sync", "other")))
+            .expect("the second account's row drew a sync cell");
+        assert!(sync.rect.width() > 0.0);
+        while app.rx.try_recv().is_ok() {}
+
+        // The cell is a hover control: no glyph at rest, the refresh arrow
+        // under the pointer.
+        let shapes = frame_shapes_at(&ctx, &mut app, 1400.0);
+        assert!(
+            triangles_in(&shapes, sync.rect).is_empty(),
+            "the sync glyph is visible without the pointer"
+        );
+        run_app_frame(
+            &ctx,
+            &mut app,
+            vec![egui::Event::PointerMoved(sync.rect.center())],
+        );
+        let shapes = frame_shapes_at(&ctx, &mut app, 1400.0);
+        assert!(
+            !triangles_in(&shapes, sync.rect).is_empty(),
+            "hovering the row did not reveal the sync glyph"
+        );
+
+        click_at(&ctx, &mut app, sync.rect.center());
+        let mut started = None;
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            match app.rx.try_recv() {
+                Ok(Event::SyncStarted { account_id }) => {
+                    started = Some(account_id);
+                    break;
+                }
+                Ok(_) => {}
+                Err(mpsc::TryRecvError::Empty) => std::thread::sleep(Duration::from_millis(2)),
+                Err(mpsc::TryRecvError::Disconnected) => break,
+            }
+        }
+        assert_eq!(
+            started.as_deref(),
+            Some("other"),
+            "the cell asked for its own account only"
+        );
+        assert!(
+            !app.collapsed_accounts.contains("other"),
+            "the sync cell is not the row's disclosure"
+        );
+
+        // While that account is syncing the cell is still a target: its click
+        // is swallowed by the guard, not by the row's disclosure.
+        app.states
+            .get_mut("other")
+            .expect("the second account")
+            .syncing = true;
+        run_app_frame(&ctx, &mut app, Vec::new());
+        click_at(&ctx, &mut app, sync.rect.center());
+        assert!(
+            !app.collapsed_accounts.contains("other"),
+            "a click on the spinner folded the account"
+        );
+    }
+
     /// The attachment cards are one run across the mail's column, not one card
     /// per line: a fixed width each, two to a row where they fit, the third
     /// wrapped onto the next row at the column's own left edge.
@@ -15675,6 +16410,217 @@ mod tests {
             );
         }
     }
+
+    /// A right-click on a link in the body offers the link's own actions, and
+    /// Copy link address puts the href on the clipboard. The menu is drawn
+    /// before the body on the next frame, which is also what lets a Copy of a
+    /// selection run before the menu's click clears it.
+    #[test]
+    fn a_body_link_offers_its_address_on_right_click() {
+        let ctx = egui::Context::default();
+        crate::fonts::install(&ctx, None, None, None);
+        let mut app = app_with_messages(&ctx, 1);
+        {
+            let state = app.states.get_mut("acct").expect("the fixture account");
+            let mail = &mut state.mailbox.folders[0].messages[0];
+            mail.body_text = "Hello Example".to_string();
+            mail.body_html =
+                Some("<p>Hello <a href=\"https://example.com/a\">Example</a></p>".to_string());
+            state.folders_changed();
+        }
+        app.selected_message = Some("0".to_string());
+        let _ = frame_shapes_at(&ctx, &mut app, 1400.0);
+        let shapes = frame_shapes_at(&ctx, &mut app, 1400.0);
+        let window = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1400.0, 900.0));
+        let link = text_boxes_of(&shapes, window, "Example")
+            .into_iter()
+            .next()
+            .expect("the body draws its link");
+
+        right_click_at(&ctx, &mut app, link.center());
+        assert!(app.body_menu.is_some(), "the right-click reached the body");
+        // The first frame is the popup's sizing pass; the menu is painted on
+        // the one after it.
+        let _ = frame_shapes_at(&ctx, &mut app, 1400.0);
+        let shapes = frame_shapes_at(&ctx, &mut app, 1400.0);
+        for item in [
+            "Open link",
+            "Copy link address",
+            "Copy",
+            "Copy message text",
+        ] {
+            assert!(
+                !text_boxes_of(&shapes, window, item).is_empty(),
+                "the body menu draws {item}"
+            );
+        }
+        let copy = text_boxes_of(&shapes, window, "Copy link address")
+            .into_iter()
+            .next()
+            .expect("the address row is drawn");
+        let output = click_at_output(&ctx, &mut app, copy.center());
+        assert!(
+            output.platform_output.commands.iter().any(|command| {
+                matches!(
+                    command,
+                    egui::OutputCommand::CopyText(text) if text == "https://example.com/a"
+                )
+            }),
+            "the href is what reaches the clipboard: {:?}",
+            output.platform_output.commands
+        );
+    }
+
+    /// A right-click on an image in the body offers its address: the loaded
+    /// texture is the target, not the mail's text around it.
+    #[test]
+    fn a_body_image_offers_its_address_on_right_click() {
+        let ctx = egui::Context::default();
+        crate::fonts::install(&ctx, None, None, None);
+        let mut app = app_with_messages(&ctx, 1);
+        let url = "https://example.com/pic.png";
+        {
+            let state = app.states.get_mut("acct").expect("the fixture account");
+            let mail = &mut state.mailbox.folders[0].messages[0];
+            mail.body_text = "A picture".to_string();
+            mail.body_html = Some(format!("<p>A picture<img src=\"{url}\" alt=\"pic\"></p>"));
+            state.folders_changed();
+        }
+        let pixels = [255u8, 0, 0, 255].repeat(4);
+        let texture = ctx.load_texture(
+            "body-image",
+            egui::ColorImage::from_rgba_unmultiplied([2, 2], &pixels),
+            Default::default(),
+        );
+        app.images
+            .insert(url.to_string(), ImageStatus::Ready(texture));
+        app.selected_message = Some("0".to_string());
+        let _ = frame_shapes_at(&ctx, &mut app, 1400.0);
+        let shapes = frame_shapes_at(&ctx, &mut app, 1400.0);
+        let window = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1400.0, 900.0));
+        let pane = egui::Rect::from_min_max(
+            egui::pos2(app.list_column.right(), TITLEBAR_HEIGHT),
+            egui::pos2(1400.0, 900.0),
+        );
+        let image = image_rects_of(&shapes, pane)
+            .into_iter()
+            .next()
+            .expect("the body draws its image");
+
+        right_click_at(&ctx, &mut app, image.center());
+        assert!(app.body_menu.is_some(), "the right-click reached the body");
+        let _ = frame_shapes_at(&ctx, &mut app, 1400.0);
+        let shapes = frame_shapes_at(&ctx, &mut app, 1400.0);
+        for item in ["Open image", "Copy image address"] {
+            assert!(
+                !text_boxes_of(&shapes, window, item).is_empty(),
+                "the body menu draws {item}"
+            );
+        }
+        let copy = text_boxes_of(&shapes, window, "Copy image address")
+            .into_iter()
+            .next()
+            .expect("the address row is drawn");
+        let output = click_at_output(&ctx, &mut app, copy.center());
+        assert!(
+            output.platform_output.commands.iter().any(|command| {
+                matches!(command, egui::OutputCommand::CopyText(text) if text == url)
+            }),
+            "the image address reaches the clipboard: {:?}",
+            output.platform_output.commands
+        );
+    }
+
+    /// A selection made with the mouse is what the body menu's Copy is about:
+    /// clicking it is a copy event sent before the body is laid out again, so
+    /// egui's label selection still has the range when the copy runs.
+    #[test]
+    fn a_body_selection_is_copied_by_the_context_menu() {
+        let ctx = egui::Context::default();
+        crate::fonts::install(&ctx, None, None, None);
+        let mut app = app_with_messages(&ctx, 1);
+        {
+            let state = app.states.get_mut("acct").expect("the fixture account");
+            let mail = &mut state.mailbox.folders[0].messages[0];
+            mail.body_text = "Hello body".to_string();
+            // No HTML: this is the plain-text fallback, one selectable label.
+            mail.body_html = None;
+            state.folders_changed();
+        }
+        app.selected_message = Some("0".to_string());
+        let _ = frame_shapes_at(&ctx, &mut app, 1400.0);
+        let shapes = frame_shapes_at(&ctx, &mut app, 1400.0);
+        let window = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1400.0, 900.0));
+        let hello = text_boxes_of(&shapes, window, "Hello body")
+            .into_iter()
+            .next()
+            .expect("the body draws its text");
+
+        // Drag across the text, the way a selection is made.
+        let start = egui::pos2(hello.left() + 1.0, hello.center().y);
+        let end = egui::pos2(hello.right() - 1.0, hello.center().y);
+        run_app_frame(&ctx, &mut app, vec![egui::Event::PointerMoved(start)]);
+        run_app_frame(
+            &ctx,
+            &mut app,
+            vec![egui::Event::PointerButton {
+                pos: start,
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: egui::Modifiers::default(),
+            }],
+        );
+        run_app_frame(&ctx, &mut app, vec![egui::Event::PointerMoved(end)]);
+        run_app_frame(
+            &ctx,
+            &mut app,
+            vec![egui::Event::PointerButton {
+                pos: end,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::default(),
+            }],
+        );
+        let _ = frame_shapes_at(&ctx, &mut app, 1400.0);
+        assert!(
+            ctx.with_plugin::<egui::text_selection::LabelSelectionState, _>(|selection| {
+                selection.has_selection()
+            })
+            .unwrap_or(false),
+            "the drag selected the label text"
+        );
+
+        right_click_at(&ctx, &mut app, hello.center());
+        let _ = frame_shapes_at(&ctx, &mut app, 1400.0);
+        let shapes = frame_shapes_at(&ctx, &mut app, 1400.0);
+        assert!(
+            ctx.with_plugin::<egui::text_selection::LabelSelectionState, _>(|selection| {
+                selection.has_selection()
+            })
+            .unwrap_or(false),
+            "opening the menu released the text selection"
+        );
+        let copy = text_boxes_of(&shapes, window, "Copy")
+            .into_iter()
+            .next()
+            .expect("the body menu draws Copy");
+        let output = click_at_output(&ctx, &mut app, copy.center());
+        assert!(
+            output.platform_output.commands.iter().any(|command| {
+                matches!(command, egui::OutputCommand::CopyText(text) if text.contains("Hello"))
+            }),
+            "the selected text reaches the clipboard: {:?}",
+            output.platform_output.commands
+        );
+        assert!(
+            ctx.with_plugin::<egui::text_selection::LabelSelectionState, _>(|selection| {
+                selection.has_selection()
+            })
+            .unwrap_or(false),
+            "using the menu released the text selection"
+        );
+    }
+
     /// Clicking an attachment card starts a download: the app finds the account
     /// and the mail the pane is showing, and hands the worker the part's place
     /// and the file's name. What the worker does with them is `sync`'s own
@@ -16128,6 +17074,67 @@ mod tests {
     /// the button goes down and up.
     fn click_at(ctx: &egui::Context, app: &mut KimoApp, pos: egui::Pos2) {
         click_at_sized(ctx, app, pos, 1400.0);
+    }
+
+    /// A primary click at a position, with the frame's whole output: the
+    /// clipboard a menu row writes is a command, not a shape.
+    fn click_at_output(
+        ctx: &egui::Context,
+        app: &mut KimoApp,
+        pos: egui::Pos2,
+    ) -> egui::FullOutput {
+        let _ = app_frame_output(ctx, app, vec![egui::Event::PointerMoved(pos)]);
+        let pressed = app_frame_output(
+            ctx,
+            app,
+            vec![egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: egui::Modifiers::default(),
+            }],
+        );
+        let released = app_frame_output(
+            ctx,
+            app,
+            vec![egui::Event::PointerButton {
+                pos,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::default(),
+            }],
+        );
+        // A context-menu row that has to copy a label selection acts on the
+        // press (the click is what clears it); everything else acts on the
+        // release. The caller wants whichever frame carried the command.
+        if pressed
+            .platform_output
+            .commands
+            .iter()
+            .any(|command| matches!(command, egui::OutputCommand::CopyText(_)))
+        {
+            pressed
+        } else {
+            released
+        }
+    }
+
+    /// A right-click at a position: the pointer moves there, then the
+    /// secondary button goes down and up. What opens a context menu.
+    fn right_click_at(ctx: &egui::Context, app: &mut KimoApp, pos: egui::Pos2) {
+        run_app_frame(ctx, app, vec![egui::Event::PointerMoved(pos)]);
+        for pressed in [true, false] {
+            run_app_frame(
+                ctx,
+                app,
+                vec![egui::Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Secondary,
+                    pressed,
+                    modifiers: egui::Modifiers::default(),
+                }],
+            );
+        }
     }
 
     /// A click in a window of the width given: the popup layout's tests click
@@ -17858,6 +18865,52 @@ mod tests {
         assert_eq!(app.selected_message, None, "and no mail was opened");
     }
 
+    /// A right-click on a message row opens the mail actions for the mail the
+    /// row speaks for, at the pointer: the title bar's run plus Open, and the
+    /// flag's wording turning over with the row. A click on Flag is the title
+    /// bar's flag action, not a second one.
+    #[test]
+    fn a_message_row_offers_its_actions_on_right_click() {
+        let ctx = egui::Context::default();
+        crate::fonts::install(&ctx, None, None, None);
+        let mut app = app_with_messages(&ctx, 2);
+        app.accounts[0].host = "127.0.0.1".to_string();
+        app.accounts[0].port = 1;
+        let shapes = frame_shapes_at(&ctx, &mut app, 1400.0);
+        let row = text_boxes_of(&shapes, app.list_column, "Subject 1")
+            .into_iter()
+            .next()
+            .expect("the second row is drawn");
+
+        right_click_at(&ctx, &mut app, row.center());
+        let shapes = frame_shapes_at(&ctx, &mut app, 1400.0);
+        let window = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1400.0, 900.0));
+        for item in [
+            "Open",
+            "Reply",
+            "Reply all",
+            "Forward",
+            "Flag",
+            "Export",
+            "Delete",
+        ] {
+            assert!(
+                !text_boxes_of(&shapes, window, item).is_empty(),
+                "the row's context menu draws {item}: {shapes:?}"
+            );
+        }
+
+        let flag = text_boxes_of(&shapes, window, "Flag")
+            .into_iter()
+            .next()
+            .expect("the Flag row is drawn");
+        click_at(&ctx, &mut app, flag.center());
+        assert!(
+            app.folder_messages_of("acct", "INBOX").unwrap()[1].flagged,
+            "the menu's Flag marks the mail the row speaks for"
+        );
+    }
+
     /// A conversation's row speaks for its newest mail — the one the reading pane
     /// opens from it — and that is the mail its own button takes, not the whole
     /// thread: the thread's mails are the box's (all at once) or the title bar's
@@ -19574,9 +20627,20 @@ mod tests {
             1,
             "the account's one disclosure is a chevron: {chevrons:?}"
         );
+        // The sync cell's refresh glyph has a solid arrowhead, which is a glyph
+        // rather than a disclosure. The account's disclosure is the chevron
+        // above, and no other solid triangle belongs in this column.
+        let sync = ctx
+            .read_response(egui::Id::new(("account-sync", "acct")))
+            .expect("the account row drew its sync cell")
+            .rect;
+        let outside_sync: Vec<Vec<egui::Pos2>> = triangles_in(&shapes, nav)
+            .into_iter()
+            .filter(|points| !sync.contains_rect(egui::Rect::from_points(points)))
+            .collect();
         assert!(
-            triangles_in(&shapes, nav).is_empty(),
-            "and the navigation column draws no solid triangle at all"
+            outside_sync.is_empty(),
+            "the navigation column draws no solid disclosure triangle: {outside_sync:?}"
         );
 
         // A click on the row folds the folders away, and the chevron turns with
@@ -19886,6 +20950,7 @@ mod tests {
                                 stylesheets: &sheets,
                                 missing_images: Vec::new(),
                                 missing_stylesheets: Vec::new(),
+                                context: None,
                             };
                             ui.scope_builder(egui::UiBuilder::new().max_rect(body_rect), |ui| {
                                 crate::html::render_document(ui, &document, &mut html_ctx);
@@ -22965,6 +24030,13 @@ mod tests {
                 let drawn = mesh.calc_bounds();
                 if rect.contains_rect(drawn) {
                     out.push(drawn);
+                }
+            }
+            // An un-rotated `Image` is a texture-filled rectangle rather than
+            // a mesh (egui 0.36), and it is still an image to a test.
+            egui::Shape::Rect(drawn) if drawn.brush.is_some() => {
+                if rect.contains_rect(drawn.rect) {
+                    out.push(drawn.rect);
                 }
             }
             egui::Shape::Vec(shapes) => {
