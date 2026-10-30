@@ -1811,15 +1811,18 @@ dependencies = [
  "blitz-html",
  "blitz-paint",
  "blitz-traits",
- "crypto-bigint",
  "csscolorparser",
  "ego-tree",
  "egui",
  "egui-wgpu",
  "egui-winit",
  "image",
+ "kimo-core",
+ "kimo-mail",
+ "kimo-plugin-abi",
+ "kimo-protocol",
+ "kimo-store",
  "kurbo",
- "mail-parser",
  "palette",
  "parley",
  "pollster",
@@ -1828,14 +1831,63 @@ dependencies = [
  "scraper",
  "serde",
  "serde_json",
- "sha1_smol",
  "ttf-parser",
  "ureq",
  "wasmi",
  "wasmi_core",
- "webpki-roots 0.26.11",
  "wgpu",
  "winit",
+]
+
+[[package]]
+name = "kimo-core"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "sha1_smol",
+]
+
+[[package]]
+name = "kimo-mail"
+version = "0.1.0"
+dependencies = [
+ "base64 0.22.1",
+ "kimo-core",
+ "mail-parser",
+ "scraper",
+ "sha1_smol",
+]
+
+[[package]]
+name = "kimo-plugin-abi"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
+name = "kimo-protocol"
+version = "0.1.0"
+dependencies = [
+ "base64 0.22.1",
+ "crypto-bigint",
+ "kimo-core",
+ "rustls",
+ "webpki-roots 0.26.11",
+]
+
+[[package]]
+name = "kimo-store"
+version = "0.1.0"
+dependencies = [
+ "base64 0.22.1",
+ "kimo-core",
+ "kimo-mail",
+ "rusqlite",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

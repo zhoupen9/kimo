@@ -1,4 +1,7 @@
-//! Folder kinds: which special mailbox a name refers to, and the icon to draw.
+//! Folder kinds: which special mailbox a mailbox name refers to.
+//!
+//! The icon a row draws for a kind belongs to the UI (`src/app/icons.rs`),
+//! not here: this crate is shared with the provider layer and holds no assets.
 //!
 //! IMAP servers may label special mailboxes with the SPECIAL-USE attributes
 //! (\Sent, \Drafts, \Trash, \Junk, \Archive, \All, \Flagged), but a plain
@@ -13,7 +16,7 @@
 //! Items` is. That is not an i18n framework: the UI strings stay English
 //! (hard rule 6).
 
-/// What a folder is, for icon purposes.
+/// What a folder is, for display and sorting purposes.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum FolderKind {
     Inbox,
@@ -26,66 +29,6 @@ pub enum FolderKind {
     Starred,
     /// Anything [`kind_of`] does not recognize.
     Folder,
-}
-
-impl FolderKind {
-    /// The embedded row icons, as (kind, open, PNG). Only a generic folder
-    /// has a second, open glyph; the special mailboxes keep one.
-    ///
-    /// The PNGs are white on transparency: egui tints by multiplying, so a
-    /// black bake could never take the row's text color.
-    pub const ICONS: &[(FolderKind, bool, &[u8])] = &[
-        (
-            FolderKind::Inbox,
-            false,
-            include_bytes!("../assets/folder-icons/inbox.png"),
-        ),
-        (
-            FolderKind::Sent,
-            false,
-            include_bytes!("../assets/folder-icons/sent.png"),
-        ),
-        (
-            FolderKind::Drafts,
-            false,
-            include_bytes!("../assets/folder-icons/drafts.png"),
-        ),
-        (
-            FolderKind::Trash,
-            false,
-            include_bytes!("../assets/folder-icons/trash.png"),
-        ),
-        (
-            FolderKind::Junk,
-            false,
-            include_bytes!("../assets/folder-icons/junk.png"),
-        ),
-        (
-            FolderKind::Archive,
-            false,
-            include_bytes!("../assets/folder-icons/archive.png"),
-        ),
-        (
-            FolderKind::AllMail,
-            false,
-            include_bytes!("../assets/folder-icons/all-mail.png"),
-        ),
-        (
-            FolderKind::Starred,
-            false,
-            include_bytes!("../assets/folder-icons/starred.png"),
-        ),
-        (
-            FolderKind::Folder,
-            false,
-            include_bytes!("../assets/folder-icons/folder.png"),
-        ),
-        (
-            FolderKind::Folder,
-            true,
-            include_bytes!("../assets/folder-icons/folder-open.png"),
-        ),
-    ];
 }
 
 /// Gmail's LIST names its system mailboxes under a container called
@@ -373,26 +316,5 @@ mod tests {
                 "Receipts",
             ]
         );
-    }
-
-    #[test]
-    fn every_kind_has_a_white_icon() {
-        for (kind, open, png) in FolderKind::ICONS {
-            let decoded = image::load_from_memory(png)
-                .unwrap_or_else(|error| panic!("{kind:?} open={open}: {error}"))
-                .to_rgba8();
-            assert_eq!(decoded.dimensions(), (48, 48), "{kind:?} open={open}");
-            // White (egui tints by multiplying) with transparency around it.
-            assert!(
-                decoded
-                    .pixels()
-                    .any(|pixel| pixel.0 == [255, 255, 255, 255]),
-                "{kind:?} open={open} has no white pixels"
-            );
-            assert!(
-                decoded.pixels().any(|pixel| pixel.0[3] == 0),
-                "{kind:?} open={open} has no transparent pixels"
-            );
-        }
     }
 }

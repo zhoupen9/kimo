@@ -10,7 +10,7 @@ UI / sync jobs                src/app/, src/sync.rs
        └─ MailProvider trait  src/provider/mod.rs
             ├─ ImapProvider   src/provider/imap.rs
             └─ Pop3Provider   src/provider/pop3.rs
-                 └─ wire      src/protocol/{imap,pop3,smtp}.rs
+                 └─ wire      crates/kimo-protocol/src/{imap,pop3,smtp}.rs
 ```
 
 - **The adapters own the wire; `sync.rs` owns the store.** `MailProvider`

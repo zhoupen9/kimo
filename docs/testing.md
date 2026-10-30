@@ -10,22 +10,18 @@ build output and are ignored by git, so a fresh worktree has to build and copy
 them before `cargo test` (or `cargo clippy --all-targets`) will even compile:
 
 ```sh
-(cd plugins/gmail && cargo build --release --target wasm32-unknown-unknown)
-cp plugins/gmail/target/wasm32-unknown-unknown/release/kimo_plugin_gmail.wasm \
+(cd plugins && cargo build --release --target wasm32-unknown-unknown)
+cp plugins/target/wasm32-unknown-unknown/release/kimo_plugin_gmail.wasm \
    plugins/gmail/gmail.wasm
-
-(cd plugins/outlook && cargo build --release --target wasm32-unknown-unknown)
-cp plugins/outlook/target/wasm32-unknown-unknown/release/kimo_plugin_outlook.wasm \
+cp plugins/target/wasm32-unknown-unknown/release/kimo_plugin_outlook.wasm \
    plugins/outlook/outlook.wasm
-
-(cd plugins/sender-groups && cargo build --release --target wasm32-unknown-unknown)
-cp plugins/sender-groups/target/wasm32-unknown-unknown/release/kimo_plugin_sender_groups.wasm \
+cp plugins/target/wasm32-unknown-unknown/release/kimo_plugin_sender_groups.wasm \
    plugins/sender-groups/sender-groups.wasm
 ```
 
 ## Looking at the UI
 
-- When touching the UI, actually run `cargo run` and click through it; the
+- When touching the UI, actually run `cargo run -p kimo` and click through it; the
   layout has no golden tests. `blitz_render` has a developer tool for
   eyeballing fidelity without the GUI:
   `KIMO_RENDER_HTML=mail.html cargo test -- --ignored dump_render` writes

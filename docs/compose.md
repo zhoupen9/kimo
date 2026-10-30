@@ -1,11 +1,11 @@
 # Compose — the card and the mail that goes out
 
-Read when touching `compose_card`, `src/outgoing.rs`, or `Job::SendMessage`.
+Read when touching `compose_card`, `crates/kimo-mail/src/outgoing.rs`, or `Job::SendMessage`.
 
 - **Sending is SMTP submission.** The compose card's Send hands its draft to
   a worker (`Job::SendMessage`), which speaks `EHLO`/`STARTTLS`/`AUTH`/`MAIL
-  FROM`/`RCPT TO`/`DATA` through `src/protocol/smtp.rs`, and the message itself
-  is built by `src/outgoing.rs`. A copy goes into the account's Sent mailbox
+  FROM`/`RCPT TO`/`DATA` through `crates/kimo-protocol/src/smtp.rs`, and the message itself
+  is built by `crates/kimo-mail/src/outgoing.rs`. A copy goes into the account's Sent mailbox
   over IMAP when the server has one. A mail with files on it goes out as
   `multipart/mixed` — the text is one part and each file another, all base64 —
   and the files are read by the worker as it sends, never by the UI thread. There

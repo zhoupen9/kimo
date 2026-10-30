@@ -16,7 +16,7 @@ Kimo is a desktop **email client** GUI written in pure Rust:
   through winit + `egui-winit` + `egui-wgpu` instead of eframe, because the
   floating title bar's blur needs the frame split in two.
 - **Protocols:** IMAP4rev1 and POP3 for reading, SMTP submission for sending —
-  all implemented by hand in `src/protocol/`.
+  all implemented by hand in `crates/kimo-protocol/`.
 - **TLS:** rustls with the pure-Rust `ring` provider and webpki-roots, plus a
   hand-written finite-field DH group for the servers that offer nothing else.
 - **Storage:** one SQLite database (FTS5) and one JSON file of UI settings.
@@ -73,7 +73,7 @@ Kimo is a desktop **email client** GUI written in pure Rust:
 | Task          | Command                                          |
 | ------------- | ------------------------------------------------ |
 | Build         | `cargo build`                                    |
-| Run           | `cargo run`                                      |
+| Run           | `cargo run -p kimo`                              |
 | Tests         | `cargo test`                                     |
 | Lint (strict) | `cargo clippy --all-targets -- -D warnings`      |
 | Format        | `cargo fmt`                                      |
@@ -83,30 +83,35 @@ done. There is no CI yet — that discipline is on you.
 
 ## Architecture
 
+Kimo is one Cargo workspace: the binary at the root, five library crates under
+`crates/`, and a separate workspace for the WASM modules.
+
 ```
+crates/kimo-core/       Account / Protocol / TlsMode / MailMessage (plain types),
+                        MailError, XDG paths, settings.json, resource cache, Mailbox/Folder
+crates/kimo-mail/       raw RFC 5322 → MailMessage, outgoing → RFC 5322, conversations,
+                        folder kinds (name → special mailbox, incl. CJK)
+crates/kimo-protocol/   TcpStream/TLS transport, FFDHE, IMAP4rev1, POP3, SMTP submission
+crates/kimo-store/      the SQLite database (schema, migrations, accounts, folders, messages,
+                        labels, old-JSON import) and FTS5/CJK mail search
+crates/kimo-plugin-abi/ the host-side JSON envelope + manifest (guest modules still carry
+                        their own import/envelope module until the SDK extraction)
+plugins/                separate workspace: gmail, outlook, sender-groups (wasm32-unknown-unknown)
+
 src/main.rs             entry point; the winit event loop, the window, egui's input state
 src/gpu.rs              the wgpu side: device, surface, egui's renderer, and one frame
 src/gpus.rs             the machine's graphics cards and the Vulkan drivers a pick may load
 src/app.rs              app root: KimoApp state and shared models, construction, one-frame `ui`
 src/app/                UI by concern: events, actions, titlebar, navigation, list, reading,
                         compose, preferences, menus, search, blitz, layout, widgets, icons, util
-src/models.rs           Account / Protocol / TlsMode / MailMessage (plain types: nothing is serialised any more)
-src/error.rs            MailError + MailResult
 src/fonts.rs            installed-font discovery (ttf-parser scan) + egui font installation
-src/storage.rs          XDG paths, settings.json, remote-resource cache, Mailbox/Folder (in memory)
-src/db.rs               the mail database: schema + migrations, accounts, folders, messages, the old-JSON import
-src/search.rs           mail search: the CJK bigram index, the FTS5 query builder and the filters they run against
-src/threads.rs          mail grouped into conversations: the message list's own model of a folder
 src/theme.rs            theme choice + the light/dark color schemes and their egui Visuals
 src/portal.rs           the desktop's own file dialog, asked for over D-Bus (XDG portal)
-src/mail.rs             raw RFC 5322 bytes → MailMessage (mail-parser; HTML kept, attachments
-                        as name/type/size, one part back out for a download)
-src/outgoing.rs         the mail being sent: addresses, headers, encoding → RFC 5322 bytes
 src/html.rs             HTML mail → egui widgets (subset: blocks, lists, tables, links, inline
                         styles; the mail's colors adapted to the theme)
 src/blitz_render.rs     HTML mail → rasterized page via Blitz (headless render, net provider, fonts)
 src/css.rs              tiny CSS subset (decls, tag/class/id selectors, CSS colors) for HTML mail
-src/folders.rs          folder kind (name → special mailbox, incl. CJK) + embedded row icons
+src/app/icons.rs        embedded folder row icons and the other shared glyph painters
 src/glass.rs            the floating title bar's frosted backdrop (wgpu passes + a paint callback)
 src/render_bench.rs     test-only: times both HTML renderers for the same bodies (bench_render)
 src/dbus.rs             the session bus: D-Bus wire protocol (marshalling, framing, the connection)
@@ -114,21 +119,12 @@ src/tray.rs             StatusNotifierItem over the session bus (std::thread) + 
 src/wake.rs             the event loop's wake channel, for work that finishes while the window is hidden
 src/notify.rs           new-mail notifications over the session bus (std::thread) + their 48·scale icon
 src/sync.rs             Job/Event enums, worker threads, and the database/Event side of every mailbox job
-src/plugin/             the WASM plugin host: manifest/ABI, discovery, the wasmi instance,
-                        the HTTP/TLS backend an account hands its instances, the OAuth
-                        browser flow (loopback + OpenURI), the MailProvider adapter
+src/plugin/             the WASM plugin host: discovery, the wasmi instance, the HTTP/TLS backend,
+                        the OAuth browser flow, the MailProvider adapter (ABI in kimo-plugin-abi)
 src/provider/mod.rs     the abstract MailProvider interface: one adapter per read protocol
 src/provider/imap.rs    the IMAP adapter: folders, incremental fetch, flags, delete, append
 src/provider/pop3.rs    the POP3 adapter: the one drop, older mail, delete, body
 src/provider/vendor.rs  the vendor layer: Gmail/Outlook/… presets, sign-in notes, Sent mailbox
-src/protocol/mod.rs     protocol modules
-src/protocol/stream.rs  TcpStream/TLS transport (MailStream, STARTTLS upgrade, buffered Conn)
-src/protocol/ffdhe.rs   FFDHE kx group + DHE-RSA suites, which rustls does not ship
-src/protocol/imap.rs    minimal IMAP4rev1 client (LOGIN, LIST, SELECT, FETCH w/ literals,
-                        UID STORE, APPEND, delete: UID FETCH probe + UID EXPUNGE)
-src/protocol/pop3.rs    minimal POP3 client (USER/PASS, STAT, UIDL, RETR w/ de-stuffing, DELE, QUIT)
-src/protocol/smtp.rs    minimal SMTP submission client (EHLO capabilities, STARTTLS,
-                        AUTH PLAIN/LOGIN, MAIL/RCPT/DATA w/ dot-stuffing)
 ```
 
 ## Where the detail lives
@@ -136,14 +132,14 @@ src/protocol/smtp.rs    minimal SMTP submission client (EHLO capabilities, START
 | Read this | Before touching |
 | --------- | --------------- |
 | [docs/architecture.md](docs/architecture.md) | `src/sync.rs`, `Job`/`Event`, anything crossing the UI/worker line |
-| [docs/storage.md](docs/storage.md) | `src/db.rs`, `src/storage.rs`, `src/search.rs`, a schema migration, an XDG path |
-| [docs/protocols.md](docs/protocols.md) | `src/protocol/`, a TLS setting, a charset, the mapping of a server's refusal |
+| [docs/storage.md](docs/storage.md) | `crates/kimo-store/`, `crates/kimo-core/src/storage.rs`, a schema migration, an XDG path |
+| [docs/protocols.md](docs/protocols.md) | `crates/kimo-protocol/`, a TLS setting, a charset, the mapping of a server's refusal |
 | [docs/providers.md](docs/providers.md) | `src/provider/`, a vendor preset, the account form's Provider row, a new mailbox operation |
 | [docs/mail-spec.md](docs/mail-spec.md) | `src/plugin/`, a provider or extension plugin under `plugins/`, the WASM ABI, an OAuth flow, an X-GM mapping |
 | [docs/ui-shell.md](docs/ui-shell.md) | `src/main.rs`, `src/gpu.rs`, `src/gpus.rs`, `src/glass.rs`, the title bar, the column plan, the navigation column |
 | [docs/ui-mail.md](docs/ui-mail.md) | a list row, threading, select mode, the search box and its popup, the reading pane, attachments, labels, flags, filters, sort |
 | [docs/ui-style.md](docs/ui-style.md) | drawing a widget: an icon or a disclosure, a mail address field, the Cc/Bcc fold |
-| [docs/compose.md](docs/compose.md) | `compose_card`, `src/outgoing.rs`, `Job::SendMessage` |
+| [docs/compose.md](docs/compose.md) | `compose_card`, `crates/kimo-mail/src/outgoing.rs`, `Job::SendMessage` |
 | [docs/theme.md](docs/theme.md) | `src/theme.rs`, `src/fonts.rs`, any color a widget draws |
 | [docs/html-mail.md](docs/html-mail.md) | `src/html.rs`, `src/css.rs`, `src/blitz_render.rs`, a Blitz build feature |
 | [docs/platform.md](docs/platform.md) | `src/portal.rs`, `src/dbus.rs`, `src/tray.rs`, `src/notify.rs`, `packaging/` |
@@ -167,7 +163,7 @@ src/protocol/smtp.rs    minimal SMTP submission client (EHLO capabilities, START
   `src/provider/vendor.rs`, not in the account form or an adapter. A preset
   switched off in Preferences is Custom everywhere: ask `vendor::enabled` /
   `vendor::effective_key` rather than assuming a preset is on.
-- When touching the UI, actually run `cargo run` and click through it; the
+- When touching the UI, actually run `cargo run -p kimo` and click through it; the
   layout has no golden tests. A rendered dump is not the app — the dumps and
   the benchmarks are in `docs/testing.md`.
 

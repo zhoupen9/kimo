@@ -7,6 +7,7 @@ mod common;
 mod compose;
 mod dump;
 mod events;
+mod icons;
 mod labels;
 mod list;
 mod navigation;

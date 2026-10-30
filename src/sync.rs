@@ -536,7 +536,7 @@ pub fn spawn(job: Job, ctx: egui::Context, tx: Sender<Event>) {
                         Ok(())
                     }
                 })
-                .and_then(|()| plugin_sign_in(&account))
+                .and_then(|()| plugin_sign_in(&account).map_err(Into::into))
                 .err()
                 .map(|error| error.to_string());
             let _ = tx.send(Event::PluginAuth { account_id, error });
@@ -741,12 +741,14 @@ pub fn spawn(job: Job, ctx: egui::Context, tx: Sender<Event>) {
                     } else {
                         Ok(())
                     };
-                    written.and_then(|()| {
-                        if purge {
-                            db::purge_mail(&account.id)?;
-                        }
-                        sync_account(&account, folder.as_deref(), &tx)
-                    })
+                    written
+                        .and_then(|()| {
+                            if purge {
+                                db::purge_mail(&account.id)?;
+                            }
+                            sync_account(&account, folder.as_deref(), &tx).map_err(Into::into)
+                        })
+                        .map_err(MailError::from)
                 }
                 Job::SyncFolder { account, folder } => sync_folder_job(&account, &folder, &tx),
                 Job::FetchImage { .. }
@@ -1151,7 +1153,7 @@ fn delete_messages(
     for uid in outcome.gone {
         match db::delete_message(&account.id, folder, &uid) {
             Ok(()) => deleted.push(uid),
-            Err(error) => first_error = first_error.or(Some(error)),
+            Err(error) => first_error = first_error.or(Some(error.into())),
         }
     }
     (deleted, first_error)

@@ -4,7 +4,7 @@ A desktop email client written in **pure Rust**, with an immediate-mode GUI
 built on [egui](https://github.com/emilk/egui) — driven directly through winit,
 `egui-winit` and `egui-wgpu`. Kimo speaks **IMAP4rev1** and **POP3** for
 reading mail and **SMTP** (submission) for sending it, all implemented by hand
-in `src/protocol/` on top of `std::net::TcpStream` + rustls. The dependency
+in `crates/kimo-protocol/` on top of `std::net::TcpStream` + rustls. The dependency
 tree has no C library beyond the bundled SQLite the mail database is: TLS uses
 rustls with the `ring` crypto provider and Mozilla's root certificates.
 
@@ -60,8 +60,8 @@ rustls with the `ring` crypto provider and Mozilla's root certificates.
 ## Build & run
 
 ```sh
-cargo run            # debug
-cargo run --release  # release
+cargo run -p kimo            # debug
+cargo run -p kimo --release  # release
 ```
 
 Linux users need the usual GUI stack headers available at runtime

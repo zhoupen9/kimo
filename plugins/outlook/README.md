@@ -53,7 +53,7 @@ tenant replaces `common` in `oauth.rs` with its tenant id.
 
 ```sh
 cargo build --release --target wasm32-unknown-unknown
-cp target/wasm32-unknown-unknown/release/kimo_plugin_outlook.wasm outlook.wasm
+cp ../target/wasm32-unknown-unknown/release/kimo_plugin_outlook.wasm outlook.wasm
 ```
 
 Install into a plugin directory (or point `KIMO_PLUGIN_PATH` here):

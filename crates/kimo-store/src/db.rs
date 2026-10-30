@@ -45,11 +45,11 @@ use base64::Engine as _;
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::Deserialize;
 
-use crate::error::{MailError, MailResult};
-use crate::models::{
+use crate::error::{StoreError, StoreResult};
+use kimo_core::models::{
     Account, Attachment, InlineImage, MailMessage, Protocol, SmtpLogin, SmtpSettings, TlsMode,
 };
-use crate::storage::{self, Folder, Mailbox};
+use kimo_core::storage::{self, Folder, Mailbox};
 
 /// The schema version this build writes and understands.
 pub const SCHEMA_VERSION: i64 = 10;
@@ -454,7 +454,7 @@ impl MailDb {
                 // import deletes what it reads, and this database is gone when
                 // the window closes.
                 let memory = Connection::open_in_memory()
-                    .map_err(MailError::from)
+                    .map_err(StoreError::from)
                     .and_then(|conn| {
                         configure(&conn)?;
                         Ok(conn)
@@ -513,10 +513,10 @@ fn lock() -> MutexGuard<'static, MailDb> {
 }
 
 /// Open (once per process) and lock the mail database.
-pub fn db() -> MailResult<Db> {
+pub fn db() -> StoreResult<Db> {
     let guard = lock();
     if guard.conn.is_none() {
-        return Err(MailError::Storage(format!(
+        return Err(StoreError::Storage(format!(
             "mail database unavailable ({})",
             guard.warning.as_deref().unwrap_or("unknown error")
         )));
@@ -530,7 +530,7 @@ pub fn warning() -> Option<String> {
     lock().warning.clone()
 }
 
-fn open_file(path: &Path) -> MailResult<Connection> {
+fn open_file(path: &Path) -> StoreResult<Connection> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
@@ -554,7 +554,7 @@ fn restrict_permissions(path: &Path) {
 #[cfg(not(unix))]
 fn restrict_permissions(_path: &Path) {}
 
-fn configure(conn: &Connection) -> MailResult<()> {
+fn configure(conn: &Connection) -> StoreResult<()> {
     conn.busy_timeout(BUSY_TIMEOUT)?;
     // WAL lives in the file; `foreign_keys` is per connection and so has to be
     // set every time. `synchronous = NORMAL` is the usual WAL pairing: a commit
@@ -574,7 +574,7 @@ fn configure(conn: &Connection) -> MailResult<()> {
 /// A database that already existed is walked forward one version at a time,
 /// each step one transaction with the `user_version` write inside it (see the
 /// ladder below).
-fn migrate(conn: &mut Connection, legacy: Option<(&Path, &Path)>) -> MailResult<()> {
+fn migrate(conn: &mut Connection, legacy: Option<(&Path, &Path)>) -> StoreResult<()> {
     let start: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
     if start >= SCHEMA_VERSION {
         return Ok(());
@@ -670,14 +670,14 @@ fn migrate(conn: &mut Connection, legacy: Option<(&Path, &Path)>) -> MailResult<
 /// Give every IMAP folder the mark its stored mail implies. A database born
 /// before version 2 has the UIDs but not the mark; deriving one is what keeps
 /// the upgrade from refetching a batch it already holds.
-fn derive_imap_marks(conn: &Connection) -> MailResult<()> {
+fn derive_imap_marks(conn: &Connection) -> StoreResult<()> {
     derive_imap_folders(conn, DERIVE_UID_NEXT_SQL)
 }
 
 /// Run one of the derivations above for every IMAP folder. They are all
 /// "recompute this folder's mark from the rows it holds", so they all walk the
 /// folders the same way.
-fn derive_imap_folders(conn: &Connection, sql: &str) -> MailResult<()> {
+fn derive_imap_folders(conn: &Connection, sql: &str) -> StoreResult<()> {
     let folders: Vec<(String, String)> = {
         let mut stmt = conn.prepare(
             "SELECT account_id, name FROM folders
@@ -700,12 +700,12 @@ fn derive_imap_folders(conn: &Connection, sql: &str) -> MailResult<()> {
 // ----- accounts --------------------------------------------------------------
 
 /// Every configured account, in the navigation column's order.
-pub fn load_accounts() -> MailResult<Vec<Account>> {
+pub fn load_accounts() -> StoreResult<Vec<Account>> {
     let db = db()?;
     load_accounts_on(db.conn())
 }
 
-fn load_accounts_on(conn: &Connection) -> MailResult<Vec<Account>> {
+fn load_accounts_on(conn: &Connection) -> StoreResult<Vec<Account>> {
     let mut stmt = conn.prepare(
         "SELECT id, name, protocol, host, port, username, password, tls,
                 smtp_host, smtp_port, smtp_tls, smtp_username, smtp_password,
@@ -757,12 +757,13 @@ fn load_accounts_on(conn: &Connection) -> MailResult<Vec<Account>> {
             token_expires_at,
         ) = row?;
         let protocol = Protocol::parse(&protocol).ok_or_else(|| {
-            MailError::Storage(format!("account {id}: unknown protocol {protocol:?}"))
+            StoreError::Storage(format!("account {id}: unknown protocol {protocol:?}"))
         })?;
-        let tls = TlsMode::parse(&tls)
-            .ok_or_else(|| MailError::Storage(format!("account {id}: unknown TLS mode {tls:?}")))?;
+        let tls = TlsMode::parse(&tls).ok_or_else(|| {
+            StoreError::Storage(format!("account {id}: unknown TLS mode {tls:?}"))
+        })?;
         let port = u16::try_from(port)
-            .map_err(|_| MailError::Storage(format!("account {id}: port {port} out of range")))?;
+            .map_err(|_| StoreError::Storage(format!("account {id}: port {port} out of range")))?;
         let smtp = smtp_from_row(
             &id,
             smtp_host,
@@ -774,7 +775,7 @@ fn load_accounts_on(conn: &Connection) -> MailResult<Vec<Account>> {
         let token_expires_at = token_expires_at
             .map(u64::try_from)
             .transpose()
-            .map_err(|_| MailError::Storage(format!("account {id}: token expiry out of range")))?;
+            .map_err(|_| StoreError::Storage(format!("account {id}: token expiry out of range")))?;
         accounts.push(Account {
             id,
             name,
@@ -808,19 +809,19 @@ fn smtp_from_row(
     tls: Option<String>,
     username: Option<String>,
     password: Option<String>,
-) -> MailResult<Option<SmtpSettings>> {
+) -> StoreResult<Option<SmtpSettings>> {
     let Some(host) = host.filter(|host| !host.is_empty()) else {
         return Ok(None);
     };
     let port = port
         .and_then(|port| u16::try_from(port).ok())
         .ok_or_else(|| {
-            MailError::Storage(format!("account {id}: outgoing server has no usable port"))
+            StoreError::Storage(format!("account {id}: outgoing server has no usable port"))
         })?;
     let tls = tls
         .as_deref()
         .and_then(TlsMode::parse)
-        .ok_or_else(|| MailError::Storage(format!("account {id}: unknown outgoing TLS mode")))?;
+        .ok_or_else(|| StoreError::Storage(format!("account {id}: unknown outgoing TLS mode")))?;
     // A username is what makes the pair a login: with none, the account's own
     // credentials are what the submission logs in with (see `Account::smtp_login`).
     let login = username
@@ -840,12 +841,12 @@ fn smtp_from_row(
 /// Insert an account, or update the one with the same id in place. An edit
 /// keeps the account's `position`, so renaming it neither moves it in the
 /// navigation column nor touches its cached mail.
-pub fn save_account(account: &Account) -> MailResult<()> {
+pub fn save_account(account: &Account) -> StoreResult<()> {
     let db = db()?;
     save_account_on(db.conn(), account)
 }
 
-fn save_account_on(conn: &Connection, account: &Account) -> MailResult<()> {
+fn save_account_on(conn: &Connection, account: &Account) -> StoreResult<()> {
     // The outgoing server as five columns, NULLs and all: no settings is five
     // NULLs, and no login is a NULL username — the same shape `smtp_from_row`
     // reads back.
@@ -918,7 +919,7 @@ pub fn save_account_tokens(
     access_token: Option<&str>,
     refresh_token: Option<&str>,
     expires_at: Option<u64>,
-) -> MailResult<()> {
+) -> StoreResult<()> {
     let db = db()?;
     save_account_tokens_on(db.conn(), id, access_token, refresh_token, expires_at)
 }
@@ -929,7 +930,7 @@ fn save_account_tokens_on(
     access_token: Option<&str>,
     refresh_token: Option<&str>,
     expires_at: Option<u64>,
-) -> MailResult<()> {
+) -> StoreResult<()> {
     conn.execute(
         "UPDATE accounts SET access_token = ?2, refresh_token = ?3, token_expires_at = ?4
           WHERE id = ?1",
@@ -944,12 +945,12 @@ fn save_account_tokens_on(
 }
 
 /// Remove an account and, through the cascades, everything cached for it.
-pub fn delete_account(id: &str) -> MailResult<()> {
+pub fn delete_account(id: &str) -> StoreResult<()> {
     let db = db()?;
     delete_account_on(db.conn(), id)
 }
 
-fn delete_account_on(conn: &Connection, id: &str) -> MailResult<()> {
+fn delete_account_on(conn: &Connection, id: &str) -> StoreResult<()> {
     conn.execute("DELETE FROM accounts WHERE id = ?1", [id])?;
     Ok(())
 }
@@ -957,12 +958,12 @@ fn delete_account_on(conn: &Connection, id: &str) -> MailResult<()> {
 /// Forget an account's cached mail while keeping the account itself: the
 /// endpoint (protocol, host, port, username) changed, so what is stored
 /// describes a mailbox these settings no longer reach.
-pub fn purge_mail(account_id: &str) -> MailResult<()> {
+pub fn purge_mail(account_id: &str) -> StoreResult<()> {
     let mut db = db()?;
     purge_mail_on(db.conn_mut(), account_id)
 }
 
-fn purge_mail_on(conn: &mut Connection, account_id: &str) -> MailResult<()> {
+fn purge_mail_on(conn: &mut Connection, account_id: &str) -> StoreResult<()> {
     let tx = conn.transaction()?;
     tx.execute("DELETE FROM messages WHERE account_id = ?1", [account_id])?;
     tx.execute("DELETE FROM folders WHERE account_id = ?1", [account_id])?;
@@ -1008,12 +1009,12 @@ pub fn older_available(first_num: Option<u32>, oldest_uid: Option<u32>) -> bool 
 /// What one folder remembers. A folder the database does not know, or one that
 /// has never been fetched, reads as the default — every mark `None`, which is
 /// what tells a sync to start from scratch.
-pub fn folder_sync(account_id: &str, folder: &str) -> MailResult<FolderSync> {
+pub fn folder_sync(account_id: &str, folder: &str) -> StoreResult<FolderSync> {
     let db = db()?;
     folder_sync_on(db.conn(), account_id, folder)
 }
 
-fn folder_sync_on(conn: &Connection, account_id: &str, folder: &str) -> MailResult<FolderSync> {
+fn folder_sync_on(conn: &Connection, account_id: &str, folder: &str) -> StoreResult<FolderSync> {
     let mark = conn
         .query_row(
             "SELECT uidvalidity, uid_next, first_num, oldest_uid FROM folders
@@ -1041,7 +1042,7 @@ fn folder_sync_on(conn: &Connection, account_id: &str, folder: &str) -> MailResu
 /// Written *before* the batch it belongs to, so the window is never lost: a
 /// folder with a floor and no mail is simply fetched from that floor next time,
 /// which can cost a repeated pass but never a message.
-pub fn set_first_num(account_id: &str, folder: &str, first_num: u32) -> MailResult<()> {
+pub fn set_first_num(account_id: &str, folder: &str, first_num: u32) -> StoreResult<()> {
     let db = db()?;
     set_first_num_on(db.conn(), account_id, folder, first_num)
 }
@@ -1051,7 +1052,7 @@ fn set_first_num_on(
     account_id: &str,
     folder: &str,
     first_num: u32,
-) -> MailResult<()> {
+) -> StoreResult<()> {
     conn.execute(
         // A POP3 drop has no `LIST` to be listed by, and this is its INBOX: a
         // folder created by fetching mail is one the server has.
@@ -1072,7 +1073,7 @@ fn set_first_num_on(
 /// `None` is an answer too: the mailbox is empty, and nothing is below a floor
 /// in an empty mailbox. It is also what the record of a folder whose generation
 /// moved has to fall back to (see `save_messages`).
-pub fn set_oldest_uid(account_id: &str, folder: &str, oldest_uid: Option<u32>) -> MailResult<()> {
+pub fn set_oldest_uid(account_id: &str, folder: &str, oldest_uid: Option<u32>) -> StoreResult<()> {
     let db = db()?;
     set_oldest_uid_on(db.conn(), account_id, folder, oldest_uid)
 }
@@ -1082,7 +1083,7 @@ fn set_oldest_uid_on(
     account_id: &str,
     folder: &str,
     oldest_uid: Option<u32>,
-) -> MailResult<()> {
+) -> StoreResult<()> {
     conn.execute(
         "INSERT INTO folders (account_id, name, uidvalidity, synced, oldest_uid, listed)
          VALUES (?1, ?2, NULL, 1, ?3, 1)
@@ -1095,12 +1096,12 @@ fn set_oldest_uid_on(
 /// The folders of one account that have been fetched at least once — what a
 /// sync catches up on. A folder that was never opened is left out: its first
 /// fetch is where the backfill belongs.
-pub fn synced_folders(account_id: &str) -> MailResult<Vec<String>> {
+pub fn synced_folders(account_id: &str) -> StoreResult<Vec<String>> {
     let db = db()?;
     synced_folders_on(db.conn(), account_id)
 }
 
-fn synced_folders_on(conn: &Connection, account_id: &str) -> MailResult<Vec<String>> {
+fn synced_folders_on(conn: &Connection, account_id: &str) -> StoreResult<Vec<String>> {
     let mut stmt = conn
         .prepare("SELECT name FROM folders WHERE account_id = ?1 AND synced = 1 ORDER BY name")?;
     let rows = stmt.query_map([account_id], |row| row.get::<_, String>(0))?;
@@ -1114,7 +1115,7 @@ fn synced_folders_on(conn: &Connection, account_id: &str) -> MailResult<Vec<Stri
 /// Every `uid` stored for one folder. POP3 is what needs this: a UIDL is the
 /// only identity a message has there, so a sync asks for the ones it does not
 /// already hold.
-pub fn stored_uids(account_id: &str, folder: &str) -> MailResult<HashSet<String>> {
+pub fn stored_uids(account_id: &str, folder: &str) -> StoreResult<HashSet<String>> {
     let db = db()?;
     stored_uids_on(db.conn(), account_id, folder)
 }
@@ -1123,7 +1124,7 @@ fn stored_uids_on(
     conn: &Connection,
     account_id: &str,
     folder: &str,
-) -> MailResult<HashSet<String>> {
+) -> StoreResult<HashSet<String>> {
     let mut stmt =
         conn.prepare("SELECT uid FROM messages WHERE account_id = ?1 AND folder = ?2")?;
     let rows = stmt.query_map(params![account_id, folder], |row| row.get::<_, String>(0))?;
@@ -1138,7 +1139,7 @@ fn stored_uids_on(
 
 /// Every folder and message of the given accounts, newest first — the working
 /// set the UI keeps in memory.
-pub fn load_mailboxes(account_ids: &[String]) -> MailResult<HashMap<String, Mailbox>> {
+pub fn load_mailboxes(account_ids: &[String]) -> StoreResult<HashMap<String, Mailbox>> {
     let db = db()?;
     load_mailboxes_on(db.conn(), account_ids)
 }
@@ -1146,7 +1147,7 @@ pub fn load_mailboxes(account_ids: &[String]) -> MailResult<HashMap<String, Mail
 fn load_mailboxes_on(
     conn: &Connection,
     account_ids: &[String],
-) -> MailResult<HashMap<String, Mailbox>> {
+) -> StoreResult<HashMap<String, Mailbox>> {
     let mut mailboxes: HashMap<String, Mailbox> = account_ids
         .iter()
         .map(|id| (id.clone(), Mailbox::default()))
@@ -1218,7 +1219,7 @@ fn load_mailboxes_on(
                     references: split_ids(&row.get::<_, String>(15)?),
                     body_text: row.get(10)?,
                     body_html: row.get(11)?,
-                    preview: crate::mail::clean_stored_preview(row.get(12)?),
+                    preview: kimo_mail::mail::clean_stored_preview(row.get(12)?),
                     // Filled in below, from the label tables.
                     labels: BTreeSet::new(),
                     attachments: Vec::new(),
@@ -1326,7 +1327,7 @@ fn split_ids(value: &str) -> Vec<String> {
 /// it this machine has. What the answer does change is which of them count as
 /// listed — it is the server's current mailbox list, so a folder it left out is
 /// marked as one it no longer has.
-pub fn save_folder_list(account_id: &str, folders: &[String]) -> MailResult<()> {
+pub fn save_folder_list(account_id: &str, folders: &[String]) -> StoreResult<()> {
     let mut db = db()?;
     save_folder_list_on(db.conn_mut(), account_id, folders)
 }
@@ -1335,7 +1336,7 @@ fn save_folder_list_on(
     conn: &mut Connection,
     account_id: &str,
     folders: &[String],
-) -> MailResult<()> {
+) -> StoreResult<()> {
     let tx = conn.transaction()?;
     {
         // The answer replaces the record, so the folders missing from it go
@@ -1362,12 +1363,12 @@ fn save_folder_list_on(
 /// falls back on this: they are the mailboxes it knows the server has, and so
 /// the ones worth trying. A folder the answer left out is deliberately not in
 /// it — it is already known to be gone.
-pub fn listed_folders(account_id: &str) -> MailResult<Vec<String>> {
+pub fn listed_folders(account_id: &str) -> StoreResult<Vec<String>> {
     let db = db()?;
     listed_folders_on(db.conn(), account_id)
 }
 
-fn listed_folders_on(conn: &Connection, account_id: &str) -> MailResult<Vec<String>> {
+fn listed_folders_on(conn: &Connection, account_id: &str) -> StoreResult<Vec<String>> {
     let mut stmt = conn
         .prepare("SELECT name FROM folders WHERE account_id = ?1 AND listed = 1 ORDER BY name")?;
     let rows = stmt.query_map([account_id], |row| row.get::<_, String>(0))?;
@@ -1386,7 +1387,7 @@ pub fn save_messages(
     folder: &str,
     uidvalidity: Option<u32>,
     messages: &[MailMessage],
-) -> MailResult<()> {
+) -> StoreResult<()> {
     let mut db = db()?;
     save_messages_on(db.conn_mut(), account_id, folder, uidvalidity, messages)
 }
@@ -1397,7 +1398,7 @@ fn save_messages_on(
     folder: &str,
     uidvalidity: Option<u32>,
     messages: &[MailMessage],
-) -> MailResult<()> {
+) -> StoreResult<()> {
     let tx = conn.transaction()?;
 
     // A new UIDVALIDITY generation means the stored UIDs describe different
@@ -1514,12 +1515,12 @@ fn save_messages_on(
 
 /// Mark one message as read locally. This is the only flag the client keeps:
 /// POP3 has no server-side flag at all, and IMAP's is pushed separately.
-pub fn set_seen(account_id: &str, folder: &str, uid: &str) -> MailResult<()> {
+pub fn set_seen(account_id: &str, folder: &str, uid: &str) -> StoreResult<()> {
     let db = db()?;
     set_seen_on(db.conn(), account_id, folder, uid)
 }
 
-fn set_seen_on(conn: &Connection, account_id: &str, folder: &str, uid: &str) -> MailResult<()> {
+fn set_seen_on(conn: &Connection, account_id: &str, folder: &str, uid: &str) -> StoreResult<()> {
     conn.execute(
         "UPDATE messages SET seen = 1 WHERE account_id = ?1 AND folder = ?2 AND uid = ?3",
         params![account_id, folder, uid],
@@ -1533,7 +1534,7 @@ fn set_seen_on(conn: &Connection, account_id: &str, folder: &str, uid: &str) -> 
 /// The folder's sync mark is deliberately left where it is. The mail is gone
 /// from the server as well — the caller deletes it there first — so a mark
 /// that walked back to it would only make the next sync fetch it again.
-pub fn delete_message(account_id: &str, folder: &str, uid: &str) -> MailResult<()> {
+pub fn delete_message(account_id: &str, folder: &str, uid: &str) -> StoreResult<()> {
     let db = db()?;
     delete_message_on(db.conn(), account_id, folder, uid)
 }
@@ -1543,7 +1544,7 @@ fn delete_message_on(
     account_id: &str,
     folder: &str,
     uid: &str,
-) -> MailResult<()> {
+) -> StoreResult<()> {
     conn.execute(
         "DELETE FROM messages WHERE account_id = ?1 AND folder = ?2 AND uid = ?3",
         params![account_id, folder, uid],
@@ -1564,7 +1565,7 @@ fn delete_message_on(
 /// carries it either way: `MESSAGE_UPSERT` does not name the column, so
 /// re-fetching a mail leaves a flag where it was, exactly as it leaves the
 /// labels alone.
-pub fn set_flagged(account_id: &str, folder: &str, uid: &str, flagged: bool) -> MailResult<()> {
+pub fn set_flagged(account_id: &str, folder: &str, uid: &str, flagged: bool) -> StoreResult<()> {
     let db = db()?;
     set_flagged_on(db.conn(), account_id, folder, uid, flagged)
 }
@@ -1575,7 +1576,7 @@ fn set_flagged_on(
     folder: &str,
     uid: &str,
     flagged: bool,
-) -> MailResult<()> {
+) -> StoreResult<()> {
     conn.execute(
         "UPDATE messages SET flagged = ?4 WHERE account_id = ?1 AND folder = ?2 AND uid = ?3",
         params![account_id, folder, uid, flagged as i64],
@@ -1589,12 +1590,12 @@ fn set_flagged_on(
 /// them: by name, case-insensitively. A label no mail carries any more is still
 /// here — it is the user's own word rather than a fact about the mail, and the
 /// popup offers it again the next time that mail is labelled.
-pub fn load_labels() -> MailResult<Vec<String>> {
+pub fn load_labels() -> StoreResult<Vec<String>> {
     let db = db()?;
     load_labels_on(db.conn())
 }
 
-fn load_labels_on(conn: &Connection) -> MailResult<Vec<String>> {
+fn load_labels_on(conn: &Connection) -> StoreResult<Vec<String>> {
     let mut stmt = conn.prepare("SELECT name FROM labels ORDER BY name COLLATE NOCASE")?;
     let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
     let mut names = Vec::new();
@@ -1613,7 +1614,7 @@ fn load_labels_on(conn: &Connection) -> MailResult<Vec<String>> {
 /// One transaction, so a mail is never half labelled. A message the database
 /// does not have is left alone and creates no label either, and an empty name
 /// is skipped — a row for the empty string would be a label nobody could say.
-pub fn set_labels(account_id: &str, folder: &str, uid: &str, labels: &[String]) -> MailResult<()> {
+pub fn set_labels(account_id: &str, folder: &str, uid: &str, labels: &[String]) -> StoreResult<()> {
     let mut db = db()?;
     set_labels_on(db.conn_mut(), account_id, folder, uid, labels)
 }
@@ -1624,7 +1625,7 @@ fn set_labels_on(
     folder: &str,
     uid: &str,
     labels: &[String],
-) -> MailResult<()> {
+) -> StoreResult<()> {
     let tx = conn.transaction()?;
     let message_id: Option<i64> = tx
         .query_row(
@@ -1668,10 +1669,10 @@ fn set_labels_on(
 /// this, so a trigger that stopped firing or a missed `cascade` cannot go
 /// unnoticed.
 #[cfg(test)]
-fn integrity_check_on(conn: &Connection) -> MailResult<()> {
+fn integrity_check_on(conn: &Connection) -> StoreResult<()> {
     let result: String = conn.query_row("PRAGMA integrity_check", [], |row| row.get(0))?;
     if result != "ok" {
-        return Err(MailError::Storage(format!("integrity_check: {result}")));
+        return Err(StoreError::Storage(format!("integrity_check: {result}")));
     }
     conn.execute_batch("INSERT INTO messages_fts (messages_fts) VALUES ('integrity-check');")?;
     Ok(())
@@ -1685,7 +1686,7 @@ fn import_legacy_json(
     conn: &mut Connection,
     config_dir: &Path,
     cache_dir: &Path,
-) -> MailResult<()> {
+) -> StoreResult<()> {
     let accounts_json = config_dir.join("accounts.json");
     if accounts_json.exists() {
         let text = fs::read_to_string(&accounts_json)?;
@@ -1746,7 +1747,7 @@ fn import_legacy_json(
                 .messages
                 .into_iter()
                 .map(LegacyMessage::into_message)
-                .collect::<MailResult<Vec<_>>>()?;
+                .collect::<StoreResult<Vec<_>>>()?;
             save_messages_on(
                 conn,
                 account_id,
@@ -1786,11 +1787,11 @@ struct LegacyAccount {
 }
 
 impl LegacyAccount {
-    fn to_account(&self) -> MailResult<Account> {
+    fn to_account(&self) -> StoreResult<Account> {
         let protocol = Protocol::parse(&self.protocol)
-            .ok_or_else(|| MailError::Storage(format!("account {}: unknown protocol", self.id)))?;
+            .ok_or_else(|| StoreError::Storage(format!("account {}: unknown protocol", self.id)))?;
         let tls = TlsMode::parse(&self.tls)
-            .ok_or_else(|| MailError::Storage(format!("account {}: unknown TLS mode", self.id)))?;
+            .ok_or_else(|| StoreError::Storage(format!("account {}: unknown TLS mode", self.id)))?;
         Ok(Account {
             id: self.id.clone(),
             name: self.name.clone(),
@@ -1859,13 +1860,13 @@ struct LegacyMessage {
 }
 
 impl LegacyMessage {
-    fn into_message(self) -> MailResult<MailMessage> {
+    fn into_message(self) -> StoreResult<MailMessage> {
         let mut inline_images = Vec::new();
         for image in self.inline_images {
             let data = base64::engine::general_purpose::STANDARD
                 .decode(image.data_base64.as_bytes())
                 .map_err(|error| {
-                    MailError::Storage(format!("inline image {}: {error}", image.cid))
+                    StoreError::Storage(format!("inline image {}: {error}", image.cid))
                 })?;
             inline_images.push(InlineImage {
                 cid: image.cid,
@@ -2024,7 +2025,7 @@ pub(crate) mod test_support {
         folder: &str,
         uidvalidity: Option<u32>,
         messages: &[MailMessage],
-    ) -> MailResult<()> {
+    ) -> StoreResult<()> {
         save_as(conn, ACCOUNT, folder, uidvalidity, messages)
     }
 
@@ -2035,7 +2036,7 @@ pub(crate) mod test_support {
         folder: &str,
         uidvalidity: Option<u32>,
         messages: &[MailMessage],
-    ) -> MailResult<()> {
+    ) -> StoreResult<()> {
         save_account_on(conn, &account(account_id))?;
         save_messages_on(conn, account_id, folder, uidvalidity, messages)
     }

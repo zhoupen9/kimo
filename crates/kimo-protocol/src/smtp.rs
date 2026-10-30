@@ -10,8 +10,8 @@
 use base64::Engine as _;
 
 use super::stream::{connect, Conn};
-use crate::error::{MailError, MailResult};
-use crate::models::TlsMode;
+use kimo_core::error::{MailError, MailResult};
+use kimo_core::models::TlsMode;
 
 /// How much of one reply is kept before it is treated as a server that will not
 /// stop talking. A capability list is a few hundred bytes; this is a backstop

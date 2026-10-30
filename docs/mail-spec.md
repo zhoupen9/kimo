@@ -19,7 +19,7 @@ sync paths ask (`send.save_copy`, `message.set_flags`, `message.append`)
 come from the module's own descriptor, and the Sent-copy rule of §5.3 is
 enforced there: a module that files its own copy is never handed a second. The IMAP/POP3/SMTP/Graph reference
 modules are not built yet, and the current client still reads IMAP/POP3
-through `src/protocol/` — but a plugin-backed account is wired: the Gmail
+through `crates/kimo-protocol/src/` — but a plugin-backed account is wired: the Gmail
 module's provider is an entry in the account form (a dedicated entry per
 installed provider), its OAuth2 sign-in runs as `Job::PluginSignIn`, its
 tokens live on the account row with refresh on session open, and its
@@ -377,7 +377,7 @@ struct MessagePart {
 ```
 
 If `raw` is present the host parses it with the existing `mail-parser` path in
-`src/mail.rs`; if only `body` is present (Graph can return structured JSON),
+`crates/kimo-mail/src/mail.rs`; if only `body` is present (Graph can return structured JSON),
 the host normalises it into the same internal `MailMessage`. A provider MUST
 NOT return both a raw source and a conflicting structured body.
 
@@ -1052,31 +1052,38 @@ module it names:
 - A missing, invalid or rejected module is reported in Preferences → Plugins;
   it does not stop Kimo from starting.
 
-A future workspace separates the boundary, the engine and the modules:
+The host workspace is in place. The boundary crate is
+`crates/kimo-plugin-abi` (the JSON envelope, manifest and permissions; no
+wasmi, no SQLite, no UI). The engine, discovery and the provider adapter still
+live in `src/plugin/` inside the binary; they earn their own crate when the
+host has a second consumer or the adapter outgrows `sync`. The plugins are a
+separate workspace:
 
 ```text
 kimo/
-  crates/kimo-plugin-abi/       JSON types + WASM ABI; no host dependency
-  crates/kimo-plugin-host/      engine, permissions, discovery, dispatch
-  plugins/imap/                 wasm32-unknown-unknown, kimo-imap/1
-  plugins/pop3/                 wasm32-unknown-unknown, kimo-pop3/1
-  plugins/smtp/                 wasm32-unknown-unknown, kimo-smtp/1
+  crates/kimo-plugin-abi/       host-side JSON types + manifest; no host dependency
+  src/plugin/                   engine, permissions, discovery, dispatch (binary for now)
+  plugins/Cargo.toml            one workspace for the modules below
   plugins/gmail/                wasm32-unknown-unknown, kimo-gmail/1
   plugins/outlook/              wasm32-unknown-unknown, kimo-graph/1
-  extensions/                   wasm32-unknown-unknown, organizer.v1 / display.v1
+  plugins/sender-groups/        wasm32-unknown-unknown, organizer.v1
 ```
 
-Plugins are built for `wasm32-unknown-unknown` and stored as `.wasm`. Build
-them with that target; the ABI crate supplies the allocator and the host-import
-declarations. They do not import WASI in v1 and never link the Kimo binary, a
+Plugins are built for `wasm32-unknown-unknown` and stored as `.wasm`. The
+workspace owns their profile and the target flags; each module keeps its own
+Cargo package. They do not import WASI in v1 and never link the Kimo binary, a
 platform TLS stack, or a C library. A future WASI reactor is possible only if
 the host exposes a WASI surface explicitly; the default engine configuration
 exposes none.
 
-The ABI crate is the only shared dependency between the host and a plugin.
-Provider crates may use extracted pure-Rust protocol crates, but they never
-link the host. The host links the ABI crate and the engine, not the provider
-crates.
+**Still to extract:** the guest side of the boundary. Gmail and Outlook each
+carry their own `src/abi.rs` (host imports, stubs and the small request/response
+envelope). That is an SDK, not host ABI, so it is not in `kimo-plugin-abi`
+today. The next step, when a third module or a guest change makes the
+duplication hurt, is a `kimo-plugin-sdk` crate in the plugins workspace, shared
+by the modules and depending only on `kimo-plugin-abi`. Provider crates may use
+extracted pure-Rust protocol crates, but they never link the host. The host
+links the ABI crate and the engine, not the provider crates.
 
 The reference providers (`imap`, `pop3`, `smtp`) are shipped as `.wasm`
 plugins too. Packaging must install them; a missing reference module leaves its

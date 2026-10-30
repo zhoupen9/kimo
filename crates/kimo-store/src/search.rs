@@ -11,8 +11,8 @@
 //! exact without a tokenizer plugin, without `unsafe`, and without the index
 //! bloat of a trigram tokenizer.
 
-use crate::error::MailResult;
-use crate::models::MailMessage;
+use crate::error::StoreResult;
+use kimo_core::models::MailMessage;
 
 /// Writing systems whose text has no word spacing — Han, Hiragana, Katakana,
 /// Hangul. Punctuation (、。「」) is deliberately outside these ranges: it still
@@ -356,7 +356,7 @@ pub fn fts_expression(text: &str) -> Option<String> {
 
 /// Run a search. The caller holds the database connection (see `db::db`) for
 /// the duration; this function touches nothing else.
-pub fn run(conn: &rusqlite::Connection, query: &SearchQuery) -> MailResult<Vec<SearchHit>> {
+pub fn run(conn: &rusqlite::Connection, query: &SearchQuery) -> StoreResult<Vec<SearchHit>> {
     use rusqlite::types::Value;
 
     // A query that asks for nothing returns nothing: the UI keeps the folder
@@ -462,7 +462,7 @@ pub fn run(conn: &rusqlite::Connection, query: &SearchQuery) -> MailResult<Vec<S
             preview,
             attachments,
         ) = row?;
-        let preview = crate::mail::clean_stored_preview(preview);
+        let preview = kimo_mail::mail::clean_stored_preview(preview);
         hits.push(SearchHit {
             account_id,
             folder,
@@ -787,7 +787,7 @@ mod tests {
         let mut new = message("2", "Weekly report", "the newest report");
         new.timestamp = Some(200_000); // 1970-01-03, two days after the other one
         new.seen = true;
-        new.attachments = vec![crate::models::Attachment {
+        new.attachments = vec![kimo_core::models::Attachment {
             name: "report.pdf".to_string(),
             content_type: "application/pdf".to_string(),
             size: 4_096,
@@ -1006,7 +1006,7 @@ mod tests {
 
     #[test]
     fn the_column_covers_subject_addresses_and_body() {
-        let mut message = crate::models::MailMessage {
+        let mut message = kimo_core::models::MailMessage {
             uid: "1".to_string(),
             subject: "发票号码".to_string(),
             from: "财务 <caiwu@nroad.com.cn>".to_string(),

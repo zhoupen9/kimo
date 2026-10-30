@@ -16,7 +16,7 @@
 
 use std::collections::HashMap;
 
-use crate::models::MailMessage;
+use kimo_core::models::MailMessage;
 
 /// One conversation: its mails, oldest first, and what a list row says about
 /// them.
@@ -201,7 +201,7 @@ const SUBJECT_PREFIXES: [&str; 11] = [
 /// One prefix off the front of `text`, if one is there: the word, an optional
 /// counter (`re[2]:`, `re(2):`), and the colon. A colon further in than a
 /// prefix can reach (`Note: the plan`) is not a prefix at all.
-pub(crate) fn strip_subject_prefix(text: &str) -> Option<&str> {
+pub fn strip_subject_prefix(text: &str) -> Option<&str> {
     // The full-width colon too: a CJK client writes 答复： as often as 答复: —
     // and it is three bytes, so where the rest of the subject starts is the
     // colon plus its own width, not plus one.
@@ -266,7 +266,7 @@ impl Sets {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::models::Attachment;
+    use kimo_core::models::Attachment;
 
     /// One mail of a folder, newest first: the headers a conversation is
     /// stitched from are what the test is about, so they are arguments and

@@ -123,6 +123,6 @@ page's link boxes draw theirs in `draw_blitz_page`.
   place; do not leave an egui default in because it is close enough.
 - When you are already in a widget that does not follow a rule, bring it in line
   and say so in the commit.
-- The layout has no golden tests: run `cargo run` and use the widget; the
+- The layout has no golden tests: run `cargo run -p kimo` and use the widget; the
   headless dumps and what they can and cannot show are in
   [testing.md](testing.md).

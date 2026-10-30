@@ -3,7 +3,8 @@
 //! protocol adapters so a standard IMAP/POP3/SMTP client remains a subset of
 //! the same operation vocabulary.
 
-pub mod abi;
+// The ABI types live in their own crate so the WASM modules can share them.
+pub use kimo_plugin_abi as abi;
 pub mod auth;
 pub mod discovery;
 // The extension hooks (organizer.v1 / display.v1) have no UI worker yet;

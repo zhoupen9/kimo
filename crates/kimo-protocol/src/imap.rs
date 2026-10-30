@@ -3,8 +3,8 @@
 //! synchronous — it runs inside sync worker threads, never on the UI thread.
 
 use super::stream::{connect, Conn};
-use crate::error::{MailError, MailResult};
-use crate::models::{Account, TlsMode};
+use kimo_core::error::{MailError, MailResult};
+use kimo_core::models::{Account, TlsMode};
 
 pub struct MailboxInfo {
     pub exists: u32,
@@ -529,7 +529,7 @@ fn decode_mutf7_segment(segment: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::models::Protocol;
+    use kimo_core::models::Protocol;
     use std::io::{BufRead, Read, Write};
 
     #[test]

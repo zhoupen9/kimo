@@ -5,7 +5,7 @@ use std::collections::BTreeSet;
 
 use mail_parser::{MessageParser, MimeHeaders};
 
-use crate::models::MailMessage;
+use kimo_core::models::MailMessage;
 
 pub fn parse(raw: &[u8], uid: &str, seen: bool) -> MailMessage {
     let parsed = MessageParser::default().parse(raw);
@@ -138,11 +138,11 @@ fn message_ids(value: &mail_parser::HeaderValue<'_>) -> Vec<String> {
 /// file somebody meant to send. The size is the *decoded* one — `contents()`
 /// is the part after its transfer encoding has been undone, which is the size
 /// the file would have on disk, not the base64 that carried it.
-fn collect_attachments(m: &mail_parser::Message<'_>) -> Vec<crate::models::Attachment> {
+fn collect_attachments(m: &mail_parser::Message<'_>) -> Vec<kimo_core::models::Attachment> {
     m.attachments()
         .filter_map(|part| {
             let name = part.attachment_name()?.to_string();
-            Some(crate::models::Attachment {
+            Some(kimo_core::models::Attachment {
                 name,
                 content_type: part.content_type().map(mime_type).unwrap_or_default(),
                 size: part.contents().len() as u64,
@@ -181,7 +181,7 @@ fn mime_type(content_type: &mail_parser::ContentType) -> String {
 
 /// Attachment parts that are images with a Content-ID — the `cid:` targets of
 /// HTML mail — with their raw bytes, which is how the database stores them.
-fn collect_inline_images(m: &mail_parser::Message<'_>) -> Vec<crate::models::InlineImage> {
+fn collect_inline_images(m: &mail_parser::Message<'_>) -> Vec<kimo_core::models::InlineImage> {
     m.attachments()
         .filter_map(|part| {
             let cid = part.content_id()?.trim_matches(['<', '>']).to_string();
@@ -189,7 +189,7 @@ fn collect_inline_images(m: &mail_parser::Message<'_>) -> Vec<crate::models::Inl
             if cid.is_empty() || !content_type.ctype().eq_ignore_ascii_case("image") {
                 return None;
             }
-            Some(crate::models::InlineImage {
+            Some(kimo_core::models::InlineImage {
                 cid,
                 content_type: mime_type(content_type),
                 data: part.contents().to_vec(),
@@ -256,7 +256,7 @@ pub(crate) fn clean_preview(text: &str) -> String {
 /// Clean a preview that was already built and stored — the database still
 /// holds rows parsed before this rule. Takes the string so a clean preview is
 /// not copied a second time by the startup load.
-pub(crate) fn clean_stored_preview(text: String) -> String {
+pub fn clean_stored_preview(text: String) -> String {
     if text.chars().any(is_preview_padding) {
         clean_preview(&text)
     } else {
@@ -266,7 +266,7 @@ pub(crate) fn clean_stored_preview(text: String) -> String {
 
 /// Plain text out of an HTML body, for list previews: concatenates text
 /// nodes (bounded), skipping style/script/head/title subtrees.
-pub(crate) fn html_to_plain(html: &str) -> String {
+pub fn html_to_plain(html: &str) -> String {
     let frag = scraper::Html::parse_fragment(html);
     let mut text = String::new();
     for node in frag.tree.root().descendants() {
@@ -338,7 +338,7 @@ pub fn rfc5322_date(secs: i64) -> String {
 /// The one piece of calendar arithmetic the app and the message builder share:
 /// `app::format_timestamp` prints it for the reading pane,
 /// `rfc5322_date` writes it into a header.
-pub(crate) fn civil_from_days(z: i64) -> (i64, u32, u32) {
+pub fn civil_from_days(z: i64) -> (i64, u32, u32) {
     let z = z + 719_468;
     let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
     let doe = z - era * 146_097;

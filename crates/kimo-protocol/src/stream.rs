@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use rustls::pki_types::ServerName;
 
-use crate::models::TlsMode;
+use kimo_core::models::TlsMode;
 
 pub enum MailStream {
     Plain(TcpStream),
@@ -46,7 +46,7 @@ impl Write for MailStream {
     }
 }
 
-pub(crate) fn tls_wrap(
+pub fn tls_wrap(
     tcp: TcpStream,
     host: &str,
 ) -> io::Result<Box<rustls::StreamOwned<rustls::ClientConnection, TcpStream>>> {

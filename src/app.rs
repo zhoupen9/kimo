@@ -589,7 +589,7 @@ pub struct KimoApp {
     was_narrow: bool,
     /// Folder-list icons, keyed by (kind, open): only a generic folder has a
     /// second, open glyph. Uploaded once at startup from the embedded PNGs
-    /// in `folders::FolderKind::ICONS`.
+    /// in `app::icons::FOLDER_ICONS`.
     folder_icons: HashMap<(FolderKind, bool), egui::TextureHandle>,
     /// The app's own icon, uploaded the first time Preferences → About draws
     /// it from the embedded PNG the tray and notifications use.

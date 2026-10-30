@@ -3,6 +3,65 @@
 
 use super::*;
 
+/// The embedded folder row icons, as (kind, open, PNG). Only a generic folder
+/// has a second, open glyph; the special mailboxes keep one.
+///
+/// The PNGs are white on transparency: egui tints by multiplying, so a black
+/// bake could never take the row's text color. The classification behind the
+/// kinds lives in `kimo_mail::folders`; the assets stay with the UI.
+pub(super) const FOLDER_ICONS: &[(FolderKind, bool, &[u8])] = &[
+    (
+        FolderKind::Inbox,
+        false,
+        include_bytes!("../../assets/folder-icons/inbox.png"),
+    ),
+    (
+        FolderKind::Sent,
+        false,
+        include_bytes!("../../assets/folder-icons/sent.png"),
+    ),
+    (
+        FolderKind::Drafts,
+        false,
+        include_bytes!("../../assets/folder-icons/drafts.png"),
+    ),
+    (
+        FolderKind::Trash,
+        false,
+        include_bytes!("../../assets/folder-icons/trash.png"),
+    ),
+    (
+        FolderKind::Junk,
+        false,
+        include_bytes!("../../assets/folder-icons/junk.png"),
+    ),
+    (
+        FolderKind::Archive,
+        false,
+        include_bytes!("../../assets/folder-icons/archive.png"),
+    ),
+    (
+        FolderKind::AllMail,
+        false,
+        include_bytes!("../../assets/folder-icons/all-mail.png"),
+    ),
+    (
+        FolderKind::Starred,
+        false,
+        include_bytes!("../../assets/folder-icons/starred.png"),
+    ),
+    (
+        FolderKind::Folder,
+        false,
+        include_bytes!("../../assets/folder-icons/folder.png"),
+    ),
+    (
+        FolderKind::Folder,
+        true,
+        include_bytes!("../../assets/folder-icons/folder-open.png"),
+    ),
+];
+
 /// The send glyph: a paper plane — a dart pointing right, its two wings meeting
 /// at the fold. Two convex fills rather than one path, because that is what the
 /// tessellator wants and a notch is not convex.
@@ -144,13 +203,13 @@ pub(super) fn load_app_icon(ctx: &egui::Context) -> Option<egui::TextureHandle> 
     let pixels = egui::ColorImage::from_rgba_unmultiplied(size, decoded.as_raw());
     Some(ctx.load_texture("app-icon", pixels, egui::TextureOptions::LINEAR))
 }
-/// Decode the embedded folder icons (see `folders::FolderKind::ICONS`) into
+/// Decode the embedded folder icons (see [`FOLDER_ICONS`]) into
 /// textures, once at startup. A failed decode is skipped: that row then draws
 /// without its icon, which is a cosmetic loss at worst.
 pub(super) fn load_folder_icons(
     ctx: &egui::Context,
 ) -> HashMap<(FolderKind, bool), egui::TextureHandle> {
-    FolderKind::ICONS
+    FOLDER_ICONS
         .iter()
         .filter_map(|(kind, open, png)| {
             let decoded = image::load_from_memory(png).ok()?.to_rgba8();

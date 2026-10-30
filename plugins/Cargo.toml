@@ -1,0 +1,12 @@
+[workspace]
+members = ["gmail", "outlook", "sender-groups"]
+resolver = "2"
+
+# The modules are interpreted by Kimo's wasmi host, never run natively, so the
+# release profile is the one that matters: small and fully stripped. Profiles
+# are workspace-level; a member's own `[profile.release]` would be ignored.
+# The wasm target flags (--export-memory) live in `.cargo/config.toml`.
+[profile.release]
+lto = true
+strip = true
+opt-level = "s"

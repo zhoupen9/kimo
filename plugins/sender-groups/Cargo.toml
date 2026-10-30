@@ -6,7 +6,3 @@ publish = false
 
 [lib]
 crate-type = ["cdylib"]
-
-[profile.release]
-lto = true
-strip = true

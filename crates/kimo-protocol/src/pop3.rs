@@ -2,8 +2,8 @@
 //! byte-de-stuffing, and QUIT. Runs on sync worker threads only.
 
 use super::stream::{connect, Conn};
-use crate::error::{MailError, MailResult};
-use crate::models::{Account, TlsMode};
+use kimo_core::error::{MailError, MailResult};
+use kimo_core::models::{Account, TlsMode};
 
 pub struct Pop3Client {
     conn: Conn,
@@ -159,8 +159,8 @@ impl Pop3Client {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::error::MailError;
-    use crate::models::{Protocol, TlsMode};
+    use kimo_core::error::MailError;
+    use kimo_core::models::{Protocol, TlsMode};
     use std::io::{BufRead, Write};
 
     /// A canned POP3 server on a loopback port: greet, then answer each

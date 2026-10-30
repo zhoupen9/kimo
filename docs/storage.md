@@ -1,6 +1,6 @@
 # Storage — database, settings and caches
 
-Read when touching `src/db.rs`, `src/storage.rs`, `src/search.rs`, a schema migration, or a path under `~/.local/share/kimo`.
+Read when touching `crates/kimo-store/src/db.rs`, `crates/kimo-core/src/storage.rs`, `crates/kimo-store/src/search.rs`, a schema migration, or a path under `~/.local/share/kimo`.
 
 - **Persistence:** accounts and cached mail live in one SQLite database,
   `~/.local/share/kimo/mail.db` (mode 0600, WAL), with an FTS5 index over the

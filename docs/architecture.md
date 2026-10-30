@@ -2,6 +2,22 @@
 
 Read when touching `src/sync.rs`, the `Job`/`Event` enums, or anything that moves data between the UI thread and a worker.
 
+## Crates
+
+The root is the binary. Five libraries below it are the boundaries that buy
+something: `kimo-core` (plain types, errors, XDG paths/settings), `kimo-mail`
+(RFC 5322 in/out, conversations, folder kinds), `kimo-protocol` (TLS and the
+three wire clients), `kimo-store` (the only `rusqlite` crate: schema, mail,
+FTS5 search) and `kimo-plugin-abi` (the host-side JSON envelope and manifest).
+The UI, `sync`, the provider layer and the plugin host stay modules of the
+binary: they share `KimoApp`, `Job`/`Event` and the worker's egui context, and
+a crate would only put a public API in front of that coupling. `crates/` has no
+`kimo-app`, `kimo-ui` or `kimo-engine` for the same reason.
+
+`plugins/` is a separate workspace (`gmail`, `outlook`, `sender-groups`) built
+for `wasm32-unknown-unknown`; its profile and target flags live there, and the
+host loads the `.wasm` at runtime rather than linking it.
+
 ## Data flow
 
 ```
@@ -114,7 +130,7 @@ clock turning. Tray Show and Quit use the same wake.
 - The UI thread touches the database exactly once, in `KimoApp::new`
   (`db::load_accounts` + `db::load_mailboxes`, replacing the JSON parse that
   used to happen there); every frame after that works from the in-memory
-  `AccountUiState`, and every write is a worker's (see `src/db.rs`).
+  `AccountUiState`, and every write is a worker's (see `crates/kimo-store/src/db.rs`).
 
 - Remote HTML-mail resources (images, stylesheets) load by default — an
   explicit decision by the project owner, accepting that this leaks the

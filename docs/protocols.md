@@ -1,13 +1,13 @@
 # Protocols — IMAP, POP3, SMTP and TLS
 
-Read when touching `src/protocol/`, `src/outgoing.rs`, a TLS setting, a charset, or the mapping of a server's refusal onto `MailError`.
+Read when touching `crates/kimo-protocol/src/`, `crates/kimo-mail/src/outgoing.rs`, a TLS setting, a charset, or the mapping of a server's refusal onto `MailError`.
 
 - **Protocols:** IMAP4rev1 and POP3 for reading, SMTP submission for
-  sending, all implemented by hand in `src/protocol/` — no `imap`/`async-imap`/
+  sending, all implemented by hand in `crates/kimo-protocol/src/` — no `imap`/`async-imap`/
   `pop`/`lettre` crates.
 
 - **TLS:** rustls with the pure-Rust `ring` crypto provider + webpki-roots.
-  `src/protocol/ffdhe.rs` adds the finite-field DH rustls does not ship (an
+  `crates/kimo-protocol/src/ffdhe.rs` adds the finite-field DH rustls does not ship (an
   FFDHE group and the two GCM `DHE-RSA` suites, the modular exponentiation
   coming from `crypto-bigint`), because some mail servers — Sina's, for one —
   offer TLS 1.2 with nothing but `DHE-RSA` and are otherwise unreachable.
@@ -74,7 +74,7 @@ Read when touching `src/protocol/`, `src/outgoing.rs`, a TLS setting, a charset,
 
 ## Finite-field DH
 
-- Finite-field DH lives in `src/protocol/ffdhe.rs` and is deliberately narrow:
+- Finite-field DH lives in `crates/kimo-protocol/src/ffdhe.rs` and is deliberately narrow:
   2048-bit groups only, and the `DHE-RSA` suites are appended *behind*
   *ring*'s, so any server offering TLS 1.3 or ECDHE still gets that — DHE is a
   fallback for Sina-class servers, never a preference. rustls matches the

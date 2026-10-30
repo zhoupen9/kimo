@@ -14,7 +14,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use base64::Engine as _;
 
-use crate::error::{MailError, MailResult};
+use kimo_core::error::{MailError, MailResult};
 
 /// A mail being sent: what the compose card holds, as the worker needs it.
 /// Everything in it is already parsed — the addresses have been through

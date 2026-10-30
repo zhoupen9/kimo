@@ -15,6 +15,6 @@ Then install it under the plugin directory:
 ```sh
 mkdir -p ~/.local/share/kimo/plugins/sender-groups
 cp plugin.json ~/.local/share/kimo/plugins/sender-groups/
-cp target/wasm32-unknown-unknown/release/kimo_plugin_sender_groups.wasm \
+cp ../target/wasm32-unknown-unknown/release/kimo_plugin_sender_groups.wasm \
    ~/.local/share/kimo/plugins/sender-groups/sender-groups.wasm
 ```

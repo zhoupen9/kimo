@@ -39,7 +39,7 @@ Do not "fix" these casually — they are known:
   around it.
 
 - TLS finite-field DH covers the 2048-bit groups listed in
-  `src/protocol/ffdhe.rs` and nothing else. A server whose DHE group is
+  `crates/kimo-protocol/src/ffdhe.rs` and nothing else. A server whose DHE group is
   another size, or yet another custom prime, still fails the handshake with
   `SelectedUnofferedKxGroup`; see the finite-field DH section in
   [protocols.md](protocols.md) for what to add.

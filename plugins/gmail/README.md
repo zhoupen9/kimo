@@ -77,7 +77,7 @@ succeed on a network where the mailbox cannot.
 
 ```sh
 cargo build --release --target wasm32-unknown-unknown
-cp target/wasm32-unknown-unknown/release/kimo_plugin_gmail.wasm gmail.wasm
+cp ../target/wasm32-unknown-unknown/release/kimo_plugin_gmail.wasm gmail.wasm
 ```
 
 Install into a plugin directory (or point `KIMO_PLUGIN_PATH` here):

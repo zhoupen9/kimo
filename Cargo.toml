@@ -1,3 +1,9 @@
+[workspace]
+members = ["crates/*"]
+default-members = ["crates/*", "."]
+exclude = ["plugins"]
+resolver = "2"
+
 [package]
 name = "kimo"
 version = "0.1.0"
@@ -6,6 +12,12 @@ description = "Kimo — a pure-Rust email client (IMAP & POP3) with an egui inte
 license = "MIT"
 
 [dependencies]
+# Host crates; the map is in AGENTS.md and the re-exports are in src/main.rs.
+kimo-core = { path = "crates/kimo-core" }
+kimo-mail = { path = "crates/kimo-mail" }
+kimo-protocol = { path = "crates/kimo-protocol" }
+kimo-store = { path = "crates/kimo-store" }
+kimo-plugin-abi = { path = "crates/kimo-plugin-abi" }
 # Kimo drives the window and the GPU itself — winit for the window and the
 # event loop, `egui-winit` for input, `egui-wgpu` for egui's meshes (see
 # `src/gpu.rs`) — rather than going through eframe. The reason is the floating
@@ -32,22 +44,10 @@ winit = { version = "0.30", default-features = false, features = [
     "x11",
 ] }
 
-# TLS: rustls with the pure-Rust `ring` crypto provider (no OpenSSL / aws-lc-rs).
+# TLS: rustls with the pure-Rust `ring` crypto provider. The clients
+# themselves live in `kimo-protocol`; this copy is for the plugin host's
+# provider probe and the startup crypto provider install.
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
-webpki-roots = "0.26"
-# Finite-field DH (the TLS 1.2 `DHE-RSA-*` suites) for mail servers that offer
-# nothing else — rustls implements DHE but ships no FFDHE group in any provider,
-# so `src/protocol/ffdhe.rs` has to do the modular exponentiation itself.
-# crypto-bigint is pure Rust and constant time (hard rule 1); only that module
-# uses it, and only `alloc` is needed — the random helpers stay off.
-crypto-bigint = { version = "0.7", default-features = false, features = [
-    "alloc",
-    "zeroize",
-] }
-
-# RFC 5322 message parsing (pure Rust). `full_encoding` pulls in encoding_rs
-# (also pure Rust) so GBK/GB2312/Big5/Shift-JIS/… bodies decode correctly.
-mail-parser = { version = "0.11", features = ["full_encoding"] }
 
 # HTML mail rendering: html5ever DOM (pure Rust, from Servo) + egui widgets.
 scraper = "0.27"
@@ -68,25 +68,10 @@ palette = { version = "0.7", default-features = false, features = ["std"] }
 # with the ring provider, gzip via miniz_oxide). Image decoding is pure Rust.
 ureq = { version = "2.10", features = ["tls", "gzip"] }
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp", "bmp"] }
-sha1_smol = "1.0"
 
 # Base64 for `data:` URLs in HTML mail (Blitz decodes those); inline `cid:`
 # images are raw bytes in the mail database, not base64.
 base64 = "0.22"
-
-# Mail storage: a single SQLite database (`~/.local/share/kimo/mail.db`) holds
-# the accounts and all cached mail, and its FTS5 index backs the search UI.
-# This is the project's one C dependency and an owner-approved exception to hard
-# rule 1: `bundled` compiles the SQLite amalgamation — with FTS5 — through `cc`
-# at build time and links it statically, so there is no system library, no
-# pkg-config and no runtime requirement; the requested storage is specifically
-# SQLite + FTS5. Everything else stays pure Rust: do not widen this into a habit.
-# default-features off drops rusqlite's wasm FFI crate (sqlite-wasm-rs),
-# which a native build never uses; "cache" keeps its statement cache.
-rusqlite = { version = "0.40", default-features = false, features = [
-    "bundled",
-    "cache",
-] }
 
 # Full-fidelity HTML mail renderer (optional second content renderer, see
 # src/blitz_render.rs): Blitz is a pure-Rust DOM/CSS/layout engine — stylo for
@@ -136,6 +121,12 @@ ttf-parser = "0.25"
 # the ResourceLimiter error type used by the host's memory cap.
 wasmi = "2.0.0"
 wasmi_core = "2.0.0"
+
+[dev-dependencies]
+# `render_bench` (test-only) reads the mail database directly for real HTML
+# bodies. The store's own dependency is the bundled SQLite in `kimo-store`;
+# this copy is never linked into the release binary.
+rusqlite = { version = "0.40", default-features = false, features = ["bundled", "cache"] }
 
 [profile.release]
 lto = true

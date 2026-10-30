@@ -6,34 +6,31 @@
 mod app;
 mod blitz_render;
 mod css;
-mod db;
 mod dbus;
-mod error;
-mod folders;
 mod fonts;
 mod glass;
 mod gpu;
 mod gpus;
 mod html;
-mod mail;
-mod models;
 mod notify;
-mod outgoing;
 mod plugin;
 mod portal;
-mod protocol;
 mod provider;
-mod threads;
 // Test-only measurement harness for the two HTML renderers; see the file.
 #[cfg(test)]
 mod render_bench;
-mod search;
-mod storage;
 mod sync;
 mod theme;
 mod tray;
 mod trim;
 mod wake;
+
+// The host crates are re-exported under their old module names so the UI,
+// providers and workers keep saying `crate::models`, `crate::db`, and so on.
+pub use kimo_core::{error, models, storage};
+pub use kimo_mail::{folders, mail, outgoing, threads};
+pub use kimo_protocol as protocol;
+pub use kimo_store::{db, search};
 
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
