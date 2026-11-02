@@ -1009,12 +1009,12 @@ mod tests {
     #[test]
     fn the_sender_groups_sample_is_a_loadable_extension() {
         let manifest = crate::plugin::abi::Manifest::parse(include_str!(
-            "../../plugins/sender-groups/plugin.json"
+            "../../../../plugins/sender-groups/plugin.json"
         ))
         .unwrap();
         let plugin = WasmPlugin::load(
             manifest,
-            include_bytes!("../../plugins/sender-groups/sender-groups.wasm"),
+            include_bytes!("../../../../plugins/sender-groups/sender-groups.wasm"),
         )
         .unwrap();
         let mut instance = plugin.instantiate().unwrap();

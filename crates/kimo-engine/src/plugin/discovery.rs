@@ -258,9 +258,9 @@ mod tests {
 
     #[test]
     fn the_gmail_sample_describes_and_signs_in_through_the_abi() {
-        let manifest = Manifest::parse(include_str!("../../plugins/gmail/plugin.json")).unwrap();
+        let manifest = Manifest::parse(include_str!("../../../../plugins/gmail/plugin.json")).unwrap();
         let plugin =
-            WasmPlugin::load(manifest, include_bytes!("../../plugins/gmail/gmail.wasm")).unwrap();
+            WasmPlugin::load(manifest, include_bytes!("../../../../plugins/gmail/gmail.wasm")).unwrap();
         let mut instance = plugin.instantiate().unwrap();
 
         let described = instance
@@ -317,10 +317,10 @@ mod tests {
 
     #[test]
     fn the_outlook_sample_describes_and_signs_in_through_the_abi() {
-        let manifest = Manifest::parse(include_str!("../../plugins/outlook/plugin.json")).unwrap();
+        let manifest = Manifest::parse(include_str!("../../../../plugins/outlook/plugin.json")).unwrap();
         let plugin = WasmPlugin::load(
             manifest,
-            include_bytes!("../../plugins/outlook/outlook.wasm"),
+            include_bytes!("../../../../plugins/outlook/outlook.wasm"),
         )
         .unwrap();
         let mut instance = plugin.instantiate().unwrap();

@@ -394,9 +394,9 @@ mod tests {
     /// The real Gmail module, loaded the way discovery loads it.
     fn gmail() -> WasmPlugin {
         let manifest =
-            crate::plugin::abi::Manifest::parse(include_str!("../../plugins/gmail/plugin.json"))
+            crate::plugin::abi::Manifest::parse(include_str!("../../../../plugins/gmail/plugin.json"))
                 .unwrap();
-        WasmPlugin::load(manifest, include_bytes!("../../plugins/gmail/gmail.wasm")).unwrap()
+        WasmPlugin::load(manifest, include_bytes!("../../../../plugins/gmail/gmail.wasm")).unwrap()
     }
 
     /// Play the browser against `listener`: ask for `path` and answer with

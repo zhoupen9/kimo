@@ -1818,6 +1818,7 @@ dependencies = [
  "egui-winit",
  "image",
  "kimo-core",
+ "kimo-engine",
  "kimo-mail",
  "kimo-platform",
  "kimo-plugin-abi",
@@ -1849,6 +1850,30 @@ dependencies = [
  "serde",
  "serde_json",
  "sha1_smol",
+]
+
+[[package]]
+name = "kimo-engine"
+version = "0.1.0"
+dependencies = [
+ "base64 0.22.1",
+ "egui",
+ "image",
+ "kimo-core",
+ "kimo-mail",
+ "kimo-platform",
+ "kimo-plugin-abi",
+ "kimo-protocol",
+ "kimo-render",
+ "kimo-store",
+ "kimo-style",
+ "rusqlite",
+ "rustls",
+ "serde",
+ "serde_json",
+ "ureq",
+ "wasmi",
+ "wasmi_core",
 ]
 
 [[package]]

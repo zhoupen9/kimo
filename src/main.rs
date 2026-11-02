@@ -6,9 +6,6 @@
 mod app;
 mod glass;
 mod gpu;
-mod plugin;
-mod provider;
-mod sync;
 mod trim;
 
 // The host crates are re-exported under their old module names so the UI,
@@ -17,6 +14,7 @@ mod trim;
 // module names stable while the split is completed.
 pub use kimo_core::{error, models, storage};
 pub use kimo_mail::{folders, mail, outgoing, threads};
+pub use kimo_engine::{plugin, provider, sync};
 pub use kimo_platform::{dbus, gpus, notify, portal, tray, wake};
 pub use kimo_protocol as protocol;
 pub use kimo_render::{blitz_render, css, html};
