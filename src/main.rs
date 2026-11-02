@@ -4,16 +4,10 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod app;
-mod blitz_render;
-mod css;
 mod glass;
 mod gpu;
-mod html;
 mod plugin;
 mod provider;
-// Test-only measurement harness for the two HTML renderers; see the file.
-#[cfg(test)]
-mod render_bench;
 mod sync;
 mod trim;
 
@@ -25,6 +19,7 @@ pub use kimo_core::{error, models, storage};
 pub use kimo_mail::{folders, mail, outgoing, threads};
 pub use kimo_platform::{dbus, gpus, notify, portal, tray, wake};
 pub use kimo_protocol as protocol;
+pub use kimo_render::{blitz_render, css, html};
 pub use kimo_store::{db, search};
 pub use kimo_style::{fonts, theme};
 

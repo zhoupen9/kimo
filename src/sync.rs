@@ -11,11 +11,10 @@
 //! the marks' ordering and the `Event`s.
 
 use std::fs;
-use std::io::{Read, Write};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::mpsc::Sender;
-use std::time::Duration;
 
 use crate::db;
 use crate::error::{MailError, MailResult};
@@ -26,6 +25,7 @@ use crate::protocol::smtp::SmtpClient;
 use crate::provider;
 use crate::provider::vendor::{sent_mailbox, VendorKey};
 use crate::storage;
+use kimo_render::http_get;
 
 /// How many older messages one `Load older mail` click fetches. The same size
 /// as a folder's first fetch (`provider::BACKFILL_LIMIT`), so the list grows in
@@ -35,8 +35,6 @@ pub const OLDER_BATCH: u32 = 50;
 /// Hard caps for remote mail resources (images / stylesheets).
 pub const MAX_IMAGE_BYTES: u64 = 10 * 1024 * 1024;
 pub const MAX_STYLESHEET_BYTES: u64 = 512 * 1024;
-const FETCH_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
-const FETCH_READ_TIMEOUT: Duration = Duration::from_secs(20);
 
 pub enum Job {
     /// Folder list (IMAP) plus new mail: INBOX, every folder that has been
@@ -779,37 +777,6 @@ pub fn spawn(job: Job, ctx: egui::Context, tx: Sender<Event>) {
             worker_wake(&ctx);
         }
     });
-}
-
-fn remote_url(url: &str) -> MailResult<()> {
-    if url.starts_with("https://") || url.starts_with("http://") {
-        Ok(())
-    } else {
-        Err(MailError::Protocol(format!("refusing non-http url: {url}")))
-    }
-}
-
-/// GET a URL with the standard timeouts and a byte cap. Shared with
-/// `blitz_render`, which fetches mail resources while rasterizing.
-pub(crate) fn http_get(url: &str, max_bytes: u64) -> MailResult<Vec<u8>> {
-    remote_url(url)?;
-    let agent = ureq::AgentBuilder::new()
-        .timeout_connect(FETCH_CONNECT_TIMEOUT)
-        .timeout_read(FETCH_READ_TIMEOUT)
-        .build();
-    let response = agent
-        .get(url)
-        .call()
-        .map_err(|e| MailError::Protocol(format!("http: {e}")))?;
-    let mut bytes = Vec::new();
-    response
-        .into_reader()
-        .take(max_bytes + 1)
-        .read_to_end(&mut bytes)?;
-    if bytes.len() as u64 > max_bytes {
-        return Err(MailError::Protocol("resource exceeds size limit".into()));
-    }
-    Ok(bytes)
 }
 
 /// Fetch (or take from the disk cache) and decode a remote image into RGBA.

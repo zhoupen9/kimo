@@ -502,7 +502,7 @@ impl MailNet {
             }
             budget.bytes_left.min(MAX_RESOURCE_BYTES)
         };
-        let Ok(bytes) = crate::sync::http_get(url, allowance) else {
+        let Ok(bytes) = crate::http::http_get(url, allowance) else {
             return Vec::new();
         };
         if let Ok(mut budget) = self.budget.lock() {

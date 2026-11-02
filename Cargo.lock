@@ -1822,6 +1822,7 @@ dependencies = [
  "kimo-platform",
  "kimo-plugin-abi",
  "kimo-protocol",
+ "kimo-render",
  "kimo-store",
  "kimo-style",
  "kurbo",
@@ -1891,6 +1892,31 @@ dependencies = [
  "kimo-core",
  "rustls",
  "webpki-roots 0.26.11",
+]
+
+[[package]]
+name = "kimo-render"
+version = "0.1.0"
+dependencies = [
+ "anyrender",
+ "anyrender_vello_cpu",
+ "base64 0.22.1",
+ "blitz-dom",
+ "blitz-html",
+ "blitz-paint",
+ "blitz-traits",
+ "csscolorparser",
+ "ego-tree",
+ "egui",
+ "image",
+ "kimo-core",
+ "kimo-style",
+ "kurbo",
+ "palette",
+ "parley",
+ "rusqlite",
+ "scraper",
+ "ureq",
 ]
 
 [[package]]
