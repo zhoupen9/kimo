@@ -1,0 +1,23 @@
+[package]
+name = "kimo-ui"
+version = "0.1.0"
+edition = "2021"
+description = "Kimo's egui application: state, title bar, columns, cards and tests"
+license = "MIT"
+publish = false
+
+[dependencies]
+kimo-core = { path = "../kimo-core" }
+kimo-mail = { path = "../kimo-mail" }
+kimo-protocol = { path = "../kimo-protocol" }
+kimo-store = { path = "../kimo-store" }
+kimo-style = { path = "../kimo-style" }
+kimo-platform = { path = "../kimo-platform" }
+kimo-render = { path = "../kimo-render" }
+kimo-engine = { path = "../kimo-engine" }
+egui = "0.36"
+egui-wgpu = "0.36"
+wgpu = "30"
+pollster = "0.4"
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp", "bmp"] }
+serde_json = "1"

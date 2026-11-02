@@ -1,5 +1,5 @@
 //! Raw RFC 5322 bytes → `MailMessage` via `mail-parser`. HTML bodies are
-//! kept as-is (`body_html`) and rendered by `crate::html` in the UI.
+//! kept as-is (`body_html`) and rendered by `kimo_render::html` in the UI.
 
 use std::collections::BTreeSet;
 
@@ -106,7 +106,7 @@ pub fn parse(raw: &[u8], uid: &str, seen: bool) -> MailMessage {
         // A mail just parsed off the wire carries no labels: they are the
         // user's own marks, and they live in the database. The flag is the one
         // mark the wire *does* carry — `\Flagged` — and the caller that knows
-        // the flags (`crate::sync`, off the FETCH) sets it; what is parsed here
+        // the flags (`kimo_engine::sync`, off the FETCH) sets it; what is parsed here
         // is the message itself.
         flagged: false,
         labels: BTreeSet::new(),

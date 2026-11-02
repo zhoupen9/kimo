@@ -7,8 +7,8 @@ pub use kimo_style::{fonts, theme};
 
 pub mod blitz_render;
 pub mod css;
-pub mod http;
 pub mod html;
+pub mod http;
 
 pub use http::http_get;
 

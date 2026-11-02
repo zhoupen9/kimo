@@ -160,12 +160,12 @@ pub struct Settings {
     /// (`0000:03:00.0`), as picked in Preferences → Graphics; absent means the
     /// Vulkan loader's own choice. Read at start-up, before any Vulkan instance
     /// exists, so the drivers of the cards it is not are never loaded
-    /// (`crate::gpus`).
+    /// (`kimo_platform::gpus`).
     ///
     /// Read leniently: a value of the wrong JSON type is treated as absent
     /// rather than as a broken file — one bad key must not lose every other
     /// preference — and a string that names no card falls back to every driver
-    /// in `crate::gpus::plan`.
+    /// in `kimo_platform::gpus::plan`.
     #[serde(
         default,
         deserialize_with = "lenient_gpu",
@@ -362,7 +362,7 @@ mod tests {
         assert_eq!(settings.auto_sync, Some(true));
 
         // A string is kept as written, even one no card answers to: which value
-        // was ignored is `crate::gpus`'s fallback to say.
+        // was ignored is `kimo_platform::gpus`'s fallback to say.
         let settings: Settings = serde_json::from_str(r#"{"gpu":"the nvidia one"}"#).unwrap();
         assert_eq!(settings.gpu.as_deref(), Some("the nvidia one"));
         let settings: Settings = serde_json::from_str(r#"{"gpu":null}"#).unwrap();

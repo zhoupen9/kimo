@@ -1,16 +1,17 @@
 # Kimo mail provider and extension specification
 
 **Status:** design draft, 2026-10-27. The host side is implemented in
-`src/plugin/`: the ABI types, manifest validation, discovery, the WASM
-instance, permissions, fuel and memory limits, extension-plan validation and a
-`MailProvider` adapter. Preferences → Plugins lists what the scan found and
+`crates/kimo-plugin-abi/` for the ABI types and manifest, and
+`crates/kimo-engine/src/plugin/` for discovery, the WASM instance, permissions,
+fuel and memory limits, extension-plan validation and the `MailProvider`
+adapter. Preferences → Plugins lists what the scan found and
 switches plugins on and off (a disabled module is not compiled at startup),
 and the host has a real HTTP/TLS backend, manifest network rules are enforced
 as an endpoint allowlist, [`plugins/sender-groups`](../plugins/sender-groups/)
 is a minimal reference extension, [`plugins/gmail`](../plugins/gmail/) is
 the first real provider: XOAUTH2, all four `X-GM-EXT-1` extensions, Gmail
 submission, and an OAuth2 authorization-code flow whose browser leg the
-host runs (`src/plugin/auth.rs`: loopback redirect, the desktop's OpenURI
+host runs (`crates/kimo-engine/src/plugin/auth.rs`: loopback redirect, the desktop's OpenURI
 portal, `xdg-open` fallback). [`plugins/outlook`](../plugins/outlook/) is
 the second, over Graph: Entra ID OAuth2, POP3-shaped sync by immutable ids,
 flags, soft delete, KQL search, and `sendMail` with its own Sent copy —
@@ -1052,17 +1053,16 @@ module it names:
 - A missing, invalid or rejected module is reported in Preferences → Plugins;
   it does not stop Kimo from starting.
 
-The host workspace is in place. The boundary crate is
-`crates/kimo-plugin-abi` (the JSON envelope, manifest and permissions; no
-wasmi, no SQLite, no UI). The engine, discovery and the provider adapter still
-live in `src/plugin/` inside the binary; they earn their own crate when the
-host has a second consumer or the adapter outgrows `sync`. The plugins are a
-separate workspace:
+The host side is split along its real boundary. `crates/kimo-plugin-abi`
+holds the JSON envelope, manifest and permissions (no wasmi, no SQLite, no UI).
+The engine, discovery and the provider adapter live in
+`crates/kimo-engine/src/plugin/`; `kimo-engine` is a normal workspace crate and
+does not depend on the UI. The plugins are a separate workspace:
 
 ```text
 kimo/
   crates/kimo-plugin-abi/       host-side JSON types + manifest; no host dependency
-  src/plugin/                   engine, permissions, discovery, dispatch (binary for now)
+  crates/kimo-engine/           engine, permissions, discovery, dispatch, provider adapter
   plugins/Cargo.toml            one workspace for the modules below
   plugins/gmail/                wasm32-unknown-unknown, kimo-gmail/1
   plugins/outlook/              wasm32-unknown-unknown, kimo-graph/1

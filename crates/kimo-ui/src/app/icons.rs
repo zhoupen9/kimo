@@ -13,52 +13,52 @@ pub(super) const FOLDER_ICONS: &[(FolderKind, bool, &[u8])] = &[
     (
         FolderKind::Inbox,
         false,
-        include_bytes!("../../assets/folder-icons/inbox.png"),
+        include_bytes!("../../../../assets/folder-icons/inbox.png"),
     ),
     (
         FolderKind::Sent,
         false,
-        include_bytes!("../../assets/folder-icons/sent.png"),
+        include_bytes!("../../../../assets/folder-icons/sent.png"),
     ),
     (
         FolderKind::Drafts,
         false,
-        include_bytes!("../../assets/folder-icons/drafts.png"),
+        include_bytes!("../../../../assets/folder-icons/drafts.png"),
     ),
     (
         FolderKind::Trash,
         false,
-        include_bytes!("../../assets/folder-icons/trash.png"),
+        include_bytes!("../../../../assets/folder-icons/trash.png"),
     ),
     (
         FolderKind::Junk,
         false,
-        include_bytes!("../../assets/folder-icons/junk.png"),
+        include_bytes!("../../../../assets/folder-icons/junk.png"),
     ),
     (
         FolderKind::Archive,
         false,
-        include_bytes!("../../assets/folder-icons/archive.png"),
+        include_bytes!("../../../../assets/folder-icons/archive.png"),
     ),
     (
         FolderKind::AllMail,
         false,
-        include_bytes!("../../assets/folder-icons/all-mail.png"),
+        include_bytes!("../../../../assets/folder-icons/all-mail.png"),
     ),
     (
         FolderKind::Starred,
         false,
-        include_bytes!("../../assets/folder-icons/starred.png"),
+        include_bytes!("../../../../assets/folder-icons/starred.png"),
     ),
     (
         FolderKind::Folder,
         false,
-        include_bytes!("../../assets/folder-icons/folder.png"),
+        include_bytes!("../../../../assets/folder-icons/folder.png"),
     ),
     (
         FolderKind::Folder,
         true,
-        include_bytes!("../../assets/folder-icons/folder-open.png"),
+        include_bytes!("../../../../assets/folder-icons/folder-open.png"),
     ),
 ];
 

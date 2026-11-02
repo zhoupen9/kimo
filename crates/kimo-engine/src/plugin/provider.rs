@@ -603,19 +603,24 @@ mod tests {
     fn the_real_modules_declare_what_the_send_and_flag_gates_ask() {
         // The submission modules file their own Sent copy; a module with no
         // descriptor answer says no, which is the gate's safe default.
-        let gmail =
-            crate::plugin::abi::Manifest::parse(include_str!("../../../../plugins/gmail/plugin.json"))
-                .unwrap();
-        let gmail =
-            WasmPlugin::load(gmail, include_bytes!("../../../../plugins/gmail/gmail.wasm")).unwrap();
+        let gmail = crate::plugin::abi::Manifest::parse(include_str!(
+            "../../../../plugins/gmail/plugin.json"
+        ))
+        .unwrap();
+        let gmail = WasmPlugin::load(
+            gmail,
+            include_bytes!("../../../../plugins/gmail/gmail.wasm"),
+        )
+        .unwrap();
         assert!(declares_in(&gmail, "send.save_copy"));
         assert!(declares_in(&gmail, "message.append"));
         assert!(declares_in(&gmail, "message.set_flags"));
         assert!(!declares_in(&gmail, "sync.stored_uids"));
 
-        let outlook =
-            crate::plugin::abi::Manifest::parse(include_str!("../../../../plugins/outlook/plugin.json"))
-                .unwrap();
+        let outlook = crate::plugin::abi::Manifest::parse(include_str!(
+            "../../../../plugins/outlook/plugin.json"
+        ))
+        .unwrap();
         let outlook = WasmPlugin::load(
             outlook,
             include_bytes!("../../../../plugins/outlook/outlook.wasm"),

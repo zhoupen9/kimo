@@ -63,7 +63,7 @@ Do not "fix" these casually — they are known:
 
 - **A mail can carry files, and the card is where they are chosen.** Two ways
   in, and one area that says both (`attach_card`): **a click opens the desktop's
-  own dialog** (`crate::portal`: the XDG portal's
+  own dialog** (`kimo_platform::portal`: the XDG portal's
   `org.freedesktop.portal.FileChooser.OpenFile` over D-Bus, which runs the dialog
   in the *compositor's* process — nothing is linked in, and it is the one way
   that works on Wayland at all), and **a file dragged from a file manager** lands
@@ -149,8 +149,8 @@ Do not "fix" these casually — they are known:
   standard protocol. See [providers.md](providers.md) for why the column was
   rejected.
 
-- HTML mail renders through the in-egui subset renderer (`src/html.rs`).
-  CSS is the `src/css.rs` subset (colors, fonts, sizes, display/visibility);
+- HTML mail renders through the in-egui subset renderer (`crates/kimo-render/src/html.rs`).
+  CSS is the `crates/kimo-render/src/css.rs` subset (colors, fonts, sizes, display/visibility);
   compound selectors and layout CSS are ignored. Simple tables render as
   aligned grids; layout tables (block elements inside cells — most HTML
   mail) render as flowing full-width rows, because egui Grid sizes columns

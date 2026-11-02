@@ -258,9 +258,13 @@ mod tests {
 
     #[test]
     fn the_gmail_sample_describes_and_signs_in_through_the_abi() {
-        let manifest = Manifest::parse(include_str!("../../../../plugins/gmail/plugin.json")).unwrap();
-        let plugin =
-            WasmPlugin::load(manifest, include_bytes!("../../../../plugins/gmail/gmail.wasm")).unwrap();
+        let manifest =
+            Manifest::parse(include_str!("../../../../plugins/gmail/plugin.json")).unwrap();
+        let plugin = WasmPlugin::load(
+            manifest,
+            include_bytes!("../../../../plugins/gmail/gmail.wasm"),
+        )
+        .unwrap();
         let mut instance = plugin.instantiate().unwrap();
 
         let described = instance
@@ -302,7 +306,7 @@ mod tests {
     #[test]
     fn the_samples_are_discovered_from_their_directories() {
         let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-        let registry = Registry::discover_from(&[root.join("plugins")]);
+        let registry = Registry::discover_from(&[root.join("../../plugins")]);
         assert_eq!(registry.errors().len(), 0, "{:?}", registry.errors());
         assert_eq!(registry.plugins().len(), 3);
         let ids: Vec<&str> = registry
@@ -317,7 +321,8 @@ mod tests {
 
     #[test]
     fn the_outlook_sample_describes_and_signs_in_through_the_abi() {
-        let manifest = Manifest::parse(include_str!("../../../../plugins/outlook/plugin.json")).unwrap();
+        let manifest =
+            Manifest::parse(include_str!("../../../../plugins/outlook/plugin.json")).unwrap();
         let plugin = WasmPlugin::load(
             manifest,
             include_bytes!("../../../../plugins/outlook/outlook.wasm"),
@@ -368,7 +373,7 @@ mod tests {
     #[test]
     fn the_outlook_sample_is_listed_by_its_provider_contribution() {
         let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-        let registry = Registry::discover_from(&[root.join("plugins")]);
+        let registry = Registry::discover_from(&[root.join("../../plugins")]);
         // The account form's provider picker is fed by exactly this lookup.
         let outlook = registry
             .provider("outlook")
@@ -382,7 +387,7 @@ mod tests {
     fn a_disabled_plugin_is_listed_but_not_compiled() {
         let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
         let registry = Registry::discover_from_with_disabled(
-            &[root.join("plugins")],
+            &[root.join("../../plugins")],
             &["org.kimo.gmail".to_string()],
         );
         assert_eq!(registry.errors().len(), 0, "{:?}", registry.errors());

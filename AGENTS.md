@@ -46,8 +46,8 @@ Kimo is a desktop **email client** GUI written in pure Rust:
    swap it for `bundled-sqlcipher`, a `libsqlite3-sys` built against a system
    library, or any other C crate.
 2. **No async runtime.** Networking runs on short-lived `std::thread` jobs
-   (see `src/sync.rs`); results come back over `std::sync::mpsc`. Do not
-   introduce tokio, async-std, or an executor.
+   (see `crates/kimo-engine/src/sync.rs`); results come back over
+   `std::sync::mpsc`. Do not introduce tokio, async-std, or an executor.
 3. **Never block the UI thread.** `KimoApp::ui` only drains the
    event channel and draws. Any socket I/O, file scan or other potentially
    slow work must be a `sync::Job` on a worker thread. Workers call
@@ -61,12 +61,13 @@ Kimo is a desktop **email client** GUI written in pure Rust:
    bodies, and DKIM or any signing. The *built-in* SMTP path authenticates
    with `AUTH PLAIN`/`AUTH LOGIN` over TLS only. OAuth2/XOAUTH2 is decided
    and allowed **for plugin providers** (the Gmail module; browser flow in
-   `src/plugin/auth.rs`) — do not add it to the built-in clients.
+   `crates/kimo-engine/src/plugin/auth.rs`) — do not add it to the built-in
+   clients.
 5. **Keep the dependency tree small.** Every new crate needs a concrete
    justification; prefer std where reasonable.
 6. **UI strings are English.** CJK rendering is handled by the best-effort
-   font fallback in `fonts.rs::install` — do not add an i18n
-   framework.
+   font fallback in `crates/kimo-style/src/fonts.rs::install` — do not add an
+   i18n framework.
 
 ## Commands
 
@@ -83,8 +84,8 @@ done. There is no CI yet — that discipline is on you.
 
 ## Architecture
 
-Kimo is one Cargo workspace: the binary at the root, five library crates under
-`crates/`, and a separate workspace for the WASM modules.
+Kimo is one Cargo workspace: a thin binary at the root, ten library crates
+under `crates/`, and a separate workspace for the WASM modules.
 
 ```
 crates/kimo-core/       Account / Protocol / TlsMode / MailMessage (plain types),
@@ -96,71 +97,70 @@ crates/kimo-store/      the SQLite database (schema, migrations, accounts, folde
                         labels, old-JSON import) and FTS5/CJK mail search
 crates/kimo-plugin-abi/ the host-side JSON envelope + manifest (guest modules still carry
                         their own import/envelope module until the SDK extraction)
+crates/kimo-style/      theme choice + light/dark color schemes and their egui Visuals;
+                        installed-font discovery (ttf-parser scan) and egui font installation
+crates/kimo-platform/   the session bus (marshalling, framing, connection), the XDG file
+                        portal, StatusNotifierItem tray, notifications, the event-loop wake
+                        channel and the machine's graphics cards/Vulkan driver selection
+crates/kimo-render/     HTML mail → egui widgets (`html`), the small CSS subset (`css`), the
+                        Blitz raster renderer (`blitz_render`), the shared HTTP resource helper,
+                        and the test-only renderer benchmark
+crates/kimo-engine/     `Job`/`Event`, worker threads, the database/Event side of every mailbox
+                        job; `provider/` (MailProvider plus IMAP, POP3 and vendor) and
+                        `plugin/` (WASM host, discovery, HTTP/TLS backend, OAuth browser flow)
+crates/kimo-ui/         `KimoApp` and the UI by concern: events, actions, titlebar,
+                        navigation, list, reading, compose, preferences, menus, search,
+                        blitz, layout, widgets, icons, util; `glass` (title-bar backdrop);
+                        `app/tests/` holds the UI tests
 plugins/                separate workspace: gmail, outlook, sender-groups (wasm32-unknown-unknown)
 
 src/main.rs             entry point; the winit event loop, the window, egui's input state
 src/gpu.rs              the wgpu side: device, surface, egui's renderer, and one frame
-src/gpus.rs             the machine's graphics cards and the Vulkan drivers a pick may load
-src/app.rs              app root: KimoApp state and shared models, construction, one-frame `ui`
-src/app/                UI by concern: events, actions, titlebar, navigation, list, reading,
-                        compose, preferences, menus, search, blitz, layout, widgets, icons, util
-src/fonts.rs            installed-font discovery (ttf-parser scan) + egui font installation
-src/theme.rs            theme choice + the light/dark color schemes and their egui Visuals
-src/portal.rs           the desktop's own file dialog, asked for over D-Bus (XDG portal)
-src/html.rs             HTML mail → egui widgets (subset: blocks, lists, tables, links, inline
-                        styles; the mail's colors adapted to the theme)
-src/blitz_render.rs     HTML mail → rasterized page via Blitz (headless render, net provider, fonts)
-src/css.rs              tiny CSS subset (decls, tag/class/id selectors, CSS colors) for HTML mail
-src/app/icons.rs        embedded folder row icons and the other shared glyph painters
-src/glass.rs            the floating title bar's frosted backdrop (wgpu passes + a paint callback)
-src/render_bench.rs     test-only: times both HTML renderers for the same bodies (bench_render)
-src/dbus.rs             the session bus: D-Bus wire protocol (marshalling, framing, the connection)
-src/tray.rs             StatusNotifierItem over the session bus (std::thread) + svg→ARGB icon
-src/wake.rs             the event loop's wake channel, for work that finishes while the window is hidden
-src/notify.rs           new-mail notifications over the session bus (std::thread) + their 48·scale icon
-src/sync.rs             Job/Event enums, worker threads, and the database/Event side of every mailbox job
-src/plugin/             the WASM plugin host: discovery, the wasmi instance, the HTTP/TLS backend,
-                        the OAuth browser flow, the MailProvider adapter (ABI in kimo-plugin-abi)
-src/provider/mod.rs     the abstract MailProvider interface: one adapter per read protocol
-src/provider/imap.rs    the IMAP adapter: folders, incremental fetch, flags, delete, append
-src/provider/pop3.rs    the POP3 adapter: the one drop, older mail, delete, body
-src/provider/vendor.rs  the vendor layer: Gmail/Outlook/… presets, sign-in notes, Sent mailbox
+src/trim.rs             the allocator policy set before the first large allocation
 ```
+
+Dependency direction: `kimo-ui` sits above `kimo-engine`; both build on
+`kimo-render` / `kimo-platform` / `kimo-style`, and the data crates are below
+all of them. The root binary depends on `kimo-ui`, `kimo-engine`,
+`kimo-platform` and `kimo-style`; it does not contain a second copy of the
+application.
 
 ## Where the detail lives
 
 | Read this | Before touching |
 | --------- | --------------- |
-| [docs/architecture.md](docs/architecture.md) | `src/sync.rs`, `Job`/`Event`, anything crossing the UI/worker line |
+| [docs/architecture.md](docs/architecture.md) | `crates/kimo-engine/src/sync.rs`, `Job`/`Event`, anything crossing the UI/worker line |
 | [docs/storage.md](docs/storage.md) | `crates/kimo-store/`, `crates/kimo-core/src/storage.rs`, a schema migration, an XDG path |
 | [docs/protocols.md](docs/protocols.md) | `crates/kimo-protocol/`, a TLS setting, a charset, the mapping of a server's refusal |
-| [docs/providers.md](docs/providers.md) | `src/provider/`, a vendor preset, the account form's Provider row, a new mailbox operation |
-| [docs/mail-spec.md](docs/mail-spec.md) | `src/plugin/`, a provider or extension plugin under `plugins/`, the WASM ABI, an OAuth flow, an X-GM mapping |
-| [docs/ui-shell.md](docs/ui-shell.md) | `src/main.rs`, `src/gpu.rs`, `src/gpus.rs`, `src/glass.rs`, the title bar, the column plan, the navigation column |
+| [docs/providers.md](docs/providers.md) | `crates/kimo-engine/src/provider/`, a vendor preset, the account form's Provider row, a new mailbox operation |
+| [docs/mail-spec.md](docs/mail-spec.md) | `crates/kimo-engine/src/plugin/`, a provider or extension plugin under `plugins/`, the WASM ABI, an OAuth flow, an X-GM mapping |
+| [docs/ui-shell.md](docs/ui-shell.md) | `src/main.rs`, `src/gpu.rs`, `crates/kimo-platform/src/gpus.rs`, `crates/kimo-ui/src/glass.rs`, the title bar, the column plan, the navigation column |
 | [docs/ui-mail.md](docs/ui-mail.md) | a list row, threading, select mode, the search box and its popup, the reading pane, attachments, labels, flags, filters, sort |
 | [docs/ui-style.md](docs/ui-style.md) | drawing a widget: an icon or a disclosure, a mail address field, the Cc/Bcc fold |
 | [docs/compose.md](docs/compose.md) | `compose_card`, `crates/kimo-mail/src/outgoing.rs`, `Job::SendMessage` |
-| [docs/theme.md](docs/theme.md) | `src/theme.rs`, `src/fonts.rs`, any color a widget draws |
-| [docs/html-mail.md](docs/html-mail.md) | `src/html.rs`, `src/css.rs`, `src/blitz_render.rs`, a Blitz build feature |
-| [docs/platform.md](docs/platform.md) | `src/portal.rs`, `src/dbus.rs`, `src/tray.rs`, `src/notify.rs`, `packaging/` |
+| [docs/theme.md](docs/theme.md) | `crates/kimo-style/src/theme.rs`, `crates/kimo-style/src/fonts.rs`, any color a widget draws |
+| [docs/html-mail.md](docs/html-mail.md) | `crates/kimo-render/src/html.rs`, `crates/kimo-render/src/css.rs`, `crates/kimo-render/src/blitz_render.rs`, a Blitz build feature |
+| [docs/platform.md](docs/platform.md) | `crates/kimo-platform/src/portal.rs`, `crates/kimo-platform/src/dbus.rs`, `crates/kimo-platform/src/tray.rs`, `crates/kimo-platform/src/notify.rs`, `packaging/` |
 | [docs/preferences.md](docs/preferences.md) | `preferences_modal`, a `settings.json` key, the sync clock |
 | [docs/testing.md](docs/testing.md) | before claiming a UI or renderer change works, or when timing one |
 | [docs/limitations.md](docs/limitations.md) | before "fixing" behaviour that looks wrong — it may be a decision |
 
 ## Conventions that are rules
 
-- **App UI code belongs in its concern module under `src/app/`.** `app.rs` is
-  the root: `KimoApp` and the shared state/models, construction and `ui`
-  orchestration. Do not grow it with another feature; add or extend the module
-  that owns the concern, and keep each module under roughly 3,000 lines.
+- **App UI code belongs in its concern module under
+  `crates/kimo-ui/src/app/`.** `app.rs` is the root: `KimoApp` and the shared
+  state/models, construction and `ui` orchestration. Do not grow it with another
+  feature; add or extend the module that owns the concern, and keep each module
+  under roughly 3,000 lines.
 - Pure parsing helpers (e.g. `extract_uid`, `literal_size`, `html_to_text`)
   live next to their users and get `#[cfg(test)]` unit tests. App UI tests
-  live under `src/app/tests/`, grouped by concern; there is no top-level
-  `tests/` directory.
+  live under `crates/kimo-ui/src/app/tests/`, grouped by concern; there is no
+  top-level `tests/` directory.
 - A new mailbox operation goes on `provider::MailProvider` with an IMAP and a
-  POP3 implementation; `src/sync.rs` must not branch on `Protocol` to reach the
-  wire. Vendor knowledge (endpoints, sign-in, Sent mailbox) goes in
-  `src/provider/vendor.rs`, not in the account form or an adapter. A preset
+  POP3 implementation; `crates/kimo-engine/src/sync.rs` must not branch on
+  `Protocol` to reach the wire. Vendor knowledge (endpoints, sign-in, Sent
+  mailbox) goes in `crates/kimo-engine/src/provider/vendor.rs`, not in the
+  account form or an adapter. A preset
   switched off in Preferences is Custom everywhere: ask `vendor::enabled` /
   `vendor::effective_key` rather than assuming a preset is on.
 - When touching the UI, actually run `cargo run -p kimo` and click through it; the

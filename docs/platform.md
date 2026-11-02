@@ -1,12 +1,12 @@
 # Platform — file dialog, tray, notifications, packaging
 
-Read when touching `src/portal.rs`, `src/dbus.rs`, `src/tray.rs`, `src/notify.rs`, or `packaging/`.
+Read when touching `crates/kimo-platform/src/portal.rs`, `crates/kimo-platform/src/dbus.rs`, `crates/kimo-platform/src/tray.rs`, `crates/kimo-platform/src/notify.rs`, or `packaging/`.
 
 ## The desktop's own file dialog
 
 - **The file dialog is the desktop's, not Kimo's.** There is no file-picker
   crate: the dialog is asked for over D-Bus from the compositor's own portal
-  (`src/portal.rs`, `org.freedesktop.portal.FileChooser`), which keeps the
+  (`crates/kimo-platform/src/portal.rs`, `org.freedesktop.portal.FileChooser`), which keeps the
   dependency list as it is — no GTK, no portal crate with an async runtime behind
   it — and is the only thing that works under Wayland, where winit 0.30 delivers
   no drag-and-drop events at all. Two calls are made: `OpenFile` for the files an
@@ -35,8 +35,8 @@ Read when touching `src/portal.rs`, `src/dbus.rs`, `src/tray.rs`, `src/notify.rs
 
 ## Tray icon
 
-- **Tray icon:** `src/tray.rs` implements StatusNotifierItem by speaking the
-  D-Bus wire protocol directly (`src/dbus.rs`) on a `std::thread` —
+- **Tray icon:** `crates/kimo-platform/src/tray.rs` implements StatusNotifierItem by speaking the
+  D-Bus wire protocol directly (`crates/kimo-platform/src/dbus.rs`) on a `std::thread` —
   deliberately not zbus (async executor, rule 2) or the GTK tray crates (C,
   rule 1). The icon is
   `assets/app.png` (256px, rasterized from the multi-color `assets/app.svg`
@@ -108,9 +108,9 @@ Read when touching `src/portal.rs`, `src/dbus.rs`, `src/tray.rs`, `src/notify.rs
 
 ## Desktop notifications
 
-- **Desktop notifications:** `src/notify.rs` announces new mail through the
+- **Desktop notifications:** `crates/kimo-platform/src/notify.rs` announces new mail through the
   freedesktop `org.freedesktop.Notifications` interface — the same raw-D-Bus
-  choice as the tray, made on the shared wire layer in `src/dbus.rs` and for
+  choice as the tray, made on the shared wire layer in `crates/kimo-platform/src/dbus.rs` and for
   the same two reasons (no `zbus` async executor, rule 2; no C, rule 1).
   Showing one is a blocking call, so it runs on one dedicated `std::thread`
   that owns the connection: `notify::show` only posts to it, whether the

@@ -291,12 +291,12 @@ every crossing.
 
 ## 9. Current implementation status
 
-The host/ABI side lives in `src/plugin/`; the full contract and its current
+The host/ABI side lives in `crates/kimo-engine/src/plugin/`; the full contract and its current
 limitations are in [mail-spec.md](mail-spec.md). The network backend is real
-(`StdNetwork` in `src/plugin/net.rs`) and is handed to an instance at
+(`StdNetwork` in `crates/kimo-engine/src/plugin/net.rs`) and is handed to an instance at
 instantiation, so startup discovery still probes with the deny-everything
 backend while a plugin-backed account gets sockets; the OAuth browser flow is
-`src/plugin/auth.rs` (loopback redirect, the desktop's OpenURI portal with an
+`crates/kimo-engine/src/plugin/auth.rs` (loopback redirect, the desktop's OpenURI portal with an
 `xdg-open` fallback). [`plugins/gmail`](../plugins/gmail/) is the first real
 provider: XOAUTH2 for IMAP and SMTP, all four `X-GM-EXT-1` extensions, Gmail
 submission, and the authorization-code flow above. The account path is wired for

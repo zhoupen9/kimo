@@ -25,8 +25,8 @@ cp plugins/target/wasm32-unknown-unknown/release/kimo_plugin_sender_groups.wasm 
   layout has no golden tests. `blitz_render` has a developer tool for
   eyeballing fidelity without the GUI:
   `KIMO_RENDER_HTML=mail.html cargo test -- --ignored dump_render` writes
-  `mail.png` next to the input. `dump_ui` (`src/app/tests/dump.rs`) is the same idea for the app's
-  own frames and needs no compositor at all:
+  `mail.png` next to the input. `dump_ui` (`crates/kimo-ui/src/app/tests/dump.rs`)
+  is the same idea for the app's own frames and needs no compositor at all:
   `cargo test -- --ignored --nocapture dump_ui` drives the clicks
   itself and rasterizes the frames — the columns, the card, the compose form in
   both its containers, the search popup, the label popup, Preferences → General,
@@ -49,7 +49,7 @@ cp plugins/target/wasm32-unknown-unknown/release/kimo_plugin_sender_groups.wasm 
   and not a reflow per pixel of a splitter drag. Blitz pays parse, layout and
   rasterization once per (message, pane width), on a worker thread. For whole
   frames rather than bodies — including what a splitter drag costs —
-  `src/app/tests/bench.rs` has `bench_frame_cost`, which drives the real app
+  `crates/kimo-ui/src/app/tests/bench.rs` has `bench_frame_cost`, which drives the real app
   headlessly at a fixed splitter position and while it is being dragged:
   `cargo test --release -- --ignored --nocapture bench_frame_cost`. Its
   companion `bench_nav_slide` measures those frames through the navigation

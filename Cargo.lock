@@ -1804,41 +1804,16 @@ checksum = "e2db585e1d738fc771bf08a151420d3ed193d9d895a36df7f6f8a9456b911ddc"
 name = "kimo"
 version = "0.1.0"
 dependencies = [
- "anyrender",
- "anyrender_vello_cpu",
- "base64 0.22.1",
- "blitz-dom",
- "blitz-html",
- "blitz-paint",
- "blitz-traits",
- "csscolorparser",
- "ego-tree",
  "egui",
  "egui-wgpu",
  "egui-winit",
- "image",
  "kimo-core",
  "kimo-engine",
- "kimo-mail",
  "kimo-platform",
- "kimo-plugin-abi",
  "kimo-protocol",
- "kimo-render",
- "kimo-store",
  "kimo-style",
- "kurbo",
- "palette",
- "parley",
+ "kimo-ui",
  "pollster",
- "rusqlite",
- "rustls",
- "scraper",
- "serde",
- "serde_json",
- "ttf-parser",
- "ureq",
- "wasmi",
- "wasmi_core",
  "wgpu",
  "winit",
 ]
@@ -1962,6 +1937,26 @@ version = "0.1.0"
 dependencies = [
  "egui",
  "ttf-parser",
+]
+
+[[package]]
+name = "kimo-ui"
+version = "0.1.0"
+dependencies = [
+ "egui",
+ "egui-wgpu",
+ "image",
+ "kimo-core",
+ "kimo-engine",
+ "kimo-mail",
+ "kimo-platform",
+ "kimo-protocol",
+ "kimo-render",
+ "kimo-store",
+ "kimo-style",
+ "pollster",
+ "serde_json",
+ "wgpu",
 ]
 
 [[package]]

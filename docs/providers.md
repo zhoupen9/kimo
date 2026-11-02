@@ -1,15 +1,15 @@
 # Providers — the mailbox interface and the vendor layer
 
-Read when touching `src/provider/`, the account form's Provider row, or adding a mailbox operation or a vendor preset.
+Read when touching `crates/kimo-engine/src/provider/`, the account form's Provider row, or adding a mailbox operation or a vendor preset.
 
 ## The stack
 
 ```
-UI / sync jobs                src/app/, src/sync.rs
-  └─ vendor policy            src/provider/vendor.rs
-       └─ MailProvider trait  src/provider/mod.rs
-            ├─ ImapProvider   src/provider/imap.rs
-            └─ Pop3Provider   src/provider/pop3.rs
+UI / sync jobs                crates/kimo-ui/src/app/, crates/kimo-engine/src/sync.rs
+  └─ vendor policy            crates/kimo-engine/src/provider/vendor.rs
+       └─ MailProvider trait  crates/kimo-engine/src/provider/mod.rs
+            ├─ ImapProvider   crates/kimo-engine/src/provider/imap.rs
+            └─ Pop3Provider   crates/kimo-engine/src/provider/pop3.rs
                  └─ wire      crates/kimo-protocol/src/{imap,pop3,smtp}.rs
 ```
 
@@ -62,7 +62,7 @@ UI / sync jobs                src/app/, src/sync.rs
 
 ## The vendor layer
 
-The profiles are in `src/provider/vendor.rs`. A profile is data — endpoints,
+The profiles are in `crates/kimo-engine/src/provider/vendor.rs`. A profile is data — endpoints,
 sign-in kind, a sentence for the form, and the mailbox names a sent copy
 prefers — because that is all the providers differ in today; a vendor that
 needs a wire quirk gets a function there, passed the profile and the folder

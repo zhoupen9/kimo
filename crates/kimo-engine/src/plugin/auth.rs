@@ -393,10 +393,15 @@ mod tests {
 
     /// The real Gmail module, loaded the way discovery loads it.
     fn gmail() -> WasmPlugin {
-        let manifest =
-            crate::plugin::abi::Manifest::parse(include_str!("../../../../plugins/gmail/plugin.json"))
-                .unwrap();
-        WasmPlugin::load(manifest, include_bytes!("../../../../plugins/gmail/gmail.wasm")).unwrap()
+        let manifest = crate::plugin::abi::Manifest::parse(include_str!(
+            "../../../../plugins/gmail/plugin.json"
+        ))
+        .unwrap();
+        WasmPlugin::load(
+            manifest,
+            include_bytes!("../../../../plugins/gmail/gmail.wasm"),
+        )
+        .unwrap()
     }
 
     /// Play the browser against `listener`: ask for `path` and answer with
@@ -661,7 +666,7 @@ mod live_probe {
     #[ignore]
     fn probe_gmail_list_with_a_bogus_token() {
         let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-        let registry = std::sync::Arc::new(Registry::discover_from(&[root.join("plugins")]));
+        let registry = std::sync::Arc::new(Registry::discover_from(&[root.join("../../plugins")]));
         discovery::install(std::sync::Arc::clone(&registry));
         let loaded = registry.provider("gmail").expect("gmail loaded");
         let mut instance = loaded
@@ -690,7 +695,7 @@ mod live_probe {
     #[ignore]
     fn probe_the_full_sign_in_leg() {
         let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-        let registry = std::sync::Arc::new(Registry::discover_from(&[root.join("plugins")]));
+        let registry = std::sync::Arc::new(Registry::discover_from(&[root.join("../../plugins")]));
         discovery::install(std::sync::Arc::clone(&registry));
         eprintln!("1. registry: {} plugins", registry.plugins().len());
         let loaded = registry.provider("outlook").expect("outlook loaded");

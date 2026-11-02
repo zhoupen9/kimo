@@ -12,25 +12,19 @@ description = "Kimo — a pure-Rust email client (IMAP & POP3) with an egui inte
 license = "MIT"
 
 [dependencies]
-# Host crates; the map is in AGENTS.md and the re-exports are in src/main.rs.
+# The binary is only the winit/wgpu integration shell. The application is in
+# kimo-ui; the worker, platform and rendering layers are the crates below it.
 kimo-core = { path = "crates/kimo-core" }
-kimo-mail = { path = "crates/kimo-mail" }
 kimo-protocol = { path = "crates/kimo-protocol" }
-kimo-store = { path = "crates/kimo-store" }
-kimo-plugin-abi = { path = "crates/kimo-plugin-abi" }
 kimo-style = { path = "crates/kimo-style" }
 kimo-platform = { path = "crates/kimo-platform" }
-kimo-render = { path = "crates/kimo-render" }
 kimo-engine = { path = "crates/kimo-engine" }
+kimo-ui = { path = "crates/kimo-ui" }
+
 # Kimo drives the window and the GPU itself — winit for the window and the
-# event loop, `egui-winit` for input, `egui-wgpu` for egui's meshes (see
-# `src/gpu.rs`) — rather than going through eframe. The reason is the floating
-# title bar's frosted backdrop: the blur needs the pixels behind the bar, and
-# wgpu gives no way to read a render target from inside the pass that draws it
-# (that is GL's `glCopyTexSubImage2D`, which the glow build leaned on), so the
-# frame has to be drawn in two passes with the backdrop copied and blurred
-# between them. Only the code that builds the render passes can do that, and
-# eframe owns its passes. egui and the egui crates stay in lockstep.
+# event loop, egui-winit for input, egui-wgpu for egui's meshes (see
+# src/gpu.rs) — rather than going through eframe. The floating title bar's
+# frosted backdrop needs the frame split in two, which eframe cannot do.
 egui = "0.36"
 egui-wgpu = "0.36"
 egui-winit = { version = "0.36", default-features = false, features = [
@@ -47,90 +41,6 @@ winit = { version = "0.30", default-features = false, features = [
     "wayland-dlopen",
     "x11",
 ] }
-
-# TLS: rustls with the pure-Rust `ring` crypto provider. The clients
-# themselves live in `kimo-protocol`; this copy is for the plugin host's
-# provider probe and the startup crypto provider install.
-rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
-
-# HTML mail rendering: html5ever DOM (pure Rust, from Servo) + egui widgets.
-scraper = "0.27"
-ego-tree = "0.11"
-# Mail HTML carries its own colours, picked for the white paper mail is
-# written on, and the Simple renderer adapts them to the theme in force
-# (`html::adapt_color`). That means reading what the mail actually wrote —
-# `csscolorparser` is CSS Colour 4, so `rgb()`/`hsl()`/the named colours come out
-# rather than being dropped — and moving a colour in a perceptual space:
-# `palette` gives sRGB ↔ OKLCH, so lightening a black body keeps its hue and
-# chroma instead of going grey. Both are pure Rust (hard rule 1); nothing else
-# here needs either.
-csscolorparser = "0.9"
-palette = { version = "0.7", default-features = false, features = ["std"] }
-
-# Remote mail content (images/stylesheets), fetched on worker threads.
-# ureq is synchronous + rustls-based (pure Rust; `tls` feature pulls rustls
-# with the ring provider, gzip via miniz_oxide). Image decoding is pure Rust.
-ureq = { version = "2.10", features = ["tls", "gzip"] }
-image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp", "bmp"] }
-
-# Base64 for `data:` URLs in HTML mail (Blitz decodes those); inline `cid:`
-# images are raw bytes in the mail database, not base64.
-base64 = "0.22"
-
-# Full-fidelity HTML mail renderer (optional second content renderer, see
-# src/blitz_render.rs): Blitz is a pure-Rust DOM/CSS/layout engine — stylo for
-# CSS, taffy for layout, vello_cpu for CPU rasterization. No GPU, no async
-# runtime. The blitz-*-0.3.0-beta.2 crates are pinned in lockstep (they require
-# each other exactly), anyrender_vello_cpu 0.17 is the CPU ImageRenderer
-# matching anyrender 0.13. The stylo crates are MPL-2.0 (file-level copyleft,
-# fine for linking).
-#
-# blitz-dom is built with default-features = false on purpose: its
-# "system-fonts" feature enables fontique's fontconfig backend, i.e. a C
-# library (hard rule 1). Instead src/blitz_render.rs registers the fonts found
-# on disk with parley/fontique, exactly like fonts.rs does for
-# egui. "svg"/"woff" keep SVG images and embedded fonts working (pure Rust);
-# "floats" turns on float layout, which HTML mail relies on heavily;
-# "complex-scripts" hands parley the ICU4X CJK/Thai/Khmer/Lao dictionaries
-# (already-compiled data). Without it every Chinese or Japanese run is logged
-# as "No segmentation model for complex script" and is only broken by the
-# coarse UAX-14 rules.
-blitz-dom = { version = "=0.3.0-beta.2", default-features = false, features = [
-    "svg",
-    "woff",
-    "floats",
-    "complex-scripts",
-] }
-blitz-html = { version = "=0.3.0-beta.2", default-features = false }
-blitz-traits = { version = "=0.3.0-beta.2", default-features = false }
-blitz-paint = { version = "=0.3.0-beta.2", default-features = false, features = ["svg"] }
-anyrender = "0.13"
-anyrender_vello_cpu = "0.17"
-# `Affine` for replaying a recorded page into per-slice surfaces (already in
-# the tree via blitz; declared here because we name the type).
-kurbo = "0.13"
-parley = { version = "0.11", default-features = false, features = ["std"] }
-
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-
-# Preferences → Appearance lists the installed font families. There is no
-# fontconfig here (hard rule 1), so `fonts.rs` walks the font directories and
-# reads each face's `name` table with ttf-parser: pure Rust, and already in
-# the tree through Blitz (fontique/fontdb), so this pulls in no new build.
-ttf-parser = "0.25"
-
-# WASM plugin engine: a pure-Rust interpreter (no JIT, no C runtime), with
-# validation, fuel metering and linear-memory isolation. `wasmi_core` supplies
-# the ResourceLimiter error type used by the host's memory cap.
-wasmi = "2.0.0"
-wasmi_core = "2.0.0"
-
-[dev-dependencies]
-# `render_bench` (test-only) reads the mail database directly for real HTML
-# bodies. The store's own dependency is the bundled SQLite in `kimo-store`;
-# this copy is never linked into the release binary.
-rusqlite = { version = "0.40", default-features = false, features = ["bundled", "cache"] }
 
 [profile.release]
 lto = true

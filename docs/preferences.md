@@ -34,7 +34,7 @@ Read when touching `preferences_modal`, a key in `settings.json`, or the sync cl
 - **About reads the build rather than remembering a string**: the version is
   `CARGO_PKG_VERSION`, so a release that bumps `Cargo.toml` cannot leave the
   page claiming another one; the icon is the embedded `assets/app.png` the
-  tray serves and notifications write (`crate::tray::APP_PNG`), decoded and
+  tray serves and notifications write (`kimo_platform::tray::APP_PNG`), decoded and
   uploaded the first time the page is drawn rather than at startup. The page
   is deliberately read-only — it is where a reader checks what is running, not
   another place to change it.
@@ -82,7 +82,7 @@ Read when touching `preferences_modal`, a key in `settings.json`, or the sync cl
   `wgpu::RequestAdapterOptions` can only choose among devices whose drivers
   have already been loaded, and the Vulkan loader opens every installed ICD as
   it creates the instance. Preferences → Graphics therefore names the card,
-  and `crate::gpus` hands the loader that card's manifests alone
+  and `kimo_platform::gpus` hands the loader that card's manifests alone
   (`VK_DRIVER_FILES`, plus `VK_ICD_FILENAMES` for a loader older than
   1.3.207 — Ubuntu 22.04 ships 1.3.204) before `main` builds the event loop —
   the last moment at which the list can still be chosen. The key is `gpu`, the card's
@@ -105,13 +105,13 @@ Read when touching `preferences_modal`, a key in `settings.json`, or the sync cl
   its library's name attributes it to another vendor (`libvulkan_nvidia.so`)
   or to a software rasterizer (`libvulkan_lvp.so`); a name the table does not
   know is kept. A `gpu` of the wrong JSON type is read as absent
-  (`storage::lenient_gpu`) instead of failing the whole file, because one key
+  by the lenient `gpu` reader instead of failing the whole file, because one key
   must not cost every other preference. A session that sets
   `VK_DRIVER_FILES` itself is left alone, and the log says so.
 
 - **The choice is the next start's.** A loaded driver cannot be unloaded, so
   the page says a change applies when Kimo starts again; it writes `gpu` on
-  the click and the page draws the value as written. `crate::gpu` asks the
+  the click and the page draws the value as written. `src/gpu.rs` asks the
   same plan for its adapter, matching the card's PCI bus id from
   `VK_EXT_pci_bus_info` — so a machine whose two cards share one vendor's
   driver still renders on the card that was picked.

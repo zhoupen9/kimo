@@ -235,7 +235,7 @@ pub struct MailMessage {
     pub references: Vec<String>,
     pub body_text: String,
     /// Raw HTML body part, when the message is HTML-based; rendered by
-    /// `crate::html` instead of the plain text.
+    /// `kimo_render::html` instead of the plain text.
     pub body_html: Option<String>,
     /// One-line plain-text snippet for the message list.
     pub preview: String,
@@ -244,7 +244,7 @@ pub struct MailMessage {
     /// mark of the user's own on top of that, of which a mail carries any
     /// number. Filled from the database when the mail is loaded, and never by a
     /// fetch: labels were never the server's, so re-fetching a mail keeps the
-    /// ones it had here (`crate::sync`'s merge).
+    /// ones it had here (`kimo_engine::sync`'s merge).
     pub labels: BTreeSet<String>,
     /// The mail's attachments, in the order the parts appear in it. Draws
     /// one card each at the end of the body.

@@ -12,7 +12,7 @@
 //! the framebuffer it is currently drawing into. wgpu will not — a texture
 //! cannot be sampled while it is a pass's attachment, and the attachment here
 //! is the window's surface, which is not even created with COPY_SRC. So the
-//! frame is split around this pass instead (see crate::gpu): everything behind
+//! frame is split around this pass instead (see `src/gpu.rs`): everything behind
 //! the bar is drawn into an offscreen *scene* texture, this module copies the
 //! bar's strip of it (a plain texture-to-texture copy, the one thing wgpu does
 //! allow), blurs it in two separable passes, and the rest of the frame — the
@@ -96,7 +96,7 @@ impl Glass {
     }
 
     /// Forget last frame's bar: backdrop records this frame's.
-    pub(crate) fn begin_frame(&self) {
+    pub fn begin_frame(&self) {
         if let Ok(mut shared) = self.shared.lock() {
             shared.rect = None;
         }
@@ -104,7 +104,7 @@ impl Glass {
 
     /// The bar's rect in physical pixels, clamped to the window, or None when
     /// the bar is docked (or the pass has failed).
-    pub(crate) fn rect_px(&self, pixels_per_point: f32, size: [u32; 2]) -> Option<[u32; 4]> {
+    pub fn rect_px(&self, pixels_per_point: f32, size: [u32; 2]) -> Option<[u32; 4]> {
         let shared = self.shared.lock().ok()?;
         if shared.failed {
             return None;
@@ -128,7 +128,7 @@ impl Glass {
     /// Where the frame splits: the index of the glass callback in the frame's
     /// shapes, which is the first shape that must be drawn *over* the blurred
     /// strip rather than into the scene behind it.
-    pub(crate) fn split(&self, shapes: &[egui::ClippedPrimitive]) -> Option<usize> {
+    pub fn split(&self, shapes: &[egui::ClippedPrimitive]) -> Option<usize> {
         let shared = self.shared.lock().ok()?;
         if shared.failed {
             return None;
@@ -146,7 +146,7 @@ impl Glass {
 
     /// Make the pass's textures and pipeline for a strip of this size, if they
     /// are not already made for it.
-    pub(crate) fn ensure(
+    pub fn ensure(
         &self,
         device: &wgpu::Device,
         queue: &wgpu::Queue,
@@ -183,12 +183,7 @@ impl Glass {
     /// Copy the bar's strip out of the scene and blur it, into the texture the
     /// callback draws. This runs between the frame's two halves, so the scene
     /// holds everything *behind* the bar and nothing of the bar itself.
-    pub(crate) fn blur(
-        &self,
-        encoder: &mut wgpu::CommandEncoder,
-        scene: &wgpu::Texture,
-        rect: [u32; 4],
-    ) {
+    pub fn blur(&self, encoder: &mut wgpu::CommandEncoder, scene: &wgpu::Texture, rect: [u32; 4]) {
         let Ok(shared) = self.shared.lock() else {
             return;
         };

@@ -19,16 +19,16 @@ Read when touching `crates/kimo-protocol/src/`, `crates/kimo-mail/src/outgoing.r
 
 ## The provider layer
 
-- The three clients above are reached through `src/provider/` and not from
+- The three clients above are reached through `crates/kimo-engine/src/provider/` and not from
   `sync.rs` directly: `MailProvider` is the mailbox interface (IMAP and POP3
-  adapters, one `open` per job), and `src/provider/vendor.rs` says where the big
+  adapters, one `open` per job), and `crates/kimo-engine/src/provider/vendor.rs` says where the big
   providers' servers are. Everything this page describes about the wire stays
   true underneath it; see [providers.md](providers.md).
 
 - The draft that generalizes this adapter layer into a capability-based,
   WASM-loaded provider ABI — including Gmail's `X-GM` extensions, Microsoft
   Graph and the GUI extension hooks — is [mail-spec.md](mail-spec.md). Its
-  host/ABI lives in `src/plugin/`; the protocol modules are not converted to
+  host/ABI lives in `crates/kimo-engine/src/plugin/`; the protocol modules are not converted to
   it yet, so this page and [providers.md](providers.md) still describe the
   code an account uses today.
 

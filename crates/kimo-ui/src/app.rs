@@ -2011,8 +2011,8 @@ impl AccountForm {
 
 impl KimoApp {
     /// The title bar's glass: the integration reads the rect it recorded for
-    /// this frame and blurs that strip of the scene (`crate::gpu`).
-    pub(crate) fn glass(&self) -> &Glass {
+    /// this frame and blurs that strip of the scene (`src/gpu.rs`).
+    pub fn glass(&self) -> &Glass {
         &self.glass
     }
 
@@ -2477,7 +2477,7 @@ impl KimoApp {
 }
 
 impl KimoApp {
-    /// One frame. The integration (`crate::gpu`) hands over the root `Ui` egui
+    /// One frame. The integration (`src/gpu.rs`) hands over the root `Ui` egui
     /// 0.36 draws the whole app into; the context is cloned out of it because
     /// the areas, modals, animations and layer painting below are all
     /// context-level.

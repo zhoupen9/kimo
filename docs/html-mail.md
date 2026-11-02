@@ -1,17 +1,17 @@
 # HTML mail — the two renderers
 
-Read when touching `src/html.rs`, `src/css.rs`, `src/blitz_render.rs`, or a Blitz build feature.
+Read when touching `crates/kimo-render/src/html.rs`, `crates/kimo-render/src/css.rs`, `crates/kimo-render/src/blitz_render.rs`, or a Blitz build feature.
 
 - **HTML mail:** two renderers, switched in Preferences → Appearance and
   remembered in `settings.json` (`html_renderer`).
   *Simple* (the default) parses with html5ever (via `scraper`) and draws
-  egui widgets in `src/html.rs` with a small CSS subset (`src/css.rs`):
+  egui widgets in `crates/kimo-render/src/html.rs` with a small CSS subset (`crates/kimo-render/src/css.rs`):
   theme-following, selectable, clickable, no layout fidelity.  The mail's own
   colours are read as CSS (`csscolorparser`) and adapted to the theme in force
   (`palette`, OKLCH) before they are drawn — see the colors section in
   [theme.md](theme.md).  *Blitz* feeds
   the same HTML to the pure-Rust Blitz browser engine (stylo/taffy/
-  vello_cpu) in `src/blitz_render.rs` and blits the rasterized page — close
+  vello_cpu) in `crates/kimo-render/src/blitz_render.rs` and blits the rasterized page — close
   to what the sender designed, but a static image with clickable link boxes.
   Remote images and stylesheets load **by default** in both (see the
   remote-resources decision in [architecture.md](architecture.md)). There is still no JavaScript.
@@ -23,7 +23,7 @@ Read when touching `src/html.rs`, `src/css.rs`, `src/blitz_render.rs`, or a Blit
   through `blitz_render::MailNet` (a blocking `NetProvider` that reuses the
   on-disk resource cache, and understands `data:` and `cid:` URLs). The page
   comes back as `Event::HtmlRendered` with premultiplied RGBA tiles and link
-  boxes, which `src/app/reading.rs` uploads as textures. Pages are keyed by
+  boxes, which `crates/kimo-ui/src/app/reading.rs` uploads as textures. Pages are keyed by
   mail + quantized *width* — never the pane height, which only feeds Blitz's viewport
   (`vh` and friends): keying on it re-rasterized an identical page on every
   window resize. At most two pages are cached; a cached page is reused, scaled

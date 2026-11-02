@@ -99,14 +99,14 @@ impl KimoApp {
     }
     /// Whether a close should hide the window instead of quitting. The loop
     /// asks before it honours a compositor close (`Kimo::window_event`).
-    pub(crate) fn close_to_tray(&self) -> bool {
+    pub fn close_to_tray(&self) -> bool {
         self.close_to_tray
     }
     /// The work that has to continue while the window is hidden: worker
     /// results are drained (a notification is one of them) and the automatic
     /// sync clock keeps turning. The UI itself is not run, so a hidden Kimo
     /// costs no frames.
-    pub(crate) fn pump_hidden(&mut self) {
+    pub fn pump_hidden(&mut self) {
         let ctx = self.ctx.clone();
         self.drain_events();
         // A hidden window still hears the mail arrive, and still hears it read

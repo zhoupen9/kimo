@@ -7,7 +7,7 @@
 //! into the reader's choice: [`startup_plan`] reads the saved card and
 //! [`apply`] hands the loader that card's manifests alone (`VK_DRIVER_FILES`,
 //! and the `VK_ICD_FILENAMES` name an older loader knows), before
-//! `crate::gpu` makes its instance. The other cards' libraries are then never
+//! `src/gpu.rs` makes its instance. The other cards' libraries are then never
 //! opened — which is the point: an adapter preference would only choose between
 //! drivers that had already been loaded.
 //!
@@ -557,7 +557,7 @@ pub fn plan(saved: Option<&str>, cards: &[Card], icds: &[Icd], locked: bool) -> 
 static OWN_DRIVERS: OnceLock<String> = OnceLock::new();
 
 /// This process's plan, decided once. `main` applies it before the event loop
-/// exists and `crate::gpu` reads the card back out of it for its adapter.
+/// exists and `src/gpu.rs` reads the card back out of it for its adapter.
 static PLAN: OnceLock<Plan> = OnceLock::new();
 
 pub fn startup_plan() -> &'static Plan {

@@ -1,18 +1,29 @@
 # Architecture — threads, jobs and events
 
-Read when touching `src/sync.rs`, the `Job`/`Event` enums, or anything that moves data between the UI thread and a worker.
+Read when touching `crates/kimo-engine/src/sync.rs`, the `Job`/`Event`
+enums, or anything that moves data between the UI thread and a worker.
 
 ## Crates
 
-The root is the binary. Five libraries below it are the boundaries that buy
-something: `kimo-core` (plain types, errors, XDG paths/settings), `kimo-mail`
-(RFC 5322 in/out, conversations, folder kinds), `kimo-protocol` (TLS and the
-three wire clients), `kimo-store` (the only `rusqlite` crate: schema, mail,
-FTS5 search) and `kimo-plugin-abi` (the host-side JSON envelope and manifest).
-The UI, `sync`, the provider layer and the plugin host stay modules of the
-binary: they share `KimoApp`, `Job`/`Event` and the worker's egui context, and
-a crate would only put a public API in front of that coupling. `crates/` has no
-`kimo-app`, `kimo-ui` or `kimo-engine` for the same reason.
+The root binary is only the winit/wgpu integration shell: `src/main.rs`,
+`src/gpu.rs` and `src/trim.rs`. Ten libraries below it are the boundaries:
+
+- `kimo-core` — plain types, errors, XDG paths/settings.
+- `kimo-mail` — RFC 5322 in/out, conversations, folder kinds.
+- `kimo-protocol` — TLS and the three wire clients.
+- `kimo-store` — the only `rusqlite` crate: schema, mail, FTS5 search.
+- `kimo-plugin-abi` — the host-side JSON envelope and manifest.
+- `kimo-style` — theme, color schemes and installed-font handling.
+- `kimo-platform` — D-Bus, portal, tray, notifications, wake and GPU discovery.
+- `kimo-render` — the egui HTML renderer, its CSS subset, the Blitz raster
+  renderer and the shared HTTP resource helper.
+- `kimo-engine` — `Job`/`Event`, worker threads, `provider/` and `plugin/`.
+- `kimo-ui` — `KimoApp`, the UI concerns, `glass` and the UI tests.
+
+The dependency direction is `kimo-ui` above `kimo-engine`; both build on
+`kimo-render` / `kimo-platform` / `kimo-style`, and the data crates sit below
+all of them. The binary depends on `kimo-ui`, `kimo-engine`, `kimo-platform`
+and `kimo-style`, and contains no application modules.
 
 `plugins/` is a separate workspace (`gmail`, `outlook`, `sender-groups`) built
 for `wasm32-unknown-unknown`; its profile and target flags live there, and the
@@ -21,10 +32,10 @@ host loads the `.wasm` at runtime rather than linking it.
 ## Data flow
 
 ```
-UI (app.rs ui; src/app/ concerns)
+UI (KimoApp::ui; kimo-ui app concerns)
    │  spawn(Job)                                   UI thread — no sockets, no DB writes
    ▼
-worker thread (sync.rs)
+worker thread (kimo-engine sync)
    │  provider::MailProvider (IMAP or POP3)        blocking I/O is fine here
    │  protocol::smtp (submission, not a mailbox)
    │  db::save_messages / db::set_seen             the only place the DB is written
@@ -32,22 +43,25 @@ worker thread (sync.rs)
 Event (mpsc) ──► drain_events() at frame start ──► merge into AccountUiState
 ```
 
-The app root (`src/app.rs`) owns `KimoApp`, the shared state/models and the
+`crates/kimo-ui/src/app.rs` owns `KimoApp`, the shared state/models and the
 one-frame `ui` orchestration. The UI itself is split by concern under
-`src/app/`: `events`/`actions`, `titlebar`, `navigation`, `list`,
-`reading`, `compose`, `preferences`, `menus`, `search`, `blitz`, and the
-`layout`/`widgets`/`icons`/`util` leaves; `src/app/tests/` holds their tests.
+`crates/kimo-ui/src/app/`: `events`/`actions`, `titlebar`, `navigation`,
+`list`, `reading`, `compose`, `preferences`, `menus`, `search`, `blitz`,
+and the `layout`/`widgets`/`icons`/`util` leaves;
+`crates/kimo-ui/src/app/tests/` holds their tests. `glass` is the title bar's
+wgpu backdrop next to the app root.
 
-Mailbox work goes through `provider::MailProvider` (`src/provider/`): the
-adapter owns the socket and the protocol, the worker owns the marks, the
-database and the events. See [providers.md](providers.md).
+Mailbox work goes through `provider::MailProvider`
+(`crates/kimo-engine/src/provider/`): the adapter owns the socket and the
+protocol, the worker owns the marks, the database and the events. See
+[providers.md](providers.md).
 
 A worker also calls `wake::now()` after sending its event. While the window is
 hidden there is no frame to start: egui can consider an immediate repaint
 already served, and a Wayland window hidden to the tray has been dropped
-altogether. `src/wake.rs` is the event loop's own channel, and a hidden
-`KimoApp::pump_hidden` drains the channel's events and keeps the auto-sync
-clock turning. Tray Show and Quit use the same wake.
+altogether. `crates/kimo-platform/src/wake.rs` is the event loop's own channel,
+and a hidden `KimoApp::pump_hidden` drains the channel's events and keeps the
+auto-sync clock turning. Tray Show and Quit use the same wake.
 
 ## Sync is incremental
 
@@ -59,7 +73,7 @@ clock turning. Tray Show and Quit use the same wake.
   UIDLs it does not already store (`db::stored_uids`). `db::save_messages` moves
   an IMAP folder's mark to one past the highest UID it holds, in the same
   transaction as the batch, so a crash can never advance past mail that did not
-  reach the disk. `BACKFILL_LIMIT` (in `src/provider/`) is the size of a folder's
+  reach the disk. `BACKFILL_LIMIT` (in `crates/kimo-engine/src/provider/`) is the size of a folder's
   *first* fetch: the newest messages only, and the rest waits for the button in
   the `Load older mail` button below. `Job::Sync` (startup
   and the title-bar button) fetches the folder list, INBOX and every folder that

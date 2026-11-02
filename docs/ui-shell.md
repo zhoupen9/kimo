@@ -1,8 +1,8 @@
 # UI shell — window, title bar and columns
 
-Read when touching `src/main.rs`, `src/gpu.rs`, `src/gpus.rs`,
-`src/glass.rs`, `src/app/titlebar.rs`, `src/app/layout.rs`,
-`src/app/navigation.rs`, the title bar, or the columns' layout plan.
+Read when touching `src/main.rs`, `src/gpu.rs`, `crates/kimo-platform/src/gpus.rs`,
+`crates/kimo-ui/src/glass.rs`, `crates/kimo-ui/src/app/titlebar.rs`, `crates/kimo-ui/src/app/layout.rs`,
+`crates/kimo-ui/src/app/navigation.rs`, the title bar, or the columns' layout plan.
 
 - **GUI:** egui (immediate mode, pinned to the 0.36 line), driven directly
   through winit + `egui-winit` + `egui-wgpu` instead of through eframe, because
@@ -67,7 +67,7 @@ Read when touching `src/main.rs`, `src/gpu.rs`, `src/gpus.rs`,
   `/proc/<pid>/smaps`.
 
 - **The GPU is picked, and so is how much of the Vulkan stack is opened**
-  (Preferences → Graphics, `src/gpus.rs`). The loader opens every installed ICD
+  (Preferences → Graphics, `crates/kimo-platform/src/gpus.rs`). The loader opens every installed ICD
   as it creates the instance, so on a machine with two cards the drivers of the
   card that will not draw are resident as well — on the box measured in
   [fix.md](fix.md), most of rows 1–2. The pick is saved as the
@@ -90,13 +90,13 @@ Read when touching `src/main.rs`, `src/gpu.rs`, `src/gpus.rs`,
 ## The window and its title bar
 
 - The window is undecorated on purpose (`with_decorations(false)` in
-  `main.rs`): `titlebar_area()` in `src/app/titlebar.rs` draws the custom title bar — an
+  `main.rs`): `titlebar_area()` in `crates/kimo-ui/src/app/titlebar.rs` draws the custom title bar — an
   `egui::Area` fixed to the window's top edge and shown *after* the panels, not
   a `TopBottomPanel`, because the bar floats over the columns and the message
   list scrolls under it. At the top of the list it is the solid chrome band it
   has always been; once the list is scrolled it turns to glass — the fill keeps
   `GLASS_ALPHA` of the scheme's `panel`, the backdrop behind it is blurred
-  (`src/glass.rs`) and a hairline appears along its bottom edge. One animated
+  (`crates/kimo-ui/src/glass.rs`) and a hairline appears along its bottom edge. One animated
   value (`TITLEBAR_FLOAT_TIME`) drives all three from the columns' scroll
   offsets (`KimoApp::nav_scroll`, `list_scroll` and `mail_scroll`, each captured
   where its scroll area is built), so scrolling any of them back to the top
@@ -461,13 +461,13 @@ Read when touching `src/main.rs`, `src/gpu.rs`, `src/gpus.rs`,
 
 ## Frosted glass
 
-- The frosted backdrop is hand-written GPU code (`src/glass.rs`), because egui
+- The frosted backdrop is hand-written GPU code (`crates/kimo-ui/src/glass.rs`), because egui
   has no blur: nothing in the painter can sample what has already been drawn.
   On wgpu that is a decision about the *frame*, not something a paint callback
   can do on its own: a texture cannot be sampled by the pass that is drawing
   it, and the pass's target here is the window's surface, which is not even
   created with `COPY_SRC`. So the frame is split around the glass —
-  `crate::gpu` renders everything *behind* the bar into an offscreen scene
+  `src/gpu.rs` renders everything *behind* the bar into an offscreen scene
   texture, `Glass::blur` copies the bar's strip of it into a texture of the
   strip's own size (a texture-to-texture copy, the one thing wgpu allows) and
   blurs that in two passes, and the second half of the frame — the bar's fill,

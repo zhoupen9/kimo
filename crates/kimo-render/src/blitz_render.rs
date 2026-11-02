@@ -9,7 +9,7 @@
 //!
 //! Rendering is synchronous and CPU-bound (a newsletter takes hundreds of
 //! milliseconds), so it always runs on a `sync` worker thread
-//! ([`crate::sync::Job::RenderHtml`]), never on the UI thread (hard rule 3).
+//! ([`kimo_engine::sync::Job::RenderHtml`]), never on the UI thread (hard rule 3).
 //! Remote resources are fetched during the render by [`MailNet`], a blocking
 //! `NetProvider` that reuses the app's on-disk resource cache, so mail that
 //! was already displayed with the built-in renderer renders offline.

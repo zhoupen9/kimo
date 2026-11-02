@@ -423,7 +423,7 @@ Read when touching a list row, threading, select mode, search in the bar, the re
 - Exporting a mail (the title bar's Export → `KimoApp::export_selected_message`
   → `Job::ExportMessage`) is the one thing in the app that writes a mail out of
   it, and the one action that asks where. **The worker asks the desktop first**
-  (`crate::portal::save_file`, the XDG portal's `SaveFile` — the same
+  (`kimo_platform::portal::save_file`, the XDG portal's `SaveFile` — the same
   hand-written D-Bus conversation the attach card's chooser uses, on a worker
   because it does not answer until the user has), then fetches the message's
   original RFC 5322 source from the server — IMAP

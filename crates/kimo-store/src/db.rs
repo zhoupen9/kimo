@@ -3,7 +3,7 @@
 //!
 //! # Who writes
 //!
-//! Worker threads own every write (`crate::sync`): a sync job stores the folder
+//! Worker threads own every write (`kimo_engine::sync`): a sync job stores the folder
 //! list and the batch it has just fetched, `Job::MarkSeen` stores the
 //! `\Seen` flag, `Job::DeleteAccount` removes an account. The UI thread only
 //! reads, once, at startup — no frame is ever blocked on the disk. Everything
@@ -19,7 +19,7 @@
 //!
 //! `folders` carries each folder's sync marks as well — `uid_next` for IMAP,
 //! `first_num` for POP3. They are what makes a sync fetch only the mail that is
-//! not stored yet (see the sync marks section below and `crate::sync`).
+//! not stored yet (see the sync marks section below and `kimo_engine::sync`).
 //!
 //! `messages_fts` is an external-content FTS5 table over `messages`: the three
 //! triggers in `SCHEMA_SQL` keep the index in step, so nothing else writes to
@@ -975,7 +975,7 @@ fn purge_mail_on(conn: &mut Connection, account_id: &str) -> StoreResult<()> {
 
 /// What the database remembers about a folder's last sync — the marks that let
 /// a sync fetch what is not stored yet instead of refetching a batch every time
-/// (see `crate::sync`).
+/// (see `kimo_engine::sync`).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct FolderSync {
     /// The IMAP generation `uid_next` belongs to: UIDs stored under another

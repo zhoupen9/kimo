@@ -2,7 +2,7 @@
 //!
 //! Kimo drives winit, egui-winit and egui-wgpu itself rather than going through
 //! eframe, because the floating title bar's frosted backdrop needs the frame to
-//! be built in two halves (see `crate::glass` for why wgpu cannot copy the
+//! be built in two halves (see `kimo_ui::glass` for why wgpu cannot copy the)
 //! pixels behind the bar the way the glow build did):
 //!
 //! * a frame whose bar is docked is one render pass straight onto the surface;

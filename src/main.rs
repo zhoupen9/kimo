@@ -3,8 +3,6 @@
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-mod app;
-mod glass;
 mod gpu;
 mod trim;
 
@@ -12,14 +10,12 @@ mod trim;
 // providers and workers keep saying `crate::models`, `crate::db`, and so on.
 // The lower layers moved to their own crates; the aliases keep the root's
 // module names stable while the split is completed.
-pub use kimo_core::{error, models, storage};
-pub use kimo_mail::{folders, mail, outgoing, threads};
-pub use kimo_engine::{plugin, provider, sync};
-pub use kimo_platform::{dbus, gpus, notify, portal, tray, wake};
+pub use kimo_core::storage;
+pub use kimo_engine::plugin;
+pub use kimo_platform::{gpus, tray, wake};
 pub use kimo_protocol as protocol;
-pub use kimo_render::{blitz_render, css, html};
-pub use kimo_store::{db, search};
-pub use kimo_style::{fonts, theme};
+pub use kimo_style::theme;
+pub use kimo_ui::app;
 
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -441,7 +437,7 @@ fn window_attributes(size: LogicalSize<f64>) -> winit::window::WindowAttributes 
     #[allow(unused_mut)]
     let mut attributes = Window::default_attributes()
         .with_title("Kimo")
-        .with_decorations(false) // the custom title bar is drawn in src/app/titlebar.rs
+        .with_decorations(false) // the custom title bar is drawn in crates/kimo-ui/src/app/titlebar.rs
         // The window's corners are cut out of the frame (see
         // `gpu::CornerMask`), so the surface has to carry an alpha channel: on
         // Wayland this flag is also what stops winit from marking the whole

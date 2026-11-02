@@ -13,7 +13,7 @@
 //! thread.
 //!
 //! The choice made in Preferences → Appearance is applied to the egui UI (and
-//! therefore to the built-in HTML renderer, `crate::html`). Blitz keeps its
+//! therefore to the built-in HTML renderer, `kimo_render::html`). Blitz keeps its
 //! own curated font set — see `blitz_render::load_fonts`.
 //!
 //! The CJK fallback is a pan-CJK collection (Noto Sans CJK), whose faces share
