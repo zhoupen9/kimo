@@ -18,6 +18,8 @@ kimo-mail = { path = "crates/kimo-mail" }
 kimo-protocol = { path = "crates/kimo-protocol" }
 kimo-store = { path = "crates/kimo-store" }
 kimo-plugin-abi = { path = "crates/kimo-plugin-abi" }
+kimo-style = { path = "crates/kimo-style" }
+kimo-platform = { path = "crates/kimo-platform" }
 # Kimo drives the window and the GPU itself — winit for the window and the
 # event loop, `egui-winit` for input, `egui-wgpu` for egui's meshes (see
 # `src/gpu.rs`) — rather than going through eframe. The reason is the floating

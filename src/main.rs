@@ -6,31 +6,27 @@
 mod app;
 mod blitz_render;
 mod css;
-mod dbus;
-mod fonts;
 mod glass;
 mod gpu;
-mod gpus;
 mod html;
-mod notify;
 mod plugin;
-mod portal;
 mod provider;
 // Test-only measurement harness for the two HTML renderers; see the file.
 #[cfg(test)]
 mod render_bench;
 mod sync;
-mod theme;
-mod tray;
 mod trim;
-mod wake;
 
 // The host crates are re-exported under their old module names so the UI,
 // providers and workers keep saying `crate::models`, `crate::db`, and so on.
+// The lower layers moved to their own crates; the aliases keep the root's
+// module names stable while the split is completed.
 pub use kimo_core::{error, models, storage};
 pub use kimo_mail::{folders, mail, outgoing, threads};
+pub use kimo_platform::{dbus, gpus, notify, portal, tray, wake};
 pub use kimo_protocol as protocol;
 pub use kimo_store::{db, search};
+pub use kimo_style::{fonts, theme};
 
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -41,14 +37,7 @@ use winit::event::WindowEvent;
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::window::{Window, WindowId};
 
-/// What asks the loop for another frame: egui's repaint requests, which can
-/// come from any thread — the tray, a sync job, an animation.
-#[derive(Debug)]
-enum Wake {
-    /// Draw again after this long, zero meaning as soon as the loop comes up
-    /// for air.
-    Repaint(Duration),
-}
+use wake::Wake;
 
 /// The window, its GPU context, egui's input state and the app. The app and
 /// the GPU renderer outlive the window: Wayland cannot hide a toplevel, so

@@ -11,22 +11,29 @@ use std::time::Duration;
 
 use winit::event_loop::EventLoopProxy;
 
-use crate::Wake;
+/// What asks the loop for another frame: egui's repaint requests, which can
+/// come from any thread — the tray, a sync job, an animation.
+#[derive(Debug)]
+pub enum Wake {
+    /// Draw again after this long, zero meaning as soon as the loop comes up
+    /// for air.
+    Repaint(Duration),
+}
 
 static PROXY: OnceLock<EventLoopProxy<Wake>> = OnceLock::new();
 
 /// Install the proxy the rest of the app wakes. Called once, from `main`.
-pub(crate) fn set(proxy: EventLoopProxy<Wake>) {
+pub fn set(proxy: EventLoopProxy<Wake>) {
     let _ = PROXY.set(proxy);
 }
 
 /// Wake the event loop now.
-pub(crate) fn now() {
+pub fn now() {
     send(Duration::ZERO);
 }
 
 /// Wake the event loop after `delay`.
-pub(crate) fn after(delay: Duration) {
+pub fn after(delay: Duration) {
     send(delay);
 }
 

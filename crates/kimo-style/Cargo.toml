@@ -1,0 +1,11 @@
+[package]
+name = "kimo-style"
+version = "0.1.0"
+edition = "2021"
+description = "Kimo's egui theme, color schemes and installed-font discovery"
+license = "MIT"
+publish = false
+
+[dependencies]
+egui = "0.36"
+ttf-parser = "0.25"

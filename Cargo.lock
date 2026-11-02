@@ -1819,9 +1819,11 @@ dependencies = [
  "image",
  "kimo-core",
  "kimo-mail",
+ "kimo-platform",
  "kimo-plugin-abi",
  "kimo-protocol",
  "kimo-store",
+ "kimo-style",
  "kurbo",
  "palette",
  "parley",
@@ -1860,6 +1862,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "kimo-platform"
+version = "0.1.0"
+dependencies = [
+ "egui",
+ "image",
+ "kimo-core",
+ "kimo-style",
+ "serde",
+ "serde_json",
+ "winit",
+]
+
+[[package]]
 name = "kimo-plugin-abi"
 version = "0.1.0"
 dependencies = [
@@ -1888,6 +1903,14 @@ dependencies = [
  "rusqlite",
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "kimo-style"
+version = "0.1.0"
+dependencies = [
+ "egui",
+ "ttf-parser",
 ]
 
 [[package]]

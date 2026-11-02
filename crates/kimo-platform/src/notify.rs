@@ -69,7 +69,7 @@ static QUEUE: OnceLock<Sender<Request>> = OnceLock::new();
 
 /// Show one desktop notification. Posting to the queue is all this does: the
 /// blocking part is the notify thread's (see the module note).
-pub(crate) fn show(summary: &str, body: &str, scale: f32) {
+pub fn show(summary: &str, body: &str, scale: f32) {
     let queue = QUEUE.get_or_init(|| {
         let (tx, rx) = mpsc::channel();
         let spawned = std::thread::Builder::new()

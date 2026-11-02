@@ -30,7 +30,7 @@ use crate::dbus::{
 /// at compile time: the tray serves it as an `IconPixmap`, and a new-mail
 /// notification (`crate::notify`) writes it out as the icon the notification
 /// shows.
-pub(crate) const APP_PNG: &[u8] = include_bytes!("../assets/app.png");
+pub const APP_PNG: &[u8] = include_bytes!("../../../assets/app.png");
 
 /// Whether the tray is registered and being served. The window's minimize
 /// button consults this before hiding the window: the tray is the way back,
@@ -53,17 +53,17 @@ static QUIT_REQUESTED: AtomicBool = AtomicBool::new(false);
 static UNREAD: AtomicBool = AtomicBool::new(false);
 
 /// Whether a tray icon is registered and listening for Show.
-pub(crate) fn available() -> bool {
+pub fn available() -> bool {
     AVAILABLE.load(Ordering::Relaxed)
 }
 
 /// Take the pending Show request, if any.
-pub(crate) fn take_show_request() -> bool {
+pub fn take_show_request() -> bool {
     SHOW_REQUESTED.swap(false, Ordering::Relaxed)
 }
 
 /// Take the pending Quit request, if any.
-pub(crate) fn take_quit_request() -> bool {
+pub fn take_quit_request() -> bool {
     QUIT_REQUESTED.swap(false, Ordering::Relaxed)
 }
 
@@ -72,7 +72,7 @@ pub(crate) fn take_quit_request() -> bool {
 /// change — the property and the `NewIcon` signal that makes a host read it
 /// again — are its own (`serve`). All this does is set the flag that thread
 /// looks at, so it is safe to call from anywhere.
-pub(crate) fn set_unread(unread: bool) {
+pub fn set_unread(unread: bool) {
     UNREAD.store(unread, Ordering::Relaxed);
 }
 

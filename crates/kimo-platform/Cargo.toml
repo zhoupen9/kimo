@@ -1,0 +1,16 @@
+[package]
+name = "kimo-platform"
+version = "0.1.0"
+edition = "2021"
+description = "Kimo's D-Bus, desktop portal, tray, notifications, wake channel and GPU discovery"
+license = "MIT"
+publish = false
+
+[dependencies]
+kimo-core = { path = "../kimo-core" }
+kimo-style = { path = "../kimo-style" }
+egui = "0.36"
+image = { version = "0.25", default-features = false, features = ["png"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+winit = { version = "0.30", default-features = false }
